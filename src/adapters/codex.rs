@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
-use tracing::warn;
+use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::adapters::{RawMessage, RawSession, SourceAdapter};
@@ -22,7 +22,7 @@ impl SourceAdapter for CodexAdapter {
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
         let codex_dir = home.join(".codex");
         if !codex_dir.exists() {
-            warn!("~/.codex not found, skipping Codex");
+            debug!("~/.codex not found, skipping Codex");
             return Ok(vec![]);
         }
 
@@ -59,7 +59,7 @@ fn scan_dir(dir: &Path) -> Vec<RawSession> {
             Ok(Some(session)) => sessions.push(session),
             Ok(None) => {}
             Err(e) => {
-                warn!("failed to parse codex session {}: {e}", path.display());
+                debug!("failed to parse codex session {}: {e}", path.display());
             }
         }
     }

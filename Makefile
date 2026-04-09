@@ -15,7 +15,7 @@ build: ## Debug build
 	$(CARGO) build
 
 release: ## Release build (LTO + strip)
-	$(CARGO) build --release
+	$(CARGO) build --release --features semantic
 
 # ── Quality ──────────────────────────────────────────────────────────────────
 

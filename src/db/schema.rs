@@ -59,6 +59,19 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
             message_id INTEGER PRIMARY KEY,
             embedding float[384]
         );
+
+        CREATE TABLE IF NOT EXISTS session_embedding_state (
+            session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            units_total INTEGER NOT NULL DEFAULT 0,
+            units_done INTEGER NOT NULL DEFAULT 0,
+            started_at INTEGER,
+            finished_at INTEGER,
+            last_error TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_embedding_status
+            ON session_embedding_state(status);
         ",
     )?;
     Ok(())

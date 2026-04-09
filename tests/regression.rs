@@ -33,7 +33,7 @@ fn make_message(session_id: &str, role: Role, content: &str, seq: u32) -> Messag
 }
 
 fn no_filters() -> SearchFilters {
-    SearchFilters { source: None, time_range: TimeRange::All, directory: None }
+    SearchFilters { sources: None, time_range: TimeRange::All, directory: None }
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn search_with_source_filter() {
 
     let engine = SearchEngine::new(&store.conn);
     let filters = SearchFilters {
-        source: Some("claude-code".to_string()),
+        sources: Some(vec!["claude-code".to_string()]),
         time_range: TimeRange::All,
         directory: None,
     };

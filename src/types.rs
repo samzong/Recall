@@ -60,3 +60,20 @@ pub struct SearchResult {
     pub match_source: MatchSource,
     pub snippet: Option<String>,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct SemanticProgress {
+    pub total_sessions: u64,
+    pub done_sessions: u64,
+    pub processing_sessions: u64,
+    pub failed_sessions: u64,
+    pub pending_sessions: u64,
+    pub current_session_title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SemanticSessionJob {
+    pub session_id: String,
+    pub title: String,
+    pub units_total: u64,
+}

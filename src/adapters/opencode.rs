@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
-use tracing::warn;
+use tracing::debug;
 
 use crate::adapters::{RawMessage, RawSession, SourceAdapter};
 use crate::types::Role;
@@ -23,7 +23,7 @@ impl SourceAdapter for OpenCodeAdapter {
             .join(".local/share/opencode/opencode.db");
 
         if !db_path.exists() {
-            warn!("OpenCode DB not found at {}, skipping", db_path.display());
+            debug!("OpenCode DB not found at {}, skipping", db_path.display());
             return Ok(vec![]);
         }
 

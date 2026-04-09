@@ -27,6 +27,10 @@ pub fn render(f: &mut Frame, app: &App) {
             render_viewing(f, app);
             render_export_input(f, app);
         }
+        AppMode::Settings => {
+            render_search(f, app);
+            render_settings(f, app);
+        }
     }
 }
 
@@ -354,45 +358,130 @@ fn render_export_input(f: &mut Frame, app: &App) {
     f.set_cursor_position((cursor_x.min(popup_area.right() - 2), y + 1));
 }
 
+fn render_settings(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let width = area.width.min(70);
+    let height = (app.all_sources.len() as u16 + 6).min(area.height.saturating_sub(2).max(6));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .title(" Settings (Enter/Space toggle, Esc close) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Black));
+
+    let mut lines = Vec::new();
+    let selected_style = Style::default().bg(Color::Yellow).fg(Color::Black);
+    let normal_style = Style::default().fg(Color::White);
+
+    lines.push(Line::from(vec![
+        Span::styled(" Time Scope: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            app.config.sync_window.label(),
+            if app.settings_selected == 0 { selected_style } else { normal_style },
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    for (index, (source_id, label)) in app.all_sources.iter().enumerate() {
+        let enabled = app.config.is_source_enabled(source_id);
+        let prefix = if enabled { "[x]" } else { "[ ]" };
+        let style = if app.settings_selected == index + 1 { selected_style } else { normal_style };
+        lines.push(Line::from(Span::styled(format!(" {prefix} {label} ({source_id})"), style)));
+    }
+
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(Clear, popup);
+    f.render_widget(widget, popup);
+}
+
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    let semantic_span = if app.semantic_progress.total_sessions > 0 {
+        let mut text = format!(
+            " [semantic {}/{}",
+            app.semantic_progress.done_sessions, app.semantic_progress.total_sessions
+        );
+        if app.semantic_progress.processing_sessions > 0 {
+            text.push_str(" active");
+        } else if app.semantic_progress.failed_sessions > 0 {
+            text.push_str(&format!(", {} failed", app.semantic_progress.failed_sessions));
+        }
+        text.push(']');
+        Some(Span::styled(text, Style::default().fg(Color::Blue)))
+    } else {
+        None
+    };
+
+    let current_span = app.semantic_progress.current_session_title.as_ref().map(|title| {
+        let short: String = title.chars().take(24).collect();
+        Span::styled(format!(" [{short}]"), Style::default().fg(Color::DarkGray))
+    });
+
     let stats_span = Span::styled(
         format!(" [{} sessions, {} messages]", app.total_sessions, app.total_messages),
         Style::default().fg(Color::DarkGray),
     );
 
     let line = if let Some(ref msg) = app.status_message {
-        Line::from(vec![
-            Span::styled(format!(" {msg}"), Style::default().fg(Color::Green)),
-            stats_span,
-        ])
+        let mut spans = vec![Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))];
+        if let Some(span) = semantic_span.clone() {
+            spans.push(span);
+        }
+        if let Some(span) = current_span.clone() {
+            spans.push(span);
+        }
+        spans.push(stats_span);
+        Line::from(spans)
     } else {
         match app.panel_focus {
-            PanelFocus::SessionList => Line::from(vec![
-                Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
-                Span::styled(" sessions  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("→", Style::default().fg(Color::Yellow)),
-                Span::styled(" preview  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                Span::styled(" detail  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Tab", Style::default().fg(Color::Yellow)),
-                Span::styled(" filter  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                Span::styled(" clear  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("q", Style::default().fg(Color::Yellow)),
-                Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-                stats_span,
-            ]),
-            PanelFocus::Preview => Line::from(vec![
-                Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
-                Span::styled(" messages  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("←", Style::default().fg(Color::Yellow)),
-                Span::styled(" sessions  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                Span::styled(" detail  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                Span::styled(" back", Style::default().fg(Color::DarkGray)),
-                stats_span,
-            ]),
+            PanelFocus::SessionList => {
+                let mut spans = vec![
+                    Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
+                    Span::styled(" sessions  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("→", Style::default().fg(Color::Yellow)),
+                    Span::styled(" preview  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                    Span::styled(" detail  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Tab", Style::default().fg(Color::Yellow)),
+                    Span::styled(" filter  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Ctrl+S", Style::default().fg(Color::Yellow)),
+                    Span::styled(" settings  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::styled(" clear  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("q", Style::default().fg(Color::Yellow)),
+                    Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+                ];
+                if let Some(span) = semantic_span.clone() {
+                    spans.push(span);
+                }
+                if let Some(span) = current_span.clone() {
+                    spans.push(span);
+                }
+                spans.push(stats_span);
+                Line::from(spans)
+            }
+            PanelFocus::Preview => {
+                let mut spans = vec![
+                    Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
+                    Span::styled(" messages  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("←", Style::default().fg(Color::Yellow)),
+                    Span::styled(" sessions  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                    Span::styled(" detail  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::styled(" back", Style::default().fg(Color::DarkGray)),
+                ];
+                if let Some(span) = semantic_span {
+                    spans.push(span);
+                }
+                if let Some(span) = current_span {
+                    spans.push(span);
+                }
+                spans.push(stats_span);
+                Line::from(spans)
+            }
         }
     };
     f.render_widget(Paragraph::new(line), area);

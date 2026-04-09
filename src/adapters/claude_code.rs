@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
-use tracing::warn;
+use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::adapters::{RawMessage, RawSession, SourceAdapter};
@@ -23,7 +23,7 @@ impl SourceAdapter for ClaudeCodeAdapter {
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
         let claude_dir = home.join(".claude");
         if !claude_dir.exists() {
-            warn!("~/.claude not found, skipping Claude Code");
+            debug!("~/.claude not found, skipping Claude Code");
             return Ok(vec![]);
         }
 
@@ -53,7 +53,7 @@ fn load_session_index(claude_dir: &Path) -> HashMap<String, SessionMeta> {
     let entries = match fs::read_dir(&sessions_dir) {
         Ok(e) => e,
         Err(e) => {
-            warn!("cannot read ~/.claude/sessions: {e}");
+            debug!("cannot read ~/.claude/sessions: {e}");
             return index;
         }
     };
@@ -97,7 +97,7 @@ fn scan_projects(
     let project_dirs = match fs::read_dir(&projects_dir) {
         Ok(e) => e,
         Err(e) => {
-            warn!("cannot read ~/.claude/projects: {e}");
+            debug!("cannot read ~/.claude/projects: {e}");
             return vec![];
         }
     };
@@ -130,7 +130,7 @@ fn scan_projects(
             let messages = match parse_conversation_jsonl(&file_path) {
                 Ok(m) => m,
                 Err(e) => {
-                    warn!("failed to parse {}: {e}", file_path.display());
+                    debug!("failed to parse {}: {e}", file_path.display());
                     continue;
                 }
             };
@@ -177,7 +177,7 @@ fn scan_transcripts(claude_dir: &Path) -> Vec<RawSession> {
         let messages = match parse_conversation_jsonl(path) {
             Ok(m) => m,
             Err(e) => {
-                warn!("failed to parse transcript {}: {e}", path.display());
+                debug!("failed to parse transcript {}: {e}", path.display());
                 continue;
             }
         };

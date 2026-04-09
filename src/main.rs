@@ -3,10 +3,12 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 
 use recall::adapters;
+use recall::config::AppConfig;
 use recall::db;
 use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
 use recall::db::store::Store;
 use recall::embedding::EmbeddingProvider;
+use recall::semantic;
 use recall::types::{self, Message, Role, Session};
 use recall::utils;
 
@@ -20,18 +22,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Info,
-    Index {
-        #[arg(long, help = "Comma-separated source IDs (e.g. claude-code,codex)")]
-        source: Option<String>,
-        #[arg(long, help = "Only index sessions newer than this (e.g. 7d, 30d, 3m)")]
-        since: Option<String>,
-    },
-    Sync {
-        #[arg(long, help = "Comma-separated source IDs (e.g. claude-code,codex)")]
-        source: Option<String>,
-        #[arg(long, help = "Only index sessions newer than this (e.g. 7d, 30d, 3m)")]
-        since: Option<String>,
-    },
+    Index,
+    Sync,
     Search {
         query: String,
         #[arg(long)]
@@ -55,12 +47,8 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Info) => cmd_info()?,
-        Some(Commands::Index { source, since }) => {
-            cmd_index(false, source.as_deref(), since.as_deref())?
-        }
-        Some(Commands::Sync { source, since }) => {
-            cmd_index(true, source.as_deref(), since.as_deref())?
-        }
+        Some(Commands::Index) => cmd_index(false)?,
+        Some(Commands::Sync) => cmd_index(true)?,
         Some(Commands::Search { query, source, time }) => {
             cmd_search(&query, source.as_deref(), time.as_deref())?
         }
@@ -73,17 +61,30 @@ fn main() -> Result<()> {
 fn cmd_info() -> Result<()> {
     let all = adapters::all_adapters();
     let labels = adapters::source_labels();
+    let mut config = AppConfig::load_or_default();
+    config.normalize_sources(&labels);
+    let store = Store::open()?;
+    let progress = store.semantic_progress().unwrap_or_default();
 
-    println!("Detected sources:\n");
+    struct SourceSummary {
+        label: String,
+        id: String,
+        sessions: usize,
+        messages: usize,
+        range: String,
+        error: Option<String>,
+    }
+
+    let mut rows = Vec::new();
 
     let mut grand_sessions = 0usize;
     let mut grand_messages = 0usize;
 
     for adapter in &all {
         let id = adapter.id();
-        let label = labels.iter().find(|(k, _)| k == id).map(|(_, v)| v.as_str()).unwrap_or(id);
+        let label =
+            labels.iter().find(|(k, _)| k == id).map(|(_, v)| v.as_str()).unwrap_or(id).to_string();
 
-        print!("  {label} ({id}): ");
         match adapter.scan() {
             Ok(sessions) => {
                 let session_count = sessions.len();
@@ -94,59 +95,141 @@ fn cmd_info() -> Result<()> {
                 grand_sessions += session_count;
                 grand_messages += message_count;
 
-                if session_count == 0 {
-                    println!("no sessions found");
-                    continue;
-                }
-
-                let oldest_str = oldest
-                    .and_then(chrono::DateTime::from_timestamp_millis)
-                    .map(|dt| dt.format("%Y-%m-%d").to_string())
-                    .unwrap_or_default();
-                let newest_str = newest
-                    .and_then(chrono::DateTime::from_timestamp_millis)
-                    .map(|dt| dt.format("%Y-%m-%d").to_string())
-                    .unwrap_or_default();
-
-                println!(
-                    "{session_count} sessions, {message_count} messages ({oldest_str} ~ {newest_str})"
-                );
+                rows.push(SourceSummary {
+                    label,
+                    id: id.to_string(),
+                    sessions: session_count,
+                    messages: message_count,
+                    range: format_date_range(oldest, newest),
+                    error: None,
+                });
             }
             Err(e) => {
-                println!("error: {e}");
+                rows.push(SourceSummary {
+                    label,
+                    id: id.to_string(),
+                    sessions: 0,
+                    messages: 0,
+                    range: "-".to_string(),
+                    error: Some(e.to_string()),
+                });
             }
         }
     }
 
-    println!("\n  Total: {grand_sessions} sessions, {grand_messages} messages");
-    println!("\nTip: use `recall index --source claude-code --since 30d` to index selectively.");
+    let source_width = rows
+        .iter()
+        .map(|row| format!("{} ({})", row.label, row.id).len())
+        .max()
+        .unwrap_or(12)
+        .max("Source".len());
+    let sessions_width = rows
+        .iter()
+        .map(|row| row.sessions.to_string().len())
+        .max()
+        .unwrap_or(1)
+        .max("Sessions".len())
+        .max(grand_sessions.to_string().len());
+    let messages_width = rows
+        .iter()
+        .map(|row| row.messages.to_string().len())
+        .max()
+        .unwrap_or(1)
+        .max("Messages".len())
+        .max(grand_messages.to_string().len());
+
+    println!("Source Scan");
+    println!(
+        "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}  Range",
+        source = "Source",
+        sessions = "Sessions",
+        messages = "Messages"
+    );
+    for row in rows {
+        let source = format!("{} ({})", row.label, row.id);
+        if let Some(error) = row.error {
+            println!(
+                "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}  error: {error}",
+                sessions = "-",
+                messages = "-"
+            );
+            continue;
+        }
+        println!(
+            "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}  {range}",
+            sessions = row.sessions,
+            messages = row.messages,
+            range = row.range
+        );
+    }
+    println!(
+        "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}",
+        source = "Total scanned",
+        sessions = grand_sessions,
+        messages = grand_messages
+    );
+
+    println!();
+    println!("Settings");
+    println!(
+        "  Sources     {}",
+        labels
+            .iter()
+            .filter(|(id, _)| config.is_source_enabled(id))
+            .map(|(_, label)| label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!("  Time scope  {}", config.sync_window.label());
+
+    println!();
+    println!("Semantic Queue");
+    println!(
+        "  Build       {}",
+        if EmbeddingProvider::is_available() { "enabled" } else { "disabled (FTS-only binary)" }
+    );
+    println!("  Indexed DB  {} sessions tracked locally", progress.total_sessions);
+    println!(
+        "  Progress    {} done, {} pending, {} failed",
+        progress.done_sessions,
+        progress.pending_sessions + progress.processing_sessions,
+        progress.failed_sessions
+    );
+    if let Some(title) = progress.current_session_title {
+        println!("  Active      {title}");
+    }
+
+    println!();
+    println!("Tip: open the TUI and press Ctrl+S to edit settings.");
 
     Ok(())
 }
 
-fn resolve_source_filter(filter: Option<&str>) -> Vec<String> {
-    match filter {
-        None => Vec::new(),
-        Some(s) => s.split(',').map(|v| v.trim().to_lowercase()).collect(),
+fn format_date_range(oldest: Option<i64>, newest: Option<i64>) -> String {
+    if oldest.is_none() && newest.is_none() {
+        return "-".to_string();
     }
+
+    let oldest = oldest
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let newest = newest
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    format!("{oldest} -> {newest}")
 }
 
-fn cmd_index(
-    incremental: bool,
-    source_filter: Option<&str>,
-    since_filter: Option<&str>,
-) -> Result<()> {
+fn cmd_index(incremental: bool) -> Result<()> {
     let store = Store::open()?;
     let all = adapters::all_adapters();
-    let allowed_sources = resolve_source_filter(source_filter);
-    let since_ts = since_filter.and_then(utils::parse_since);
+    let labels = adapters::source_labels();
+    let mut config = AppConfig::load_or_default();
+    config.normalize_sources(&labels);
+    let since_ts = config.sync_window.to_since_cutoff();
 
-    if since_filter.is_some() && since_ts.is_none() {
-        eprintln!("Invalid --since value. Use format like: 7d, 30d, 3m, 2w");
-        std::process::exit(1);
-    }
-
-    let mut message_texts: Vec<(i64, String)> = Vec::new();
     let mut new_sessions = 0u32;
     let mut updated_sessions = 0u32;
     let mut total_messages = 0u32;
@@ -157,7 +240,7 @@ fn cmd_index(
         let source_id = adapter.id();
         let label = adapter.label();
 
-        if !allowed_sources.is_empty() && !allowed_sources.contains(&source_id.to_string()) {
+        if !config.is_source_enabled(source_id) {
             println!("Skipping {label} (filtered)");
             continue;
         }
@@ -234,16 +317,8 @@ fn cmd_index(
                 .collect();
 
             store.insert_messages(&messages)?;
-
-            for (msg_id, content) in store.embeddable_messages(&session_uuid)? {
-                let text = format!("{}: {content}", session.title);
-                let text = if text.chars().count() > 500 {
-                    text.chars().take(500).collect()
-                } else {
-                    text
-                };
-                message_texts.push((msg_id, text));
-            }
+            let units_total = store.embeddable_message_count(&session_uuid)?;
+            store.upsert_session_embedding_state(&session_uuid, units_total)?;
             total_messages += msg_count;
         }
 
@@ -259,25 +334,28 @@ fn cmd_index(
         print!("Indexed {} sessions, {total_messages} messages", new_sessions);
     }
     if filtered_out > 0 {
-        print!(", {filtered_out} filtered by --since");
+        print!(", {filtered_out} outside configured time scope");
     }
     println!();
-
-    if !message_texts.is_empty() {
-        println!("Loading embedding model...");
-        let provider = EmbeddingProvider::new(true)?;
-        let texts: Vec<String> = message_texts.iter().map(|(_, t)| t.clone()).collect();
-        println!("Embedding {} messages...", texts.len());
-        let embeddings = provider.embed_documents(&texts)?;
-
-        println!("Writing embeddings...");
-        let items: Vec<(i64, &[f32])> = message_texts
+    println!(
+        "Settings: sources [{}], time scope [{}]",
+        labels
             .iter()
-            .zip(embeddings.iter())
-            .map(|((id, _), emb)| (*id, emb.as_slice()))
-            .collect();
-        store.upsert_embeddings(&items)?;
-        println!("Embeddings complete.");
+            .filter(|(id, _)| config.is_source_enabled(id))
+            .map(|(_, label)| label.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        config.sync_window.label()
+    );
+    let progress = store.semantic_progress()?;
+    if progress.total_sessions > 0 {
+        println!(
+            "Semantic queue: {}/{} done, {} pending, {} failed",
+            progress.done_sessions,
+            progress.total_sessions,
+            progress.pending_sessions + progress.processing_sessions,
+            progress.failed_sessions
+        );
     }
 
     Ok(())
@@ -285,22 +363,36 @@ fn cmd_index(
 
 fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str>) -> Result<()> {
     let store = Store::open()?;
-    println!("Loading embedding model...");
-    let provider = EmbeddingProvider::new(true)?;
     let engine = SearchEngine::new(&store.conn);
     let sources = adapters::source_labels();
+    let progress = store.semantic_progress().unwrap_or_default();
 
-    let query_embedding = provider.embed_query(&[query])?;
-    let query_embedding = query_embedding
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("failed to generate query embedding"))?;
+    let query_embedding = if EmbeddingProvider::is_available()
+        && (progress.done_sessions > 0 || progress.processing_sessions > 0)
+    {
+        println!("Loading embedding model...");
+        match EmbeddingProvider::new(true) {
+            Ok(provider) => provider
+                .embed_query(&[query])?
+                .into_iter()
+                .next()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("failed to generate query embedding"))?,
+            Err(e) => {
+                println!("Semantic unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let resolved_source = source_filter.and_then(|s| {
         let lower = s.to_lowercase();
         sources
             .iter()
             .find(|(id, label)| id == &lower || label.to_lowercase() == lower)
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| vec![id.clone()])
     });
 
     let time_range = match time_filter.map(|t| t.to_lowercase()) {
@@ -310,9 +402,9 @@ fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str
         _ => TimeRange::All,
     };
 
-    let filters = SearchFilters { source: resolved_source, time_range, directory: None };
+    let filters = SearchFilters { sources: resolved_source, time_range, directory: None };
 
-    let results = engine.hybrid_search(query, Some(query_embedding), &filters, 20)?;
+    let results = engine.hybrid_search(query, query_embedding.as_deref(), &filters, 20)?;
 
     if results.is_empty() {
         println!("No results found.");
@@ -344,7 +436,6 @@ fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str
 
     Ok(())
 }
-
 fn cmd_tui() -> Result<()> {
     use std::io;
     use std::time::Duration;
@@ -361,6 +452,7 @@ fn cmd_tui() -> Result<()> {
     use recall::tui::ui;
 
     let store = Store::open()?;
+    semantic::start_background_worker();
     let sources = adapters::source_labels();
 
     struct TerminalGuard;
@@ -382,8 +474,10 @@ fn cmd_tui() -> Result<()> {
 
     let engine = SearchEngine::new(&store.conn);
     let mut provider: Option<EmbeddingProvider> = None;
+    let mut config = AppConfig::load_or_default();
+    config.normalize_sources(&sources);
 
-    let mut app = App::new(&store, sources);
+    let mut app = App::new(&store, sources, config);
     let tick_rate = Duration::from_millis(50);
 
     loop {

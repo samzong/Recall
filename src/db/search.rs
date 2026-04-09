@@ -10,7 +10,7 @@ pub struct SearchEngine<'a> {
 }
 
 pub struct SearchFilters {
-    pub source: Option<String>,
+    pub sources: Option<Vec<String>>,
     pub time_range: TimeRange,
     pub directory: Option<String>,
 }
@@ -24,7 +24,7 @@ pub enum TimeRange {
 }
 
 impl TimeRange {
-    fn millis_ago(&self) -> Option<i64> {
+    pub fn millis_ago(&self) -> Option<i64> {
         let now = chrono::Utc::now().timestamp_millis();
         match self {
             TimeRange::Today => Some(now - 24 * 3600 * 1000),
@@ -205,10 +205,16 @@ fn apply_filters(
     param_idx: &mut usize,
     filters: &SearchFilters,
 ) {
-    if let Some(ref source) = filters.source {
-        sql.push_str(&format!(" AND s.source = ?{}", *param_idx));
-        params.push(Box::new(source.clone()));
-        *param_idx += 1;
+    if let Some(ref sources) = filters.sources
+        && !sources.is_empty()
+    {
+        let placeholders: Vec<String> =
+            (0..sources.len()).map(|offset| format!("?{}", *param_idx + offset)).collect();
+        sql.push_str(&format!(" AND s.source IN ({})", placeholders.join(", ")));
+        for source in sources {
+            params.push(Box::new(source.clone()));
+        }
+        *param_idx += sources.len();
     }
     if let Some(min_ts) = filters.time_range.millis_ago() {
         sql.push_str(&format!(" AND s.started_at >= ?{}", *param_idx));

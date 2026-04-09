@@ -1,21 +1,36 @@
-use std::path::PathBuf;
-
 use anyhow::Result;
+#[cfg(feature = "semantic")]
 use candle_core::{Device, Tensor};
+#[cfg(feature = "semantic")]
 use candle_nn::VarBuilder;
+#[cfg(feature = "semantic")]
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+#[cfg(feature = "semantic")]
 use hf_hub::{Repo, RepoType};
+#[cfg(feature = "semantic")]
+use std::path::PathBuf;
+#[cfg(feature = "semantic")]
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 
+#[cfg(feature = "semantic")]
 const MODEL_ID: &str = "intfloat/multilingual-e5-small";
 
+#[cfg(feature = "semantic")]
 pub struct EmbeddingProvider {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
 }
 
+#[cfg(not(feature = "semantic"))]
+pub struct EmbeddingProvider;
+
 impl EmbeddingProvider {
+    pub fn is_available() -> bool {
+        cfg!(feature = "semantic")
+    }
+
+    #[cfg(feature = "semantic")]
     pub fn new(show_progress: bool) -> Result<Self> {
         let device = select_device()?;
         let (config_path, tokenizer_path, weights_path) = download_model(show_progress)?;
@@ -30,12 +45,24 @@ impl EmbeddingProvider {
         Ok(Self { model, tokenizer, device })
     }
 
+    #[cfg(not(feature = "semantic"))]
+    pub fn new(_show_progress: bool) -> Result<Self> {
+        Err(anyhow::anyhow!("semantic search is not enabled in this build"))
+    }
+
+    #[cfg(feature = "semantic")]
     pub fn embed_query(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let prefixed: Vec<String> = texts.iter().map(|t| format!("query: {t}")).collect();
         let refs: Vec<&str> = prefixed.iter().map(|s| s.as_str()).collect();
         self.embed_batch(&refs)
     }
 
+    #[cfg(not(feature = "semantic"))]
+    pub fn embed_query(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Err(anyhow::anyhow!("semantic search is not enabled in this build"))
+    }
+
+    #[cfg(feature = "semantic")]
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         const BATCH_SIZE: usize = 64;
         let prefixed: Vec<String> = texts.iter().map(|t| format!("passage: {t}")).collect();
@@ -47,6 +74,12 @@ impl EmbeddingProvider {
         Ok(all)
     }
 
+    #[cfg(not(feature = "semantic"))]
+    pub fn embed_documents(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Err(anyhow::anyhow!("semantic search is not enabled in this build"))
+    }
+
+    #[cfg(feature = "semantic")]
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -97,6 +130,7 @@ impl EmbeddingProvider {
         Ok(result)
     }
 
+    #[cfg(feature = "semantic")]
     pub fn device_name(&self) -> &str {
         match &self.device {
             Device::Cpu => "CPU",
@@ -104,8 +138,14 @@ impl EmbeddingProvider {
             Device::Metal(_) => "Metal",
         }
     }
+
+    #[cfg(not(feature = "semantic"))]
+    pub fn device_name(&self) -> &str {
+        "disabled"
+    }
 }
 
+#[cfg(feature = "semantic")]
 fn select_device() -> Result<Device> {
     if candle_core::utils::cuda_is_available() {
         Ok(Device::new_cuda(0)?)
@@ -116,6 +156,7 @@ fn select_device() -> Result<Device> {
     }
 }
 
+#[cfg(feature = "semantic")]
 fn download_model(show_progress: bool) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let api = hf_hub::api::sync::ApiBuilder::from_env().build()?;
     let repo =
