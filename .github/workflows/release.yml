@@ -19,7 +19,7 @@ jobs:
             os: ubuntu-latest
             artifact: recall-linux-x86_64
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15
             artifact: recall-macos-x86_64
             features: metal
           - target: aarch64-apple-darwin
@@ -62,7 +62,7 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path target/${{ matrix.target }}/release/recall.exe -DestinationPath ${{ matrix.artifact }}.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.*
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
 

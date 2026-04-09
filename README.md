@@ -24,17 +24,24 @@ Requires Rust 1.85+ (edition 2024).
 recall index    # build full index (first run)
 recall sync     # incremental update
 recall          # launch TUI
+recall info     # show index stats and worker status
 ```
 
 ### TUI
 
 Type to search. Results update in real-time with hybrid ranking: FTS5 keyword matching at message level + semantic vector search at session level, fused via RRF.
 
-- `Tab` — cycle source filter (All / CC / OC / CDX)
+- `Tab` — cycle filters (source → time → sort)
 - `Enter` — open full conversation
-- `y` — copy session to clipboard
-- `e` — export session to file
+- `Ctrl+S` — settings (toggle sources, sync window)
 - `q` / `Esc` — back / quit
+
+In conversation view:
+
+- `j` / `k` — scroll messages
+- `g` / `G` — jump to first / last message
+- `c` — copy current message to clipboard
+- `e` — export session to file
 
 ### CLI Search
 
