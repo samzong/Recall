@@ -72,6 +72,13 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_session_embedding_status
             ON session_embedding_state(status);
+
+        CREATE TABLE IF NOT EXISTS background_job_state (
+            job TEXT PRIMARY KEY,
+            phase TEXT NOT NULL,
+            detail TEXT,
+            updated_at INTEGER NOT NULL
+        );
         ",
     )?;
     Ok(())

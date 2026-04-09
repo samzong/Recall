@@ -77,3 +77,9 @@ pub struct SemanticSessionJob {
     pub title: String,
     pub units_total: u64,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct BackgroundJobStatus {
+    pub phase: Option<String>,
+    pub detail: Option<String>,
+}

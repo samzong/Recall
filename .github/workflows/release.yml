@@ -18,19 +18,17 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: recall-linux-x86_64
-            features: semantic
           - target: x86_64-apple-darwin
             os: macos-13
             artifact: recall-macos-x86_64
-            features: semantic,metal
+            features: metal
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: recall-macos-aarch64
-            features: semantic,metal
+            features: metal
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: recall-windows-x86_64
-            features: semantic
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:

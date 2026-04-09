@@ -24,6 +24,11 @@ enum Commands {
     Info,
     Index,
     Sync,
+    #[command(hide = true, name = "__background-worker")]
+    BackgroundWorker {
+        #[arg(long)]
+        sync_first: bool,
+    },
     Search {
         query: String,
         #[arg(long)]
@@ -49,6 +54,7 @@ fn main() -> Result<()> {
         Some(Commands::Info) => cmd_info()?,
         Some(Commands::Index) => cmd_index(false)?,
         Some(Commands::Sync) => cmd_index(true)?,
+        Some(Commands::BackgroundWorker { sync_first }) => cmd_background_worker(sync_first)?,
         Some(Commands::Search { query, source, time }) => {
             cmd_search(&query, source.as_deref(), time.as_deref())?
         }
@@ -65,6 +71,7 @@ fn cmd_info() -> Result<()> {
     config.normalize_sources(&labels);
     let store = Store::open()?;
     let progress = store.semantic_progress().unwrap_or_default();
+    let worker = store.background_job_status("pipeline").unwrap_or_default();
 
     struct SourceSummary {
         label: String,
@@ -184,10 +191,6 @@ fn cmd_info() -> Result<()> {
 
     println!();
     println!("Semantic Queue");
-    println!(
-        "  Build       {}",
-        if EmbeddingProvider::is_available() { "enabled" } else { "disabled (FTS-only binary)" }
-    );
     println!("  Indexed DB  {} sessions tracked locally", progress.total_sessions);
     println!(
         "  Progress    {} done, {} pending, {} failed",
@@ -195,8 +198,8 @@ fn cmd_info() -> Result<()> {
         progress.pending_sessions + progress.processing_sessions,
         progress.failed_sessions
     );
-    if let Some(title) = progress.current_session_title {
-        println!("  Active      {title}");
+    if let Some(phase) = worker.phase {
+        println!("  Worker      {phase}");
     }
 
     println!();
@@ -223,6 +226,12 @@ fn format_date_range(oldest: Option<i64>, newest: Option<i64>) -> String {
 }
 
 fn cmd_index(incremental: bool) -> Result<()> {
+    run_sync_job(incremental, true)?;
+    semantic::ensure_background_worker(false)?;
+    Ok(())
+}
+
+fn run_sync_job(incremental: bool, show_output: bool) -> Result<()> {
     let store = Store::open()?;
     let all = adapters::all_adapters();
     let labels = adapters::source_labels();
@@ -241,19 +250,27 @@ fn cmd_index(incremental: bool) -> Result<()> {
         let label = adapter.label();
 
         if !config.is_source_enabled(source_id) {
-            println!("Skipping {label} (filtered)");
+            if show_output {
+                println!("Skipping {label} (filtered)");
+            }
             continue;
         }
 
-        println!("Scanning {label}...");
+        if show_output {
+            println!("Scanning {label}...");
+        }
         let raw_sessions = match adapter.scan() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("  Error scanning {label}: {e}");
+                if show_output {
+                    eprintln!("  Error scanning {label}: {e}");
+                }
                 continue;
             }
         };
-        println!("  Found {} sessions", raw_sessions.len());
+        if show_output {
+            println!("  Found {} sessions", raw_sessions.len());
+        }
 
         for raw in raw_sessions {
             if let Some(cutoff) = since_ts {
@@ -325,40 +342,46 @@ fn cmd_index(incremental: bool) -> Result<()> {
         info!("{label} done");
     }
 
-    println!();
-    if incremental {
-        print!(
-            "Sync: {new_sessions} new, {updated_sessions} updated, {skipped} unchanged, {total_messages} messages"
-        );
-    } else {
-        print!("Indexed {} sessions, {total_messages} messages", new_sessions);
-    }
-    if filtered_out > 0 {
-        print!(", {filtered_out} outside configured time scope");
-    }
-    println!();
-    println!(
-        "Settings: sources [{}], time scope [{}]",
-        labels
-            .iter()
-            .filter(|(id, _)| config.is_source_enabled(id))
-            .map(|(_, label)| label.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        config.sync_window.label()
-    );
-    let progress = store.semantic_progress()?;
-    if progress.total_sessions > 0 {
+    if show_output {
+        println!();
+        if incremental {
+            print!(
+                "Sync: {new_sessions} new, {updated_sessions} updated, {skipped} unchanged, {total_messages} messages"
+            );
+        } else {
+            print!("Indexed {} sessions, {total_messages} messages", new_sessions);
+        }
+        if filtered_out > 0 {
+            print!(", {filtered_out} outside configured time scope");
+        }
+        println!();
         println!(
-            "Semantic queue: {}/{} done, {} pending, {} failed",
-            progress.done_sessions,
-            progress.total_sessions,
-            progress.pending_sessions + progress.processing_sessions,
-            progress.failed_sessions
+            "Settings: sources [{}], time scope [{}]",
+            labels
+                .iter()
+                .filter(|(id, _)| config.is_source_enabled(id))
+                .map(|(_, label)| label.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            config.sync_window.label()
         );
+        let progress = store.semantic_progress()?;
+        if progress.total_sessions > 0 {
+            println!(
+                "Semantic queue: {}/{} done, {} pending, {} failed",
+                progress.done_sessions,
+                progress.total_sessions,
+                progress.pending_sessions + progress.processing_sessions,
+                progress.failed_sessions
+            );
+        }
     }
 
     Ok(())
+}
+
+fn cmd_background_worker(sync_first: bool) -> Result<()> {
+    semantic::run_background_worker(sync_first, || run_sync_job(true, false))
 }
 
 fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str>) -> Result<()> {
@@ -367,9 +390,7 @@ fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str
     let sources = adapters::source_labels();
     let progress = store.semantic_progress().unwrap_or_default();
 
-    let query_embedding = if EmbeddingProvider::is_available()
-        && (progress.done_sessions > 0 || progress.processing_sessions > 0)
-    {
+    let query_embedding = if progress.done_sessions > 0 || progress.processing_sessions > 0 {
         println!("Loading embedding model...");
         match EmbeddingProvider::new(true) {
             Ok(provider) => provider
@@ -452,7 +473,7 @@ fn cmd_tui() -> Result<()> {
     use recall::tui::ui;
 
     let store = Store::open()?;
-    semantic::start_background_worker();
+    semantic::ensure_background_worker(true)?;
     let sources = adapters::source_labels();
 
     struct TerminalGuard;

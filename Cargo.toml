@@ -10,11 +10,11 @@ repository = "https://github.com/samzong/Recall"
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sqlite-vec = "0.1"
-candle-core = { version = "0.10", optional = true }
-candle-nn = { version = "0.10", optional = true }
-candle-transformers = { version = "0.10", optional = true }
-hf-hub = { version = "0.5", features = ["ureq"], optional = true }
-tokenizers = { version = "0.22", default-features = false, optional = true }
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+hf-hub = { version = "0.5", features = ["ureq"] }
+tokenizers = { version = "0.22", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
@@ -27,19 +27,13 @@ uuid = { version = "1", features = ["v4"] }
 ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.2"
+fs2 = "0.4"
 
 [features]
 default = []
-semantic = [
-    "dep:candle-core",
-    "dep:candle-nn",
-    "dep:candle-transformers",
-    "dep:hf-hub",
-    "dep:tokenizers",
-]
-metal = ["semantic", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
-cuda = ["semantic", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-accelerate = ["semantic", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 
 [profile.release]
 opt-level = 3

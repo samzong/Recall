@@ -10,8 +10,8 @@ use crate::db::search::TimeRange;
 pub enum SyncWindow {
     Today,
     Week,
-    #[default]
     Month,
+    #[default]
     All,
 }
 
@@ -61,7 +61,7 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { enabled_sources: Vec::new(), sync_window: SyncWindow::Month }
+        Self { enabled_sources: Vec::new(), sync_window: SyncWindow::All }
     }
 }
 

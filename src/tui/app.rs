@@ -8,7 +8,9 @@ use crate::config::AppConfig;
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::Store;
 use crate::embedding::EmbeddingProvider;
-use crate::types::{MatchSource, Message, Role, SearchResult, SemanticProgress};
+use crate::types::{
+    BackgroundJobStatus, MatchSource, Message, Role, SearchResult, SemanticProgress,
+};
 
 pub enum AppMode {
     Search,
@@ -63,6 +65,7 @@ pub struct App {
     pub total_sessions: u64,
     pub total_messages: u64,
     pub semantic_progress: SemanticProgress,
+    pub background_status: BackgroundJobStatus,
     pub semantic_last_refresh: Instant,
     pub settings_selected: usize,
 }
@@ -73,6 +76,7 @@ impl App {
 
         let (total_sessions, total_messages) = store.stats().unwrap_or((0, 0));
         let semantic_progress = store.semantic_progress().unwrap_or_default();
+        let background_status = store.background_job_status("pipeline").unwrap_or_default();
 
         let mut app = Self {
             mode: AppMode::Search,
@@ -102,6 +106,7 @@ impl App {
             total_sessions,
             total_messages,
             semantic_progress,
+            background_status,
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
         };
@@ -503,6 +508,9 @@ impl App {
             store.semantic_progress_for_scope(self.source_filter_ids().as_deref(), self.time_filter)
         {
             self.semantic_progress = progress;
+        }
+        if let Ok(status) = store.background_job_status("pipeline") {
+            self.background_status = status;
         }
     }
 

@@ -4,7 +4,9 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 
 use crate::db::search::TimeRange;
-use crate::types::{Message, Role, SemanticProgress, SemanticSessionJob, Session};
+use crate::types::{
+    BackgroundJobStatus, Message, Role, SemanticProgress, SemanticSessionJob, Session,
+};
 use crate::utils::f32_slice_to_bytes;
 
 pub struct Store {
@@ -282,6 +284,43 @@ impl Store {
             rusqlite::params![session_id, now, error],
         )?;
         Ok(())
+    }
+
+    pub fn set_background_job_state(
+        &self,
+        job: &str,
+        phase: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        self.conn.execute(
+            "INSERT INTO background_job_state (job, phase, detail, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(job) DO UPDATE SET
+                phase = excluded.phase,
+                detail = excluded.detail,
+                updated_at = excluded.updated_at",
+            rusqlite::params![job, phase, detail, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_background_job_state(&self, job: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM background_job_state WHERE job = ?1", rusqlite::params![job])?;
+        Ok(())
+    }
+
+    pub fn background_job_status(&self, job: &str) -> Result<BackgroundJobStatus> {
+        let status = self
+            .conn
+            .query_row(
+                "SELECT phase, detail FROM background_job_state WHERE job = ?1",
+                rusqlite::params![job],
+                |row| Ok(BackgroundJobStatus { phase: Some(row.get(0)?), detail: row.get(1)? }),
+            )
+            .optional()?;
+        Ok(status.unwrap_or_default())
     }
 
     pub fn semantic_progress(&self) -> Result<SemanticProgress> {

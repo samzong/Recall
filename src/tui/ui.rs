@@ -400,24 +400,21 @@ fn render_settings(f: &mut Frame, app: &App) {
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let semantic_span = if app.semantic_progress.total_sessions > 0 {
         let mut text = format!(
-            " [semantic {}/{}",
+            " [semantic {}/{}]",
             app.semantic_progress.done_sessions, app.semantic_progress.total_sessions
         );
-        if app.semantic_progress.processing_sessions > 0 {
-            text.push_str(" active");
-        } else if app.semantic_progress.failed_sessions > 0 {
-            text.push_str(&format!(", {} failed", app.semantic_progress.failed_sessions));
+        if app.semantic_progress.failed_sessions > 0 {
+            text = format!(
+                " [semantic {}/{}, {} failed]",
+                app.semantic_progress.done_sessions,
+                app.semantic_progress.total_sessions,
+                app.semantic_progress.failed_sessions
+            );
         }
-        text.push(']');
         Some(Span::styled(text, Style::default().fg(Color::Blue)))
     } else {
         None
     };
-
-    let current_span = app.semantic_progress.current_session_title.as_ref().map(|title| {
-        let short: String = title.chars().take(24).collect();
-        Span::styled(format!(" [{short}]"), Style::default().fg(Color::DarkGray))
-    });
 
     let stats_span = Span::styled(
         format!(" [{} sessions, {} messages]", app.total_sessions, app.total_messages),
@@ -427,9 +424,6 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let line = if let Some(ref msg) = app.status_message {
         let mut spans = vec![Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))];
         if let Some(span) = semantic_span.clone() {
-            spans.push(span);
-        }
-        if let Some(span) = current_span.clone() {
             spans.push(span);
         }
         spans.push(stats_span);
@@ -456,9 +450,6 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 if let Some(span) = semantic_span.clone() {
                     spans.push(span);
                 }
-                if let Some(span) = current_span.clone() {
-                    spans.push(span);
-                }
                 spans.push(stats_span);
                 Line::from(spans)
             }
@@ -474,9 +465,6 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" back", Style::default().fg(Color::DarkGray)),
                 ];
                 if let Some(span) = semantic_span {
-                    spans.push(span);
-                }
-                if let Some(span) = current_span {
                     spans.push(span);
                 }
                 spans.push(stats_span);

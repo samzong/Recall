@@ -2681,6 +2681,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs 5.0.1",
+ "fs2",
  "hf-hub",
  "ratatui",
  "rusqlite",
