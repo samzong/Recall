@@ -1,0 +1,40 @@
+[package]
+name = "recall"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Unified search for AI coding sessions"
+repository = "https://github.com/samzong/Recall"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1"
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+hf-hub = { version = "0.5", features = ["ureq"] }
+tokenizers = { version = "0.22", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+chrono = "0.4"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+uuid = { version = "1", features = ["v4"] }
+ratatui = "0.29"
+crossterm = "0.28"
+unicode-width = "0.2"
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

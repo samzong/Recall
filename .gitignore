@@ -1,0 +1,7 @@
+/target
+*.swp
+*.swo
+.DS_Store
+.claude/
+.fastembed_cache/
+recall-*.txt
