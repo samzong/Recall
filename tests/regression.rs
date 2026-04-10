@@ -1,3 +1,4 @@
+use recall::adapters::copilot::parse_copilot_events;
 use recall::adapters::gemini::parse_gemini_session;
 use recall::adapters::kiro::parse_kiro_conversation;
 use recall::config::AppConfig;
@@ -539,6 +540,82 @@ fn kiro_parser_tool_use_results_text_and_json() {
 fn kiro_parser_empty_history_returns_none() {
     let json = r#"{"history": []}"#;
     assert!(parse_kiro_conversation("c", "/proj", json, 0, 0).unwrap().is_none());
+}
+
+#[test]
+fn copilot_parser_plain_conversation() {
+    let jsonl = r#"{"type":"session.start","data":{"sessionId":"sess-1","startTime":"2026-02-26T06:29:59.692Z","context":{"cwd":"/Users/x/proj","repository":"x/proj","branch":"main"}},"id":"e1","timestamp":"2026-02-26T06:29:59.802Z","parentId":null}
+{"type":"user.message","data":{"content":"how do I run tests","transformedContent":"wrapped","attachments":[]},"id":"e2","timestamp":"2026-02-26T06:30:00.000Z","parentId":"e1"}
+{"type":"assistant.message","data":{"messageId":"m1","content":"Run make check","toolRequests":[]},"id":"e3","timestamp":"2026-02-26T06:30:01.000Z","parentId":"e2"}"#;
+
+    let session = parse_copilot_events(jsonl, "fallback").unwrap().unwrap();
+    assert_eq!(session.source_id, "sess-1");
+    assert_eq!(session.directory.as_deref(), Some("/Users/x/proj"));
+    assert_eq!(session.messages.len(), 2);
+    assert!(matches!(session.messages[0].role, Role::User));
+    assert_eq!(session.messages[0].content, "how do I run tests");
+    assert!(matches!(session.messages[1].role, Role::Assistant));
+    assert_eq!(session.messages[1].content, "Run make check");
+}
+
+#[test]
+fn copilot_parser_indexes_tool_requests_and_results() {
+    let jsonl = r##"{"type":"session.start","data":{"sessionId":"sess-2","startTime":"2026-02-26T06:29:59.692Z","context":{"cwd":"/proj"}},"id":"e1","timestamp":"2026-02-26T06:29:59.802Z","parentId":null}
+{"type":"assistant.message","data":{"messageId":"m1","content":"Let me read the file.","toolRequests":[{"toolCallId":"tc1","name":"read_file","arguments":{"path":"/tmp/README.md"},"type":"function"}]},"id":"e2","timestamp":"2026-02-26T06:30:00.000Z","parentId":"e1"}
+{"type":"tool.execution_start","data":{"toolCallId":"tc1","toolName":"read_file","arguments":{"path":"/tmp/README.md"}},"id":"e3","timestamp":"2026-02-26T06:30:00.100Z","parentId":"e2"}
+{"type":"tool.execution_complete","data":{"toolCallId":"tc1","success":true,"result":{"content":"short summary","detailedContent":"# My Project\nHello world."}},"id":"e4","timestamp":"2026-02-26T06:30:00.500Z","parentId":"e3"}"##;
+
+    let session = parse_copilot_events(jsonl, "fallback").unwrap().unwrap();
+    assert_eq!(session.messages.len(), 2);
+    let assistant = &session.messages[0];
+    assert!(
+        assistant.content.contains("Let me read the file"),
+        "prose preserved: {}",
+        assistant.content
+    );
+    assert!(assistant.content.contains("[read_file]"), "tool name indexed: {}", assistant.content);
+    assert!(
+        assistant.content.contains("/tmp/README.md"),
+        "tool args indexed: {}",
+        assistant.content
+    );
+    let tool_result = &session.messages[1];
+    assert!(
+        tool_result.content.contains("[read_file]"),
+        "tool result tagged with name: {}",
+        tool_result.content
+    );
+    assert!(
+        tool_result.content.contains("Hello world"),
+        "detailedContent preferred over content: {}",
+        tool_result.content
+    );
+}
+
+#[test]
+fn copilot_parser_skips_empty_and_unknown() {
+    let jsonl = r#"{"type":"session.start","data":{"sessionId":"s","startTime":"2026-02-26T06:29:59.692Z","context":{"cwd":"/p"}},"id":"e1","timestamp":"2026-02-26T06:29:59.802Z"}
+{"type":"session.info","data":{"msg":"anything"},"id":"e2","timestamp":"2026-02-26T06:30:00.000Z"}
+{"type":"user.message","data":{"content":"   "},"id":"e3","timestamp":"2026-02-26T06:30:01.000Z"}
+{"type":"assistant.message","data":{"messageId":"m","content":"","toolRequests":[]},"id":"e4","timestamp":"2026-02-26T06:30:02.000Z"}
+{"type":"user.message","data":{"content":"real question"},"id":"e5","timestamp":"2026-02-26T06:30:03.000Z"}"#;
+
+    let session = parse_copilot_events(jsonl, "fallback").unwrap().unwrap();
+    assert_eq!(session.messages.len(), 1, "empty and unknown events should be skipped");
+    assert_eq!(session.messages[0].content, "real question");
+}
+
+#[test]
+fn copilot_parser_empty_returns_none() {
+    let jsonl = r#"{"type":"session.start","data":{"sessionId":"s","startTime":"2026-02-26T06:29:59.692Z"},"id":"e1","timestamp":"2026-02-26T06:29:59.802Z"}"#;
+    assert!(parse_copilot_events(jsonl, "fallback").unwrap().is_none());
+}
+
+#[test]
+fn copilot_parser_falls_back_to_dir_id_when_session_missing() {
+    let jsonl = r#"{"type":"user.message","data":{"content":"hi"},"id":"e1","timestamp":"2026-02-26T06:30:00.000Z"}"#;
+    let session = parse_copilot_events(jsonl, "dir-uuid").unwrap().unwrap();
+    assert_eq!(session.source_id, "dir-uuid");
 }
 
 #[test]

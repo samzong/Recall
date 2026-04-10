@@ -1,5 +1,6 @@
 pub mod claude_code;
 pub mod codex;
+pub mod copilot;
 pub mod gemini;
 pub mod kiro;
 pub mod opencode;
@@ -52,6 +53,7 @@ pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(codex::CodexAdapter),
         Box::new(gemini::GeminiAdapter),
         Box::new(kiro::KiroAdapter),
+        Box::new(copilot::CopilotAdapter),
     ]
 }
 
@@ -60,11 +62,5 @@ pub fn resume_command_for(source: &str, source_id: &str) -> Option<ResumeCommand
 }
 
 pub fn source_labels() -> Vec<(String, String)> {
-    vec![
-        ("claude-code".to_string(), "CC".to_string()),
-        ("opencode".to_string(), "OC".to_string()),
-        ("codex".to_string(), "CDX".to_string()),
-        ("gemini-cli".to_string(), "GEM".to_string()),
-        ("kiro-cli".to_string(), "KIRO".to_string()),
-    ]
+    all_adapters().iter().map(|a| (a.id().to_string(), a.label().to_string())).collect()
 }
