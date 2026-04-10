@@ -722,8 +722,12 @@ impl App {
             .collect();
         let source = self.source_label_for(&session.source);
 
-        let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
-        self.export_path = format!("{home}/recall-{source}-{safe_title}.txt");
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string())
+            .or_else(|| dirs::home_dir().map(|h| h.display().to_string()))
+            .unwrap_or_default();
+        self.export_path = format!("{cwd}/recall-{source}-{safe_title}.txt");
         self.export_cursor = self.export_path.len();
         self.mode = AppMode::ExportInput;
     }
