@@ -289,6 +289,7 @@ fn render_preview(f: &mut Frame, app: &App, area: Rect) {
 
         let text: String = msg.content.chars().take(300).collect();
         for line in text.lines().take(6) {
+            let line = crate::utils::sanitize_line(line);
             lines.push(Line::from(Span::styled(
                 format!("  {line}"),
                 Style::default().fg(Color::White).bg(bg),
@@ -360,7 +361,8 @@ fn render_viewing(f: &mut Frame, app: &App) {
 
         let body_style = Style::default().fg(Color::White).bg(bg);
         for line in msg.content.lines() {
-            let spans = highlight_spans(line, &needle_lower, body_style);
+            let line = crate::utils::sanitize_line(line);
+            let spans = highlight_spans(&line, &needle_lower, body_style);
             lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
