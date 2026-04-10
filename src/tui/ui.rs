@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::db::search::TimeRange;
-use crate::tui::app::{App, AppMode, PanelFocus, SortOrder};
+use crate::tui::app::{App, AppMode, PanelFocus, ResumeOrigin, SortOrder};
 use crate::types::{MatchSource, Role};
 
 fn scroll_offset(selected_line_start: usize, inner_height: usize) -> u16 {
@@ -32,7 +32,10 @@ pub fn render(f: &mut Frame, app: &App) {
             render_settings(f, app);
         }
         AppMode::ConfirmResume => {
-            render_search(f, app);
+            match app.pending_resume.as_ref().map(|p| p.origin) {
+                Some(ResumeOrigin::Viewing) => render_viewing(f, app),
+                _ => render_search(f, app),
+            }
             render_confirm_resume(f, app);
         }
     }
@@ -323,6 +326,8 @@ fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" copy  ", Style::default().fg(Color::DarkGray)),
         Span::styled("e", Style::default().fg(Color::Yellow)),
         Span::styled(" export  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Ctrl+R", Style::default().fg(Color::Yellow)),
+        Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
         Span::styled(" back  ", Style::default().fg(Color::DarkGray)),
         Span::styled("q", Style::default().fg(Color::Yellow)),

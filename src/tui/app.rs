@@ -21,11 +21,18 @@ pub enum AppMode {
     ConfirmResume,
 }
 
+#[derive(Clone, Copy)]
+pub enum ResumeOrigin {
+    Search,
+    Viewing,
+}
+
 pub struct PendingResume {
     pub command: ResumeCommand,
     pub source_label: String,
     pub session_title: String,
     pub cwd: Option<String>,
+    pub origin: ResumeOrigin,
 }
 
 #[derive(PartialEq)]
@@ -272,7 +279,7 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-            self.start_resume_confirmation();
+            self.start_resume_confirmation(ResumeOrigin::Search);
             return;
         }
 
@@ -356,6 +363,10 @@ impl App {
     }
 
     fn handle_viewing_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            self.start_resume_confirmation(ResumeOrigin::Viewing);
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.mode = AppMode::Search;
@@ -390,7 +401,7 @@ impl App {
         }
     }
 
-    fn start_resume_confirmation(&mut self) {
+    fn start_resume_confirmation(&mut self, origin: ResumeOrigin) {
         let Some(result) = self.results.get(self.selected_index) else {
             return;
         };
@@ -404,6 +415,7 @@ impl App {
             source_label: self.source_label_for(&session.source).to_string(),
             session_title: session.title.clone(),
             cwd: session.directory.clone(),
+            origin,
         });
         self.mode = AppMode::ConfirmResume;
     }
@@ -419,8 +431,12 @@ impl App {
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.pending_resume = None;
-                self.mode = AppMode::Search;
+                let origin =
+                    self.pending_resume.take().map(|p| p.origin).unwrap_or(ResumeOrigin::Search);
+                self.mode = match origin {
+                    ResumeOrigin::Search => AppMode::Search,
+                    ResumeOrigin::Viewing => AppMode::Viewing,
+                };
             }
             _ => {}
         }
