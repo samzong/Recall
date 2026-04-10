@@ -5,7 +5,7 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
-use crate::adapters::{RawMessage, RawSession, SourceAdapter};
+use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
 use crate::types::Role;
 
 pub struct GeminiAdapter;
@@ -16,6 +16,10 @@ impl SourceAdapter for GeminiAdapter {
     }
     fn label(&self) -> &str {
         "GEM"
+    }
+
+    fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
+        None
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {

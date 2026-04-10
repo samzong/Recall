@@ -2,7 +2,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tracing::debug;
 
-use crate::adapters::{RawMessage, RawSession, SourceAdapter};
+use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
 use crate::types::Role;
 
 pub struct KiroAdapter;
@@ -13,6 +13,10 @@ impl SourceAdapter for KiroAdapter {
     }
     fn label(&self) -> &str {
         "KIRO"
+    }
+
+    fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
+        None
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
