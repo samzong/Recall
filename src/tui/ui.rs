@@ -360,9 +360,10 @@ fn render_viewing(f: &mut Frame, app: &App) {
         lines.push(Line::from(header));
 
         let body_style = Style::default().fg(Color::White).bg(bg);
-        for line in msg.content.lines() {
-            let line = crate::utils::sanitize_line(line);
-            let spans = highlight_spans(&line, &needle_lower, body_style);
+        let empty: Vec<String> = Vec::new();
+        let cached_lines = app.viewing_sanitized_lines.get(i).unwrap_or(&empty);
+        for line in cached_lines {
+            let spans = highlight_spans(line, &needle_lower, body_style);
             lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
@@ -420,7 +421,8 @@ fn render_viewing(f: &mut Frame, app: &App) {
     };
 
     if let Some(ref input) = app.viewing_search_input {
-        let cursor_x = outer[1].x + 2 + UnicodeWidthStr::width(input.as_str()) as u16;
+        let cursor_byte = app.viewing_search_input_cursor.min(input.len());
+        let cursor_x = outer[1].x + 2 + UnicodeWidthStr::width(&input[..cursor_byte]) as u16;
         f.set_cursor_position((cursor_x, outer[1].y));
     }
 

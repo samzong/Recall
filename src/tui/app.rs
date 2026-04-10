@@ -90,6 +90,9 @@ pub struct App {
     pub viewing_search_input: Option<String>,
     pub viewing_search_input_cursor: usize,
     pub viewing_search_status: Option<String>,
+    pub viewing_sanitized_lines: Vec<Vec<String>>,
+    pub viewing_content_lower: Vec<String>,
+    pub viewing_match_cache: Vec<usize>,
 }
 
 impl App {
@@ -137,6 +140,9 @@ impl App {
             viewing_search_input: None,
             viewing_search_input_cursor: 0,
             viewing_search_status: None,
+            viewing_sanitized_lines: Vec::new(),
+            viewing_content_lower: Vec::new(),
+            viewing_match_cache: Vec::new(),
         };
         app.reset_search_defaults();
         app.update_scope_metrics(store);
@@ -387,6 +393,9 @@ impl App {
                 self.viewing_selected_msg = 0;
                 self.viewing_search_query.clear();
                 self.viewing_search_status = None;
+                self.viewing_sanitized_lines.clear();
+                self.viewing_content_lower.clear();
+                self.viewing_match_cache.clear();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.viewing_selected_msg > 0 {
@@ -437,17 +446,18 @@ impl App {
                 self.viewing_search_input_cursor = 0;
             }
             KeyCode::Enter => {
-                let query = input.trim().to_string();
+                let query = input.clone();
                 self.viewing_search_input = None;
                 self.viewing_search_input_cursor = 0;
                 if query.is_empty() {
                     self.viewing_search_query.clear();
                     self.viewing_search_status = None;
+                    self.viewing_match_cache.clear();
                     return;
                 }
                 self.viewing_search_query = query;
-                let matches = self.viewing_match_indices();
-                if matches.is_empty() {
+                self.recompute_viewing_matches();
+                if self.viewing_match_cache.is_empty() {
                     self.viewing_search_status = Some("No match".to_string());
                     return;
                 }
@@ -465,6 +475,32 @@ impl App {
                     self.viewing_search_input_cursor = prev;
                 }
             }
+            KeyCode::Left => {
+                if self.viewing_search_input_cursor > 0 {
+                    let prev = input[..self.viewing_search_input_cursor]
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.viewing_search_input_cursor = prev;
+                }
+            }
+            KeyCode::Right => {
+                if self.viewing_search_input_cursor < input.len() {
+                    let next = input[self.viewing_search_input_cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| self.viewing_search_input_cursor + i)
+                        .unwrap_or(input.len());
+                    self.viewing_search_input_cursor = next;
+                }
+            }
+            KeyCode::Home => {
+                self.viewing_search_input_cursor = 0;
+            }
+            KeyCode::End => {
+                self.viewing_search_input_cursor = input.len();
+            }
             KeyCode::Char(c) => {
                 input.insert(self.viewing_search_input_cursor, c);
                 self.viewing_search_input_cursor += c.len_utf8();
@@ -473,38 +509,44 @@ impl App {
         }
     }
 
-    pub fn viewing_match_indices(&self) -> Vec<usize> {
-        if self.viewing_search_query.is_empty() {
-            return Vec::new();
-        }
-        let needle = self.viewing_search_query.to_lowercase();
-        self.viewing_messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.content.to_lowercase().contains(&needle))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    fn jump_viewing_match(&mut self, forward: bool) {
+    fn recompute_viewing_matches(&mut self) {
+        self.viewing_match_cache.clear();
         if self.viewing_search_query.is_empty() {
             return;
         }
-        let matches = self.viewing_match_indices();
-        if matches.is_empty() {
-            self.viewing_search_status = Some("No match".to_string());
+        let needle = self.viewing_search_query.to_lowercase();
+        for (i, lower) in self.viewing_content_lower.iter().enumerate() {
+            if lower.contains(&needle) {
+                self.viewing_match_cache.push(i);
+            }
+        }
+    }
+
+    pub fn viewing_match_indices(&self) -> &[usize] {
+        &self.viewing_match_cache
+    }
+
+    fn jump_viewing_match(&mut self, forward: bool) {
+        if self.viewing_search_query.is_empty() || self.viewing_match_cache.is_empty() {
+            if !self.viewing_search_query.is_empty() {
+                self.viewing_search_status = Some("No match".to_string());
+            }
             return;
         }
         let current = self.viewing_selected_msg;
         let next = if forward {
-            matches.iter().find(|&&i| i > current).copied().or_else(|| matches.first().copied())
+            self.viewing_match_cache
+                .iter()
+                .find(|&&i| i > current)
+                .copied()
+                .or_else(|| self.viewing_match_cache.first().copied())
         } else {
-            matches
+            self.viewing_match_cache
                 .iter()
                 .rev()
                 .find(|&&i| i < current)
                 .copied()
-                .or_else(|| matches.last().copied())
+                .or_else(|| self.viewing_match_cache.last().copied())
         };
         if let Some(idx) = next {
             self.viewing_selected_msg = idx;
@@ -783,12 +825,18 @@ impl App {
         if let Some(result) = self.results.get(self.selected_index)
             && let Ok(msgs) = store.get_messages(&result.session.id)
         {
+            self.viewing_sanitized_lines = msgs
+                .iter()
+                .map(|m| m.content.lines().map(crate::utils::sanitize_line).collect())
+                .collect();
+            self.viewing_content_lower = msgs.iter().map(|m| m.content.to_lowercase()).collect();
             self.viewing_messages = msgs;
             self.viewing_selected_msg = 0;
             self.viewing_search_query.clear();
             self.viewing_search_input = None;
             self.viewing_search_input_cursor = 0;
             self.viewing_search_status = None;
+            self.viewing_match_cache.clear();
             self.mode = AppMode::Viewing;
         }
     }
