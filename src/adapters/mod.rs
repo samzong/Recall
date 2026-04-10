@@ -1,5 +1,7 @@
 pub mod claude_code;
 pub mod codex;
+pub mod gemini;
+pub mod kiro;
 pub mod opencode;
 
 use crate::types::Role;
@@ -30,6 +32,8 @@ pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(claude_code::ClaudeCodeAdapter),
         Box::new(opencode::OpenCodeAdapter),
         Box::new(codex::CodexAdapter),
+        Box::new(gemini::GeminiAdapter),
+        Box::new(kiro::KiroAdapter),
     ]
 }
 
@@ -38,5 +42,7 @@ pub fn source_labels() -> Vec<(String, String)> {
         ("claude-code".to_string(), "CC".to_string()),
         ("opencode".to_string(), "OC".to_string()),
         ("codex".to_string(), "CDX".to_string()),
+        ("gemini-cli".to_string(), "GEM".to_string()),
+        ("kiro-cli".to_string(), "KIRO".to_string()),
     ]
 }
