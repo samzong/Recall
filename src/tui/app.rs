@@ -86,6 +86,10 @@ pub struct App {
     pub settings_selected: usize,
     pub pending_resume: Option<PendingResume>,
     pub exec_on_exit: Option<(ResumeCommand, Option<String>)>,
+    pub viewing_search_query: String,
+    pub viewing_search_input: Option<String>,
+    pub viewing_search_input_cursor: usize,
+    pub viewing_search_status: Option<String>,
 }
 
 impl App {
@@ -129,6 +133,10 @@ impl App {
             settings_selected: 0,
             pending_resume: None,
             exec_on_exit: None,
+            viewing_search_query: String::new(),
+            viewing_search_input: None,
+            viewing_search_input_cursor: 0,
+            viewing_search_status: None,
         };
         app.reset_search_defaults();
         app.update_scope_metrics(store);
@@ -363,6 +371,11 @@ impl App {
     }
 
     fn handle_viewing_key(&mut self, key: KeyEvent) {
+        if self.viewing_search_input.is_some() {
+            self.handle_viewing_search_input(key);
+            return;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
             self.start_resume_confirmation(ResumeOrigin::Viewing);
             return;
@@ -372,6 +385,8 @@ impl App {
                 self.mode = AppMode::Search;
                 self.viewing_messages.clear();
                 self.viewing_selected_msg = 0;
+                self.viewing_search_query.clear();
+                self.viewing_search_status = None;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.viewing_selected_msg > 0 {
@@ -397,7 +412,103 @@ impl App {
             KeyCode::Char('e') => {
                 self.start_export();
             }
+            KeyCode::Char('/') => {
+                self.viewing_search_input = Some(String::new());
+                self.viewing_search_input_cursor = 0;
+                self.viewing_search_status = None;
+            }
+            KeyCode::Char('n') => {
+                self.jump_viewing_match(true);
+            }
+            KeyCode::Char('N') => {
+                self.jump_viewing_match(false);
+            }
             _ => {}
+        }
+    }
+
+    fn handle_viewing_search_input(&mut self, key: KeyEvent) {
+        let Some(input) = self.viewing_search_input.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.viewing_search_input = None;
+                self.viewing_search_input_cursor = 0;
+            }
+            KeyCode::Enter => {
+                let query = input.trim().to_string();
+                self.viewing_search_input = None;
+                self.viewing_search_input_cursor = 0;
+                if query.is_empty() {
+                    self.viewing_search_query.clear();
+                    self.viewing_search_status = None;
+                    return;
+                }
+                self.viewing_search_query = query;
+                let matches = self.viewing_match_indices();
+                if matches.is_empty() {
+                    self.viewing_search_status = Some("No match".to_string());
+                    return;
+                }
+                self.viewing_search_status = None;
+                self.jump_viewing_match(true);
+            }
+            KeyCode::Backspace => {
+                if self.viewing_search_input_cursor > 0 {
+                    let prev = input[..self.viewing_search_input_cursor]
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    input.replace_range(prev..self.viewing_search_input_cursor, "");
+                    self.viewing_search_input_cursor = prev;
+                }
+            }
+            KeyCode::Char(c) => {
+                input.insert(self.viewing_search_input_cursor, c);
+                self.viewing_search_input_cursor += c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn viewing_match_indices(&self) -> Vec<usize> {
+        if self.viewing_search_query.is_empty() {
+            return Vec::new();
+        }
+        let needle = self.viewing_search_query.to_lowercase();
+        self.viewing_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.content.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn jump_viewing_match(&mut self, forward: bool) {
+        if self.viewing_search_query.is_empty() {
+            return;
+        }
+        let matches = self.viewing_match_indices();
+        if matches.is_empty() {
+            self.viewing_search_status = Some("No match".to_string());
+            return;
+        }
+        let current = self.viewing_selected_msg;
+        let next = if forward {
+            matches.iter().find(|&&i| i > current).copied().or_else(|| matches.first().copied())
+        } else {
+            matches
+                .iter()
+                .rev()
+                .find(|&&i| i < current)
+                .copied()
+                .or_else(|| matches.last().copied())
+        };
+        if let Some(idx) = next {
+            self.viewing_selected_msg = idx;
+            self.viewing_search_status = None;
         }
     }
 
@@ -674,6 +785,10 @@ impl App {
         {
             self.viewing_messages = msgs;
             self.viewing_selected_msg = 0;
+            self.viewing_search_query.clear();
+            self.viewing_search_input = None;
+            self.viewing_search_input_cursor = 0;
+            self.viewing_search_status = None;
             self.mode = AppMode::Viewing;
         }
     }

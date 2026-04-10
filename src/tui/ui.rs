@@ -9,6 +9,45 @@ use crate::db::search::TimeRange;
 use crate::tui::app::{App, AppMode, PanelFocus, ResumeOrigin, SortOrder};
 use crate::types::{MatchSource, Role};
 
+fn highlight_spans(text: &str, needle_lower: &str, base: Style) -> Vec<Span<'static>> {
+    if needle_lower.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let hay = text.to_lowercase();
+    if hay.len() != text.len() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+    let match_style =
+        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
+    while cursor < text.len() {
+        match hay[cursor..].find(needle_lower) {
+            Some(rel) => {
+                let start = cursor + rel;
+                let end = start + needle_lower.len();
+                if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                    spans.push(Span::styled(text[cursor..].to_string(), base));
+                    break;
+                }
+                if start > cursor {
+                    spans.push(Span::styled(text[cursor..start].to_string(), base));
+                }
+                spans.push(Span::styled(text[start..end].to_string(), match_style));
+                cursor = end;
+            }
+            None => {
+                spans.push(Span::styled(text[cursor..].to_string(), base));
+                break;
+            }
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), base));
+    }
+    spans
+}
+
 fn scroll_offset(selected_line_start: usize, inner_height: usize) -> u16 {
     if inner_height == 0 {
         0
@@ -291,6 +330,7 @@ fn render_viewing(f: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     let mut selected_line_start: usize = 0;
+    let needle_lower = app.viewing_search_query.to_lowercase();
 
     for (i, msg) in app.viewing_messages.iter().enumerate() {
         let selected = i == app.viewing_selected_msg;
@@ -318,11 +358,10 @@ fn render_viewing(f: &mut Frame, app: &App) {
         }
         lines.push(Line::from(header));
 
+        let body_style = Style::default().fg(Color::White).bg(bg);
         for line in msg.content.lines() {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::White).bg(bg),
-            )));
+            let spans = highlight_spans(line, &needle_lower, body_style);
+            lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
     }
@@ -335,6 +374,10 @@ fn render_viewing(f: &mut Frame, app: &App) {
     let help_spans = vec![
         Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
         Span::styled(" messages  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("/", Style::default().fg(Color::Yellow)),
+        Span::styled(" find  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("n/N", Style::default().fg(Color::Yellow)),
+        Span::styled(" next/prev  ", Style::default().fg(Color::DarkGray)),
         Span::styled("c", Style::default().fg(Color::Yellow)),
         Span::styled(" copy  ", Style::default().fg(Color::DarkGray)),
         Span::styled("e", Style::default().fg(Color::Yellow)),
@@ -347,11 +390,37 @@ fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
     ];
 
-    let status_line = if let Some(ref msg) = app.status_message {
+    let status_line = if let Some(ref input) = app.viewing_search_input {
+        Line::from(vec![
+            Span::styled(" /", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(input.clone(), Style::default().fg(Color::White)),
+        ])
+    } else if let Some(ref msg) = app.status_message {
         Line::from(vec![Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))])
+    } else if let Some(ref note) = app.viewing_search_status {
+        Line::from(vec![Span::styled(
+            format!(" {note}: \"{}\"", app.viewing_search_query),
+            Style::default().fg(Color::Red),
+        )])
+    } else if !app.viewing_search_query.is_empty() {
+        let matches = app.viewing_match_indices();
+        let total = matches.len();
+        let current_pos =
+            matches.iter().position(|&i| i == app.viewing_selected_msg).map(|n| n + 1).unwrap_or(0);
+        let mut spans = help_spans.clone();
+        spans.push(Span::styled(
+            format!("  [{current_pos}/{total} \"{}\"]", app.viewing_search_query),
+            Style::default().fg(Color::Yellow),
+        ));
+        Line::from(spans)
     } else {
         Line::from(help_spans)
     };
+
+    if let Some(ref input) = app.viewing_search_input {
+        let cursor_x = outer[1].x + 2 + UnicodeWidthStr::width(input.as_str()) as u16;
+        f.set_cursor_position((cursor_x, outer[1].y));
+    }
 
     f.render_widget(Paragraph::new(status_line), outer[1]);
 }
