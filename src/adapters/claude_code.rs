@@ -6,7 +6,7 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
-use crate::adapters::{RawMessage, RawSession, SourceAdapter};
+use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
 use crate::types::Role;
 
 pub struct ClaudeCodeAdapter;
@@ -17,6 +17,13 @@ impl SourceAdapter for ClaudeCodeAdapter {
     }
     fn label(&self) -> &str {
         "CC"
+    }
+
+    fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        Some(ResumeCommand {
+            program: "claude".to_string(),
+            args: vec!["--resume".to_string(), source_id.to_string()],
+        })
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {

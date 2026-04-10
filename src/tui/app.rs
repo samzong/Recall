@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::adapters::{ResumeCommand, resume_command_for};
 use crate::config::AppConfig;
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::Store;
@@ -17,6 +18,41 @@ pub enum AppMode {
     Viewing,
     ExportInput,
     Settings,
+    ConfirmResume,
+}
+
+#[derive(Clone, Copy)]
+pub enum ResumeOrigin {
+    Search,
+    Viewing,
+}
+
+pub struct PendingResume {
+    pub command: ResumeCommand,
+    pub source_label: String,
+    pub session_title: String,
+    pub cwd: Option<String>,
+    pub origin: ResumeOrigin,
+}
+
+pub struct SanitizedLine {
+    pub text: String,
+    pub lower: String,
+}
+
+fn build_viewing_caches(msgs: &[Message]) -> Vec<Vec<SanitizedLine>> {
+    msgs.iter()
+        .map(|m| {
+            m.content
+                .lines()
+                .map(|line| {
+                    let text = crate::utils::sanitize_line(line);
+                    let lower = text.to_lowercase();
+                    SanitizedLine { text, lower }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 #[derive(PartialEq)]
@@ -68,6 +104,14 @@ pub struct App {
     pub background_status: BackgroundJobStatus,
     pub semantic_last_refresh: Instant,
     pub settings_selected: usize,
+    pub pending_resume: Option<PendingResume>,
+    pub exec_on_exit: Option<(ResumeCommand, Option<String>)>,
+    pub viewing_search_query: String,
+    pub viewing_search_input: Option<String>,
+    pub viewing_search_input_cursor: usize,
+    pub viewing_search_status: Option<String>,
+    pub viewing_sanitized_lines: Vec<Vec<SanitizedLine>>,
+    pub viewing_match_cache: Vec<usize>,
 }
 
 impl App {
@@ -109,6 +153,14 @@ impl App {
             background_status,
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
+            pending_resume: None,
+            exec_on_exit: None,
+            viewing_search_query: String::new(),
+            viewing_search_input: None,
+            viewing_search_input_cursor: 0,
+            viewing_search_status: None,
+            viewing_sanitized_lines: Vec::new(),
+            viewing_match_cache: Vec::new(),
         };
         app.reset_search_defaults();
         app.update_scope_metrics(store);
@@ -183,6 +235,7 @@ impl App {
             AppMode::Viewing => self.handle_viewing_key(key),
             AppMode::ExportInput => self.handle_export_key(key),
             AppMode::Settings => self.handle_settings_key(key, store, engine, provider),
+            AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
         }
     }
 
@@ -254,6 +307,11 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             self.mode = AppMode::Settings;
             self.settings_selected = 0;
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            self.start_resume_confirmation(ResumeOrigin::Search);
             return;
         }
 
@@ -337,11 +395,24 @@ impl App {
     }
 
     fn handle_viewing_key(&mut self, key: KeyEvent) {
+        if self.viewing_search_input.is_some() {
+            self.handle_viewing_search_input(key);
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            self.start_resume_confirmation(ResumeOrigin::Viewing);
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.mode = AppMode::Search;
                 self.viewing_messages.clear();
                 self.viewing_selected_msg = 0;
+                self.viewing_search_query.clear();
+                self.viewing_search_status = None;
+                self.viewing_sanitized_lines.clear();
+                self.viewing_match_cache.clear();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.viewing_selected_msg > 0 {
@@ -366,6 +437,176 @@ impl App {
             }
             KeyCode::Char('e') => {
                 self.start_export();
+            }
+            KeyCode::Char('/') => {
+                self.viewing_search_input = Some(String::new());
+                self.viewing_search_input_cursor = 0;
+                self.viewing_search_status = None;
+            }
+            KeyCode::Char('n') => {
+                self.jump_viewing_match(true);
+            }
+            KeyCode::Char('N') => {
+                self.jump_viewing_match(false);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_viewing_search_input(&mut self, key: KeyEvent) {
+        let Some(input) = self.viewing_search_input.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.viewing_search_input = None;
+                self.viewing_search_input_cursor = 0;
+            }
+            KeyCode::Enter => {
+                let query = input.clone();
+                self.viewing_search_input = None;
+                self.viewing_search_input_cursor = 0;
+                if query.is_empty() {
+                    self.viewing_search_query.clear();
+                    self.viewing_search_status = None;
+                    self.viewing_match_cache.clear();
+                    return;
+                }
+                self.viewing_search_query = query;
+                self.recompute_viewing_matches();
+                if self.viewing_match_cache.is_empty() {
+                    self.viewing_search_status = Some("No match".to_string());
+                    return;
+                }
+                self.viewing_search_status = None;
+                self.jump_viewing_match(true);
+            }
+            KeyCode::Backspace => {
+                if self.viewing_search_input_cursor > 0 {
+                    let prev = input[..self.viewing_search_input_cursor]
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    input.replace_range(prev..self.viewing_search_input_cursor, "");
+                    self.viewing_search_input_cursor = prev;
+                }
+            }
+            KeyCode::Left => {
+                if self.viewing_search_input_cursor > 0 {
+                    let prev = input[..self.viewing_search_input_cursor]
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.viewing_search_input_cursor = prev;
+                }
+            }
+            KeyCode::Right => {
+                if self.viewing_search_input_cursor < input.len() {
+                    let next = input[self.viewing_search_input_cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| self.viewing_search_input_cursor + i)
+                        .unwrap_or(input.len());
+                    self.viewing_search_input_cursor = next;
+                }
+            }
+            KeyCode::Home => {
+                self.viewing_search_input_cursor = 0;
+            }
+            KeyCode::End => {
+                self.viewing_search_input_cursor = input.len();
+            }
+            KeyCode::Char(c) => {
+                input.insert(self.viewing_search_input_cursor, c);
+                self.viewing_search_input_cursor += c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    fn recompute_viewing_matches(&mut self) {
+        self.viewing_match_cache.clear();
+        if self.viewing_search_query.is_empty() {
+            return;
+        }
+        let needle = self.viewing_search_query.to_lowercase();
+        for (i, msg_lines) in self.viewing_sanitized_lines.iter().enumerate() {
+            if msg_lines.iter().any(|l| l.lower.contains(&needle)) {
+                self.viewing_match_cache.push(i);
+            }
+        }
+    }
+
+    pub fn viewing_match_indices(&self) -> &[usize] {
+        &self.viewing_match_cache
+    }
+
+    fn jump_viewing_match(&mut self, forward: bool) {
+        if self.viewing_search_query.is_empty() || self.viewing_match_cache.is_empty() {
+            if !self.viewing_search_query.is_empty() {
+                self.viewing_search_status = Some("No match".to_string());
+            }
+            return;
+        }
+        let current = self.viewing_selected_msg;
+        let next = if forward {
+            self.viewing_match_cache
+                .iter()
+                .find(|&&i| i > current)
+                .copied()
+                .or_else(|| self.viewing_match_cache.first().copied())
+        } else {
+            self.viewing_match_cache
+                .iter()
+                .rev()
+                .find(|&&i| i < current)
+                .copied()
+                .or_else(|| self.viewing_match_cache.last().copied())
+        };
+        if let Some(idx) = next {
+            self.viewing_selected_msg = idx;
+            self.viewing_search_status = None;
+        }
+    }
+
+    fn start_resume_confirmation(&mut self, origin: ResumeOrigin) {
+        let Some(result) = self.results.get(self.selected_index) else {
+            return;
+        };
+        let session = &result.session;
+        let Some(command) = resume_command_for(&session.source, &session.source_id) else {
+            self.status_message = Some(format!("Resume not supported for {}", session.source));
+            return;
+        };
+        self.pending_resume = Some(PendingResume {
+            command,
+            source_label: self.source_label_for(&session.source).to_string(),
+            session_title: session.title.clone(),
+            cwd: session.directory.clone(),
+            origin,
+        });
+        self.mode = AppMode::ConfirmResume;
+    }
+
+    fn handle_confirm_resume_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(pending) = self.pending_resume.take() {
+                    self.exec_on_exit = Some((pending.command, pending.cwd));
+                    self.should_quit = true;
+                } else {
+                    self.mode = AppMode::Search;
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                let origin =
+                    self.pending_resume.take().map(|p| p.origin).unwrap_or(ResumeOrigin::Search);
+                self.mode = match origin {
+                    ResumeOrigin::Search => AppMode::Search,
+                    ResumeOrigin::Viewing => AppMode::Viewing,
+                };
             }
             _ => {}
         }
@@ -603,8 +844,14 @@ impl App {
         if let Some(result) = self.results.get(self.selected_index)
             && let Ok(msgs) = store.get_messages(&result.session.id)
         {
+            self.viewing_sanitized_lines = build_viewing_caches(&msgs);
             self.viewing_messages = msgs;
             self.viewing_selected_msg = 0;
+            self.viewing_search_query.clear();
+            self.viewing_search_input = None;
+            self.viewing_search_input_cursor = 0;
+            self.viewing_search_status = None;
+            self.viewing_match_cache.clear();
             self.mode = AppMode::Viewing;
         }
     }
@@ -653,8 +900,12 @@ impl App {
             .collect();
         let source = self.source_label_for(&session.source);
 
-        let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
-        self.export_path = format!("{home}/recall-{source}-{safe_title}.txt");
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string())
+            .or_else(|| dirs::home_dir().map(|h| h.display().to_string()))
+            .unwrap_or_default();
+        self.export_path = format!("{cwd}/recall-{source}-{safe_title}.txt");
         self.export_cursor = self.export_path.len();
         self.mode = AppMode::ExportInput;
     }

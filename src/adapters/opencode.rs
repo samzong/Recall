@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tracing::debug;
 
-use crate::adapters::{RawMessage, RawSession, SourceAdapter};
+use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
 use crate::types::Role;
 
 pub struct OpenCodeAdapter;
@@ -15,6 +15,13 @@ impl SourceAdapter for OpenCodeAdapter {
     }
     fn label(&self) -> &str {
         "OC"
+    }
+
+    fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        Some(ResumeCommand {
+            program: "opencode".to_string(),
+            args: vec!["--session".to_string(), source_id.to_string()],
+        })
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {

@@ -523,7 +523,40 @@ fn cmd_tui() -> Result<()> {
     drop(_guard);
     terminal.show_cursor()?;
 
+    if let Some((command, cwd)) = app.exec_on_exit.take() {
+        exec_resume(command, cwd)?;
+    }
+
     Ok(())
+}
+
+#[cfg(unix)]
+fn exec_resume(command: adapters::ResumeCommand, cwd: Option<String>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = std::process::Command::new(&command.program);
+    cmd.args(&command.args);
+    if let Some(ref dir) = cwd
+        && std::path::Path::new(dir).is_dir()
+    {
+        cmd.current_dir(dir);
+    }
+    let err = cmd.exec();
+    Err(anyhow::anyhow!("failed to exec {}: {err}", command.program))
+}
+
+#[cfg(not(unix))]
+fn exec_resume(command: adapters::ResumeCommand, cwd: Option<String>) -> Result<()> {
+    let mut cmd = std::process::Command::new(&command.program);
+    cmd.args(&command.args);
+    if let Some(ref dir) = cwd
+        && std::path::Path::new(dir).is_dir()
+    {
+        cmd.current_dir(dir);
+    }
+    let status =
+        cmd.status().map_err(|e| anyhow::anyhow!("failed to run {}: {e}", command.program))?;
+    std::process::exit(status.code().unwrap_or(0));
 }
 
 fn generate_title(messages: &[adapters::RawMessage]) -> String {

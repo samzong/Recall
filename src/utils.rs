@@ -32,6 +32,29 @@ pub fn parse_since(s: &str) -> Option<i64> {
     Some(now - n * multiplier)
 }
 
+pub fn sanitize_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        if c == '\t' {
+            out.push_str("    ");
+        } else if c.is_control() {
+            continue;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn format_message_time(ts: Option<i64>) -> String {
+    let Some(ts) = ts else {
+        return String::new();
+    };
+    chrono::DateTime::from_timestamp_millis(ts)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
 pub fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(data.len() * 4);
     for &f in data {
