@@ -8,6 +8,7 @@ pub trait SourceAdapter {
     fn id(&self) -> &str;
     fn label(&self) -> &str;
     fn scan(&self) -> anyhow::Result<Vec<RawSession>>;
+    fn resume_command(&self, source_id: &str) -> Option<ResumeCommand>;
 }
 
 pub struct RawSession {
@@ -25,12 +26,33 @@ pub struct RawMessage {
     pub timestamp: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResumeCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl ResumeCommand {
+    pub fn display(&self) -> String {
+        let mut out = self.program.clone();
+        for arg in &self.args {
+            out.push(' ');
+            out.push_str(arg);
+        }
+        out
+    }
+}
+
 pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
     vec![
         Box::new(claude_code::ClaudeCodeAdapter),
         Box::new(opencode::OpenCodeAdapter),
         Box::new(codex::CodexAdapter),
     ]
+}
+
+pub fn resume_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {
+    all_adapters().iter().find(|a| a.id() == source).and_then(|a| a.resume_command(source_id))
 }
 
 pub fn source_labels() -> Vec<(String, String)> {

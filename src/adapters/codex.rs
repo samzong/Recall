@@ -5,7 +5,7 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
-use crate::adapters::{RawMessage, RawSession, SourceAdapter};
+use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
 use crate::types::Role;
 
 pub struct CodexAdapter;
@@ -16,6 +16,13 @@ impl SourceAdapter for CodexAdapter {
     }
     fn label(&self) -> &str {
         "CDX"
+    }
+
+    fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        Some(ResumeCommand {
+            program: "codex".to_string(),
+            args: vec!["resume".to_string(), source_id.to_string()],
+        })
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {

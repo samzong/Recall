@@ -6,8 +6,46 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::db::search::TimeRange;
-use crate::tui::app::{App, AppMode, PanelFocus, SortOrder};
+use crate::tui::app::{App, AppMode, PanelFocus, ResumeOrigin, SanitizedLine, SortOrder};
 use crate::types::{MatchSource, Role};
+
+fn highlight_spans(text: &str, hay: &str, needle_lower: &str, base: Style) -> Vec<Span<'static>> {
+    if needle_lower.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    if hay.len() != text.len() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+    let match_style =
+        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
+    while cursor < text.len() {
+        match hay[cursor..].find(needle_lower) {
+            Some(rel) => {
+                let start = cursor + rel;
+                let end = start + needle_lower.len();
+                if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                    spans.push(Span::styled(text[cursor..].to_string(), base));
+                    break;
+                }
+                if start > cursor {
+                    spans.push(Span::styled(text[cursor..start].to_string(), base));
+                }
+                spans.push(Span::styled(text[start..end].to_string(), match_style));
+                cursor = end;
+            }
+            None => {
+                spans.push(Span::styled(text[cursor..].to_string(), base));
+                break;
+            }
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), base));
+    }
+    spans
+}
 
 fn scroll_offset(selected_line_start: usize, inner_height: usize) -> u16 {
     if inner_height == 0 {
@@ -30,6 +68,13 @@ pub fn render(f: &mut Frame, app: &App) {
         AppMode::Settings => {
             render_search(f, app);
             render_settings(f, app);
+        }
+        AppMode::ConfirmResume => {
+            match app.pending_resume.as_ref().map(|p| p.origin) {
+                Some(ResumeOrigin::Viewing) => render_viewing(f, app),
+                _ => render_search(f, app),
+            }
+            render_confirm_resume(f, app);
         }
     }
 }
@@ -231,13 +276,19 @@ fn render_preview(f: &mut Frame, app: &App, area: Rect) {
 
         let bg = if selected { Color::DarkGray } else { Color::Reset };
 
-        lines.push(Line::from(Span::styled(
+        let time_str = crate::utils::format_message_time(msg.timestamp);
+        let mut header = vec![Span::styled(
             prefix,
             Style::default().fg(color).bg(bg).add_modifier(Modifier::BOLD),
-        )));
+        )];
+        if !time_str.is_empty() {
+            header.push(Span::styled(time_str, Style::default().fg(Color::DarkGray).bg(bg)));
+        }
+        lines.push(Line::from(header));
 
         let text: String = msg.content.chars().take(300).collect();
         for line in text.lines().take(6) {
+            let line = crate::utils::sanitize_line(line);
             lines.push(Line::from(Span::styled(
                 format!("  {line}"),
                 Style::default().fg(Color::White).bg(bg),
@@ -279,6 +330,7 @@ fn render_viewing(f: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     let mut selected_line_start: usize = 0;
+    let needle_lower = app.viewing_search_query.to_lowercase();
 
     for (i, msg) in app.viewing_messages.iter().enumerate() {
         let selected = i == app.viewing_selected_msg;
@@ -293,16 +345,25 @@ fn render_viewing(f: &mut Frame, app: &App) {
 
         let bg = if selected { Color::DarkGray } else { Color::Reset };
 
-        lines.push(Line::from(Span::styled(
+        let time_str = crate::utils::format_message_time(msg.timestamp);
+        let mut header = vec![Span::styled(
             format!("── {prefix} ──"),
             Style::default().fg(color).bg(bg).add_modifier(Modifier::BOLD),
-        )));
+        )];
+        if !time_str.is_empty() {
+            header.push(Span::styled(
+                format!("  {time_str}"),
+                Style::default().fg(Color::DarkGray).bg(bg),
+            ));
+        }
+        lines.push(Line::from(header));
 
-        for line in msg.content.lines() {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::White).bg(bg),
-            )));
+        let body_style = Style::default().fg(Color::White).bg(bg);
+        let empty: Vec<SanitizedLine> = Vec::new();
+        let cached_lines = app.viewing_sanitized_lines.get(i).unwrap_or(&empty);
+        for sl in cached_lines {
+            let spans = highlight_spans(&sl.text, &sl.lower, &needle_lower, body_style);
+            lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
     }
@@ -315,21 +376,54 @@ fn render_viewing(f: &mut Frame, app: &App) {
     let help_spans = vec![
         Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
         Span::styled(" messages  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("/", Style::default().fg(Color::Yellow)),
+        Span::styled(" find  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("n/N", Style::default().fg(Color::Yellow)),
+        Span::styled(" next/prev  ", Style::default().fg(Color::DarkGray)),
         Span::styled("c", Style::default().fg(Color::Yellow)),
         Span::styled(" copy  ", Style::default().fg(Color::DarkGray)),
         Span::styled("e", Style::default().fg(Color::Yellow)),
         Span::styled(" export  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Ctrl+R", Style::default().fg(Color::Yellow)),
+        Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
         Span::styled(" back  ", Style::default().fg(Color::DarkGray)),
         Span::styled("q", Style::default().fg(Color::Yellow)),
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
     ];
 
-    let status_line = if let Some(ref msg) = app.status_message {
+    let status_line = if let Some(ref input) = app.viewing_search_input {
+        Line::from(vec![
+            Span::styled(" /", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(input.clone(), Style::default().fg(Color::White)),
+        ])
+    } else if let Some(ref msg) = app.status_message {
         Line::from(vec![Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))])
+    } else if let Some(ref note) = app.viewing_search_status {
+        Line::from(vec![Span::styled(
+            format!(" {note}: \"{}\"", app.viewing_search_query),
+            Style::default().fg(Color::Red),
+        )])
+    } else if !app.viewing_search_query.is_empty() {
+        let matches = app.viewing_match_indices();
+        let total = matches.len();
+        let current_pos =
+            matches.iter().position(|&i| i == app.viewing_selected_msg).map(|n| n + 1).unwrap_or(0);
+        let mut spans = help_spans.clone();
+        spans.push(Span::styled(
+            format!("  [{current_pos}/{total} \"{}\"]", app.viewing_search_query),
+            Style::default().fg(Color::Yellow),
+        ));
+        Line::from(spans)
     } else {
         Line::from(help_spans)
     };
+
+    if let Some(ref input) = app.viewing_search_input {
+        let cursor_byte = app.viewing_search_input_cursor.min(input.len());
+        let cursor_x = outer[1].x + 2 + UnicodeWidthStr::width(&input[..cursor_byte]) as u16;
+        f.set_cursor_position((cursor_x, outer[1].y));
+    }
 
     f.render_widget(Paragraph::new(status_line), outer[1]);
 }
@@ -397,6 +491,75 @@ fn render_settings(f: &mut Frame, app: &App) {
     f.render_widget(widget, popup);
 }
 
+fn render_confirm_resume(f: &mut Frame, app: &App) {
+    let Some(pending) = app.pending_resume.as_ref() else {
+        return;
+    };
+
+    let area = f.area();
+    let width = area.width.clamp(40, 76);
+    let height: u16 = 9;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .title(" Resume session ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Black));
+
+    let title: String = pending.session_title.chars().take(width as usize - 10).collect();
+    let command_text: String =
+        pending.command.display().chars().take(width as usize - 14).collect();
+    let cwd_text: String = pending
+        .cwd
+        .as_deref()
+        .unwrap_or("-")
+        .chars()
+        .rev()
+        .take(width as usize - 10)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Source:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                pending.source_label.clone(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(title, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Cwd:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(cwd_text, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Command: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                command_text,
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [Y] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("confirm & exec     ", Style::default().fg(Color::White)),
+            Span::styled("[N] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(Clear, popup);
+    f.render_widget(widget, popup);
+}
+
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let semantic_span = if app.semantic_progress.total_sessions > 0 {
         let mut text = format!(
@@ -440,6 +603,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" detail  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Tab", Style::default().fg(Color::Yellow)),
                     Span::styled(" filter  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Ctrl+R", Style::default().fg(Color::Yellow)),
+                    Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Ctrl+S", Style::default().fg(Color::Yellow)),
                     Span::styled(" settings  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
