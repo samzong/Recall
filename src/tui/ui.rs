@@ -238,10 +238,15 @@ fn render_preview(f: &mut Frame, app: &App, area: Rect) {
 
         let bg = if selected { Color::DarkGray } else { Color::Reset };
 
-        lines.push(Line::from(Span::styled(
+        let time_str = crate::utils::format_message_time(msg.timestamp);
+        let mut header = vec![Span::styled(
             prefix,
             Style::default().fg(color).bg(bg).add_modifier(Modifier::BOLD),
-        )));
+        )];
+        if !time_str.is_empty() {
+            header.push(Span::styled(time_str, Style::default().fg(Color::DarkGray).bg(bg)));
+        }
+        lines.push(Line::from(header));
 
         let text: String = msg.content.chars().take(300).collect();
         for line in text.lines().take(6) {
@@ -300,10 +305,18 @@ fn render_viewing(f: &mut Frame, app: &App) {
 
         let bg = if selected { Color::DarkGray } else { Color::Reset };
 
-        lines.push(Line::from(Span::styled(
+        let time_str = crate::utils::format_message_time(msg.timestamp);
+        let mut header = vec![Span::styled(
             format!("── {prefix} ──"),
             Style::default().fg(color).bg(bg).add_modifier(Modifier::BOLD),
-        )));
+        )];
+        if !time_str.is_empty() {
+            header.push(Span::styled(
+                format!("  {time_str}"),
+                Style::default().fg(Color::DarkGray).bg(bg),
+            ));
+        }
+        lines.push(Line::from(header));
 
         for line in msg.content.lines() {
             lines.push(Line::from(Span::styled(
