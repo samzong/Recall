@@ -1,6 +1,6 @@
 # Recall
 
-Search all your AI coding sessions in one place. Recall indexes conversations from Claude Code, OpenCode, and Codex into a local SQLite database, then lets you search them with a fast TUI powered by hybrid FTS + semantic retrieval.
+Search all your AI coding sessions in one place. Recall indexes conversations from Claude Code, OpenCode, Codex, Gemini CLI, and Kiro CLI into a local SQLite database, then lets you search them with a fast TUI powered by hybrid FTS + semantic retrieval.
 
 [![Recall TUI](recall.png)](https://asciinema.org/a/909453)
 
@@ -57,6 +57,8 @@ recall search "refactor" --source cc --time 7d
 | Claude Code | CC | `~/.claude/projects/`, `~/.claude/transcripts/` |
 | OpenCode | OC | `~/.local/share/opencode/opencode.db` |
 | Codex | CDX | `~/.codex/sessions/` |
+| Gemini CLI | GEM | `~/.gemini/tmp/*/chats/` |
+| Kiro CLI | KIRO | `<data_dir>/kiro-cli/data.sqlite3` |
 
 Missing tools are skipped automatically.
 
