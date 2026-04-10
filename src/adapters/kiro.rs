@@ -25,30 +25,44 @@ impl SourceAdapter for KiroAdapter {
 
         let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 
-        // conversations_v2 schema:
-        //   key TEXT (cwd path), conversation_id TEXT, value TEXT (JSON),
-        //   created_at INTEGER (ms), updated_at INTEGER (ms)
+        let has_table = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversations_v2'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok();
+        if !has_table {
+            debug!("Kiro CLI DB missing conversations_v2 table, skipping");
+            return Ok(vec![]);
+        }
+
         let mut stmt = conn.prepare(
             "SELECT key, conversation_id, value, created_at, updated_at
              FROM conversations_v2
              ORDER BY updated_at DESC",
         )?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })?
-            .filter_map(|r| r.ok());
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
 
         let mut sessions = Vec::new();
 
-        for (cwd, conversation_id, value_json, created_at, updated_at) in rows {
+        for row in rows {
+            let (cwd, conversation_id, value_json, created_at, updated_at) = match row {
+                Ok(t) => t,
+                Err(e) => {
+                    debug!("failed to read kiro row: {e}");
+                    continue;
+                }
+            };
             match parse_kiro_conversation(
                 &conversation_id,
                 &cwd,
@@ -59,7 +73,7 @@ impl SourceAdapter for KiroAdapter {
                 Ok(Some(session)) => sessions.push(session),
                 Ok(None) => {}
                 Err(e) => {
-                    debug!("failed to parse kiro conversation {}: {e}", conversation_id);
+                    debug!("failed to parse kiro conversation {conversation_id}: {e}");
                 }
             }
         }
@@ -73,7 +87,7 @@ fn kiro_db_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(data_dir.join("kiro-cli/data.sqlite3"))
 }
 
-fn parse_kiro_conversation(
+pub fn parse_kiro_conversation(
     conversation_id: &str,
     cwd: &str,
     value_json: &str,
@@ -90,11 +104,9 @@ fn parse_kiro_conversation(
     let mut messages = Vec::new();
 
     for turn in history {
-        // Each turn has "user" and "assistant" objects
         if let Some(user_obj) = turn.get("user") {
             let content = extract_user_content(user_obj);
             let timestamp = parse_kiro_timestamp(user_obj.get("timestamp"));
-
             if !content.is_empty() {
                 messages.push(RawMessage { role: Role::User, content, timestamp });
             }
@@ -102,12 +114,10 @@ fn parse_kiro_conversation(
 
         if let Some(assistant_obj) = turn.get("assistant") {
             let content = extract_assistant_content(assistant_obj);
-            // Assistant timestamp from request_metadata
             let timestamp = turn
                 .get("request_metadata")
                 .and_then(|m| m.get("request_start_timestamp_ms"))
                 .and_then(|t| t.as_i64());
-
             if !content.is_empty() {
                 messages.push(RawMessage { role: Role::Assistant, content, timestamp });
             }
@@ -128,59 +138,70 @@ fn parse_kiro_conversation(
     }))
 }
 
-/// Extract user prompt text from Kiro user object.
-/// Content can be: {"Prompt": {"prompt": "..."}} or {"ToolResult": {...}}
 fn extract_user_content(user_obj: &Value) -> String {
     let content = match user_obj.get("content") {
         Some(c) => c,
         None => return String::new(),
     };
 
-    // Most common: {"Prompt": {"prompt": "..."}}
     if let Some(prompt_obj) = content.get("Prompt")
         && let Some(text) = prompt_obj.get("prompt").and_then(|p| p.as_str())
     {
         return text.to_string();
     }
 
-    // Tool result: {"ToolResult": {"tool_use_id": "...", "content": [...]}}
-    if let Some(tool_result) = content.get("ToolResult") {
-        let tool_id = tool_result.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or("tool");
-        if let Some(arr) = tool_result.get("content").and_then(|c| c.as_array()) {
-            let parts: Vec<String> = arr
-                .iter()
-                .filter_map(|item| {
-                    if let Some(text_obj) = item.get("text") {
-                        text_obj.get("text").and_then(|t| t.as_str()).map(String::from)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !parts.is_empty() {
-                return format!("[{tool_id}] {}", parts.join("\n"));
+    if let Some(tool_results) = content.get("ToolUseResults")
+        && let Some(arr) = tool_results.get("tool_use_results").and_then(|v| v.as_array())
+    {
+        let mut parts = Vec::new();
+        for result in arr {
+            let Some(inner) = result.get("content").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for item in inner {
+                if let Some(text) = item.get("Text").and_then(|t| t.as_str()) {
+                    parts.push(text.to_string());
+                } else if let Some(json_val) = item.get("Json")
+                    && let Ok(s) = serde_json::to_string(json_val)
+                {
+                    parts.push(s);
+                }
             }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n");
         }
     }
 
     String::new()
 }
 
-/// Extract assistant response text from Kiro assistant object.
-/// Can be: {"Response": {"content": "..."}} or {"ToolUse": {...}}
 fn extract_assistant_content(assistant_obj: &Value) -> String {
-    // Response: {"Response": {"content": "..."}}
     if let Some(response) = assistant_obj.get("Response")
         && let Some(text) = response.get("content").and_then(|c| c.as_str())
     {
         return text.to_string();
     }
 
-    // ToolUse: {"ToolUse": {"name": "...", "input": {...}}}
     if let Some(tool_use) = assistant_obj.get("ToolUse") {
-        let name = tool_use.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-        if let Some(input) = tool_use.get("input") {
-            return format!("[{name}] {input}");
+        let mut parts = Vec::new();
+        if let Some(prose) = tool_use.get("content").and_then(|c| c.as_str())
+            && !prose.is_empty()
+        {
+            parts.push(prose.to_string());
+        }
+        if let Some(tool_uses) = tool_use.get("tool_uses").and_then(|v| v.as_array()) {
+            for tu in tool_uses {
+                let name = tu.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                let args = tu
+                    .get("args")
+                    .map(|a| serde_json::to_string(a).unwrap_or_default())
+                    .unwrap_or_default();
+                parts.push(format!("[{name}] {args}"));
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n");
         }
     }
 

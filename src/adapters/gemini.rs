@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 
 use serde_json::Value;
 use tracing::debug;
@@ -20,7 +21,6 @@ impl SourceAdapter for GeminiAdapter {
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
 
-        // Gemini CLI stores sessions under ~/.gemini/tmp/{project}/chats/
         let gemini_tmp = home.join(".gemini/tmp");
         if !gemini_tmp.exists() {
             debug!("~/.gemini/tmp not found, skipping Gemini CLI");
@@ -37,12 +37,11 @@ impl SourceAdapter for GeminiAdapter {
             if !path.is_file() {
                 continue;
             }
-            // Only parse files inside a "chats" directory
             if path.parent().is_none_or(|p| p.file_name().is_none_or(|n| n != "chats")) {
                 continue;
             }
 
-            match parse_gemini_session(path) {
+            match parse_gemini_session_file(path) {
                 Ok(Some(session)) => sessions.push(session),
                 Ok(None) => {}
                 Err(e) => {
@@ -55,15 +54,17 @@ impl SourceAdapter for GeminiAdapter {
     }
 }
 
-fn parse_gemini_session(path: &std::path::Path) -> anyhow::Result<Option<RawSession>> {
+fn parse_gemini_session_file(path: &Path) -> anyhow::Result<Option<RawSession>> {
     let content = fs::read_to_string(path)?;
-    let doc: Value = serde_json::from_str(&content)?;
+    let fallback_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+    parse_gemini_session(&content, fallback_id)
+}
 
-    let session_id = doc
-        .get("sessionId")
-        .and_then(|s| s.as_str())
-        .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown"))
-        .to_string();
+pub fn parse_gemini_session(json: &str, fallback_id: &str) -> anyhow::Result<Option<RawSession>> {
+    let doc: Value = serde_json::from_str(json)?;
+
+    let session_id =
+        doc.get("sessionId").and_then(|s| s.as_str()).unwrap_or(fallback_id).to_string();
 
     let started_at = doc
         .get("startTime")
@@ -77,14 +78,6 @@ fn parse_gemini_session(path: &std::path::Path) -> anyhow::Result<Option<RawSess
         .and_then(|t| t.as_str())
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         .map(|dt| dt.timestamp_millis());
-
-    // Derive project directory from path: ~/.gemini/tmp/{project}/chats/session.json
-    let directory = path
-        .parent() // chats/
-        .and_then(|p| p.parent()) // {project}/
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .map(String::from);
 
     let messages_arr = match doc.get("messages").and_then(|m| m.as_array()) {
         Some(arr) => arr,
@@ -107,17 +100,20 @@ fn parse_gemini_session(path: &std::path::Path) -> anyhow::Result<Option<RawSess
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
             .map(|dt| dt.timestamp_millis());
 
-        // User messages have content as array of {text}, assistant has content as string
-        let content = match role {
-            Role::User => extract_user_content(msg.get("content")),
-            Role::Assistant => {
-                msg.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string()
-            }
+        let prose = msg.get("content").and_then(|c| c.as_str()).unwrap_or("").trim().to_string();
+
+        let tool_text = if matches!(role, Role::Assistant) {
+            extract_tool_calls(msg.get("toolCalls"))
+        } else {
+            String::new()
         };
 
-        if content.is_empty() {
-            continue;
-        }
+        let content = match (prose.is_empty(), tool_text.is_empty()) {
+            (true, true) => continue,
+            (false, true) => prose,
+            (true, false) => tool_text,
+            (false, false) => format!("{prose}\n{tool_text}"),
+        };
 
         messages.push(RawMessage { role, content, timestamp });
     }
@@ -128,7 +124,7 @@ fn parse_gemini_session(path: &std::path::Path) -> anyhow::Result<Option<RawSess
 
     Ok(Some(RawSession {
         source_id: session_id,
-        directory,
+        directory: None,
         started_at,
         updated_at,
         entrypoint: None,
@@ -136,15 +132,40 @@ fn parse_gemini_session(path: &std::path::Path) -> anyhow::Result<Option<RawSess
     }))
 }
 
-/// Extract text from user content array: [{"text": "..."}, ...]
-fn extract_user_content(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::Array(arr)) => {
-            let parts: Vec<&str> =
-                arr.iter().filter_map(|item| item.get("text").and_then(|t| t.as_str())).collect();
-            parts.join("\n")
+fn extract_tool_calls(tool_calls: Option<&Value>) -> String {
+    let Some(arr) = tool_calls.and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+
+    let mut parts = Vec::new();
+    for call in arr {
+        let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+        let args = call
+            .get("args")
+            .map(|a| serde_json::to_string(a).unwrap_or_default())
+            .unwrap_or_default();
+        let result_text = extract_tool_result(call.get("result"));
+
+        let mut part = format!("[{name}] {args}");
+        if !result_text.is_empty() {
+            part.push_str(" -> ");
+            part.push_str(&result_text);
         }
-        Some(Value::String(s)) => s.clone(),
-        _ => String::new(),
+        parts.push(part);
     }
+    parts.join("\n")
+}
+
+fn extract_tool_result(result: Option<&Value>) -> String {
+    let Some(arr) = result.and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+
+    let mut parts = Vec::new();
+    for item in arr {
+        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+            parts.push(text.to_string());
+        }
+    }
+    parts.join("\n")
 }
