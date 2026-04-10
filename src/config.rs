@@ -53,16 +53,14 @@ impl SyncWindow {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
-    pub enabled_sources: Vec<String>,
+    #[serde(default)]
+    pub disabled_sources: Vec<String>,
+    #[serde(default, rename = "enabled_sources", skip_serializing_if = "Vec::is_empty")]
+    legacy_enabled_sources: Vec<String>,
+    #[serde(default)]
     pub sync_window: SyncWindow,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self { enabled_sources: Vec::new(), sync_window: SyncWindow::All }
-    }
 }
 
 impl AppConfig {
@@ -73,9 +71,7 @@ impl AppConfig {
         }
 
         let content = std::fs::read_to_string(path)?;
-        let mut config: Self = serde_json::from_str(&content)?;
-        config.enabled_sources.sort();
-        config.enabled_sources.dedup();
+        let config: Self = serde_json::from_str(&content)?;
         Ok(config)
     }
 
@@ -93,20 +89,20 @@ impl AppConfig {
     }
 
     pub fn normalize_sources(&mut self, known_sources: &[(String, String)]) {
-        if self.enabled_sources.is_empty() {
-            self.enabled_sources = known_sources.iter().map(|(id, _)| id.clone()).collect();
-        } else {
-            self.enabled_sources.retain(|id| known_sources.iter().any(|(known, _)| known == id));
-            if self.enabled_sources.is_empty() {
-                self.enabled_sources = known_sources.iter().map(|(id, _)| id.clone()).collect();
-            }
+        self.legacy_enabled_sources.clear();
+
+        self.disabled_sources.retain(|id| known_sources.iter().any(|(known, _)| known == id));
+        self.disabled_sources.sort();
+        self.disabled_sources.dedup();
+
+        let enabled_count = known_sources.len().saturating_sub(self.disabled_sources.len());
+        if enabled_count == 0 {
+            self.disabled_sources.clear();
         }
-        self.enabled_sources.sort();
-        self.enabled_sources.dedup();
     }
 
     pub fn is_source_enabled(&self, source_id: &str) -> bool {
-        self.enabled_sources.iter().any(|id| id == source_id)
+        !self.disabled_sources.iter().any(|id| id == source_id)
     }
 }
 
