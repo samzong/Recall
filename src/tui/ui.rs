@@ -31,6 +31,10 @@ pub fn render(f: &mut Frame, app: &App) {
             render_search(f, app);
             render_settings(f, app);
         }
+        AppMode::ConfirmResume => {
+            render_search(f, app);
+            render_confirm_resume(f, app);
+        }
     }
 }
 
@@ -397,6 +401,75 @@ fn render_settings(f: &mut Frame, app: &App) {
     f.render_widget(widget, popup);
 }
 
+fn render_confirm_resume(f: &mut Frame, app: &App) {
+    let Some(pending) = app.pending_resume.as_ref() else {
+        return;
+    };
+
+    let area = f.area();
+    let width = area.width.clamp(40, 76);
+    let height: u16 = 9;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .title(" Resume session ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Black));
+
+    let title: String = pending.session_title.chars().take(width as usize - 10).collect();
+    let command_text: String =
+        pending.command.display().chars().take(width as usize - 14).collect();
+    let cwd_text: String = pending
+        .cwd
+        .as_deref()
+        .unwrap_or("-")
+        .chars()
+        .rev()
+        .take(width as usize - 10)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Source:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                pending.source_label.clone(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(title, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Cwd:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(cwd_text, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Command: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                command_text,
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [Y] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("confirm & exec     ", Style::default().fg(Color::White)),
+            Span::styled("[N] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(Clear, popup);
+    f.render_widget(widget, popup);
+}
+
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let semantic_span = if app.semantic_progress.total_sessions > 0 {
         let mut text = format!(
@@ -440,6 +513,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" detail  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Tab", Style::default().fg(Color::Yellow)),
                     Span::styled(" filter  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Ctrl+R", Style::default().fg(Color::Yellow)),
+                    Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Ctrl+S", Style::default().fg(Color::Yellow)),
                     Span::styled(" settings  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),

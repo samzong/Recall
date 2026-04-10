@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::adapters::{ResumeCommand, resume_command_for};
 use crate::config::AppConfig;
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::Store;
@@ -17,6 +18,14 @@ pub enum AppMode {
     Viewing,
     ExportInput,
     Settings,
+    ConfirmResume,
+}
+
+pub struct PendingResume {
+    pub command: ResumeCommand,
+    pub source_label: String,
+    pub session_title: String,
+    pub cwd: Option<String>,
 }
 
 #[derive(PartialEq)]
@@ -68,6 +77,8 @@ pub struct App {
     pub background_status: BackgroundJobStatus,
     pub semantic_last_refresh: Instant,
     pub settings_selected: usize,
+    pub pending_resume: Option<PendingResume>,
+    pub exec_on_exit: Option<(ResumeCommand, Option<String>)>,
 }
 
 impl App {
@@ -109,6 +120,8 @@ impl App {
             background_status,
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
+            pending_resume: None,
+            exec_on_exit: None,
         };
         app.reset_search_defaults();
         app.update_scope_metrics(store);
@@ -183,6 +196,7 @@ impl App {
             AppMode::Viewing => self.handle_viewing_key(key),
             AppMode::ExportInput => self.handle_export_key(key),
             AppMode::Settings => self.handle_settings_key(key, store, engine, provider),
+            AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
         }
     }
 
@@ -254,6 +268,11 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             self.mode = AppMode::Settings;
             self.settings_selected = 0;
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            self.start_resume_confirmation();
             return;
         }
 
@@ -366,6 +385,42 @@ impl App {
             }
             KeyCode::Char('e') => {
                 self.start_export();
+            }
+            _ => {}
+        }
+    }
+
+    fn start_resume_confirmation(&mut self) {
+        let Some(result) = self.results.get(self.selected_index) else {
+            return;
+        };
+        let session = &result.session;
+        let Some(command) = resume_command_for(&session.source, &session.source_id) else {
+            self.status_message = Some(format!("Resume not supported for {}", session.source));
+            return;
+        };
+        self.pending_resume = Some(PendingResume {
+            command,
+            source_label: self.source_label_for(&session.source).to_string(),
+            session_title: session.title.clone(),
+            cwd: session.directory.clone(),
+        });
+        self.mode = AppMode::ConfirmResume;
+    }
+
+    fn handle_confirm_resume_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(pending) = self.pending_resume.take() {
+                    self.exec_on_exit = Some((pending.command, pending.cwd));
+                    self.should_quit = true;
+                } else {
+                    self.mode = AppMode::Search;
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.pending_resume = None;
+                self.mode = AppMode::Search;
             }
             _ => {}
         }
