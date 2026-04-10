@@ -778,15 +778,17 @@ impl App {
             self.config.sync_window = self.config.sync_window.next();
         } else if let Some((source_id, _)) = self.all_sources.get(self.settings_selected - 1) {
             if self.config.is_source_enabled(source_id) {
-                if self.config.enabled_sources.len() == 1 {
+                let enabled_count =
+                    self.all_sources.len().saturating_sub(self.config.disabled_sources.len());
+                if enabled_count <= 1 {
                     self.status_message = Some("At least one source must stay enabled".to_string());
                     return;
                 }
-                self.config.enabled_sources.retain(|id| id != source_id);
+                self.config.disabled_sources.push(source_id.clone());
+                self.config.disabled_sources.sort();
+                self.config.disabled_sources.dedup();
             } else {
-                self.config.enabled_sources.push(source_id.clone());
-                self.config.enabled_sources.sort();
-                self.config.enabled_sources.dedup();
+                self.config.disabled_sources.retain(|id| id != source_id);
             }
         }
 

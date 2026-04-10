@@ -1,3 +1,6 @@
+use recall::adapters::gemini::parse_gemini_session;
+use recall::adapters::kiro::parse_kiro_conversation;
+use recall::config::AppConfig;
 use recall::db::schema;
 use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
 use recall::db::store::Store;
@@ -344,4 +347,276 @@ fn sync_detects_updated_timestamp() {
     let changed = old_msg_count != new_msg_count
         || (new_updated_at.is_some() && new_updated_at != old_updated_at);
     assert!(changed, "sync must detect updated_at change even when message count is same");
+}
+
+#[test]
+fn gemini_parser_plain_conversation() {
+    let json = r#"{
+        "sessionId": "abc-123",
+        "projectHash": "deadbeef",
+        "startTime": "2025-11-13T13:48:00.000Z",
+        "lastUpdated": "2025-11-13T14:00:00.000Z",
+        "messages": [
+            {"id": 0, "type": "user", "content": "hello", "timestamp": "2025-11-13T13:48:05.000Z"},
+            {"id": 1, "type": "gemini", "content": "hi there", "timestamp": "2025-11-13T13:48:10.000Z"}
+        ]
+    }"#;
+
+    let session = parse_gemini_session(json, "fallback").unwrap().unwrap();
+    assert_eq!(session.source_id, "abc-123");
+    assert_eq!(session.directory, None, "gemini has no resolvable cwd");
+    assert_eq!(session.messages.len(), 2);
+    assert!(matches!(session.messages[0].role, Role::User));
+    assert_eq!(session.messages[0].content, "hello");
+    assert!(matches!(session.messages[1].role, Role::Assistant));
+    assert_eq!(session.messages[1].content, "hi there");
+}
+
+#[test]
+fn gemini_parser_indexes_tool_calls() {
+    let json = r##"{
+        "sessionId": "xyz",
+        "startTime": "2025-11-13T13:48:00.000Z",
+        "messages": [
+            {"id": 0, "type": "user", "content": "read README", "timestamp": "2025-11-13T13:48:00.000Z"},
+            {
+                "id": 1,
+                "type": "gemini",
+                "content": "Let me read the file.",
+                "timestamp": "2025-11-13T13:48:05.000Z",
+                "toolCalls": [{
+                    "id": "t1",
+                    "name": "read_file",
+                    "args": {"path": "/tmp/README.md"},
+                    "result": [{"text": "# My Project\nHello world."}]
+                }]
+            }
+        ]
+    }"##;
+
+    let session = parse_gemini_session(json, "fallback").unwrap().unwrap();
+    let assistant = &session.messages[1];
+    assert!(
+        assistant.content.contains("Let me read the file"),
+        "prose preserved: {}",
+        assistant.content
+    );
+    assert!(assistant.content.contains("[read_file]"), "tool name indexed: {}", assistant.content);
+    assert!(
+        assistant.content.contains("/tmp/README.md"),
+        "tool args indexed: {}",
+        assistant.content
+    );
+    assert!(
+        assistant.content.contains("Hello world"),
+        "tool result indexed: {}",
+        assistant.content
+    );
+}
+
+#[test]
+fn gemini_parser_skips_info_messages() {
+    let json = r#"{
+        "sessionId": "s",
+        "startTime": "2025-11-13T13:48:00.000Z",
+        "messages": [
+            {"id": 0, "type": "info", "content": "CLI update available"},
+            {"id": 1, "type": "user", "content": "hi", "timestamp": "2025-11-13T13:48:05.000Z"}
+        ]
+    }"#;
+
+    let session = parse_gemini_session(json, "fallback").unwrap().unwrap();
+    assert_eq!(session.messages.len(), 1, "info messages should be skipped");
+    assert_eq!(session.messages[0].content, "hi");
+}
+
+#[test]
+fn gemini_parser_empty_returns_none() {
+    let json = r#"{"sessionId": "s", "messages": []}"#;
+    assert!(parse_gemini_session(json, "fallback").unwrap().is_none());
+}
+
+#[test]
+fn kiro_parser_prompt_and_response() {
+    let json = r#"{
+        "history": [{
+            "user": {
+                "content": {"Prompt": {"prompt": "how use skill"}},
+                "timestamp": "2026-04-11T00:34:50.549369+08:00"
+            },
+            "assistant": {
+                "Response": {"message_id": "m1", "content": "Skills are markdown files."}
+            },
+            "request_metadata": {"request_start_timestamp_ms": 1775838890550}
+        }]
+    }"#;
+
+    let session =
+        parse_kiro_conversation("conv1", "/Users/x/proj", json, 1000, 2000).unwrap().unwrap();
+    assert_eq!(session.source_id, "conv1");
+    assert_eq!(session.directory.as_deref(), Some("/Users/x/proj"));
+    assert_eq!(session.started_at, 1000);
+    assert_eq!(session.updated_at, Some(2000));
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].content, "how use skill");
+    assert_eq!(session.messages[1].content, "Skills are markdown files.");
+    assert_eq!(session.messages[1].timestamp, Some(1775838890550));
+}
+
+#[test]
+fn kiro_parser_assistant_tool_use() {
+    let json = r#"{
+        "history": [{
+            "user": {
+                "content": {"Prompt": {"prompt": "analyze project"}}
+            },
+            "assistant": {
+                "ToolUse": {
+                    "message_id": "m1",
+                    "content": "Let me look around.",
+                    "tool_uses": [
+                        {"id": "t1", "name": "fs_read", "args": {"path": "/src"}},
+                        {"id": "t2", "name": "execute_bash", "args": {"command": "ls"}}
+                    ]
+                }
+            },
+            "request_metadata": {"request_start_timestamp_ms": 1775838890550}
+        }]
+    }"#;
+
+    let session = parse_kiro_conversation("c", "/proj", json, 0, 0).unwrap().unwrap();
+    let assistant = &session.messages[1];
+    assert!(
+        assistant.content.contains("Let me look around"),
+        "prose preserved: {}",
+        assistant.content
+    );
+    assert!(assistant.content.contains("[fs_read]"), "first tool indexed: {}", assistant.content);
+    assert!(
+        assistant.content.contains("[execute_bash]"),
+        "second tool indexed: {}",
+        assistant.content
+    );
+    assert!(assistant.content.contains("/src"), "fs_read args indexed: {}", assistant.content);
+}
+
+#[test]
+fn kiro_parser_tool_use_results_text_and_json() {
+    let json = r#"{
+        "history": [{
+            "user": {
+                "content": {
+                    "ToolUseResults": {
+                        "tool_use_results": [
+                            {
+                                "tool_use_id": "t1",
+                                "content": [{"Text": "file contents here"}]
+                            },
+                            {
+                                "tool_use_id": "t2",
+                                "content": [{"Json": {"status": "ok", "rows": 42}}]
+                            }
+                        ]
+                    }
+                }
+            },
+            "assistant": {"Response": {"message_id": "m", "content": "done"}}
+        }]
+    }"#;
+
+    let session = parse_kiro_conversation("c", "/proj", json, 0, 0).unwrap().unwrap();
+    let user_msg = &session.messages[0];
+    assert!(
+        user_msg.content.contains("file contents here"),
+        "Text variant indexed: {}",
+        user_msg.content
+    );
+    assert!(user_msg.content.contains("\"status\""), "Json variant indexed: {}", user_msg.content);
+    assert!(user_msg.content.contains("42"), "Json values indexed: {}", user_msg.content);
+}
+
+#[test]
+fn kiro_parser_empty_history_returns_none() {
+    let json = r#"{"history": []}"#;
+    assert!(parse_kiro_conversation("c", "/proj", json, 0, 0).unwrap().is_none());
+}
+
+#[test]
+fn config_migrates_legacy_enabled_sources() {
+    let legacy_json = r#"{
+        "enabled_sources": ["claude-code", "codex", "opencode"],
+        "sync_window": "week"
+    }"#;
+    let mut config: AppConfig = serde_json::from_str(legacy_json).unwrap();
+
+    let known = vec![
+        ("claude-code".to_string(), "CC".to_string()),
+        ("opencode".to_string(), "OC".to_string()),
+        ("codex".to_string(), "CDX".to_string()),
+        ("gemini-cli".to_string(), "GEM".to_string()),
+        ("kiro-cli".to_string(), "KIRO".to_string()),
+    ];
+    config.normalize_sources(&known);
+
+    assert!(config.is_source_enabled("claude-code"));
+    assert!(config.is_source_enabled("opencode"));
+    assert!(config.is_source_enabled("codex"));
+    assert!(
+        config.is_source_enabled("gemini-cli"),
+        "newly-added adapter should be enabled after migration"
+    );
+    assert!(
+        config.is_source_enabled("kiro-cli"),
+        "newly-added adapter should be enabled after migration"
+    );
+
+    let round_tripped = serde_json::to_string(&config).unwrap();
+    assert!(
+        !round_tripped.contains("enabled_sources"),
+        "legacy field must not be re-serialized: {round_tripped}"
+    );
+}
+
+#[test]
+fn config_disables_persist_across_reloads() {
+    let mut known = vec![
+        ("claude-code".to_string(), "CC".to_string()),
+        ("gemini-cli".to_string(), "GEM".to_string()),
+    ];
+
+    let mut config = AppConfig::default();
+    config.normalize_sources(&known);
+    config.disabled_sources.push("gemini-cli".to_string());
+
+    let json = serde_json::to_string(&config).unwrap();
+    let mut reloaded: AppConfig = serde_json::from_str(&json).unwrap();
+    reloaded.normalize_sources(&known);
+
+    assert!(reloaded.is_source_enabled("claude-code"));
+    assert!(
+        !reloaded.is_source_enabled("gemini-cli"),
+        "explicit disable must survive a save/load cycle"
+    );
+
+    known.push(("kiro-cli".to_string(), "KIRO".to_string()));
+    reloaded.normalize_sources(&known);
+    assert!(
+        reloaded.is_source_enabled("kiro-cli"),
+        "a brand new adapter should default to enabled"
+    );
+    assert!(
+        !reloaded.is_source_enabled("gemini-cli"),
+        "previously disabled adapter must stay disabled"
+    );
+}
+
+#[test]
+fn config_drops_obsolete_disabled_entries() {
+    let mut config = AppConfig::default();
+    config.disabled_sources = vec!["ghost-adapter".to_string(), "claude-code".to_string()];
+    let known = vec![("claude-code".to_string(), "CC".to_string())];
+    config.normalize_sources(&known);
+
+    assert!(!config.disabled_sources.iter().any(|id| id == "ghost-adapter"));
+    assert!(config.is_source_enabled("claude-code"), "cleared to avoid zero-source state");
 }
