@@ -6,14 +6,13 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::db::search::TimeRange;
-use crate::tui::app::{App, AppMode, PanelFocus, ResumeOrigin, SortOrder};
+use crate::tui::app::{App, AppMode, PanelFocus, ResumeOrigin, SanitizedLine, SortOrder};
 use crate::types::{MatchSource, Role};
 
-fn highlight_spans(text: &str, needle_lower: &str, base: Style) -> Vec<Span<'static>> {
+fn highlight_spans(text: &str, hay: &str, needle_lower: &str, base: Style) -> Vec<Span<'static>> {
     if needle_lower.is_empty() {
         return vec![Span::styled(text.to_string(), base)];
     }
-    let hay = text.to_lowercase();
     if hay.len() != text.len() {
         return vec![Span::styled(text.to_string(), base)];
     }
@@ -360,10 +359,10 @@ fn render_viewing(f: &mut Frame, app: &App) {
         lines.push(Line::from(header));
 
         let body_style = Style::default().fg(Color::White).bg(bg);
-        let empty: Vec<String> = Vec::new();
+        let empty: Vec<SanitizedLine> = Vec::new();
         let cached_lines = app.viewing_sanitized_lines.get(i).unwrap_or(&empty);
-        for line in cached_lines {
-            let spans = highlight_spans(line, &needle_lower, body_style);
+        for sl in cached_lines {
+            let spans = highlight_spans(&sl.text, &sl.lower, &needle_lower, body_style);
             lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));

@@ -35,6 +35,26 @@ pub struct PendingResume {
     pub origin: ResumeOrigin,
 }
 
+pub struct SanitizedLine {
+    pub text: String,
+    pub lower: String,
+}
+
+fn build_viewing_caches(msgs: &[Message]) -> Vec<Vec<SanitizedLine>> {
+    msgs.iter()
+        .map(|m| {
+            m.content
+                .lines()
+                .map(|line| {
+                    let text = crate::utils::sanitize_line(line);
+                    let lower = text.to_lowercase();
+                    SanitizedLine { text, lower }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 #[derive(PartialEq)]
 pub enum PanelFocus {
     SessionList,
@@ -90,8 +110,7 @@ pub struct App {
     pub viewing_search_input: Option<String>,
     pub viewing_search_input_cursor: usize,
     pub viewing_search_status: Option<String>,
-    pub viewing_sanitized_lines: Vec<Vec<String>>,
-    pub viewing_content_lower: Vec<String>,
+    pub viewing_sanitized_lines: Vec<Vec<SanitizedLine>>,
     pub viewing_match_cache: Vec<usize>,
 }
 
@@ -141,7 +160,6 @@ impl App {
             viewing_search_input_cursor: 0,
             viewing_search_status: None,
             viewing_sanitized_lines: Vec::new(),
-            viewing_content_lower: Vec::new(),
             viewing_match_cache: Vec::new(),
         };
         app.reset_search_defaults();
@@ -394,7 +412,6 @@ impl App {
                 self.viewing_search_query.clear();
                 self.viewing_search_status = None;
                 self.viewing_sanitized_lines.clear();
-                self.viewing_content_lower.clear();
                 self.viewing_match_cache.clear();
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -515,8 +532,8 @@ impl App {
             return;
         }
         let needle = self.viewing_search_query.to_lowercase();
-        for (i, lower) in self.viewing_content_lower.iter().enumerate() {
-            if lower.contains(&needle) {
+        for (i, msg_lines) in self.viewing_sanitized_lines.iter().enumerate() {
+            if msg_lines.iter().any(|l| l.lower.contains(&needle)) {
                 self.viewing_match_cache.push(i);
             }
         }
@@ -825,11 +842,7 @@ impl App {
         if let Some(result) = self.results.get(self.selected_index)
             && let Ok(msgs) = store.get_messages(&result.session.id)
         {
-            self.viewing_sanitized_lines = msgs
-                .iter()
-                .map(|m| m.content.lines().map(crate::utils::sanitize_line).collect())
-                .collect();
-            self.viewing_content_lower = msgs.iter().map(|m| m.content.to_lowercase()).collect();
+            self.viewing_sanitized_lines = build_viewing_caches(&msgs);
             self.viewing_messages = msgs;
             self.viewing_selected_msg = 0;
             self.viewing_search_query.clear();
