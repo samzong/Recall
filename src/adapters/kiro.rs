@@ -19,10 +19,7 @@ impl SourceAdapter for KiroAdapter {
         let db_path = kiro_db_path()?;
 
         if !db_path.exists() {
-            debug!(
-                "Kiro CLI DB not found at {}, skipping",
-                db_path.display()
-            );
+            debug!("Kiro CLI DB not found at {}, skipping", db_path.display());
             return Ok(vec![]);
         }
 
@@ -37,31 +34,32 @@ impl SourceAdapter for KiroAdapter {
              ORDER BY updated_at DESC",
         )?;
 
-        let rows: Vec<(String, String, String, i64, i64)> = stmt
+        let rows = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .filter_map(|r| r.ok());
 
         let mut sessions = Vec::new();
 
         for (cwd, conversation_id, value_json, created_at, updated_at) in rows {
-            match parse_kiro_conversation(&conversation_id, &cwd, &value_json, created_at, updated_at)
-            {
+            match parse_kiro_conversation(
+                &conversation_id,
+                &cwd,
+                &value_json,
+                created_at,
+                updated_at,
+            ) {
                 Ok(Some(session)) => sessions.push(session),
                 Ok(None) => {}
                 Err(e) => {
-                    debug!(
-                        "failed to parse kiro conversation {}: {e}",
-                        conversation_id
-                    );
+                    debug!("failed to parse kiro conversation {}: {e}", conversation_id);
                 }
             }
         }
@@ -71,16 +69,8 @@ impl SourceAdapter for KiroAdapter {
 }
 
 fn kiro_db_path() -> anyhow::Result<std::path::PathBuf> {
-    // macOS: ~/Library/Application Support/kiro-cli/data.sqlite3
-    // Linux: ~/.local/share/kiro-cli/data.sqlite3
-    if cfg!(target_os = "macos") {
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-        Ok(home.join("Library/Application Support/kiro-cli/data.sqlite3"))
-    } else {
-        let data_dir =
-            dirs::data_dir().ok_or_else(|| anyhow::anyhow!("no data dir"))?;
-        Ok(data_dir.join("kiro-cli/data.sqlite3"))
-    }
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("no data dir"))?;
+    Ok(data_dir.join("kiro-cli/data.sqlite3"))
 }
 
 fn parse_kiro_conversation(
@@ -106,11 +96,7 @@ fn parse_kiro_conversation(
             let timestamp = parse_kiro_timestamp(user_obj.get("timestamp"));
 
             if !content.is_empty() {
-                messages.push(RawMessage {
-                    role: Role::User,
-                    content,
-                    timestamp,
-                });
+                messages.push(RawMessage { role: Role::User, content, timestamp });
             }
         }
 
@@ -123,11 +109,7 @@ fn parse_kiro_conversation(
                 .and_then(|t| t.as_i64());
 
             if !content.is_empty() {
-                messages.push(RawMessage {
-                    role: Role::Assistant,
-                    content,
-                    timestamp,
-                });
+                messages.push(RawMessage { role: Role::Assistant, content, timestamp });
             }
         }
     }
@@ -155,18 +137,15 @@ fn extract_user_content(user_obj: &Value) -> String {
     };
 
     // Most common: {"Prompt": {"prompt": "..."}}
-    if let Some(prompt_obj) = content.get("Prompt") {
-        if let Some(text) = prompt_obj.get("prompt").and_then(|p| p.as_str()) {
-            return text.to_string();
-        }
+    if let Some(prompt_obj) = content.get("Prompt")
+        && let Some(text) = prompt_obj.get("prompt").and_then(|p| p.as_str())
+    {
+        return text.to_string();
     }
 
     // Tool result: {"ToolResult": {"tool_use_id": "...", "content": [...]}}
     if let Some(tool_result) = content.get("ToolResult") {
-        let tool_id = tool_result
-            .get("tool_use_id")
-            .and_then(|t| t.as_str())
-            .unwrap_or("tool");
+        let tool_id = tool_result.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or("tool");
         if let Some(arr) = tool_result.get("content").and_then(|c| c.as_array()) {
             let parts: Vec<String> = arr
                 .iter()
@@ -191,18 +170,15 @@ fn extract_user_content(user_obj: &Value) -> String {
 /// Can be: {"Response": {"content": "..."}} or {"ToolUse": {...}}
 fn extract_assistant_content(assistant_obj: &Value) -> String {
     // Response: {"Response": {"content": "..."}}
-    if let Some(response) = assistant_obj.get("Response") {
-        if let Some(text) = response.get("content").and_then(|c| c.as_str()) {
-            return text.to_string();
-        }
+    if let Some(response) = assistant_obj.get("Response")
+        && let Some(text) = response.get("content").and_then(|c| c.as_str())
+    {
+        return text.to_string();
     }
 
     // ToolUse: {"ToolUse": {"name": "...", "input": {...}}}
     if let Some(tool_use) = assistant_obj.get("ToolUse") {
-        let name = tool_use
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("tool");
+        let name = tool_use.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
         if let Some(input) = tool_use.get("input") {
             return format!("[{name}] {input}");
         }

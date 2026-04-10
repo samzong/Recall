@@ -38,7 +38,7 @@ impl SourceAdapter for GeminiAdapter {
                 continue;
             }
             // Only parse files inside a "chats" directory
-            if !path.parent().is_some_and(|p| p.file_name().is_some_and(|n| n == "chats")) {
+            if path.parent().is_none_or(|p| p.file_name().is_none_or(|n| n != "chats")) {
                 continue;
             }
 
@@ -62,11 +62,7 @@ fn parse_gemini_session(path: &std::path::Path) -> anyhow::Result<Option<RawSess
     let session_id = doc
         .get("sessionId")
         .and_then(|s| s.as_str())
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-        })
+        .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown"))
         .to_string();
 
     let started_at = doc
@@ -114,22 +110,16 @@ fn parse_gemini_session(path: &std::path::Path) -> anyhow::Result<Option<RawSess
         // User messages have content as array of {text}, assistant has content as string
         let content = match role {
             Role::User => extract_user_content(msg.get("content")),
-            Role::Assistant => msg
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string(),
+            Role::Assistant => {
+                msg.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string()
+            }
         };
 
         if content.is_empty() {
             continue;
         }
 
-        messages.push(RawMessage {
-            role,
-            content,
-            timestamp,
-        });
+        messages.push(RawMessage { role, content, timestamp });
     }
 
     if messages.is_empty() {
@@ -150,10 +140,8 @@ fn parse_gemini_session(path: &std::path::Path) -> anyhow::Result<Option<RawSess
 fn extract_user_content(content: Option<&Value>) -> String {
     match content {
         Some(Value::Array(arr)) => {
-            let parts: Vec<&str> = arr
-                .iter()
-                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                .collect();
+            let parts: Vec<&str> =
+                arr.iter().filter_map(|item| item.get("text").and_then(|t| t.as_str())).collect();
             parts.join("\n")
         }
         Some(Value::String(s)) => s.clone(),
