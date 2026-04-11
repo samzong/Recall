@@ -8,14 +8,8 @@ use fs2::FileExt;
 use crate::db::store::Store;
 use crate::embedding::EmbeddingProvider;
 
-const SESSION_EMBED_BATCH: usize = 64;
+const SESSION_EMBED_BATCH: usize = 8;
 const BACKGROUND_JOB: &str = "pipeline";
-
-pub struct SemanticRunOutcome {
-    pub title: String,
-    pub units_done: u64,
-    pub units_total: u64,
-}
 
 pub fn ensure_background_worker(sync_first: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
@@ -56,30 +50,27 @@ where
             return Err(err);
         }
     };
+    store.set_background_job_state(
+        BACKGROUND_JOB,
+        "semantic",
+        Some(&format!("starting on {}", provider.device_name())),
+    )?;
 
-    while let Some(outcome) = process_next_session(&store, &provider)? {
-        let detail = format!("{} ({}/{})", outcome.title, outcome.units_done, outcome.units_total);
-        store.set_background_job_state(BACKGROUND_JOB, "semantic", Some(&detail))?;
-    }
+    while process_next_session(&store, &provider)? {}
 
     store.clear_background_job_state(BACKGROUND_JOB)?;
     Ok(())
 }
 
-fn process_next_session(
-    store: &Store,
-    provider: &EmbeddingProvider,
-) -> Result<Option<SemanticRunOutcome>> {
+fn process_next_session(store: &Store, provider: &EmbeddingProvider) -> Result<bool> {
     let Some(job) = store.claim_next_session_embedding_job()? else {
-        return Ok(None);
+        return Ok(false);
     };
 
-    store.set_background_job_state(BACKGROUND_JOB, "semantic", Some(&job.title))?;
-    let result = process_session(store, provider, &job);
-    match result {
-        Ok(outcome) => {
+    match process_session(store, provider, &job) {
+        Ok(()) => {
             store.complete_session_embedding(&job.session_id)?;
-            Ok(Some(outcome))
+            Ok(true)
         }
         Err(err) => {
             let message = format!("{err:#}");
@@ -94,19 +85,14 @@ fn process_session(
     store: &Store,
     provider: &EmbeddingProvider,
     job: &crate::types::SemanticSessionJob,
-) -> Result<SemanticRunOutcome> {
+) -> Result<()> {
     let pending = store.pending_embeddable_messages(&job.session_id)?;
+    let mut units_done = store.embedded_message_count(&job.session_id)?;
     if pending.is_empty() {
-        let units_done = store.embedded_message_count(&job.session_id)?;
-        return Ok(SemanticRunOutcome {
-            title: job.title.clone(),
-            units_done,
-            units_total: job.units_total,
-        });
+        return Ok(());
     }
 
-    let mut units_done = store.embedded_message_count(&job.session_id)?;
-
+    let device = provider.device_name();
     for chunk in pending.chunks(SESSION_EMBED_BATCH) {
         let texts: Vec<String> =
             chunk.iter().map(|(_, content)| build_embedding_text(&job.title, content)).collect();
@@ -119,14 +105,14 @@ fn process_session(
         store.upsert_embeddings(&items)?;
         units_done += chunk.len() as u64;
         store.update_session_embedding_progress(&job.session_id, units_done)?;
-        let detail = format!("{} ({}/{})", job.title, units_done, job.units_total);
+        let detail = format!("{} ({}/{}) • {device}", job.title, units_done, job.units_total);
         store.set_background_job_state(BACKGROUND_JOB, "semantic", Some(&detail))?;
     }
 
-    Ok(SemanticRunOutcome { title: job.title.clone(), units_done, units_total: job.units_total })
+    Ok(())
 }
 
-fn build_embedding_text(title: &str, content: &str) -> String {
+pub(crate) fn build_embedding_text(title: &str, content: &str) -> String {
     let text = format!("{title}: {content}");
     if text.chars().count() > 500 { text.chars().take(500).collect() } else { text }
 }

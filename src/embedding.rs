@@ -4,7 +4,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use hf_hub::{Repo, RepoType};
 use std::path::PathBuf;
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 const MODEL_ID: &str = "intfloat/multilingual-e5-small";
 
@@ -23,8 +23,15 @@ impl EmbeddingProvider {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device)? };
         let model = BertModel::load(vb, &config)?;
 
-        let tokenizer =
+        let mut tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
+            ..Default::default()
+        }));
+        tokenizer
+            .with_truncation(Some(TruncationParams { max_length: 512, ..Default::default() }))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         Ok(Self { model, tokenizer, device })
     }
@@ -36,12 +43,20 @@ impl EmbeddingProvider {
     }
 
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        const BATCH_SIZE: usize = 64;
         let prefixed: Vec<String> = texts.iter().map(|t| format!("passage: {t}")).collect();
+        let refs: Vec<&str> = prefixed.iter().map(|s| s.as_str()).collect();
+        self.embed_batch(&refs)
+    }
+
+    pub fn embed_documents_with_batch(
+        &self,
+        texts: &[String],
+        batch_size: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let bs = batch_size.max(1);
         let mut all = Vec::with_capacity(texts.len());
-        for chunk in prefixed.chunks(BATCH_SIZE) {
-            let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-            all.extend(self.embed_batch(&refs)?);
+        for chunk in texts.chunks(bs) {
+            all.extend(self.embed_documents(chunk)?);
         }
         Ok(all)
     }
@@ -51,18 +66,10 @@ impl EmbeddingProvider {
             return Ok(vec![]);
         }
 
-        let mut tokenizer = self.tokenizer.clone();
-        if let Some(pp) = tokenizer.get_padding_mut() {
-            pp.strategy = PaddingStrategy::BatchLongest;
-        } else {
-            tokenizer.with_padding(Some(PaddingParams {
-                strategy: PaddingStrategy::BatchLongest,
-                ..Default::default()
-            }));
-        }
-
-        let encodings =
-            tokenizer.encode_batch(texts.to_vec(), true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let token_ids = encodings
             .iter()
@@ -88,12 +95,7 @@ impl EmbeddingProvider {
         let norm = pooled.sqr()?.sum_keepdim(1)?.sqrt()?;
         let normalized = pooled.broadcast_div(&norm)?;
 
-        let (batch, _dim) = normalized.dims2()?;
-        let mut result = Vec::with_capacity(batch);
-        for i in 0..batch {
-            result.push(normalized.get(i)?.to_vec1::<f32>()?);
-        }
-        Ok(result)
+        Ok(normalized.to_vec2::<f32>()?)
     }
 
     pub fn device_name(&self) -> &str {
