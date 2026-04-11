@@ -1,0 +1,14 @@
+#!/bin/sh
+# Auto-append Signed-off-by (DCO) to every commit on this repo.
+# Enable once with: git config core.hooksPath .githooks
+
+NAME=$(git config user.name)
+EMAIL=$(git config user.email)
+
+if [ -z "$NAME" ] || [ -z "$EMAIL" ]; then
+    exit 0
+fi
+
+if ! grep -qs "^Signed-off-by: $NAME <$EMAIL>" "$1"; then
+    printf "\nSigned-off-by: %s <%s>\n" "$NAME" "$EMAIL" >> "$1"
+fi

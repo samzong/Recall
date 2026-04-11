@@ -110,3 +110,42 @@ make check = cargo fmt --check → cargo clippy → cargo test
 ```
 
 Always run `make check` before pushing. If it passes locally, CI will pass.
+
+## Releases
+
+Releases are driven by `cargo-release`, which bumps `Cargo.toml`, updates
+`Cargo.lock`, commits, tags, and pushes in one step. The GitHub Actions
+release workflow triggers on `v*` tag push and builds cross-platform
+binaries.
+
+### One-time setup
+
+```bash
+cargo install cargo-release
+git config core.hooksPath .githooks   # enables auto DCO signoff
+```
+
+The `.githooks/prepare-commit-msg` hook appends `Signed-off-by` to every
+commit, so both hand-written and `cargo-release`-driven commits satisfy the
+project's DCO convention.
+
+### Cut a release
+
+```bash
+make release-patch              # dry-run: shows what would happen
+make release-patch EXECUTE=1    # apply: bump, commit, tag, push
+```
+
+`release-minor` and `release-major` work the same way. The tag name is
+`v{{version}}` and the commit subject is `chore(release): bump to v{{version}}`.
+
+### First release after a stale baseline
+
+If `Cargo.toml` is at `0.1.0` but tags `v0.1.1`..`v0.1.3` already exist (because
+earlier releases were tagged without bumping `Cargo.toml`), a patch bump will
+collide with `v0.1.1`. Skip to the next free version explicitly:
+
+```bash
+cargo release 0.1.4              # dry-run
+cargo release 0.1.4 --execute    # apply
+```

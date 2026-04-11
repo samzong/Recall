@@ -76,6 +76,19 @@ search: ## Search sessions (Q="query")
 	@test -n "$(Q)" || { printf 'Usage: make search Q="query"\n'; exit 1; }
 	$(CARGO) run $(CARGO_RUN_FEATURES) -- search "$(Q)"
 
+# ── Release ──────────────────────────────────────────────────────────────────
+
+.PHONY: release-patch release-minor release-major
+
+release-patch: ## Bump patch + commit + tag + push (append EXECUTE=1 to apply)
+	cargo release patch $(if $(EXECUTE),--execute,)
+
+release-minor: ## Bump minor + commit + tag + push (append EXECUTE=1 to apply)
+	cargo release minor $(if $(EXECUTE),--execute,)
+
+release-major: ## Bump major + commit + tag + push (append EXECUTE=1 to apply)
+	cargo release major $(if $(EXECUTE),--execute,)
+
 # ── Maintenance ──────────────────────────────────────────────────────────────
 
 .PHONY: clean

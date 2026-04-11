@@ -39,3 +39,11 @@ accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transfor
 opt-level = 3
 lto = true
 strip = true
+
+[package.metadata.release]
+publish = false
+verify = false
+push-remote = "origin"
+pre-release-commit-message = "chore(release): bump to v{{version}}"
+tag-message = "v{{version}}"
+tag-name = "v{{version}}"
