@@ -7,21 +7,15 @@ RESET := \033[0m
 
 .DEFAULT_GOAL := help
 
-# Enable Metal automatically on macOS — without it Candle silently falls
-# back to CPU and embedding throughput drops ~6x on Apple Silicon.
-ifeq ($(shell uname -s),Darwin)
-CARGO_RUN_FEATURES := --features metal
-endif
-
 # ── Build ────────────────────────────────────────────────────────────────────
 
 .PHONY: build release
 
 build: ## Debug build
-	$(CARGO) build $(CARGO_RUN_FEATURES)
+	$(CARGO) build
 
 release: ## Release build (LTO + strip)
-	$(CARGO) build --release $(CARGO_RUN_FEATURES)
+	$(CARGO) build --release
 
 # ── Quality ──────────────────────────────────────────────────────────────────
 
@@ -67,14 +61,14 @@ uninstall: ## Remove installed binary
 .PHONY: run sync search
 
 run: ## Launch TUI
-	$(CARGO) run $(CARGO_RUN_FEATURES)
+	$(CARGO) run
 
 sync: ## Incremental sync (use FORCE=1 to reprocess all)
-	$(CARGO) run $(CARGO_RUN_FEATURES) -- sync $(if $(FORCE),--force,)
+	$(CARGO) run -- sync $(if $(FORCE),--force,)
 
 search: ## Search sessions (Q="query")
 	@test -n "$(Q)" || { printf 'Usage: make search Q="query"\n'; exit 1; }
-	$(CARGO) run $(CARGO_RUN_FEATURES) -- search "$(Q)"
+	$(CARGO) run -- search "$(Q)"
 
 # ── Release ──────────────────────────────────────────────────────────────────
 

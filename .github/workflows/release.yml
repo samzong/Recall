@@ -21,11 +21,9 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-15
             artifact: recall-macos-x86_64
-            features: metal
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: recall-macos-aarch64
-            features: metal
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: recall-windows-x86_64
@@ -41,14 +39,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        shell: bash
-        run: |
-          FEATURES="${{ matrix.features }}"
-          if [ -n "$FEATURES" ]; then
-            cargo build --release --target ${{ matrix.target }} --features "$FEATURES"
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
