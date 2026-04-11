@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod bench;
 pub mod config;
 pub mod db;
 pub mod embedding;

@@ -29,6 +29,12 @@ enum Commands {
         #[arg(long)]
         sync_first: bool,
     },
+    #[command(hide = true, name = "__bench-semantic")]
+    BenchSemantic,
+    #[command(hide = true, name = "__bench-search")]
+    BenchSearch {
+        query: String,
+    },
     Search {
         query: String,
         #[arg(long)]
@@ -55,6 +61,8 @@ fn main() -> Result<()> {
         Some(Commands::Index) => cmd_index(false)?,
         Some(Commands::Sync) => cmd_index(true)?,
         Some(Commands::BackgroundWorker { sync_first }) => cmd_background_worker(sync_first)?,
+        Some(Commands::BenchSemantic) => recall::bench::run_semantic()?,
+        Some(Commands::BenchSearch { query }) => recall::bench::run_search(&query)?,
         Some(Commands::Search { query, source, time }) => {
             cmd_search(&query, source.as_deref(), time.as_deref())?
         }
