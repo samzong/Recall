@@ -22,8 +22,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Info,
-    Index,
-    Sync,
+    Sync {
+        #[arg(long, help = "Reprocess every session, even if unchanged")]
+        force: bool,
+        #[arg(short, long, help = "Show per-source scan progress and settings")]
+        verbose: bool,
+    },
     #[command(hide = true, name = "__background-worker")]
     BackgroundWorker {
         #[arg(long)]
@@ -58,8 +62,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Info) => cmd_info()?,
-        Some(Commands::Index) => cmd_index(false)?,
-        Some(Commands::Sync) => cmd_index(true)?,
+        Some(Commands::Sync { force, verbose }) => cmd_sync(force, verbose)?,
         Some(Commands::BackgroundWorker { sync_first }) => cmd_background_worker(sync_first)?,
         Some(Commands::BenchSemantic) => recall::bench::run_semantic()?,
         Some(Commands::BenchSearch { query }) => recall::bench::run_search(&query)?,
@@ -233,13 +236,13 @@ fn format_date_range(oldest: Option<i64>, newest: Option<i64>) -> String {
     format!("{oldest} -> {newest}")
 }
 
-fn cmd_index(incremental: bool) -> Result<()> {
-    run_sync_job(incremental, true)?;
+fn cmd_sync(force: bool, verbose: bool) -> Result<()> {
+    run_sync_job(force, verbose)?;
     semantic::ensure_background_worker(false)?;
     Ok(())
 }
 
-fn run_sync_job(incremental: bool, show_output: bool) -> Result<()> {
+fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
     let store = Store::open()?;
     let all = adapters::all_adapters();
     let labels = adapters::source_labels();
@@ -249,6 +252,7 @@ fn run_sync_job(incremental: bool, show_output: bool) -> Result<()> {
 
     let mut new_sessions = 0u32;
     let mut updated_sessions = 0u32;
+    let mut reprocessed_sessions = 0u32;
     let mut total_messages = 0u32;
     let mut skipped = 0u32;
     let mut filtered_out = 0u32;
@@ -258,25 +262,23 @@ fn run_sync_job(incremental: bool, show_output: bool) -> Result<()> {
         let label = adapter.label();
 
         if !config.is_source_enabled(source_id) {
-            if show_output {
+            if verbose {
                 println!("Skipping {label} (filtered)");
             }
             continue;
         }
 
-        if show_output {
+        if verbose {
             println!("Scanning {label}...");
         }
         let raw_sessions = match adapter.scan() {
             Ok(s) => s,
             Err(e) => {
-                if show_output {
-                    eprintln!("  Error scanning {label}: {e}");
-                }
+                eprintln!("Error scanning {label}: {e}");
                 continue;
             }
         };
-        if show_output {
+        if verbose {
             println!("  Found {} sessions", raw_sessions.len());
         }
 
@@ -291,24 +293,24 @@ fn run_sync_job(incremental: bool, show_output: bool) -> Result<()> {
 
             let msg_count = raw.messages.len() as u32;
 
-            if incremental {
-                if let Some((old_updated_at, old_msg_count)) =
-                    store.session_meta(source_id, &raw.source_id)?
-                {
+            match store.session_meta(source_id, &raw.source_id)? {
+                Some((old_updated_at, old_msg_count)) => {
                     let changed = old_msg_count != msg_count
                         || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
-                    if !changed {
+                    if !changed && !force {
                         skipped += 1;
                         continue;
                     }
                     store.delete_session_data(source_id, &raw.source_id)?;
-                    updated_sessions += 1;
-                } else {
+                    if changed {
+                        updated_sessions += 1;
+                    } else {
+                        reprocessed_sessions += 1;
+                    }
+                }
+                None => {
                     new_sessions += 1;
                 }
-            } else {
-                store.delete_session_data(source_id, &raw.source_id)?;
-                new_sessions += 1;
             }
 
             let session_uuid = uuid::Uuid::new_v4().to_string();
@@ -350,14 +352,18 @@ fn run_sync_job(incremental: bool, show_output: bool) -> Result<()> {
         info!("{label} done");
     }
 
-    if show_output {
+    let touched = new_sessions + updated_sessions + reprocessed_sessions;
+
+    if verbose {
         println!();
-        if incremental {
+        if force {
+            print!(
+                "Force sync: {new_sessions} new, {updated_sessions} updated, {reprocessed_sessions} reprocessed, {total_messages} messages"
+            );
+        } else {
             print!(
                 "Sync: {new_sessions} new, {updated_sessions} updated, {skipped} unchanged, {total_messages} messages"
             );
-        } else {
-            print!("Indexed {} sessions, {total_messages} messages", new_sessions);
         }
         if filtered_out > 0 {
             print!(", {filtered_out} outside configured time scope");
@@ -383,13 +389,19 @@ fn run_sync_job(incremental: bool, show_output: bool) -> Result<()> {
                 progress.failed_sessions
             );
         }
+    } else if force {
+        println!("Reprocessed {touched} sessions, {total_messages} messages");
+    } else if touched == 0 {
+        println!("Up to date.");
+    } else {
+        println!("{new_sessions} new, {updated_sessions} updated, {total_messages} messages");
     }
 
     Ok(())
 }
 
 fn cmd_background_worker(sync_first: bool) -> Result<()> {
-    semantic::run_background_worker(sync_first, || run_sync_job(true, false))
+    semantic::run_background_worker(sync_first, || run_sync_job(false, false))
 }
 
 fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str>) -> Result<()> {

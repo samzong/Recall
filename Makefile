@@ -64,16 +64,13 @@ uninstall: ## Remove installed binary
 
 # ── Run ──────────────────────────────────────────────────────────────────────
 
-.PHONY: run index sync search
+.PHONY: run sync search
 
 run: ## Launch TUI
 	$(CARGO) run $(CARGO_RUN_FEATURES)
 
-index: ## Full index
-	$(CARGO) run $(CARGO_RUN_FEATURES) -- index
-
-sync: ## Incremental sync
-	$(CARGO) run $(CARGO_RUN_FEATURES) -- sync
+sync: ## Incremental sync (use FORCE=1 to reprocess all)
+	$(CARGO) run $(CARGO_RUN_FEATURES) -- sync $(if $(FORCE),--force,)
 
 search: ## Search sessions (Q="query")
 	@test -n "$(Q)" || { printf 'Usage: make search Q="query"\n'; exit 1; }

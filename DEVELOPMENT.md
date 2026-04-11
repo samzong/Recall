@@ -96,7 +96,7 @@ That's it. The DB schema, search engine, TUI source filter, and CLI `--source` f
 
 ```bash
 make check                  # must pass before push — same gate as CI
-make index                  # should show "Scanning MT..." with session count
+cargo run -- sync -v        # should show "Scanning MT..." with session count
 make search Q="test --source mt"
 make run                    # TUI filter should include MT
 ```

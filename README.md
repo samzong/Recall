@@ -26,11 +26,11 @@ make install # clone
 ## Usage
 
 ```bash
-recall index     # build full index (first run)
-recall sync      # incremental update
-recall           # launch TUI
-recall search Q  # one-shot CLI search
-recall info      # index stats and worker status
+recall sync          # incremental sync (safe to run anytime)
+recall sync --force  # reprocess every session (after changing embedding model)
+recall               # launch TUI
+recall search Q      # one-shot CLI search
+recall info          # index stats and worker status
 ```
 
 ## License
