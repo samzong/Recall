@@ -13,7 +13,9 @@ use crate::types::Role;
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
 const PARSED_PART_FILTER_SQL: &str = "
-    json_extract(m.data, '$.role') IN ('user', 'assistant')
+    json_valid(m.data)
+    AND json_valid(p.data)
+    AND json_extract(m.data, '$.role') IN ('user', 'assistant')
     AND (
         (json_extract(p.data, '$.type') = 'text'
             AND NULLIF(TRIM(CAST(json_extract(p.data, '$.text') AS TEXT)), '') IS NOT NULL)
@@ -206,6 +208,7 @@ fn load_message_chunk(
          FROM message m
          JOIN part p ON p.message_id = m.id
          WHERE m.session_id IN ({placeholders})
+           AND {PARSED_PART_FILTER_SQL}
          ORDER BY m.time_created, p.id"
     );
 
@@ -218,8 +221,8 @@ fn load_message_chunk(
         Ok((session_id, role, part_data, timestamp))
     })?;
 
-    for row in msg_rows.flatten() {
-        let (session_id, role_str, part_data, timestamp) = row;
+    for row in msg_rows {
+        let (session_id, role_str, part_data, timestamp) = row?;
         let Some(role) = parse_role(role_str.as_deref()) else {
             continue;
         };
@@ -281,10 +284,10 @@ fn parse_part_content(part_data: &str) -> Option<String> {
     let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match part_type {
-        "text" => part.get("text").and_then(|t| t.as_str()).and_then(|text| {
-            let trimmed = text.trim();
-            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
-        }),
+        "text" => part
+            .get("text")
+            .and_then(|t| t.as_str())
+            .and_then(|text| if text.trim().is_empty() { None } else { Some(text.to_string()) }),
         "tool-invocation" | "tool-result" => {
             let name = part.get("toolName").and_then(|n| n.as_str()).unwrap_or("tool");
             if let Some(input) = part.get("input") {
@@ -305,6 +308,7 @@ fn scan_for_sync_conn(
 ) -> anyhow::Result<SyncScanResult> {
     let filtered_sessions = count_filtered_sessions(conn, since_ts)?;
     let sessions = load_session_rows(conn, since_ts)?;
+    let existing = store.session_meta_map(source_id)?;
     let current_counts = load_message_counts(
         conn,
         &sessions.iter().map(|session| session.id.clone()).collect::<Vec<_>>(),
@@ -314,19 +318,15 @@ fn scan_for_sync_conn(
     let mut candidates = Vec::new();
 
     for session in sessions {
-        match store.session_meta(source_id, &session.id)? {
-            Some((old_updated_at, old_message_count)) => {
-                let current_message_count = current_counts.get(&session.id).copied().unwrap_or(0);
-                let unchanged = session.time_updated == old_updated_at
-                    && current_message_count == old_message_count;
-                if unchanged {
-                    stats.skipped_sessions += 1;
-                    continue;
-                }
-                candidates.push(session);
+        if let Some(&(old_updated_at, old_message_count)) = existing.get(&session.id) {
+            let current_message_count = current_counts.get(&session.id).copied().unwrap_or(0);
+            if session.time_updated == old_updated_at && current_message_count == old_message_count
+            {
+                stats.skipped_sessions += 1;
+                continue;
             }
-            None => candidates.push(session),
         }
+        candidates.push(session);
     }
 
     let sessions = scan_session_messages(conn, candidates)?;
@@ -517,5 +517,45 @@ mod tests {
         assert_eq!(summary.newest_started_at, Some(200));
         drop(conn);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn incremental_scan_tolerates_malformed_json_rows() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "good", 220, 100, "hello");
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('bad', 'Bad', '/tmp/project', 100, 220)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (session_id, data, time_created)
+             VALUES ('bad', '{\"role\":\"user\"}', 110)",
+            [],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data)
+             VALUES (NULL, ?1, 'not-json')",
+            rusqlite::params![message_id],
+        )
+        .unwrap();
+
+        let store = setup_store();
+        let result = scan_for_sync_conn(&conn, &store, None, "opencode").unwrap();
+
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].source_id, "good");
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parse_part_content_preserves_non_blank_whitespace() {
+        let parsed = parse_part_content("{\"type\":\"text\",\"text\":\"  hello  \"}");
+        assert_eq!(parsed.as_deref(), Some("  hello  "));
+        assert_eq!(parse_part_content("{\"type\":\"text\",\"text\":\"   \"}"), None);
     }
 }
