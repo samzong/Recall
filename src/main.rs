@@ -103,25 +103,50 @@ fn cmd_info() -> Result<()> {
         let label =
             labels.iter().find(|(k, _)| k == id).map(|(_, v)| v.as_str()).unwrap_or(id).to_string();
 
-        match adapter.scan() {
-            Ok(sessions) => {
-                let session_count = sessions.len();
-                let message_count: usize = sessions.iter().map(|s| s.messages.len()).sum();
-                let oldest = sessions.iter().map(|s| s.started_at).min();
-                let newest = sessions.iter().map(|s| s.started_at).max();
-
-                grand_sessions += session_count;
-                grand_messages += message_count;
+        match adapter.scan_summary() {
+            Ok(Some(summary)) => {
+                grand_sessions += summary.sessions;
+                grand_messages += summary.messages;
 
                 rows.push(SourceSummary {
                     label,
                     id: id.to_string(),
-                    sessions: session_count,
-                    messages: message_count,
-                    range: format_date_range(oldest, newest),
+                    sessions: summary.sessions,
+                    messages: summary.messages,
+                    range: format_date_range(summary.oldest_started_at, summary.newest_started_at),
                     error: None,
                 });
             }
+            Ok(None) => match adapter.scan() {
+                Ok(sessions) => {
+                    let session_count = sessions.len();
+                    let message_count: usize = sessions.iter().map(|s| s.messages.len()).sum();
+                    let oldest = sessions.iter().map(|s| s.started_at).min();
+                    let newest = sessions.iter().map(|s| s.started_at).max();
+
+                    grand_sessions += session_count;
+                    grand_messages += message_count;
+
+                    rows.push(SourceSummary {
+                        label,
+                        id: id.to_string(),
+                        sessions: session_count,
+                        messages: message_count,
+                        range: format_date_range(oldest, newest),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    rows.push(SourceSummary {
+                        label,
+                        id: id.to_string(),
+                        sessions: 0,
+                        messages: 0,
+                        range: "-".to_string(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            },
             Err(e) => {
                 rows.push(SourceSummary {
                     label,
@@ -271,13 +296,34 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
         if verbose {
             println!("Scanning {label}...");
         }
-        let raw_sessions = match adapter.scan() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Error scanning {label}: {e}");
-                continue;
+        let optimized = if force {
+            None
+        } else {
+            match adapter.scan_for_sync(&store, since_ts) {
+                Ok(scan) => scan,
+                Err(e) => {
+                    eprintln!("Error scanning {label}: {e}");
+                    continue;
+                }
             }
         };
+        let (raw_sessions, pre_skipped, pre_filtered) = match optimized {
+            Some(scan) => {
+                (scan.sessions, scan.stats.skipped_sessions, scan.stats.filtered_sessions)
+            }
+            None => {
+                let raw_sessions = match adapter.scan() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Error scanning {label}: {e}");
+                        continue;
+                    }
+                };
+                (raw_sessions, 0, 0)
+            }
+        };
+        skipped += pre_skipped;
+        filtered_out += pre_filtered;
         if verbose {
             println!("  Found {} sessions", raw_sessions.len());
         }
