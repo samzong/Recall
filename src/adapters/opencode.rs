@@ -150,7 +150,14 @@ fn load_session_rows(conn: &Connection, since_ts: Option<i64>) -> anyhow::Result
         stmt.query_map([], map_session_row)?
     };
 
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    let mut sessions = Vec::new();
+    for row in rows {
+        match row {
+            Ok(session) => sessions.push(session),
+            Err(err) => debug!("skipping malformed OpenCode session row: {err}"),
+        }
+    }
+    Ok(sessions)
 }
 
 fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
@@ -548,6 +555,24 @@ mod tests {
 
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "good");
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_session_rows_skips_malformed_session_rows() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "good", 220, 100, "hello");
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('bad', 'Bad', NULL, 100, 220)",
+            [],
+        )
+        .unwrap();
+
+        let sessions = load_session_rows(&conn, None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "good");
         drop(conn);
         let _ = std::fs::remove_file(path);
     }
