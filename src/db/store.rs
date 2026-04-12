@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::Connection;
@@ -46,6 +48,16 @@ impl Store {
             Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
             None => Ok(None),
         }
+    }
+
+    pub fn session_meta_map(&self, source: &str) -> Result<HashMap<String, (Option<i64>, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_id, updated_at, message_count FROM sessions WHERE source = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source], |row| {
+            Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?)))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
 
     pub fn insert_session(&self, session: &Session) -> Result<()> {
