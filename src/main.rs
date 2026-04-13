@@ -389,10 +389,6 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
                 entrypoint: raw.entrypoint,
             };
 
-            store.insert_session(&session)?;
-            existing_meta
-                .insert(session.source_id.clone(), (session.updated_at, session.message_count));
-
             let messages: Vec<Message> = raw
                 .messages
                 .into_iter()
@@ -406,9 +402,9 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
                 })
                 .collect();
 
-            store.insert_messages(&messages)?;
-            let units_total = store.embeddable_message_count(&session_uuid)?;
-            store.upsert_session_embedding_state(&session_uuid, units_total)?;
+            store.persist_session(&session, &messages)?;
+            existing_meta
+                .insert(session.source_id.clone(), (session.updated_at, session.message_count));
             total_messages += msg_count;
         }
 
