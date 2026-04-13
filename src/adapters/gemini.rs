@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::BufReader;
 use std::path::Path;
 
 use serde_json::Value;
@@ -59,14 +60,19 @@ impl SourceAdapter for GeminiAdapter {
 }
 
 fn parse_gemini_session_file(path: &Path) -> anyhow::Result<Option<RawSession>> {
-    let content = fs::read_to_string(path)?;
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let doc: Value = serde_json::from_reader(reader)?;
     let fallback_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
-    parse_gemini_session(&content, fallback_id)
+    parse_gemini_session_value(doc, fallback_id)
 }
 
 pub fn parse_gemini_session(json: &str, fallback_id: &str) -> anyhow::Result<Option<RawSession>> {
     let doc: Value = serde_json::from_str(json)?;
+    parse_gemini_session_value(doc, fallback_id)
+}
 
+fn parse_gemini_session_value(doc: Value, fallback_id: &str) -> anyhow::Result<Option<RawSession>> {
     let session_id =
         doc.get("sessionId").and_then(|s| s.as_str()).unwrap_or(fallback_id).to_string();
 

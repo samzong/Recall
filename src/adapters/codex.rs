@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -143,13 +144,14 @@ fn extract_session_id_from_filename(stem: &str) -> Option<String> {
 }
 
 fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
-    let content = fs::read_to_string(path)?;
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
     let mut meta_id: Option<String> = None;
     let mut meta_cwd: Option<String> = None;
     let mut meta_timestamp: Option<i64> = None;
     let mut messages = Vec::new();
 
-    for line in content.lines() {
+    for line in reader.lines().map_while(Result::ok) {
         let line = line.trim();
         if line.is_empty() {
             continue;

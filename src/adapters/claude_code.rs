@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -255,10 +256,11 @@ fn parse_claude_session_file(
 }
 
 fn parse_conversation_jsonl(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
-    let content = fs::read_to_string(path)?;
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
     let mut messages = Vec::new();
 
-    for line in content.lines() {
+    for line in reader.lines().map_while(Result::ok) {
         let line = line.trim();
         if line.is_empty() {
             continue;

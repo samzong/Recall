@@ -146,14 +146,15 @@ fn parse_copilot_session_for_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
 ) -> anyhow::Result<Option<RawSession>> {
-    let content = match fs::read_to_string(&entry.stat_target) {
-        Ok(c) => c,
+    let file = match fs::File::open(&entry.stat_target) {
+        Ok(f) => f,
         Err(e) => {
             debug!("failed to read {}: {e}", entry.stat_target.display());
             return Ok(None);
         }
     };
-    let mut raw = match parse_copilot_events(&content, &entry.session_id) {
+    let lines = BufReader::new(file).lines().map_while(Result::ok);
+    let mut raw = match parse_copilot_events_from_lines(lines, &entry.session_id) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
         Err(e) => {
@@ -170,13 +171,23 @@ pub fn parse_copilot_events(
     content: &str,
     fallback_id: &str,
 ) -> anyhow::Result<Option<RawSession>> {
+    parse_copilot_events_from_lines(content.lines().map(String::from), fallback_id)
+}
+
+fn parse_copilot_events_from_lines<I>(
+    lines: I,
+    fallback_id: &str,
+) -> anyhow::Result<Option<RawSession>>
+where
+    I: IntoIterator<Item = String>,
+{
     let mut session_id: Option<String> = None;
     let mut directory: Option<String> = None;
     let mut meta_started_at: Option<i64> = None;
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut messages = Vec::new();
 
-    for line in content.lines() {
+    for line in lines {
         let line = line.trim();
         if line.is_empty() {
             continue;
