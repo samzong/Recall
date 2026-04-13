@@ -175,7 +175,7 @@ pub fn run_search(query: &str) -> Result<()> {
     let filters = SearchFilters { sources: None, time_range: TimeRange::All, directory: None };
 
     let t_search = Instant::now();
-    let results = engine.hybrid_search(query, Some(&query_embedding), &filters, 20)?;
+    let results = engine.hybrid_search(query, Some(&query_embedding), &filters, 20, 3)?;
     let search_ms = t_search.elapsed().as_millis();
 
     let total_ms = open_ms + load_ms + embed_ms + search_ms;
@@ -314,7 +314,8 @@ where
 
     for entry in entries {
         let emb = embedder(&entry.query);
-        let results = engine.hybrid_search(&entry.query, emb.as_deref(), &filters, top_k_max)?;
+        let results =
+            engine.hybrid_search(&entry.query, emb.as_deref(), &filters, top_k_max, 20)?;
         let best_rank = find_best_rank(&results, &entry.expected);
         let hits_in_top_k = count_expected_hits(&results, &entry.expected);
 
@@ -323,7 +324,7 @@ where
             total_expected: entry.expected.len(),
             hits_in_top_k,
             best_rank,
-            top_results: build_result_summaries(&results, &entry.expected, 5),
+            top_results: build_result_summaries(&results, &entry.expected, 10),
         });
 
         match best_rank {

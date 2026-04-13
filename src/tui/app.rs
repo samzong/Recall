@@ -707,7 +707,7 @@ impl App {
             directory: None,
         };
 
-        match engine.hybrid_search(query, embedding, &filters, 200) {
+        match engine.hybrid_search(query, embedding, &filters, 200, 3) {
             Ok(mut results) => {
                 self.apply_sort(&mut results);
                 self.results = results;

@@ -147,7 +147,7 @@ fn fts_search_basic() {
     store.insert_messages(&messages).unwrap();
 
     let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("iterators", None, &no_filters(), 10).unwrap();
+    let results = engine.hybrid_search("iterators", None, &no_filters(), 10, 3).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].session.id, "s1");
 }
@@ -162,7 +162,7 @@ fn fts_search_no_results() {
     store.insert_messages(&messages).unwrap();
 
     let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("zzzznonexistent", None, &no_filters(), 10).unwrap();
+    let results = engine.hybrid_search("zzzznonexistent", None, &no_filters(), 10, 3).unwrap();
     assert!(results.is_empty());
 }
 
@@ -170,7 +170,7 @@ fn fts_search_no_results() {
 fn fts_search_empty_query() {
     let store = setup();
     let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("", None, &no_filters(), 10).unwrap();
+    let results = engine.hybrid_search("", None, &no_filters(), 10, 3).unwrap();
     assert!(results.is_empty());
 }
 
@@ -184,7 +184,7 @@ fn fts_search_special_characters() {
     store.insert_messages(&messages).unwrap();
 
     let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("bug OR 1=1 --", None, &no_filters(), 10).unwrap();
+    let results = engine.hybrid_search("bug OR 1=1 --", None, &no_filters(), 10, 3).unwrap();
     assert!(!results.is_empty());
 }
 
@@ -198,7 +198,7 @@ fn fts_search_sql_keywords_safe() {
     store.insert_messages(&messages).unwrap();
 
     let engine = SearchEngine::new(&store.conn);
-    let result = engine.hybrid_search("AND OR NOT", None, &no_filters(), 10);
+    let result = engine.hybrid_search("AND OR NOT", None, &no_filters(), 10, 3);
     assert!(result.is_ok(), "FTS5 keywords must not cause SQL errors");
 }
 
@@ -212,7 +212,7 @@ fn hybrid_search_fts_only_without_embedding() {
     store.insert_messages(&messages).unwrap();
 
     let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("segfault", None, &no_filters(), 10).unwrap();
+    let results = engine.hybrid_search("segfault", None, &no_filters(), 10, 3).unwrap();
     assert_eq!(results.len(), 1);
 }
 
@@ -236,7 +236,7 @@ fn search_with_source_filter() {
         time_range: TimeRange::All,
         directory: None,
     };
-    let results = engine.hybrid_search("parser", None, &filters, 10).unwrap();
+    let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].session.source, "claude-code");
 }
