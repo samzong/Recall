@@ -51,8 +51,9 @@ impl<'a> SearchEngine<'a> {
         embedding: Option<&[f32]>,
         filters: &SearchFilters,
         limit: usize,
+        fetch_multiplier: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let fetch_size = limit * 20;
+        let fetch_size = limit * fetch_multiplier;
         let fts_hits = self.fts_search(query, filters, fetch_size)?;
         let vec_hits = match embedding {
             Some(e) => self.vec_search(e, filters, fetch_size)?,

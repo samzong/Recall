@@ -508,7 +508,7 @@ fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str
 
     let filters = SearchFilters { sources: resolved_source, time_range, directory: None };
 
-    let results = engine.hybrid_search(query, query_embedding.as_deref(), &filters, 20)?;
+    let results = engine.hybrid_search(query, query_embedding.as_deref(), &filters, 20, 3)?;
 
     if results.is_empty() {
         println!("No results found.");
