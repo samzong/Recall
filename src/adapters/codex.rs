@@ -118,8 +118,13 @@ fn parse_codex_session_for_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
 ) -> anyhow::Result<Option<RawSession>> {
-    let Some(mut raw) = parse_codex_session(&entry.stat_target)? else {
-        return Ok(None);
+    let mut raw = match parse_codex_session(&entry.stat_target) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            debug!("failed to parse codex session {}: {e}", entry.stat_target.display());
+            return Ok(None);
+        }
     };
     raw.source_id = entry.session_id;
     raw.updated_at = Some(mtime_ms);
@@ -397,6 +402,31 @@ mod tests {
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
         assert_eq!(result.stats.skipped_sessions, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_keeps_going_when_one_file_is_unreadable() {
+        use std::io::Write as _;
+
+        let root = temp_codex_root("unreadable");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let good_uuid = "019a4c01-e8f4-7270-bdab-7f19273b237e";
+        write_codex_rollout(&sessions_dir, good_uuid, "still here");
+
+        let bad_uuid = "019a4c02-e8f4-7270-bdab-7f19273b237e";
+        let bad_path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{bad_uuid}.jsonl"));
+        let mut f = fs::File::create(&bad_path).unwrap();
+        f.write_all(&[0xFF, 0xFE, 0xFD, 0xFC]).unwrap();
+
+        let store = setup_store();
+
+        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].source_id, good_uuid);
 
         let _ = fs::remove_dir_all(&root);
     }
