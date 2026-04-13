@@ -328,6 +328,8 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
             println!("  Found {} sessions", raw_sessions.len());
         }
 
+        let mut existing_meta = store.session_meta_map(source_id)?;
+
         for raw in raw_sessions {
             if let Some(cutoff) = since_ts {
                 let ts = raw.updated_at.unwrap_or(raw.started_at);
@@ -339,8 +341,8 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
 
             let msg_count = raw.messages.len() as u32;
 
-            match store.session_meta(source_id, &raw.source_id)? {
-                Some((old_updated_at, old_msg_count)) => {
+            match existing_meta.get(&raw.source_id) {
+                Some(&(old_updated_at, old_msg_count)) => {
                     let changed = old_msg_count != msg_count
                         || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
                     if !changed && !force {
@@ -375,6 +377,8 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
             };
 
             store.insert_session(&session)?;
+            existing_meta
+                .insert(session.source_id.clone(), (session.updated_at, session.message_count));
 
             let messages: Vec<Message> = raw
                 .messages

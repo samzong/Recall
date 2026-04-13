@@ -1,6 +1,7 @@
 pub mod claude_code;
 pub mod codex;
 pub mod copilot;
+pub mod file_scan;
 pub mod gemini;
 pub mod kiro;
 pub mod opencode;
