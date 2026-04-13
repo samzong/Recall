@@ -151,7 +151,8 @@ fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
     let mut meta_timestamp: Option<i64> = None;
     let mut messages = Vec::new();
 
-    for line in reader.lines().map_while(Result::ok) {
+    for line in reader.lines() {
+        let line = line?;
         let line = line.trim();
         if line.is_empty() {
             continue;

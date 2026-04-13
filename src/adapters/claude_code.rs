@@ -260,7 +260,8 @@ fn parse_conversation_jsonl(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
 
-    for line in reader.lines().map_while(Result::ok) {
+    for line in reader.lines() {
+        let line = line?;
         let line = line.trim();
         if line.is_empty() {
             continue;

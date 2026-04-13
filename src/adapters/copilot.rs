@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -153,7 +153,7 @@ fn parse_copilot_session_for_entry(
             return Ok(None);
         }
     };
-    let lines = BufReader::new(file).lines().map_while(Result::ok);
+    let lines = BufReader::new(file).lines();
     let mut raw = match parse_copilot_events_from_lines(lines, &entry.session_id) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
@@ -171,7 +171,10 @@ pub fn parse_copilot_events(
     content: &str,
     fallback_id: &str,
 ) -> anyhow::Result<Option<RawSession>> {
-    parse_copilot_events_from_lines(content.lines().map(String::from), fallback_id)
+    parse_copilot_events_from_lines(
+        content.lines().map(|s| io::Result::Ok(s.to_string())),
+        fallback_id,
+    )
 }
 
 fn parse_copilot_events_from_lines<I>(
@@ -179,7 +182,7 @@ fn parse_copilot_events_from_lines<I>(
     fallback_id: &str,
 ) -> anyhow::Result<Option<RawSession>>
 where
-    I: IntoIterator<Item = String>,
+    I: IntoIterator<Item = io::Result<String>>,
 {
     let mut session_id: Option<String> = None;
     let mut directory: Option<String> = None;
@@ -188,6 +191,7 @@ where
     let mut messages = Vec::new();
 
     for line in lines {
+        let line = line?;
         let line = line.trim();
         if line.is_empty() {
             continue;
