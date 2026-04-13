@@ -52,13 +52,13 @@ impl<'a> SearchEngine<'a> {
         filters: &SearchFilters,
         limit: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let fetch_size = limit * 3;
+        let fetch_size = limit * 20;
         let fts_hits = self.fts_search(query, filters, fetch_size)?;
         let vec_hits = match embedding {
             Some(e) => self.vec_search(e, filters, fetch_size)?,
             None => vec![],
         };
-        let merged = rrf_merge(&fts_hits, &vec_hits, 60);
+        let merged = rrf_merge(&fts_hits, &vec_hits, 10);
 
         let session_ids: Vec<&str> =
             merged.iter().take(limit).map(|(id, _, _)| id.as_str()).collect();
@@ -92,7 +92,7 @@ impl<'a> SearchEngine<'a> {
 
         let mut sql = String::from(
             "SELECT m.session_id, SUBSTR(m.content, 1, 200) AS snip,
-                    SUM(messages_fts.rank) AS total_rank
+                    MIN(messages_fts.rank) AS best_rank
              FROM messages_fts
              JOIN messages m ON m.id = messages_fts.rowid
              JOIN sessions s ON s.id = m.session_id
@@ -103,7 +103,7 @@ impl<'a> SearchEngine<'a> {
         let mut param_idx = 2;
         apply_filters(&mut sql, &mut params, &mut param_idx, filters);
 
-        sql.push_str(&format!(" GROUP BY m.session_id ORDER BY total_rank LIMIT {limit}"));
+        sql.push_str(&format!(" GROUP BY m.session_id ORDER BY best_rank LIMIT {limit}"));
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();

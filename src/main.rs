@@ -39,6 +39,15 @@ enum Commands {
     BenchSearch {
         query: String,
     },
+    #[command(hide = true, name = "__bench-eval")]
+    BenchEval {
+        #[arg(long)]
+        dataset: Option<String>,
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    #[command(hide = true, name = "__bench-dump-sessions")]
+    BenchDumpSessions,
     Search {
         query: String,
         #[arg(long)]
@@ -66,6 +75,10 @@ fn main() -> Result<()> {
         Some(Commands::BackgroundWorker { sync_first }) => cmd_background_worker(sync_first)?,
         Some(Commands::BenchSemantic) => recall::bench::run_semantic()?,
         Some(Commands::BenchSearch { query }) => recall::bench::run_search(&query)?,
+        Some(Commands::BenchEval { dataset, verbose }) => {
+            recall::bench::run_eval(dataset.as_deref(), verbose)?
+        }
+        Some(Commands::BenchDumpSessions) => recall::bench::dump_sessions()?,
         Some(Commands::Search { query, source, time }) => {
             cmd_search(&query, source.as_deref(), time.as_deref())?
         }
@@ -630,17 +643,7 @@ fn exec_resume(command: adapters::ResumeCommand, cwd: Option<String>) -> Result<
 }
 
 fn generate_title(messages: &[adapters::RawMessage]) -> String {
-    let first_user_msg = messages.iter().find(|m| m.role == Role::User);
-    match first_user_msg {
-        Some(msg) => {
-            let text = msg.content.trim();
-            if text.chars().count() > 80 {
-                let truncated: String = text.chars().take(77).collect();
-                format!("{truncated}...")
-            } else {
-                text.to_string()
-            }
-        }
-        None => "Untitled".to_string(),
-    }
+    let user_contents: Vec<&str> =
+        messages.iter().filter(|m| m.role == Role::User).map(|m| m.content.as_str()).collect();
+    utils::title_from_user_messages(&user_contents)
 }
