@@ -5,3 +5,4 @@
 .claude/
 .fastembed_cache/
 recall-*.txt
+search-eval.json
