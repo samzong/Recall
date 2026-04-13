@@ -23,14 +23,18 @@ impl Store {
         std::fs::create_dir_all(&data_dir)?;
         let db_path = data_dir.join("recall.db");
         let conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;
+             PRAGMA foreign_keys=ON;",
+        )?;
         crate::db::schema::init(&conn)?;
         Ok(Store { conn })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
         crate::db::schema::init(&conn)?;
         Ok(Store { conn })
     }
@@ -94,6 +98,81 @@ impl Store {
                     msg.timestamp,
                     msg.seq,
                 ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn persist_session(&self, session: &Session, messages: &[Message]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            tx.execute(
+                "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    session.id,
+                    session.source,
+                    session.source_id,
+                    session.title,
+                    session.directory,
+                    session.started_at,
+                    session.updated_at,
+                    session.message_count,
+                    session.entrypoint,
+                ],
+            )?;
+
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO messages (session_id, role, content, timestamp, seq)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for msg in messages {
+                    stmt.execute(rusqlite::params![
+                        msg.session_id,
+                        msg.role.as_str(),
+                        msg.content,
+                        msg.timestamp,
+                        msg.seq,
+                    ])?;
+                }
+            }
+
+            let units_total: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE session_id = ?1 AND role = 'user' AND LENGTH(content) > 2",
+                rusqlite::params![session.id],
+                |row| row.get(0),
+            )?;
+
+            let now = Utc::now().timestamp_millis();
+            if units_total == 0 {
+                tx.execute(
+                    "INSERT INTO session_embedding_state (session_id, status, units_total, units_done, finished_at, last_error)
+                     VALUES (?1, 'done', 0, 0, ?2, NULL)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                        status = 'done',
+                        units_total = 0,
+                        units_done = 0,
+                        started_at = NULL,
+                        finished_at = excluded.finished_at,
+                        last_error = NULL",
+                    rusqlite::params![session.id, now],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT INTO session_embedding_state (session_id, status, units_total, units_done, started_at, finished_at, last_error)
+                     VALUES (?1, 'pending', ?2, 0, NULL, NULL, NULL)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                        status = 'pending',
+                        units_total = excluded.units_total,
+                        units_done = 0,
+                        started_at = NULL,
+                        finished_at = NULL,
+                        last_error = NULL",
+                    rusqlite::params![session.id, units_total],
+                )?;
             }
         }
         tx.commit()?;
