@@ -18,19 +18,19 @@ make install # clone
 
 One index across every AI coding CLI. Sync once, search everywhere, resume right where you left off.
 
-| Capability             | Claude Code | OpenCode | Codex | Gemini | Kiro | Copilot CLI |
-| ---------------------- | :---------: | :------: | :---: | :----: | :--: | :---------: |
-| Auto-discovery         |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |
-| Full index             |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |
-| Incremental sync       |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |
-| FTS5 keyword search    |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |
-| Semantic search        |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |
-| Source filter          |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |
-| Time range filter      |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |
-| In-session search      |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |
-| Copy message           |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |
-| Export to Markdown     |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |
-| Resume in original CLI |     ✅      |    ✅    |  ✅   |   —    |  —   |     ✅      |
+| Capability             | Claude Code | OpenCode | Codex | Gemini | Kiro | Copilot CLI | Cursor |
+| ---------------------- | :---------: | :------: | :---: | :----: | :--: | :---------: | :----: |
+| Auto-discovery         |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |   ✅   |
+| Full index             |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |   ✅   |
+| Incremental sync       |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |   ✅   |
+| FTS5 keyword search    |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |   ✅   |
+| Semantic search        |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |   ✅   |
+| Source filter          |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |   ✅   |
+| Time range filter      |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |   ✅   |
+| In-session search      |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |   ✅   |
+| Copy message           |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |   ✅   |
+| Export to Markdown     |     ✅      |    ✅    |  ✅   |   ✅   |  ✅  |     ✅      |   ✅   |
+| Resume in original CLI |     ✅      |    ✅    |  ✅   |   —    |  —   |     ✅      |   —    |
 
 ## Usage
 

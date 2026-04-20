@@ -254,15 +254,11 @@ impl App {
                     }
                 }
             },
-            AppMode::Viewing => {
-                if self.viewing_selected_msg > 0 {
-                    self.viewing_selected_msg -= 1;
-                }
+            AppMode::Viewing if self.viewing_selected_msg > 0 => {
+                self.viewing_selected_msg -= 1;
             }
-            AppMode::Settings => {
-                if self.settings_selected > 0 {
-                    self.settings_selected -= 1;
-                }
+            AppMode::Settings if self.settings_selected > 0 => {
+                self.settings_selected -= 1;
             }
             _ => {}
         }
@@ -283,15 +279,11 @@ impl App {
                     }
                 }
             },
-            AppMode::Viewing => {
-                if self.viewing_selected_msg + 1 < self.viewing_messages.len() {
-                    self.viewing_selected_msg += 1;
-                }
+            AppMode::Viewing if self.viewing_selected_msg + 1 < self.viewing_messages.len() => {
+                self.viewing_selected_msg += 1;
             }
-            AppMode::Settings => {
-                if self.settings_selected + 1 < self.settings_row_count() {
-                    self.settings_selected += 1;
-                }
+            AppMode::Settings if self.settings_selected + 1 < self.settings_row_count() => {
+                self.settings_selected += 1;
             }
             _ => {}
         }
@@ -338,18 +330,18 @@ impl App {
                 self.last_keystroke = Instant::now();
                 self.search_pending = true;
             }
-            KeyCode::Backspace if self.panel_focus == PanelFocus::SessionList => {
-                if self.cursor_pos > 0 {
-                    let prev = self.query[..self.cursor_pos]
-                        .char_indices()
-                        .last()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    self.query.replace_range(prev..self.cursor_pos, "");
-                    self.cursor_pos = prev;
-                    self.last_keystroke = Instant::now();
-                    self.search_pending = true;
-                }
+            KeyCode::Backspace
+                if self.panel_focus == PanelFocus::SessionList && self.cursor_pos > 0 =>
+            {
+                let prev = self.query[..self.cursor_pos]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.query.replace_range(prev..self.cursor_pos, "");
+                self.cursor_pos = prev;
+                self.last_keystroke = Instant::now();
+                self.search_pending = true;
             }
             KeyCode::Left => {
                 if self.panel_focus == PanelFocus::Preview {
@@ -362,18 +354,16 @@ impl App {
                         .unwrap_or(0);
                 }
             }
-            KeyCode::Right => {
-                if self.panel_focus == PanelFocus::SessionList {
-                    if self.cursor_pos < self.query.len() {
-                        self.cursor_pos = self.query[self.cursor_pos..]
-                            .char_indices()
-                            .nth(1)
-                            .map(|(i, _)| self.cursor_pos + i)
-                            .unwrap_or(self.query.len());
-                    } else if !self.preview_messages.is_empty() {
-                        self.panel_focus = PanelFocus::Preview;
-                        self.preview_selected_msg = 0;
-                    }
+            KeyCode::Right if self.panel_focus == PanelFocus::SessionList => {
+                if self.cursor_pos < self.query.len() {
+                    self.cursor_pos = self.query[self.cursor_pos..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| self.cursor_pos + i)
+                        .unwrap_or(self.query.len());
+                } else if !self.preview_messages.is_empty() {
+                    self.panel_focus = PanelFocus::Preview;
+                    self.preview_selected_msg = 0;
                 }
             }
             KeyCode::Up => {
@@ -382,10 +372,8 @@ impl App {
             KeyCode::Down => {
                 self.handle_scroll_down(store);
             }
-            KeyCode::Enter => {
-                if !self.results.is_empty() {
-                    self.enter_viewing(store);
-                }
+            KeyCode::Enter if !self.results.is_empty() => {
+                self.enter_viewing(store);
             }
             KeyCode::Tab => {
                 self.cycle_filter(store, engine, provider);
@@ -414,23 +402,19 @@ impl App {
                 self.viewing_sanitized_lines.clear();
                 self.viewing_match_cache.clear();
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.viewing_selected_msg > 0 {
-                    self.viewing_selected_msg -= 1;
-                }
+            KeyCode::Up | KeyCode::Char('k') if self.viewing_selected_msg > 0 => {
+                self.viewing_selected_msg -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.viewing_selected_msg + 1 < self.viewing_messages.len() {
-                    self.viewing_selected_msg += 1;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if self.viewing_selected_msg + 1 < self.viewing_messages.len() =>
+            {
+                self.viewing_selected_msg += 1;
             }
             KeyCode::Home | KeyCode::Char('g') => {
                 self.viewing_selected_msg = 0;
             }
-            KeyCode::End | KeyCode::Char('G') => {
-                if !self.viewing_messages.is_empty() {
-                    self.viewing_selected_msg = self.viewing_messages.len() - 1;
-                }
+            KeyCode::End | KeyCode::Char('G') if !self.viewing_messages.is_empty() => {
+                self.viewing_selected_msg = self.viewing_messages.len() - 1;
             }
             KeyCode::Char('c') => {
                 self.copy_current_message();
@@ -481,36 +465,30 @@ impl App {
                 self.viewing_search_status = None;
                 self.jump_viewing_match(true);
             }
-            KeyCode::Backspace => {
-                if self.viewing_search_input_cursor > 0 {
-                    let prev = input[..self.viewing_search_input_cursor]
-                        .char_indices()
-                        .last()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    input.replace_range(prev..self.viewing_search_input_cursor, "");
-                    self.viewing_search_input_cursor = prev;
-                }
+            KeyCode::Backspace if self.viewing_search_input_cursor > 0 => {
+                let prev = input[..self.viewing_search_input_cursor]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                input.replace_range(prev..self.viewing_search_input_cursor, "");
+                self.viewing_search_input_cursor = prev;
             }
-            KeyCode::Left => {
-                if self.viewing_search_input_cursor > 0 {
-                    let prev = input[..self.viewing_search_input_cursor]
-                        .char_indices()
-                        .last()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    self.viewing_search_input_cursor = prev;
-                }
+            KeyCode::Left if self.viewing_search_input_cursor > 0 => {
+                let prev = input[..self.viewing_search_input_cursor]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.viewing_search_input_cursor = prev;
             }
-            KeyCode::Right => {
-                if self.viewing_search_input_cursor < input.len() {
-                    let next = input[self.viewing_search_input_cursor..]
-                        .char_indices()
-                        .nth(1)
-                        .map(|(i, _)| self.viewing_search_input_cursor + i)
-                        .unwrap_or(input.len());
-                    self.viewing_search_input_cursor = next;
-                }
+            KeyCode::Right if self.viewing_search_input_cursor < input.len() => {
+                let next = input[self.viewing_search_input_cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| self.viewing_search_input_cursor + i)
+                    .unwrap_or(input.len());
+                self.viewing_search_input_cursor = next;
             }
             KeyCode::Home => {
                 self.viewing_search_input_cursor = 0;
@@ -926,34 +904,28 @@ impl App {
                 self.export_path.insert(self.export_cursor, c);
                 self.export_cursor += c.len_utf8();
             }
-            KeyCode::Backspace => {
-                if self.export_cursor > 0 {
-                    let prev = self.export_path[..self.export_cursor]
-                        .char_indices()
-                        .last()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    self.export_path.replace_range(prev..self.export_cursor, "");
-                    self.export_cursor = prev;
-                }
+            KeyCode::Backspace if self.export_cursor > 0 => {
+                let prev = self.export_path[..self.export_cursor]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.export_path.replace_range(prev..self.export_cursor, "");
+                self.export_cursor = prev;
             }
-            KeyCode::Left => {
-                if self.export_cursor > 0 {
-                    self.export_cursor = self.export_path[..self.export_cursor]
-                        .char_indices()
-                        .last()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                }
+            KeyCode::Left if self.export_cursor > 0 => {
+                self.export_cursor = self.export_path[..self.export_cursor]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
             }
-            KeyCode::Right => {
-                if self.export_cursor < self.export_path.len() {
-                    self.export_cursor = self.export_path[self.export_cursor..]
-                        .char_indices()
-                        .nth(1)
-                        .map(|(i, _)| self.export_cursor + i)
-                        .unwrap_or(self.export_path.len());
-                }
+            KeyCode::Right if self.export_cursor < self.export_path.len() => {
+                self.export_cursor = self.export_path[self.export_cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| self.export_cursor + i)
+                    .unwrap_or(self.export_path.len());
             }
             _ => {}
         }
@@ -1007,7 +979,7 @@ impl App {
 
     fn apply_sort(&self, results: &mut [SearchResult]) {
         if self.sort_order == SortOrder::Newest {
-            results.sort_by(|a, b| b.session.started_at.cmp(&a.session.started_at));
+            results.sort_by_key(|b| std::cmp::Reverse(b.session.started_at));
         }
     }
 
