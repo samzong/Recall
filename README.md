@@ -6,6 +6,10 @@
 
 You bounce between Claude Code, Codex, Copilot CLI, and whatever comes next. Each tool keeps its own sessions in its own place, in its own format. Recall pulls them all into one local index you can actually search — and drops you right back into any session in its original CLI.
 
+## Architecture
+
+![Recall Architecture](docs/architecture.png)
+
 ## Install
 
 ```bash
