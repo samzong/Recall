@@ -18,7 +18,81 @@ pub enum AppMode {
     Viewing,
     ExportInput,
     Settings,
+    FilterHotbar,
+    SourcePicker,
     ConfirmResume,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(id: &str, label: &str) -> (String, String) {
+        (id.to_string(), label.to_string())
+    }
+
+    fn app_with_sources() -> App {
+        App {
+            mode: AppMode::Search,
+            panel_focus: PanelFocus::SessionList,
+            query: String::new(),
+            cursor_pos: 0,
+            results: Vec::new(),
+            selected_index: 0,
+            preview_messages: Vec::new(),
+            preview_selected_msg: 0,
+            viewing_messages: Vec::new(),
+            viewing_selected_msg: 0,
+            all_sources: vec![
+                source("claude", "Claude"),
+                source("cursor", "Cursor"),
+                source("codex", "Codex"),
+            ],
+            config: AppConfig::default(),
+            source_filter_selection: Vec::new(),
+            time_filter: TimeRange::All,
+            filter_focus: FilterFocus::Source,
+            should_quit: false,
+            last_keystroke: Instant::now(),
+            search_pending: false,
+            embedding_init_pending: false,
+            embedding_unavailable: false,
+            status_message: None,
+            sort_order: SortOrder::Relevance,
+            export_path: String::new(),
+            export_cursor: 0,
+            total_sessions: 0,
+            total_messages: 0,
+            semantic_progress: SemanticProgress::default(),
+            background_status: BackgroundJobStatus::default(),
+            semantic_last_refresh: Instant::now(),
+            settings_selected: 0,
+            pending_resume: None,
+            exec_on_exit: None,
+            viewing_search_query: String::new(),
+            viewing_search_input: None,
+            viewing_search_input_cursor: 0,
+            viewing_search_status: None,
+            viewing_sanitized_lines: Vec::new(),
+            viewing_match_cache: Vec::new(),
+            source_picker_query: String::new(),
+            source_picker_cursor: 0,
+            source_picker_selected: 0,
+            source_picker_selection: Vec::new(),
+            source_picker_dirty: false,
+        }
+    }
+
+    #[test]
+    fn confirming_source_picker_preserves_existing_multi_source_selection() {
+        let mut app = app_with_sources();
+        app.source_filter_selection = vec!["claude".to_string(), "cursor".to_string()];
+
+        app.open_source_picker();
+        app.commit_source_picker_filter();
+
+        assert_eq!(app.source_filter_selection, vec!["claude".to_string(), "cursor".to_string()]);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -67,6 +141,12 @@ pub enum FilterFocus {
     Sort,
 }
 
+#[derive(Clone, Copy)]
+pub enum SourcePickerRow {
+    All,
+    Source(usize),
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum SortOrder {
     Relevance,
@@ -86,7 +166,7 @@ pub struct App {
     pub viewing_selected_msg: usize,
     pub all_sources: Vec<(String, String)>,
     pub config: AppConfig,
-    pub source_filter_index: usize,
+    pub source_filter_selection: Vec<String>,
     pub time_filter: TimeRange,
     pub filter_focus: FilterFocus,
     pub should_quit: bool,
@@ -112,6 +192,11 @@ pub struct App {
     pub viewing_search_status: Option<String>,
     pub viewing_sanitized_lines: Vec<Vec<SanitizedLine>>,
     pub viewing_match_cache: Vec<usize>,
+    pub source_picker_query: String,
+    pub source_picker_cursor: usize,
+    pub source_picker_selected: usize,
+    pub source_picker_selection: Vec<String>,
+    pub source_picker_dirty: bool,
 }
 
 impl App {
@@ -135,7 +220,7 @@ impl App {
             viewing_selected_msg: 0,
             all_sources,
             config,
-            source_filter_index: 0,
+            source_filter_selection: Vec::new(),
             time_filter: TimeRange::All,
             filter_focus: FilterFocus::Source,
             should_quit: false,
@@ -161,6 +246,11 @@ impl App {
             viewing_search_status: None,
             viewing_sanitized_lines: Vec::new(),
             viewing_match_cache: Vec::new(),
+            source_picker_query: String::new(),
+            source_picker_cursor: 0,
+            source_picker_selected: 0,
+            source_picker_selection: Vec::new(),
+            source_picker_dirty: false,
         };
         app.reset_search_defaults();
         app.update_scope_metrics(store);
@@ -169,29 +259,59 @@ impl App {
     }
 
     pub fn source_filter_ids(&self) -> Option<Vec<String>> {
+        let explicit = self.normalized_source_selection(&self.source_filter_selection);
+        if !explicit.is_empty() {
+            return Some(explicit);
+        }
+
         let enabled = self.enabled_sources();
         if enabled.is_empty() {
             return None;
         }
-        if self.source_filter_index == 0 {
-            if enabled.len() == self.all_sources.len() {
-                None
-            } else {
-                Some(enabled.into_iter().map(|(id, _)| id.clone()).collect())
-            }
+
+        if enabled.len() == self.all_sources.len() {
+            None
         } else {
-            enabled.get(self.source_filter_index - 1).map(|(id, _)| vec![id.clone()])
+            Some(enabled.into_iter().map(|(id, _)| id.clone()).collect())
         }
     }
 
-    pub fn source_filter_label(&self) -> &str {
-        if self.source_filter_index == 0 {
-            if self.enabled_sources().len() == self.all_sources.len() { "ALL" } else { "DEFAULT" }
+    pub fn source_filter_label(&self) -> String {
+        let explicit = self.normalized_source_selection(&self.source_filter_selection);
+        if explicit.is_empty() {
+            return if self.enabled_sources().len() == self.all_sources.len() {
+                "ALL".to_string()
+            } else {
+                "DEFAULT".to_string()
+            };
+        }
+
+        if explicit.len() == 1 {
+            return self.source_label_for(&explicit[0]).to_string();
+        }
+
+        let labels: Vec<&str> =
+            explicit.iter().map(|id| self.source_label_for(id)).take(2).collect();
+        if explicit.len() == 2 {
+            labels.join(", ")
         } else {
-            self.enabled_sources()
-                .get(self.source_filter_index - 1)
-                .map(|(_, label)| label.as_str())
-                .unwrap_or("ALL")
+            format!("{}, +{}", labels.join(", "), explicit.len() - labels.len())
+        }
+    }
+
+    pub fn time_filter_label(&self) -> &'static str {
+        match self.time_filter {
+            TimeRange::Today => "Today",
+            TimeRange::Week => "7d",
+            TimeRange::Month => "30d",
+            TimeRange::All => "All",
+        }
+    }
+
+    pub fn sort_label(&self) -> &'static str {
+        match self.sort_order {
+            SortOrder::Relevance => "Relevance",
+            SortOrder::Newest => "Newest",
         }
     }
 
@@ -235,6 +355,8 @@ impl App {
             AppMode::Viewing => self.handle_viewing_key(key),
             AppMode::ExportInput => self.handle_export_key(key),
             AppMode::Settings => self.handle_settings_key(key, store, engine, provider),
+            AppMode::FilterHotbar => self.handle_filter_hotbar_key(key, store, engine, provider),
+            AppMode::SourcePicker => self.handle_source_picker_key(key, store, engine, provider),
             AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
         }
     }
@@ -259,6 +381,9 @@ impl App {
             }
             AppMode::Settings if self.settings_selected > 0 => {
                 self.settings_selected -= 1;
+            }
+            AppMode::SourcePicker if self.source_picker_selected > 0 => {
+                self.source_picker_selected -= 1;
             }
             _ => {}
         }
@@ -285,6 +410,11 @@ impl App {
             AppMode::Settings if self.settings_selected + 1 < self.settings_row_count() => {
                 self.settings_selected += 1;
             }
+            AppMode::SourcePicker
+                if self.source_picker_selected + 1 < self.source_picker_rows().len() =>
+            {
+                self.source_picker_selected += 1;
+            }
             _ => {}
         }
     }
@@ -296,6 +426,11 @@ impl App {
         engine: &SearchEngine,
         provider: &mut Option<EmbeddingProvider>,
     ) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+            self.mode = AppMode::FilterHotbar;
+            return;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             self.mode = AppMode::Settings;
             self.settings_selected = 0;
@@ -610,6 +745,260 @@ impl App {
         }
     }
 
+    fn handle_filter_hotbar_key(
+        &mut self,
+        key: KeyEvent,
+        store: &Store,
+        engine: &SearchEngine,
+        provider: &mut Option<EmbeddingProvider>,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = AppMode::Search;
+            }
+            KeyCode::Char('/') => {
+                self.open_source_picker();
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.source_filter_selection.clear();
+                self.apply_filter_change(store, engine, provider);
+            }
+            KeyCode::Char(c) if ('1'..='9').contains(&c) => {
+                let slot = c.to_digit(10).unwrap_or(1) as usize - 1;
+                let source_id = {
+                    let enabled = self.enabled_sources();
+                    enabled.get(slot).map(|(id, _)| (*id).clone())
+                };
+
+                if let Some(source_id) = source_id {
+                    self.source_filter_selection = vec![source_id];
+                    self.apply_filter_change(store, engine, provider);
+                } else {
+                    self.status_message = Some(format!("No source bound to {c}"));
+                    self.mode = AppMode::Search;
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.time_filter = TimeRange::Today;
+                self.apply_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('w') | KeyCode::Char('W') => {
+                self.time_filter = TimeRange::Week;
+                self.apply_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                self.time_filter = TimeRange::Month;
+                self.apply_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.time_filter = TimeRange::All;
+                self.apply_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.sort_order = SortOrder::Relevance;
+                self.apply_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.sort_order = SortOrder::Newest;
+                self.apply_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.clear_filters();
+                self.apply_filter_change(store, engine, provider);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_source_picker_key(
+        &mut self,
+        key: KeyEvent,
+        store: &Store,
+        engine: &SearchEngine,
+        provider: &mut Option<EmbeddingProvider>,
+    ) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+            self.source_picker_query.clear();
+            self.source_picker_cursor = 0;
+            self.source_picker_selected = 0;
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_source_picker();
+            }
+            KeyCode::Enter => {
+                self.apply_source_picker(store, engine, provider);
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_source_picker_row();
+            }
+            KeyCode::Up => self.handle_scroll_up(store),
+            KeyCode::Down => self.handle_scroll_down(store),
+            KeyCode::Backspace if self.source_picker_cursor > 0 => {
+                let prev = self.source_picker_query[..self.source_picker_cursor]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.source_picker_query.replace_range(prev..self.source_picker_cursor, "");
+                self.source_picker_cursor = prev;
+                self.source_picker_selected = 0;
+                self.clamp_source_picker_selected();
+            }
+            KeyCode::Left if self.source_picker_cursor > 0 => {
+                let prev = self.source_picker_query[..self.source_picker_cursor]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.source_picker_cursor = prev;
+            }
+            KeyCode::Right if self.source_picker_cursor < self.source_picker_query.len() => {
+                let next = self.source_picker_query[self.source_picker_cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| self.source_picker_cursor + i)
+                    .unwrap_or(self.source_picker_query.len());
+                self.source_picker_cursor = next;
+            }
+            KeyCode::Home => {
+                self.source_picker_cursor = 0;
+            }
+            KeyCode::End => {
+                self.source_picker_cursor = self.source_picker_query.len();
+            }
+            KeyCode::Char(c) => {
+                self.source_picker_query.insert(self.source_picker_cursor, c);
+                self.source_picker_cursor += c.len_utf8();
+                self.source_picker_selected = 0;
+                self.clamp_source_picker_selected();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_source_picker(&mut self) {
+        self.mode = AppMode::SourcePicker;
+        self.source_picker_query.clear();
+        self.source_picker_cursor = 0;
+        self.source_picker_selected = 0;
+        self.source_picker_selection =
+            self.normalized_source_selection(&self.source_filter_selection);
+        if let Some(selected_source) = self.source_picker_selection.first() {
+            self.source_picker_selected = self
+                .source_picker_rows()
+                .iter()
+                .position(|row| match row {
+                    SourcePickerRow::All => false,
+                    SourcePickerRow::Source(index) => self
+                        .all_sources
+                        .get(*index)
+                        .map(|(source_id, _)| source_id == selected_source)
+                        .unwrap_or(false),
+                })
+                .unwrap_or(0);
+        }
+        self.source_picker_dirty = false;
+    }
+
+    fn close_source_picker(&mut self) {
+        self.mode = AppMode::Search;
+        self.source_picker_query.clear();
+        self.source_picker_cursor = 0;
+        self.source_picker_selected = 0;
+        self.source_picker_selection.clear();
+        self.source_picker_dirty = false;
+    }
+
+    fn apply_source_picker(
+        &mut self,
+        store: &Store,
+        engine: &SearchEngine,
+        provider: &mut Option<EmbeddingProvider>,
+    ) {
+        self.commit_source_picker_filter();
+
+        self.source_picker_query.clear();
+        self.source_picker_cursor = 0;
+        self.source_picker_selected = 0;
+        self.source_picker_selection.clear();
+        self.source_picker_dirty = false;
+        self.apply_filter_change(store, engine, provider);
+    }
+
+    fn commit_source_picker_filter(&mut self) {
+        let confirming_existing_multi_selection = !self.source_picker_dirty
+            && self.source_picker_query.trim().is_empty()
+            && self.source_picker_selection.len() > 1;
+
+        if self.source_picker_dirty || confirming_existing_multi_selection {
+            self.source_filter_selection =
+                self.normalized_source_selection(&self.source_picker_selection);
+        } else if let Some(row) = self.source_picker_rows().get(self.source_picker_selected) {
+            match *row {
+                SourcePickerRow::All => {
+                    self.source_filter_selection.clear();
+                }
+                SourcePickerRow::Source(index) => {
+                    if let Some((source_id, _)) = self.all_sources.get(index) {
+                        self.source_filter_selection = vec![source_id.clone()];
+                    }
+                }
+            }
+        }
+    }
+
+    fn toggle_source_picker_row(&mut self) {
+        let Some(row) = self.source_picker_rows().get(self.source_picker_selected).copied() else {
+            return;
+        };
+
+        match row {
+            SourcePickerRow::All => {
+                self.source_picker_selection.clear();
+            }
+            SourcePickerRow::Source(index) => {
+                let Some((source_id, _)) = self.all_sources.get(index) else {
+                    return;
+                };
+                if let Some(pos) =
+                    self.source_picker_selection.iter().position(|id| id == source_id)
+                {
+                    self.source_picker_selection.remove(pos);
+                } else {
+                    self.source_picker_selection.push(source_id.clone());
+                }
+                self.source_picker_selection =
+                    self.normalized_source_selection(&self.source_picker_selection);
+            }
+        }
+        self.source_picker_dirty = true;
+    }
+
+    fn clear_filters(&mut self) {
+        self.source_filter_selection.clear();
+        self.time_filter = TimeRange::All;
+        self.sort_order = SortOrder::Relevance;
+        self.filter_focus = FilterFocus::Source;
+    }
+
+    fn apply_filter_change(
+        &mut self,
+        store: &Store,
+        engine: &SearchEngine,
+        provider: &mut Option<EmbeddingProvider>,
+    ) {
+        self.mode = AppMode::Search;
+        self.update_scope_metrics(store);
+        if self.query.is_empty() {
+            self.load_recent(store);
+        } else {
+            self.do_search(store, engine, provider);
+        }
+    }
+
     pub fn try_search(
         &mut self,
         store: &Store,
@@ -733,12 +1122,71 @@ impl App {
         }
     }
 
-    fn enabled_sources(&self) -> Vec<&(String, String)> {
+    pub fn enabled_sources(&self) -> Vec<&(String, String)> {
         self.all_sources.iter().filter(|(id, _)| self.config.is_source_enabled(id)).collect()
     }
 
+    pub fn source_hotbar_sources(&self) -> Vec<&(String, String)> {
+        self.enabled_sources().into_iter().take(9).collect()
+    }
+
+    pub fn source_is_selected(&self, source_id: &str) -> bool {
+        self.normalized_source_selection(&self.source_filter_selection)
+            .iter()
+            .any(|id| id == source_id)
+    }
+
+    pub fn source_is_selected_in_picker(&self, source_id: &str) -> bool {
+        self.normalized_source_selection(&self.source_picker_selection)
+            .iter()
+            .any(|id| id == source_id)
+    }
+
+    pub fn source_picker_rows(&self) -> Vec<SourcePickerRow> {
+        let query = self.source_picker_query.trim().to_lowercase();
+        let mut rows = Vec::new();
+        if query.is_empty() {
+            rows.push(SourcePickerRow::All);
+        }
+
+        for (index, (source_id, label)) in self.all_sources.iter().enumerate() {
+            if !self.config.is_source_enabled(source_id) {
+                continue;
+            }
+
+            if query.is_empty()
+                || source_id.to_lowercase().contains(&query)
+                || label.to_lowercase().contains(&query)
+            {
+                rows.push(SourcePickerRow::Source(index));
+            }
+        }
+
+        rows
+    }
+
+    fn clamp_source_picker_selected(&mut self) {
+        let row_count = self.source_picker_rows().len();
+        if row_count == 0 {
+            self.source_picker_selected = 0;
+        } else if self.source_picker_selected >= row_count {
+            self.source_picker_selected = row_count - 1;
+        }
+    }
+
+    fn normalized_source_selection(&self, selection: &[String]) -> Vec<String> {
+        self.all_sources
+            .iter()
+            .filter(|(source_id, _)| {
+                self.config.is_source_enabled(source_id)
+                    && selection.iter().any(|selected| selected == source_id)
+            })
+            .map(|(source_id, _)| source_id.clone())
+            .collect()
+    }
+
     fn reset_search_defaults(&mut self) {
-        self.source_filter_index = 0;
+        self.source_filter_selection.clear();
         self.time_filter = self.config.sync_window.to_time_range();
     }
 
@@ -991,8 +1439,23 @@ impl App {
     ) {
         match self.filter_focus {
             FilterFocus::Source => {
-                self.source_filter_index =
-                    (self.source_filter_index + 1) % (self.enabled_sources().len() + 1);
+                let next_source = {
+                    let enabled = self.enabled_sources();
+                    if self.source_filter_selection.len() == 1 {
+                        enabled
+                            .iter()
+                            .position(|(id, _)| id == &self.source_filter_selection[0])
+                            .and_then(|index| enabled.get(index + 1).map(|(id, _)| (*id).clone()))
+                    } else {
+                        enabled.first().map(|(id, _)| (*id).clone())
+                    }
+                };
+
+                if let Some(source_id) = next_source {
+                    self.source_filter_selection = vec![source_id];
+                } else {
+                    self.source_filter_selection.clear();
+                }
                 self.filter_focus = FilterFocus::Time;
             }
             FilterFocus::Time => {

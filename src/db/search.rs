@@ -15,7 +15,7 @@ pub struct SearchFilters {
     pub directory: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TimeRange {
     Today,
     Week,
