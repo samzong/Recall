@@ -1,3 +1,4 @@
+pub mod antigravity;
 pub mod claude_code;
 pub mod codex;
 pub mod copilot;
@@ -82,6 +83,7 @@ pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(claude_code::ClaudeCodeAdapter),
         Box::new(opencode::OpenCodeAdapter),
         Box::new(codex::CodexAdapter),
+        Box::new(antigravity::AntigravityAdapter),
         Box::new(gemini::GeminiAdapter),
         Box::new(kiro::KiroAdapter),
         Box::new(copilot::CopilotAdapter),
