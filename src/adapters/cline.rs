@@ -189,7 +189,21 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
                     // api_req_started contains the full request (user input + system context),
                     // which is not a meaningful AI reply. Skip it.
                     "api_req_started" => {}
-                    "tool" | "reasoning" | "command" | "completion_result" | "task_progress" => {
+                    "tool" => {
+                        if let Some(content) = format_tool_message(&msg) {
+                            // Skip empty content messages
+                            if content.trim().is_empty() {
+                                continue;
+                            }
+                            let timestamp = msg.get("ts").and_then(|v| v.as_i64());
+                            result.push(RawMessage {
+                                role: Role::Assistant,
+                                content,
+                                timestamp,
+                            });
+                        }
+                    }
+                    "reasoning" | "command" | "completion_result" | "task_progress" => {
                         if let Some(text) = extract_text(&msg) {
                             // Skip empty text messages
                             if text.trim().is_empty() {
@@ -212,6 +226,13 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
                     result.push(RawMessage { role: Role::User, content: text, timestamp });
                 }
             }
+            "question" => {
+                // AI asking user a question, e.g., {"type": "question", "question": "请问你xxxx"}
+                if let Some(text) = msg.get("question").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                    let timestamp = msg.get("ts").and_then(|v| v.as_i64());
+                    result.push(RawMessage { role: Role::Assistant, content: text, timestamp });
+                }
+            }
             _ => {}
         }
     }
@@ -221,6 +242,38 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
 
 fn extract_text(msg: &Value) -> Option<String> {
     msg.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+fn format_tool_message(msg: &Value) -> Option<String> {
+    // Try to parse the text as JSON
+    let text = extract_text(msg)?;
+    let tool_json: Value = serde_json::from_str(&text).ok()?;
+
+    let tool_name = tool_json.get("tool").and_then(|v| v.as_str()).unwrap_or("Unknown");
+    let path = tool_json.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let regex = tool_json.get("regex").and_then(|v| v.as_str()).unwrap_or("");
+    let file_pattern = tool_json.get("filePattern").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Format based on tool name
+    let formatted = match tool_name {
+        "readFile" => format!("[ReadFile] {path}"),
+        "editedExistingFile" => format!("[EditedFile] {path}"),
+        "listFilesTopLevel" => format!("[ListFiles] {path}"),
+        "listFilesRecursive" => format!("[ListFilesRecursive] {path}"),
+        "searchFiles" => {
+            let mut parts = vec![format!("[SearchFiles] {path}")];
+            if !regex.is_empty() {
+                parts.push(format!("regex: {regex}"));
+            }
+            if !file_pattern.is_empty() {
+                parts.push(format!("pattern: {file_pattern}"));
+            }
+            parts.join(" - ")
+        }
+        _ => format!("[{tool_name}] {path}"),
+    };
+
+    Some(formatted)
 }
 
 fn extract_directory(messages_path: &Path) -> Option<String> {
@@ -288,7 +341,7 @@ mod tests {
             {"ts": 1000, "type": "say", "say": "text", "text": "hello world"},
             {"ts": 2000, "type": "say", "say": "text", "text": "hi there"},
             {"ts": 3000, "type": "say", "say": "user_feedback", "text": "fix it"},
-            {"ts": 4000, "type": "say", "say": "tool", "text": "[ReadFile] foo.txt"}
+            {"ts": 4000, "type": "say", "say": "tool", "text": "{\"tool\":\"readFile\",\"path\":\"foo.txt\"}"}
         ]"#;
         let path = write_task(&root, "1000", messages_json);
 
@@ -301,7 +354,58 @@ mod tests {
         assert!(matches!(msgs[2].role, Role::User));
         assert_eq!(msgs[2].content, "fix it");
         assert!(matches!(msgs[3].role, Role::Assistant));
-        assert!(msgs[3].content.contains("[ReadFile]"));
+        assert_eq!(msgs[3].content, "[ReadFile] foo.txt");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_ui_messages_question_type() {
+        let root = temp_root("question");
+        let messages_json = r#"[
+            {"ts": 1000, "type": "say", "say": "task", "text": "do something"},
+            {"ts": 2000, "type": "say", "say": "text", "text": "ok, let me check"},
+            {"ts": 3000, "type": "question", "question": "请问你要选择哪个方案？"},
+            {"ts": 4000, "type": "say", "say": "text", "text": "根据你的选择继续"}
+        ]"#;
+        let path = write_task(&root, "3000", messages_json);
+
+        let msgs = load_ui_messages(&path).unwrap();
+        assert_eq!(msgs.len(), 4);
+        // Task is User
+        assert!(matches!(msgs[0].role, Role::User));
+        assert_eq!(msgs[0].content, "do something");
+        // Text after task is Assistant
+        assert!(matches!(msgs[1].role, Role::Assistant));
+        assert_eq!(msgs[1].content, "ok, let me check");
+        // Question is Assistant
+        assert!(matches!(msgs[2].role, Role::Assistant));
+        assert_eq!(msgs[2].content, "请问你要选择哪个方案？");
+        // Text is Assistant
+        assert!(matches!(msgs[3].role, Role::Assistant));
+        assert_eq!(msgs[3].content, "根据你的选择继续");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn format_tool_message_various_tools() {
+        let root = temp_root("tools");
+        let messages_json = r#"[
+            {"ts": 1000, "type": "say", "say": "task", "text": "test tools"},
+            {"ts": 2000, "type": "say", "say": "tool", "text": "{\"tool\":\"readFile\",\"path\":\"src/main.rs\"}"},
+            {"ts": 3000, "type": "say", "say": "tool", "text": "{\"tool\":\"editedExistingFile\",\"path\":\"src/main.rs\"}"},
+            {"ts": 4000, "type": "say", "say": "tool", "text": "{\"tool\":\"listFilesTopLevel\",\"path\":\"src\"}"},
+            {"ts": 5000, "type": "say", "say": "tool", "text": "{\"tool\":\"searchFiles\",\"path\":\"vllm\",\"regex\":\"gelu\",\"filePattern\":\"*.py\"}"}
+        ]"#;
+        let path = write_task(&root, "1000", messages_json);
+
+        let msgs = load_ui_messages(&path).unwrap();
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[1].content, "[ReadFile] src/main.rs");
+        assert_eq!(msgs[2].content, "[EditedFile] src/main.rs");
+        assert_eq!(msgs[3].content, "[ListFiles] src");
+        assert_eq!(msgs[4].content, "[SearchFiles] vllm - regex: gelu - pattern: *.py");
 
         let _ = fs::remove_dir_all(&root);
     }
