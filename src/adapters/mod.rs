@@ -1,5 +1,6 @@
 pub mod antigravity;
 pub mod claude_code;
+pub mod cline;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
@@ -88,6 +89,7 @@ pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(kiro::KiroAdapter),
         Box::new(copilot::CopilotAdapter),
         Box::new(cursor::CursorAdapter),
+        Box::new(cline::ClineAdapter),
     ]
 }
 
