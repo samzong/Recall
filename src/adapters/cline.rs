@@ -147,7 +147,7 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
     let messages: Vec<Value> = serde_json::from_str(&content)?;
 
     let mut result = Vec::new();
-    let mut first_user = true;
+    let mut user_input_seen = false;
 
     for msg in messages {
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -155,10 +155,23 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
             "say" => {
                 let say_type = msg.get("say").and_then(|v| v.as_str()).unwrap_or("");
                 match say_type {
+                    "task" => {
+                        // "task" is the user's initial task message
+                        if let Some(text) = extract_text(&msg) {
+                            let timestamp = msg.get("ts").and_then(|v| v.as_i64());
+                            result.push(RawMessage { role: Role::User, content: text, timestamp });
+                            user_input_seen = true;
+                        }
+                    }
                     "text" => {
                         if let Some(text) = extract_text(&msg) {
-                            let role = if first_user {
-                                first_user = false;
+                            // Skip empty text messages
+                            if text.trim().is_empty() {
+                                continue;
+                            }
+                            // First non-empty text message is User input (if not already seen from "task")
+                            let role = if !user_input_seen {
+                                user_input_seen = true;
                                 Role::User
                             } else {
                                 Role::Assistant
@@ -173,9 +186,15 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
                             result.push(RawMessage { role: Role::User, content: text, timestamp });
                         }
                     }
-                    "tool" | "api_req_started" | "reasoning" | "command" | "completion_result"
-                    | "task_progress" => {
+                    // api_req_started contains the full request (user input + system context),
+                    // which is not a meaningful AI reply. Skip it.
+                    "api_req_started" => {}
+                    "tool" | "reasoning" | "command" | "completion_result" | "task_progress" => {
                         if let Some(text) = extract_text(&msg) {
+                            // Skip empty text messages
+                            if text.trim().is_empty() {
+                                continue;
+                            }
                             let timestamp = msg.get("ts").and_then(|v| v.as_i64());
                             result.push(RawMessage {
                                 role: Role::Assistant,
@@ -301,6 +320,32 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert!(matches!(msgs[0].role, Role::User));
         assert!(matches!(msgs[1].role, Role::Assistant));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_ui_messages_task_type_is_user() {
+        let root = temp_root("tasktype");
+        let messages_json = r#"[
+            {"ts": 1000, "type": "say", "say": "task", "text": "fix the bug"},
+            {"ts": 2000, "type": "say", "say": "checkpoint_created"},
+            {"ts": 3000, "type": "say", "say": "api_req_started", "text": "{\"request\":\"<task>fix the bug</task>\"}"},
+            {"ts": 4000, "type": "say", "say": "reasoning", "text": "用户想修复bug"},
+            {"ts": 5000, "type": "say", "say": "text", "text": "I found the issue"}
+        ]"#;
+        let path = write_task(&root, "3000", messages_json);
+
+        let msgs = load_ui_messages(&path).unwrap();
+        assert_eq!(msgs.len(), 3);
+        // First message should be User from "task" type
+        assert!(matches!(msgs[0].role, Role::User));
+        assert_eq!(msgs[0].content, "fix the bug");
+        // Reasoning should be Assistant
+        assert!(matches!(msgs[1].role, Role::Assistant));
+        // Text after task should be Assistant
+        assert!(matches!(msgs[2].role, Role::Assistant));
+        assert_eq!(msgs[2].content, "I found the issue");
 
         let _ = fs::remove_dir_all(&root);
     }
