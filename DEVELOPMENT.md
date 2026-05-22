@@ -1,8 +1,12 @@
 # Adding a New Source Adapter
 
-Recall discovers AI coding sessions through **source adapters**. Each adapter knows how to find and parse one tool's session data. Adding a new one requires exactly two files touched.
+Recall discovers AI coding sessions through **source adapters**. A source adapter is
+the single entry point for a tool. Search is the base capability; usage is an
+optional extension on the same adapter.
 
-## 1. Create the adapter
+Start with search. Add usage only when the tool exposes token data.
+
+## 1. Add Search Support
 
 Create `src/adapters/<tool>.rs`:
 
@@ -27,15 +31,15 @@ impl SourceAdapter for MyToolAdapter {
 
         let mut sessions = Vec::new();
 
-        // Parse session files / databases here...
+        // Parse session files or databases here...
         // For each session found:
-        sessions.push(RawSession {
-            source_id: "unique-session-id".to_string(),  // tool's native session ID
-            directory: Some("/path/to/project".to_string()),
-            started_at: 1700000000000,                    // Unix timestamp in milliseconds
-            updated_at: None,
-            entrypoint: None,
-            messages: vec![
+        sessions.push(RawSession::search_only(
+            "unique-session-id",                         // tool's native session ID
+            Some("/path/to/project".to_string()),
+            1700000000000,                               // Unix timestamp in milliseconds
+            None,
+            None,
+            vec![
                 RawMessage {
                     role: Role::User,
                     content: "user message text".to_string(),
@@ -47,7 +51,7 @@ impl SourceAdapter for MyToolAdapter {
                     timestamp: None,
                 },
             ],
-        });
+        ));
 
         Ok(sessions)
     }
@@ -75,7 +79,7 @@ pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
 
 That's it. The DB schema, search engine, TUI source filter, and CLI `--source` flag all pick it up automatically.
 
-## Contract
+## Search Contract
 
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
@@ -85,12 +89,73 @@ That's it. The DB schema, search engine, TUI source filter, and CLI `--source` f
 | `started_at` | `i64` | yes | Unix timestamp in **milliseconds**. |
 | `messages` | `Vec<RawMessage>` | yes | Ordered by time. Only `User` and `Assistant` roles. |
 
+## Optional: Add Usage Support
+
+Usage is not a separate adapter. It is token data attached to the same
+`RawSession`.
+
+Add a parser version:
+
+```rust
+const USAGE_PARSER_VERSION: u32 = 1;
+
+impl SourceAdapter for MyToolAdapter {
+    fn usage_parser_version(&self) -> Option<u32> {
+        Some(USAGE_PARSER_VERSION)
+    }
+
+    // ...
+}
+```
+
+Then attach usage events to the session:
+
+```rust
+let usage_events = vec![/* RawUsageEvent values parsed from the same tool data */];
+
+sessions.push(
+    RawSession::search_only(source_id, directory, started_at, updated_at, entrypoint, messages)
+        .with_usage(usage_events, USAGE_PARSER_VERSION),
+);
+```
+
+If the adapter uses file mtimes to skip unchanged sessions, pass the same parser
+version into file scanning:
+
+```rust
+file_scan::run_file_scan_with_options(
+    store,
+    "my-tool",
+    since_ts,
+    file_scan::FileScanOptions {
+        usage_parser_version: Some(USAGE_PARSER_VERSION),
+    },
+    entries,
+    parse_my_tool_session_for_entry,
+)
+```
+
+This lets Recall backfill usage when the usage parser changes, even when the
+session messages did not change.
+
+Usage event rules:
+
+| Field | Notes |
+|-------|-------|
+| `event_key` | Stable and unique within the session. |
+| `model` / `provider` | Use source data. Use `unknown` only when the source does not record it. |
+| token fields | Split into input, output, cache read, cache write, and reasoning tokens. |
+| `token_source` | `Observed` for source-reported values, `Derived` for deltas from counters, `Estimated` only for estimates. |
+| `parser_version` | Set to `USAGE_PARSER_VERSION`; bump it when usage parsing changes. |
+
 ## Guidelines
 
 - If the tool is not installed, return `Ok(vec![])` -- never error on missing data.
 - Open external databases read-only (`SQLITE_OPEN_READ_ONLY`) to avoid locking the user's data.
 - Extract only `text` content. Skip tool calls, images, and internal metadata.
 - Use `tracing::warn!` for recoverable parse errors, skip the session, and continue.
+- Do not add usage support until the source exposes real token data.
+- Do not create a separate usage adapter for the same tool.
 
 ## Verify
 
@@ -98,6 +163,7 @@ That's it. The DB schema, search engine, TUI source filter, and CLI `--source` f
 make check                  # must pass before push — same gate as CI
 cargo run -- sync -v        # should show "Scanning MT..." with session count
 make search Q="test --source mt"
+cargo run -- usage --source my-tool   # only when usage support was added
 make run                    # TUI filter should include MT
 ```
 

@@ -12,9 +12,11 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
 use crate::db::store::Store;
-use crate::types::Role;
+use crate::types::{RawUsageEvent, Role, TokenSource};
 
 pub struct ClaudeCodeAdapter;
+
+const USAGE_PARSER_VERSION: u32 = 4;
 
 impl SourceAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &str {
@@ -29,6 +31,10 @@ impl SourceAdapter for ClaudeCodeAdapter {
             program: "claude".to_string(),
             args: vec!["--resume".to_string(), source_id.to_string()],
         })
+    }
+
+    fn usage_parser_version(&self) -> Option<u32> {
+        Some(USAGE_PARSER_VERSION)
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
@@ -91,9 +97,14 @@ fn scan_for_sync_impl(
     let mut entries = collect_project_entries(claude_dir, &session_index);
     entries.extend(collect_transcript_entries(claude_dir));
 
-    file_scan::run_file_scan(store, "claude-code", since_ts, entries, |entry, mtime_ms| {
-        parse_claude_session_file(entry, mtime_ms, &session_index)
-    })
+    file_scan::run_file_scan_with_options(
+        store,
+        "claude-code",
+        since_ts,
+        file_scan::FileScanOptions { usage_parser_version: Some(USAGE_PARSER_VERSION) },
+        entries,
+        |entry, mtime_ms| parse_claude_session_file(entry, mtime_ms, &session_index),
+    )
 }
 
 fn load_session_index(claude_dir: &Path) -> HashMap<String, SessionMeta> {
@@ -164,14 +175,12 @@ fn collect_project_entries(
         let dir_name = project_entry.file_name().to_string_lossy().to_string();
         let directory_hint = project_key_to_path(&dir_name);
 
-        let jsonl_files = match fs::read_dir(&project_path) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for file_entry in jsonl_files.flatten() {
+        for file_entry in WalkDir::new(&project_path).into_iter().filter_map(|e| e.ok()) {
             let file_path = file_entry.path();
             if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if !file_path.is_file() {
                 continue;
             }
             let session_id = match file_path.file_stem().and_then(|s| s.to_str()) {
@@ -182,7 +191,11 @@ fn collect_project_entries(
             let meta_cwd = session_index.get(&session_id).and_then(|m| m.cwd.clone());
             let directory = meta_cwd.or_else(|| Some(directory_hint.clone()));
 
-            entries.push(FileScanEntry { session_id, stat_target: file_path, directory });
+            entries.push(FileScanEntry {
+                session_id,
+                stat_target: file_path.to_path_buf(),
+                directory,
+            });
         }
     }
 
@@ -225,22 +238,23 @@ fn parse_claude_session_file(
     mtime_ms: i64,
     session_index: &HashMap<String, SessionMeta>,
 ) -> anyhow::Result<Option<RawSession>> {
-    let messages = match parse_conversation_jsonl(&entry.stat_target) {
-        Ok(m) => m,
+    let parsed = match parse_conversation_jsonl(&entry.stat_target, mtime_ms) {
+        Ok(parsed) => parsed,
         Err(e) => {
             debug!("failed to parse {}: {e}", entry.stat_target.display());
             return Ok(None);
         }
     };
 
-    if messages.is_empty() {
+    if parsed.messages.is_empty() && parsed.usage_events.is_empty() {
         return Ok(None);
     }
 
     let meta = session_index.get(&entry.session_id);
     let started_at = meta
         .map(|m| m.started_at)
-        .or_else(|| messages.first().and_then(|m| m.timestamp))
+        .or_else(|| parsed.messages.first().and_then(|m| m.timestamp))
+        .or_else(|| parsed.usage_events.first().map(|event| event.timestamp))
         .unwrap_or(0);
     let directory = meta.and_then(|m| m.cwd.clone()).or(entry.directory);
     let entrypoint = meta.and_then(|m| m.entrypoint.clone());
@@ -251,16 +265,29 @@ fn parse_claude_session_file(
         started_at,
         updated_at: Some(mtime_ms),
         entrypoint,
-        messages,
+        messages: parsed.messages,
+        usage_events: parsed.usage_events,
+        usage_parser_version: Some(USAGE_PARSER_VERSION),
     }))
 }
 
-fn parse_conversation_jsonl(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
+struct ParsedConversation {
+    messages: Vec<RawMessage>,
+    usage_events: Vec<RawUsageEvent>,
+}
+
+fn parse_conversation_jsonl(
+    path: &Path,
+    fallback_timestamp: i64,
+) -> anyhow::Result<ParsedConversation> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
+    let mut usage_events: Vec<RawUsageEvent> = Vec::new();
+    let mut usage_index: HashMap<String, usize> = HashMap::new();
+    let source_path = path.to_string_lossy().to_string();
 
-    for line in reader.lines() {
+    for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
         let line = line.trim();
         if line.is_empty() {
@@ -285,20 +312,93 @@ fn parse_conversation_jsonl(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
         };
 
         let text = extract_content(message.get("content"));
-        if text.is_empty() {
-            continue;
-        }
-
         let timestamp = v
             .get("timestamp")
             .and_then(|t| t.as_str())
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
             .map(|dt| dt.timestamp_millis());
 
-        messages.push(RawMessage { role, content: text, timestamp });
+        let message_seq = if !text.is_empty() { Some(messages.len() as u32) } else { None };
+        if role == Role::Assistant
+            && let Some(event) = extract_claude_usage_event(
+                &v,
+                message,
+                timestamp.unwrap_or(fallback_timestamp),
+                line_index as u32,
+                message_seq,
+                &source_path,
+            )
+        {
+            if let Some(existing_index) = usage_index.get(&event.event_key).copied() {
+                merge_claude_usage_event(&mut usage_events[existing_index], event);
+            } else {
+                usage_index.insert(event.event_key.clone(), usage_events.len());
+                usage_events.push(event);
+            }
+        }
+
+        if !text.is_empty() {
+            messages.push(RawMessage { role, content: text, timestamp });
+        }
     }
 
-    Ok(messages)
+    Ok(ParsedConversation { messages, usage_events })
+}
+
+fn extract_claude_usage_event(
+    row: &Value,
+    message: &Value,
+    timestamp: i64,
+    event_seq: u32,
+    message_seq: Option<u32>,
+    source_path: &str,
+) -> Option<RawUsageEvent> {
+    let usage = message.get("usage")?;
+    let input_tokens = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    let output_tokens = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    let cache_read_tokens =
+        usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    let cache_write_tokens =
+        usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+
+    let model = message.get("model").and_then(|v| v.as_str()).filter(|v| !v.trim().is_empty())?;
+
+    let request_id = row.get("requestId").and_then(|v| v.as_str());
+    let message_id = message.get("id").and_then(|v| v.as_str());
+    let event_key = match (request_id, message_id) {
+        (Some(request_id), Some(message_id)) => format!("assistant:{request_id}:{message_id}"),
+        (Some(request_id), None) => format!("assistant:{request_id}:line:{event_seq}"),
+        (None, Some(message_id)) => format!("assistant:{message_id}:line:{event_seq}"),
+        (None, None) => format!("line:{event_seq}"),
+    };
+
+    Some(RawUsageEvent {
+        event_key,
+        event_seq,
+        message_seq,
+        timestamp,
+        model: model.to_string(),
+        provider: "anthropic".to_string(),
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        reasoning_tokens: 0,
+        token_source: TokenSource::Observed,
+        parser_version: USAGE_PARSER_VERSION,
+        source_path: Some(source_path.to_string()),
+        raw_usage_json: Some(usage.to_string()),
+    })
+}
+
+fn merge_claude_usage_event(existing: &mut RawUsageEvent, next: RawUsageEvent) {
+    existing.input_tokens = existing.input_tokens.max(next.input_tokens);
+    existing.output_tokens = existing.output_tokens.max(next.output_tokens);
+    existing.cache_read_tokens = existing.cache_read_tokens.max(next.cache_read_tokens);
+    existing.cache_write_tokens = existing.cache_write_tokens.max(next.cache_write_tokens);
+    existing.reasoning_tokens = existing.reasoning_tokens.max(next.reasoning_tokens);
+    existing.timestamp = existing.timestamp.max(next.timestamp);
+    existing.raw_usage_json = next.raw_usage_json;
 }
 
 fn extract_content(content: Option<&Value>) -> String {
@@ -401,6 +501,71 @@ mod tests {
         path
     }
 
+    fn write_usage_jsonl(project_dir: &Path, session_id: &str) -> PathBuf {
+        fs::create_dir_all(project_dir).unwrap();
+        let path = project_dir.join(format!("{session_id}.jsonl"));
+        let first = serde_json::json!({
+            "type": "assistant",
+            "requestId": "req-1",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "message": {
+                "id": "msg-1",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "partial"}],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 50,
+                    "cache_creation_input_tokens": 5
+                }
+            }
+        });
+        let second = serde_json::json!({
+            "type": "assistant",
+            "requestId": "req-1",
+            "timestamp": "2026-04-13T10:00:02Z",
+            "message": {
+                "id": "msg-1",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "complete"}],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 30,
+                    "cache_read_input_tokens": 50,
+                    "cache_creation_input_tokens": 5
+                }
+            }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{first}").unwrap();
+        writeln!(f, "{second}").unwrap();
+        path
+    }
+
+    fn write_usage_only_jsonl(project_dir: &Path, session_id: &str) -> PathBuf {
+        fs::create_dir_all(project_dir).unwrap();
+        let path = project_dir.join(format!("{session_id}.jsonl"));
+        let line = serde_json::json!({
+            "type": "assistant",
+            "requestId": "req-usage-only",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "message": {
+                "id": "msg-usage-only",
+                "model": "claude-opus-4-7",
+                "content": [],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation_input_tokens": 40
+                }
+            }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{line}").unwrap();
+        path
+    }
+
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
             id: format!("internal-{source_id}"),
@@ -440,19 +605,112 @@ mod tests {
     }
 
     #[test]
+    fn parse_claude_session_file_extracts_deduped_usage() {
+        let root = temp_claude_root("usage");
+        let project = root.join("projects").join("-tmp-foo");
+        let path = write_usage_jsonl(&project, "usage-session");
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let entry = FileScanEntry {
+            session_id: "usage-session".to_string(),
+            stat_target: path,
+            directory: Some("/tmp/foo".to_string()),
+        };
+        let session_index = HashMap::new();
+        let raw = parse_claude_session_file(entry, mtime, &session_index).unwrap().unwrap();
+
+        assert_eq!(raw.usage_events.len(), 1);
+        let event = &raw.usage_events[0];
+        assert_eq!(event.event_key, "assistant:req-1:msg-1");
+        assert_eq!(event.model, "claude-sonnet-4-5");
+        assert_eq!(event.provider, "anthropic");
+        assert_eq!(event.input_tokens, 100);
+        assert_eq!(event.output_tokens, 30);
+        assert_eq!(event.cache_read_tokens, 50);
+        assert_eq!(event.cache_write_tokens, 5);
+        assert_eq!(event.token_source, TokenSource::Observed);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_claude_session_file_keeps_usage_without_searchable_messages() {
+        let root = temp_claude_root("usage-only");
+        let project = root.join("projects").join("-tmp-foo");
+        let path = write_usage_only_jsonl(&project, "usage-only-session");
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let entry = FileScanEntry {
+            session_id: "usage-only-session".to_string(),
+            stat_target: path,
+            directory: Some("/tmp/foo".to_string()),
+        };
+        let session_index = HashMap::new();
+        let raw = parse_claude_session_file(entry, mtime, &session_index).unwrap().unwrap();
+
+        assert!(raw.messages.is_empty());
+        assert_eq!(raw.started_at, 1_776_074_400_000);
+        assert_eq!(raw.usage_events.len(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_claude_session_file_keeps_zero_token_usage_events() {
+        let root = temp_claude_root("zero-usage");
+        let project = root.join("projects").join("-tmp-foo");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("zero-session.jsonl");
+        let line = serde_json::json!({
+            "type": "assistant",
+            "requestId": "req-zero",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "message": {
+                "id": "msg-zero",
+                "model": "gpt-5.5",
+                "content": [{"type": "text", "text": "zero"}],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0
+                }
+            }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{line}").unwrap();
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let entry = FileScanEntry {
+            session_id: "zero-session".to_string(),
+            stat_target: path,
+            directory: Some("/tmp/foo".to_string()),
+        };
+        let raw = parse_claude_session_file(entry, mtime, &HashMap::new()).unwrap().unwrap();
+
+        assert_eq!(raw.usage_events.len(), 1);
+        assert_eq!(raw.usage_events[0].model, "gpt-5.5");
+        assert_eq!(raw.usage_events[0].input_tokens, 0);
+        assert_eq!(raw.usage_events[0].output_tokens, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn collect_project_entries_walks_nested_projects() {
         let root = temp_claude_root("collect");
         let p1 = root.join("projects").join("-tmp-foo");
         let p2 = root.join("projects").join("-tmp-bar");
+        let nested = p1.join("parent-session").join("subagents");
         write_user_jsonl(&p1, "sess-1", "a");
         write_user_jsonl(&p2, "sess-2", "b");
+        write_user_jsonl(&nested, "agent-a123", "nested");
 
         let session_index = HashMap::new();
         let entries = collect_project_entries(&root, &session_index);
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         let ids: Vec<_> = entries.iter().map(|e| e.session_id.clone()).collect();
         assert!(ids.contains(&"sess-1".to_string()));
         assert!(ids.contains(&"sess-2".to_string()));
+        assert!(ids.contains(&"agent-a123".to_string()));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -466,6 +724,15 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session("sess-skip", mtime, 1)).unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "claude-code",
+                "sess-skip",
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
 
         let result = scan_for_sync_impl(&root, &store, None).unwrap();
         assert_eq!(result.sessions.len(), 0);

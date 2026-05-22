@@ -289,14 +289,7 @@ where
         meta_started_at.or_else(|| messages.first().and_then(|m| m.timestamp)).unwrap_or(0);
     let updated_at = messages.last().and_then(|m| m.timestamp);
 
-    Ok(Some(RawSession {
-        source_id,
-        directory,
-        started_at,
-        updated_at,
-        entrypoint: None,
-        messages,
-    }))
+    Ok(Some(RawSession::search_only(source_id, directory, started_at, updated_at, None, messages)))
 }
 
 fn extract_tool_requests(tool_requests: Option<&Value>) -> String {

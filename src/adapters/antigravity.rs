@@ -241,14 +241,14 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
 
     let started_at = messages.first().and_then(|message| message.timestamp).unwrap_or(0);
 
-    Ok(Some(RawSession {
-        source_id: fallback_id.to_string(),
-        directory: None,
+    Ok(Some(RawSession::search_only(
+        fallback_id.to_string(),
+        None,
         started_at,
-        updated_at: messages.last().and_then(|message| message.timestamp),
-        entrypoint: None,
+        messages.last().and_then(|message| message.timestamp),
+        None,
         messages,
-    }))
+    )))
 }
 
 fn extract_user_request(content: &str) -> String {

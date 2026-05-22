@@ -6,10 +6,11 @@ use recall::adapters;
 use recall::config::AppConfig;
 use recall::db;
 use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
-use recall::db::store::Store;
+use recall::db::store::{Store, UsageSessionStateMeta};
 use recall::embedding::EmbeddingProvider;
 use recall::semantic;
 use recall::types::{self, Message, Role, Session};
+use recall::usage::{self, UsageFilters};
 use recall::utils;
 
 #[derive(Parser)]
@@ -55,6 +56,14 @@ enum Commands {
         #[arg(long)]
         time: Option<String>,
     },
+    Usage {
+        #[arg(long, help = "Output usage report as JSON")]
+        json: bool,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        time: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -81,6 +90,9 @@ fn main() -> Result<()> {
         Some(Commands::BenchDumpSessions) => recall::bench::dump_sessions()?,
         Some(Commands::Search { query, source, time }) => {
             cmd_search(&query, source.as_deref(), time.as_deref())?
+        }
+        Some(Commands::Usage { json, source, time }) => {
+            cmd_usage(json, source.as_deref(), time.as_deref())?
         }
         None => cmd_tui()?,
     }
@@ -281,12 +293,33 @@ fn cmd_sync(force: bool, verbose: bool) -> Result<()> {
 }
 
 fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
+    run_sync_job_inner(SyncRunOptions { force, verbose, emit: true, usage_only: false })
+}
+
+fn run_usage_sync_job() -> Result<()> {
+    run_sync_job_inner(SyncRunOptions {
+        force: false,
+        verbose: false,
+        emit: false,
+        usage_only: true,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SyncRunOptions {
+    force: bool,
+    verbose: bool,
+    emit: bool,
+    usage_only: bool,
+}
+
+fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
     let store = Store::open()?;
     let all = adapters::all_adapters();
     let labels = adapters::source_labels();
     let mut config = AppConfig::load_or_default();
     config.normalize_sources(&labels);
-    let since_ts = config.sync_window.to_since_cutoff();
+    let since_ts = if options.usage_only { None } else { config.sync_window.to_since_cutoff() };
 
     let mut new_sessions = 0u32;
     let mut updated_sessions = 0u32;
@@ -299,23 +332,29 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
         let source_id = adapter.id();
         let label = adapter.label();
 
+        if options.usage_only && adapter.usage_parser_version().is_none() {
+            continue;
+        }
+
         if !config.is_source_enabled(source_id) {
-            if verbose {
+            if options.verbose {
                 println!("Skipping {label} (filtered)");
             }
             continue;
         }
 
-        if verbose {
+        if options.verbose {
             println!("Scanning {label}...");
         }
-        let optimized = if force {
+        let optimized = if options.force {
             None
         } else {
             match adapter.scan_for_sync(&store, since_ts) {
                 Ok(scan) => scan,
                 Err(e) => {
-                    eprintln!("Error scanning {label}: {e}");
+                    if options.emit {
+                        eprintln!("Error scanning {label}: {e}");
+                    }
                     continue;
                 }
             }
@@ -328,7 +367,9 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
                 let raw_sessions = match adapter.scan() {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("Error scanning {label}: {e}");
+                        if options.emit {
+                            eprintln!("Error scanning {label}: {e}");
+                        }
                         continue;
                     }
                 };
@@ -337,11 +378,12 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
         };
         skipped += pre_skipped;
         filtered_out += pre_filtered;
-        if verbose {
+        if options.verbose {
             println!("  Found {} sessions", raw_sessions.len());
         }
 
         let mut existing_meta = store.session_meta_map(source_id)?;
+        let mut existing_usage_meta = store.usage_state_meta_map(source_id)?;
 
         for raw in raw_sessions {
             if let Some(cutoff) = since_ts {
@@ -353,17 +395,45 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
             }
 
             let msg_count = raw.messages.len() as u32;
+            let usage_backfill_needed = raw.usage_parser_version.is_some_and(|version| {
+                !usage_state_is_current(
+                    version,
+                    existing_usage_meta.get(&raw.source_id).copied(),
+                    raw.updated_at,
+                )
+            });
 
             match existing_meta.get(&raw.source_id) {
                 Some(&(old_updated_at, old_msg_count)) => {
-                    let changed = old_msg_count != msg_count
+                    let content_changed = old_msg_count != msg_count
                         || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
-                    if !changed && !force {
+                    if !content_changed && usage_backfill_needed && !options.force {
+                        if let Some(parser_version) = raw.usage_parser_version
+                            && store.persist_usage_events_for_existing_session(
+                                source_id,
+                                &raw.source_id,
+                                &raw.usage_events,
+                                parser_version,
+                                raw.updated_at,
+                            )?
+                        {
+                            existing_usage_meta.insert(
+                                raw.source_id.clone(),
+                                UsageSessionStateMeta {
+                                    parser_version,
+                                    source_updated_at: raw.updated_at,
+                                },
+                            );
+                            reprocessed_sessions += 1;
+                        }
+                        continue;
+                    }
+                    if !content_changed && !options.force {
                         skipped += 1;
                         continue;
                     }
                     store.delete_session_data(source_id, &raw.source_id)?;
-                    if changed {
+                    if content_changed {
                         updated_sessions += 1;
                     } else {
                         reprocessed_sessions += 1;
@@ -402,9 +472,20 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
                 })
                 .collect();
 
-            store.persist_session(&session, &messages)?;
+            store.persist_session_with_usage(
+                &session,
+                &messages,
+                &raw.usage_events,
+                raw.usage_parser_version,
+            )?;
             existing_meta
                 .insert(session.source_id.clone(), (session.updated_at, session.message_count));
+            if let Some(parser_version) = raw.usage_parser_version {
+                existing_usage_meta.insert(
+                    session.source_id.clone(),
+                    UsageSessionStateMeta { parser_version, source_updated_at: session.updated_at },
+                );
+            }
             total_messages += msg_count;
         }
 
@@ -413,9 +494,9 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
 
     let touched = new_sessions + updated_sessions + reprocessed_sessions;
 
-    if verbose {
+    if options.verbose {
         println!();
-        if force {
+        if options.force {
             print!(
                 "Force sync: {new_sessions} new, {updated_sessions} updated, {reprocessed_sessions} reprocessed, {total_messages} messages"
             );
@@ -448,7 +529,8 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
                 progress.failed_sessions
             );
         }
-    } else if force {
+    } else if !options.emit {
+    } else if options.force {
         println!("Reprocessed {touched} sessions, {total_messages} messages");
     } else if touched == 0 {
         println!("Up to date.");
@@ -457,6 +539,17 @@ fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn usage_state_is_current(
+    required_parser_version: u32,
+    state: Option<UsageSessionStateMeta>,
+    source_updated_at: Option<i64>,
+) -> bool {
+    state.is_some_and(|state| {
+        state.parser_version >= required_parser_version
+            && state.source_updated_at == source_updated_at
+    })
 }
 
 fn cmd_background_worker(sync_first: bool) -> Result<()> {
@@ -535,6 +628,117 @@ fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str
     }
 
     Ok(())
+}
+
+fn cmd_usage(json: bool, source_filter: Option<&str>, time_filter: Option<&str>) -> Result<()> {
+    run_usage_sync_job()?;
+
+    let store = Store::open()?;
+    let sources = adapters::source_labels();
+    let filters = UsageFilters {
+        sources: resolve_source_filter(source_filter, &sources)?,
+        time_range: parse_time_range(time_filter),
+    };
+    let report = usage::build_usage_report(&store, &filters)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("Usage");
+    println!("  Total tokens  {}", format_usage_number(report.summary.tokens.total_tokens));
+    println!("  Sessions      {}", report.summary.sessions);
+
+    if !report.by_source.is_empty() {
+        println!();
+        println!("By source");
+        for source in report.by_source.iter().take(10) {
+            println!(
+                "  {:<14} {:>12} tokens  {:>4} sessions",
+                source.source,
+                format_usage_number(source.tokens.total_tokens),
+                source.sessions
+            );
+        }
+    }
+
+    if !report.by_model.is_empty() {
+        println!();
+        println!("By model");
+        for model in report.by_model.iter().take(10) {
+            println!(
+                "  {:<12} {:<18} {:>12} tokens",
+                model.source,
+                truncate_usage_label(&model.model, 18),
+                format_usage_number(model.tokens.total_tokens)
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_source_filter(
+    source_filter: Option<&str>,
+    sources: &[(String, String)],
+) -> Result<Option<Vec<String>>> {
+    let Some(source) = source_filter else {
+        return Ok(None);
+    };
+    let lower = source.to_lowercase();
+    let resolved = sources
+        .iter()
+        .find(|(id, label)| id == &lower || label.to_lowercase() == lower)
+        .map(|(id, _)| id.clone())
+        .ok_or_else(|| anyhow::anyhow!("unknown source: {source}"))?;
+    Ok(Some(vec![resolved]))
+}
+
+fn parse_time_range(time_filter: Option<&str>) -> TimeRange {
+    match time_filter.map(|t| t.to_lowercase()) {
+        Some(ref t) if t == "today" => TimeRange::Today,
+        Some(ref t) if t == "7d" || t == "week" => TimeRange::Week,
+        Some(ref t) if t == "30d" || t == "month" => TimeRange::Month,
+        _ => TimeRange::All,
+    }
+}
+
+fn format_usage_number(value: i64) -> String {
+    let abs = value.abs();
+    if abs >= 1_000_000_000 {
+        return format_compact_decimal(value as f64 / 1_000_000_000.0, "B");
+    }
+    if abs >= 1_000_000 {
+        return format_compact_decimal(value as f64 / 1_000_000.0, "M");
+    }
+
+    let s = value.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn format_compact_decimal(value: f64, suffix: &str) -> String {
+    let formatted = format!("{value:.2}");
+    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.').to_string();
+    format!("{trimmed}{suffix}")
+}
+
+fn truncate_usage_label(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let suffix = "...";
+    let keep = max_chars.saturating_sub(suffix.len());
+    let mut out = value.chars().take(keep).collect::<String>();
+    out.push_str(suffix);
+    out
 }
 fn cmd_tui() -> Result<()> {
     use std::io;

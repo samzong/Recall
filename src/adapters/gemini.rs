@@ -135,14 +135,7 @@ fn parse_gemini_session_value(doc: Value, fallback_id: &str) -> anyhow::Result<O
         return Ok(None);
     }
 
-    Ok(Some(RawSession {
-        source_id: session_id,
-        directory: None,
-        started_at,
-        updated_at,
-        entrypoint: None,
-        messages,
-    }))
+    Ok(Some(RawSession::search_only(session_id, None, started_at, updated_at, None, messages)))
 }
 
 fn extract_tool_calls(tool_calls: Option<&Value>) -> String {

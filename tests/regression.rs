@@ -5,7 +5,8 @@ use recall::config::AppConfig;
 use recall::db::schema;
 use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
 use recall::db::store::Store;
-use recall::types::{Message, Role, Session};
+use recall::types::{Message, RawUsageEvent, Role, Session, TokenSource};
+use recall::usage::{UsageFilters, build_usage_report};
 
 fn setup() -> Store {
     schema::register_sqlite_vec();
@@ -36,8 +37,34 @@ fn make_message(session_id: &str, role: Role, content: &str, seq: u32) -> Messag
     }
 }
 
+fn make_usage_event(key: &str, timestamp: i64, model: &str) -> RawUsageEvent {
+    RawUsageEvent {
+        event_key: key.to_string(),
+        event_seq: 0,
+        message_seq: Some(1),
+        timestamp,
+        model: model.to_string(),
+        provider: "test-provider".to_string(),
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_tokens: 3,
+        cache_write_tokens: 2,
+        reasoning_tokens: 1,
+        token_source: TokenSource::Observed,
+        parser_version: 1,
+        source_path: Some("/tmp/source.jsonl".to_string()),
+        raw_usage_json: Some(r#"{"input_tokens":10}"#.to_string()),
+    }
+}
+
 fn no_filters() -> SearchFilters {
     SearchFilters { sources: None, time_range: TimeRange::All, directory: None }
+}
+
+#[test]
+fn schema_migration_sets_current_version() {
+    let store = setup();
+    assert_eq!(schema::schema_version(&store.conn).unwrap(), schema::current_schema_version());
 }
 
 #[test]
@@ -112,6 +139,58 @@ fn delete_session_cleans_embeddings() {
 
     let sessions = store.list_recent_sessions(10).unwrap();
     assert!(sessions.is_empty());
+}
+
+#[test]
+fn persist_session_writes_usage_events_and_report_aggregates() {
+    let store = setup();
+    let session = make_session("s1", "claude-code", "raw1", "Usage session");
+    let messages = vec![
+        make_message("s1", Role::User, "hello", 0),
+        make_message("s1", Role::Assistant, "hi", 1),
+    ];
+    let usage = vec![make_usage_event("evt-1", 1_800_000_000_000, "claude-sonnet")];
+
+    store.persist_session_with_usage(&session, &messages, &usage, Some(1)).unwrap();
+
+    let count: i64 =
+        store.conn.query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0)).unwrap();
+    assert_eq!(count, 1);
+    let state_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM usage_session_state", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(state_count, 1);
+
+    let report =
+        build_usage_report(&store, &UsageFilters { sources: None, time_range: TimeRange::All })
+            .unwrap();
+    assert_eq!(report.summary.events, 1);
+    assert_eq!(report.summary.sessions, 1);
+    assert_eq!(report.summary.tokens.total_tokens, 21);
+    assert_eq!(report.summary.token_source_events.get("observed"), Some(&1));
+    assert_eq!(report.by_source[0].source, "claude-code");
+    assert_eq!(report.by_model[0].model, "claude-sonnet");
+}
+
+#[test]
+fn delete_session_cascades_usage_events() {
+    let store = setup();
+    let session = make_session("s1", "codex", "raw1", "Usage session");
+    let messages = vec![make_message("s1", Role::User, "hello", 0)];
+    let usage = vec![make_usage_event("evt-1", 1_800_000_000_000, "gpt-5")];
+    store.persist_session_with_usage(&session, &messages, &usage, Some(1)).unwrap();
+
+    store.delete_session_data("codex", "raw1").unwrap();
+
+    let count: i64 =
+        store.conn.query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0)).unwrap();
+    assert_eq!(count, 0, "usage events must follow session lifecycle");
+    let state_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM usage_session_state", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(state_count, 0, "usage parser state must follow session lifecycle");
 }
 
 #[test]

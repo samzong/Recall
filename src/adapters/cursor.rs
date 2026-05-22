@@ -175,14 +175,7 @@ fn parse_cursor_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
         return Ok(None);
     }
 
-    Ok(Some(RawSession {
-        source_id: String::new(),
-        directory: None,
-        started_at: 0,
-        updated_at: None,
-        entrypoint: None,
-        messages,
-    }))
+    Ok(Some(RawSession::search_only(String::new(), None, 0, None, None, messages)))
 }
 
 fn render_content_items(items: &[Value], is_user: bool) -> String {

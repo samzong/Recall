@@ -13,6 +13,37 @@ impl Role {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TokenSource {
+    Observed,
+    Derived,
+    Estimated,
+}
+
+impl TokenSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenSource::Observed => "observed",
+            TokenSource::Derived => "derived",
+            TokenSource::Estimated => "estimated",
+        }
+    }
+}
+
+impl std::str::FromStr for TokenSource {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "observed" => Ok(TokenSource::Observed),
+            "derived" => Ok(TokenSource::Derived),
+            "estimated" => Ok(TokenSource::Estimated),
+            _ => Err(()),
+        }
+    }
+}
+
 impl std::str::FromStr for Role {
     type Err = ();
 
@@ -45,6 +76,42 @@ pub struct Message {
     pub content: String,
     pub timestamp: Option<i64>,
     pub seq: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawUsageEvent {
+    pub event_key: String,
+    pub event_seq: u32,
+    pub message_seq: Option<u32>,
+    pub timestamp: i64,
+    pub model: String,
+    pub provider: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub token_source: TokenSource,
+    pub parser_version: u32,
+    pub source_path: Option<String>,
+    pub raw_usage_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageEventRecord {
+    pub session_id: String,
+    pub source: String,
+    pub source_id: String,
+    pub event_key: String,
+    pub timestamp: i64,
+    pub model: String,
+    pub provider: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub token_source: String,
 }
 
 #[derive(Debug)]

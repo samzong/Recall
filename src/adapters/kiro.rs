@@ -132,14 +132,14 @@ pub fn parse_kiro_conversation(
         return Ok(None);
     }
 
-    Ok(Some(RawSession {
-        source_id: conversation_id.to_string(),
-        directory: Some(cwd.to_string()),
-        started_at: created_at,
-        updated_at: Some(updated_at),
-        entrypoint: None,
+    Ok(Some(RawSession::search_only(
+        conversation_id.to_string(),
+        Some(cwd.to_string()),
+        created_at,
+        Some(updated_at),
+        None,
         messages,
-    }))
+    )))
 }
 
 fn extract_user_content(user_obj: &Value) -> String {

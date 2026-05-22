@@ -7,6 +7,11 @@ use anyhow::Result;
 use crate::adapters::{RawSession, SyncScanResult, SyncScanStats};
 use crate::db::store::Store;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileScanOptions {
+    pub usage_parser_version: Option<u32>,
+}
+
 pub struct FileScanEntry {
     pub session_id: String,
     pub stat_target: PathBuf,
@@ -24,7 +29,33 @@ where
     I: IntoIterator<Item = FileScanEntry>,
     F: Fn(FileScanEntry, i64) -> Result<Option<RawSession>>,
 {
+    run_file_scan_with_options(
+        store,
+        source_id,
+        since_ts,
+        FileScanOptions::default(),
+        entries,
+        parse_fn,
+    )
+}
+
+pub fn run_file_scan_with_options<I, F>(
+    store: &Store,
+    source_id: &str,
+    since_ts: Option<i64>,
+    options: FileScanOptions,
+    entries: I,
+    parse_fn: F,
+) -> Result<SyncScanResult>
+where
+    I: IntoIterator<Item = FileScanEntry>,
+    F: Fn(FileScanEntry, i64) -> Result<Option<RawSession>>,
+{
     let existing = store.session_meta_map(source_id)?;
+    let usage_state = match options.usage_parser_version {
+        Some(_) => store.usage_state_meta_map(source_id)?,
+        None => Default::default(),
+    };
     let mut sessions = Vec::new();
     let mut stats = SyncScanStats::default();
 
@@ -42,6 +73,11 @@ where
 
         if let Some((old_updated_at, _)) = existing.get(&entry.session_id)
             && *old_updated_at == Some(mtime_ms)
+            && usage_state_is_current(
+                options.usage_parser_version,
+                usage_state.get(&entry.session_id).copied(),
+                mtime_ms,
+            )
         {
             stats.skipped_sessions += 1;
             continue;
@@ -53,6 +89,20 @@ where
     }
 
     Ok(SyncScanResult { sessions, stats })
+}
+
+fn usage_state_is_current(
+    required_parser_version: Option<u32>,
+    state: Option<crate::db::store::UsageSessionStateMeta>,
+    mtime_ms: i64,
+) -> bool {
+    let Some(required_parser_version) = required_parser_version else {
+        return true;
+    };
+    let Some(state) = state else {
+        return false;
+    };
+    state.parser_version >= required_parser_version && state.source_updated_at == Some(mtime_ms)
 }
 
 pub fn stat_mtime_ms(path: &Path) -> Option<i64> {
@@ -104,18 +154,18 @@ mod tests {
     }
 
     fn stub_raw_session(source_id: &str, mtime_ms: i64) -> RawSession {
-        RawSession {
-            source_id: source_id.to_string(),
-            directory: None,
-            started_at: mtime_ms,
-            updated_at: Some(mtime_ms),
-            entrypoint: None,
-            messages: vec![RawMessage {
+        RawSession::search_only(
+            source_id,
+            None,
+            mtime_ms,
+            Some(mtime_ms),
+            None,
+            vec![RawMessage {
                 role: Role::User,
                 content: "hi".to_string(),
                 timestamp: Some(mtime_ms),
             }],
-        }
+        )
     }
 
     #[test]
@@ -170,6 +220,58 @@ mod tests {
         })
         .unwrap();
 
+        assert_eq!(result.sessions.len(), 0);
+        assert_eq!(result.stats.skipped_sessions, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn matching_mtime_reparses_until_usage_state_is_current() {
+        let store = setup_store();
+        let path = temp_file_with_mtime("usage-backfill");
+        let mtime_ms = stat_mtime_ms(&path).unwrap();
+        store.insert_session(&make_session("s1", "sess-usage", Some(mtime_ms), 1)).unwrap();
+
+        let entry = FileScanEntry {
+            session_id: "sess-usage".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+        let result = run_file_scan_with_options(
+            &store,
+            "test-source",
+            None,
+            FileScanOptions { usage_parser_version: Some(1) },
+            vec![entry],
+            |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.stats.skipped_sessions, 0);
+
+        store
+            .persist_usage_events_for_existing_session(
+                "test-source",
+                "sess-usage",
+                &[],
+                1,
+                Some(mtime_ms),
+            )
+            .unwrap();
+        let entry = FileScanEntry {
+            session_id: "sess-usage".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+        let result = run_file_scan_with_options(
+            &store,
+            "test-source",
+            None,
+            FileScanOptions { usage_parser_version: Some(1) },
+            vec![entry],
+            |_, _| panic!("current usage state should skip parsing"),
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
         let _ = fs::remove_file(&path);

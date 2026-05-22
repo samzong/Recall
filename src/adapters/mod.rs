@@ -10,7 +10,7 @@ pub mod kiro;
 pub mod opencode;
 
 use crate::db::store::Store;
-use crate::types::Role;
+use crate::types::{RawUsageEvent, Role};
 
 pub trait SourceAdapter {
     fn id(&self) -> &str;
@@ -18,6 +18,9 @@ pub trait SourceAdapter {
     fn scan(&self) -> anyhow::Result<Vec<RawSession>>;
     fn scan_summary(&self) -> anyhow::Result<Option<SourceScanSummary>> {
         Ok(None)
+    }
+    fn usage_parser_version(&self) -> Option<u32> {
+        None
     }
     fn scan_for_sync(
         &self,
@@ -36,6 +39,36 @@ pub struct RawSession {
     pub updated_at: Option<i64>,
     pub entrypoint: Option<String>,
     pub messages: Vec<RawMessage>,
+    pub usage_events: Vec<RawUsageEvent>,
+    pub usage_parser_version: Option<u32>,
+}
+
+impl RawSession {
+    pub fn search_only(
+        source_id: impl Into<String>,
+        directory: Option<String>,
+        started_at: i64,
+        updated_at: Option<i64>,
+        entrypoint: Option<String>,
+        messages: Vec<RawMessage>,
+    ) -> Self {
+        Self {
+            source_id: source_id.into(),
+            directory,
+            started_at,
+            updated_at,
+            entrypoint,
+            messages,
+            usage_events: Vec::new(),
+            usage_parser_version: None,
+        }
+    }
+
+    pub fn with_usage(mut self, usage_events: Vec<RawUsageEvent>, parser_version: u32) -> Self {
+        self.usage_events = usage_events;
+        self.usage_parser_version = Some(parser_version);
+        self
+    }
 }
 
 pub struct RawMessage {

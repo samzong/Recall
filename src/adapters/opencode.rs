@@ -191,14 +191,14 @@ fn scan_session_messages(
             continue;
         }
 
-        raw_sessions.push(RawSession {
-            source_id: session.id,
-            directory: Some(session.directory),
-            started_at: session.time_created,
-            updated_at: session.time_updated,
-            entrypoint: None,
+        raw_sessions.push(RawSession::search_only(
+            session.id,
+            Some(session.directory),
+            session.time_created,
+            session.time_updated,
+            None,
             messages,
-        });
+        ));
     }
 
     Ok(raw_sessions)

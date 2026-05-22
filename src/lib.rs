@@ -6,4 +6,5 @@ pub mod embedding;
 pub mod semantic;
 pub mod tui;
 pub mod types;
+pub mod usage;
 pub mod utils;

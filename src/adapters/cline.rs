@@ -132,14 +132,14 @@ fn parse_cline_task(entry: FileScanEntry, mtime_ms: i64) -> anyhow::Result<Optio
 
     let directory = extract_directory(&entry.stat_target);
 
-    Ok(Some(RawSession {
-        source_id: entry.session_id,
+    Ok(Some(RawSession::search_only(
+        entry.session_id,
         directory,
         started_at,
-        updated_at: Some(mtime_ms),
-        entrypoint: None,
+        Some(mtime_ms),
+        None,
         messages,
-    }))
+    )))
 }
 
 fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {

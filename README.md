@@ -47,3 +47,7 @@ recall info          # index stats and worker status
 ## License
 
 [MIT](LICENSE)
+
+## Acknowledgements
+
+Thanks to [tokscale](https://github.com/junhoyeo/tokscale) for the usage dashboard reference and token accounting behavior.
