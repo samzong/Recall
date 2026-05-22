@@ -884,42 +884,16 @@ mod tests {
         let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2381";
         let path = sessions_dir.join(format!("rollout-2026-05-05T21-51-57-{uuid}.jsonl"));
         let mut f = fs::File::create(&path).unwrap();
-        writeln!(
-            f,
-            "{}",
-            r#"{"timestamp":"2026-05-05T21:51:57.991Z","type":"session_meta","payload":{"id":"child-session","forked_from_id":"parent-session","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1}}},"model_provider":"openai","agent_nickname":"worker","cwd":"/repo-child"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            r#"{"timestamp":"2026-05-05T21:51:57.992Z","type":"session_meta","payload":{"id":"parent-session","source":"interactive","model_provider":"azure","agent_nickname":"parent","cwd":"/repo-parent"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            r#"{"timestamp":"2026-05-05T21:51:57.994Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":116000,"cached_input_tokens":114000,"output_tokens":1000,"total_tokens":117000},"last_token_usage":{"input_tokens":73000,"cached_input_tokens":72000,"output_tokens":500,"total_tokens":73500}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            r#"{"timestamp":"2026-05-05T21:51:58.947Z","type":"turn_context","payload":{"model":"gpt-5.5","cwd":"/repo-child"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            r#"{"timestamp":"2026-05-05T21:51:58.948Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":116000,"cached_input_tokens":114000,"output_tokens":1000,"total_tokens":117000},"last_token_usage":{"input_tokens":73000,"cached_input_tokens":72000,"output_tokens":500,"total_tokens":73500}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            r#"{"timestamp":"2026-05-05T21:51:59.253Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":117500,"cached_input_tokens":115000,"output_tokens":1200,"reasoning_output_tokens":50,"total_tokens":118700},"last_token_usage":{"input_tokens":1500,"cached_input_tokens":1000,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":1700}}}}"#
-        )
-        .unwrap();
+        for line in [
+            r#"{"timestamp":"2026-05-05T21:51:57.991Z","type":"session_meta","payload":{"id":"child-session","forked_from_id":"parent-session","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1}}},"model_provider":"openai","agent_nickname":"worker","cwd":"/repo-child"}}"#,
+            r#"{"timestamp":"2026-05-05T21:51:57.992Z","type":"session_meta","payload":{"id":"parent-session","source":"interactive","model_provider":"azure","agent_nickname":"parent","cwd":"/repo-parent"}}"#,
+            r#"{"timestamp":"2026-05-05T21:51:57.994Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":116000,"cached_input_tokens":114000,"output_tokens":1000,"total_tokens":117000},"last_token_usage":{"input_tokens":73000,"cached_input_tokens":72000,"output_tokens":500,"total_tokens":73500}}}}"#,
+            r#"{"timestamp":"2026-05-05T21:51:58.947Z","type":"turn_context","payload":{"model":"gpt-5.5","cwd":"/repo-child"}}"#,
+            r#"{"timestamp":"2026-05-05T21:51:58.948Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":116000,"cached_input_tokens":114000,"output_tokens":1000,"total_tokens":117000},"last_token_usage":{"input_tokens":73000,"cached_input_tokens":72000,"output_tokens":500,"total_tokens":73500}}}}"#,
+            r#"{"timestamp":"2026-05-05T21:51:59.253Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":117500,"cached_input_tokens":115000,"output_tokens":1200,"reasoning_output_tokens":50,"total_tokens":118700},"last_token_usage":{"input_tokens":1500,"cached_input_tokens":1000,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":1700}}}}"#,
+        ] {
+            writeln!(f, "{line}").unwrap();
+        }
 
         let raw = parse_codex_session(&path).unwrap().unwrap();
 
@@ -943,30 +917,14 @@ mod tests {
         let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2382";
         let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
         let mut f = fs::File::create(&path).unwrap();
-        writeln!(
-            f,
-            "{}",
-            r#"{"timestamp":"2026-04-13T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            r#"{"timestamp":"2026-04-13T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"plain event fixes prior model as unknown"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            r#"{"timestamp":"2026-04-13T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5-codex"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            r#"{"timestamp":"2026-04-13T10:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15,"cached_input_tokens":3,"output_tokens":5,"reasoning_output_tokens":1},"last_token_usage":{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2,"reasoning_output_tokens":0}}}}"#
-        )
-        .unwrap();
+        for line in [
+            r#"{"timestamp":"2026-04-13T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}}}"#,
+            r#"{"timestamp":"2026-04-13T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"plain event fixes prior model as unknown"}}"#,
+            r#"{"timestamp":"2026-04-13T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5-codex"}}"#,
+            r#"{"timestamp":"2026-04-13T10:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15,"cached_input_tokens":3,"output_tokens":5,"reasoning_output_tokens":1},"last_token_usage":{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2,"reasoning_output_tokens":0}}}}"#,
+        ] {
+            writeln!(f, "{line}").unwrap();
+        }
 
         let raw = parse_codex_session(&path).unwrap().unwrap();
 
