@@ -18,8 +18,7 @@ pub enum AppMode {
     Viewing,
     ExportInput,
     Settings,
-    FilterHotbar,
-    SourcePicker,
+    Filters,
     ConfirmResume,
 }
 
@@ -80,6 +79,8 @@ mod tests {
             source_picker_selected: 0,
             source_picker_selection: Vec::new(),
             source_picker_dirty: false,
+            source_picker_typing: false,
+            filters_editing_source: false,
         }
     }
 
@@ -135,16 +136,51 @@ pub enum PanelFocus {
     Preview,
 }
 
+#[derive(Clone, Copy, PartialEq)]
 pub enum FilterFocus {
     Source,
     Time,
     Sort,
 }
 
+impl FilterFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Source => Self::Time,
+            Self::Time => Self::Sort,
+            Self::Sort => Self::Source,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Source => Self::Sort,
+            Self::Time => Self::Source,
+            Self::Sort => Self::Time,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum SourcePickerRow {
     All,
     Source(usize),
+}
+
+fn source_digit_slot(key: char) -> Option<usize> {
+    match key {
+        '1'..='9' => Some(key as usize - '1' as usize),
+        '0' => Some(9),
+        _ => None,
+    }
+}
+
+fn source_digit_key(slot: usize) -> Option<char> {
+    match slot {
+        0..=8 => char::from_digit((slot + 1) as u32, 10),
+        9 => Some('0'),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -197,6 +233,8 @@ pub struct App {
     pub source_picker_selected: usize,
     pub source_picker_selection: Vec<String>,
     pub source_picker_dirty: bool,
+    pub source_picker_typing: bool,
+    pub filters_editing_source: bool,
 }
 
 impl App {
@@ -251,6 +289,8 @@ impl App {
             source_picker_selected: 0,
             source_picker_selection: Vec::new(),
             source_picker_dirty: false,
+            source_picker_typing: false,
+            filters_editing_source: false,
         };
         app.reset_search_defaults();
         app.update_scope_metrics(store);
@@ -355,8 +395,7 @@ impl App {
             AppMode::Viewing => self.handle_viewing_key(key),
             AppMode::ExportInput => self.handle_export_key(key),
             AppMode::Settings => self.handle_settings_key(key, store, engine, provider),
-            AppMode::FilterHotbar => self.handle_filter_hotbar_key(key, store, engine, provider),
-            AppMode::SourcePicker => self.handle_source_picker_key(key, store, engine, provider),
+            AppMode::Filters => self.handle_filters_key(key, store, engine, provider),
             AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
         }
     }
@@ -382,8 +421,11 @@ impl App {
             AppMode::Settings if self.settings_selected > 0 => {
                 self.settings_selected -= 1;
             }
-            AppMode::SourcePicker if self.source_picker_selected > 0 => {
+            AppMode::Filters if self.filters_editing_source && self.source_picker_selected > 0 => {
                 self.source_picker_selected -= 1;
+            }
+            AppMode::Filters if !self.filters_editing_source => {
+                self.filter_focus = self.filter_focus.previous();
             }
             _ => {}
         }
@@ -410,10 +452,14 @@ impl App {
             AppMode::Settings if self.settings_selected + 1 < self.settings_row_count() => {
                 self.settings_selected += 1;
             }
-            AppMode::SourcePicker
-                if self.source_picker_selected + 1 < self.source_picker_rows().len() =>
+            AppMode::Filters
+                if self.filters_editing_source
+                    && self.source_picker_selected + 1 < self.source_picker_rows().len() =>
             {
                 self.source_picker_selected += 1;
+            }
+            AppMode::Filters if !self.filters_editing_source => {
+                self.filter_focus = self.filter_focus.next();
             }
             _ => {}
         }
@@ -423,11 +469,11 @@ impl App {
         &mut self,
         key: KeyEvent,
         store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
+        _engine: &SearchEngine,
+        _provider: &mut Option<EmbeddingProvider>,
     ) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
-            self.mode = AppMode::FilterHotbar;
+            self.open_filters();
             return;
         }
 
@@ -511,7 +557,7 @@ impl App {
                 self.enter_viewing(store);
             }
             KeyCode::Tab => {
-                self.cycle_filter(store, engine, provider);
+                self.open_filters();
             }
             _ => {}
         }
@@ -745,68 +791,85 @@ impl App {
         }
     }
 
-    fn handle_filter_hotbar_key(
+    fn handle_filters_key(
         &mut self,
         key: KeyEvent,
         store: &Store,
         engine: &SearchEngine,
         provider: &mut Option<EmbeddingProvider>,
     ) {
+        if self.filters_editing_source {
+            self.handle_source_picker_key(key, store, engine, provider);
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.mode = AppMode::Search;
             }
-            KeyCode::Char('/') => {
-                self.open_source_picker();
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.source_filter_selection.clear();
-                self.apply_filter_change(store, engine, provider);
-            }
-            KeyCode::Char(c) if ('1'..='9').contains(&c) => {
-                let slot = c.to_digit(10).unwrap_or(1) as usize - 1;
-                let source_id = {
-                    let enabled = self.enabled_sources();
-                    enabled.get(slot).map(|(id, _)| (*id).clone())
-                };
-
-                if let Some(source_id) = source_id {
-                    self.source_filter_selection = vec![source_id];
-                    self.apply_filter_change(store, engine, provider);
-                } else {
-                    self.status_message = Some(format!("No source bound to {c}"));
-                    self.mode = AppMode::Search;
-                }
-            }
-            KeyCode::Char('d') | KeyCode::Char('D') => {
-                self.time_filter = TimeRange::Today;
-                self.apply_filter_change(store, engine, provider);
-            }
-            KeyCode::Char('w') | KeyCode::Char('W') => {
-                self.time_filter = TimeRange::Week;
-                self.apply_filter_change(store, engine, provider);
-            }
-            KeyCode::Char('m') | KeyCode::Char('M') => {
-                self.time_filter = TimeRange::Month;
-                self.apply_filter_change(store, engine, provider);
-            }
-            KeyCode::Char('l') | KeyCode::Char('L') => {
-                self.time_filter = TimeRange::All;
-                self.apply_filter_change(store, engine, provider);
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.sort_order = SortOrder::Relevance;
-                self.apply_filter_change(store, engine, provider);
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.sort_order = SortOrder::Newest;
-                self.apply_filter_change(store, engine, provider);
+            KeyCode::Up => self.handle_scroll_up(store),
+            KeyCode::Down => self.handle_scroll_down(store),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.activate_filter_row(store, engine, provider);
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 self.clear_filters();
-                self.apply_filter_change(store, engine, provider);
+                self.refresh_after_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.time_filter = TimeRange::Today;
+                self.refresh_after_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('w') | KeyCode::Char('W') => {
+                self.time_filter = TimeRange::Week;
+                self.refresh_after_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                self.time_filter = TimeRange::Month;
+                self.refresh_after_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.time_filter = TimeRange::All;
+                self.refresh_after_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.sort_order = SortOrder::Relevance;
+                self.refresh_after_filter_change(store, engine, provider);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.sort_order = SortOrder::Newest;
+                self.refresh_after_filter_change(store, engine, provider);
             }
             _ => {}
+        }
+    }
+
+    fn activate_filter_row(
+        &mut self,
+        store: &Store,
+        engine: &SearchEngine,
+        provider: &mut Option<EmbeddingProvider>,
+    ) {
+        match self.filter_focus {
+            FilterFocus::Source => {
+                self.open_source_picker();
+            }
+            FilterFocus::Time => {
+                self.time_filter = match self.time_filter {
+                    TimeRange::All => TimeRange::Today,
+                    TimeRange::Today => TimeRange::Week,
+                    TimeRange::Week => TimeRange::Month,
+                    TimeRange::Month => TimeRange::All,
+                };
+                self.refresh_after_filter_change(store, engine, provider);
+            }
+            FilterFocus::Sort => {
+                self.sort_order = match self.sort_order {
+                    SortOrder::Relevance => SortOrder::Newest,
+                    SortOrder::Newest => SortOrder::Relevance,
+                };
+                self.refresh_after_filter_change(store, engine, provider);
+            }
         }
     }
 
@@ -821,22 +884,38 @@ impl App {
             self.source_picker_query.clear();
             self.source_picker_cursor = 0;
             self.source_picker_selected = 0;
+            self.source_picker_typing = true;
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+            self.source_picker_selection.clear();
+            self.source_picker_dirty = true;
             return;
         }
 
         match key.code {
             KeyCode::Esc => {
-                self.close_source_picker();
+                if self.source_picker_typing {
+                    self.source_picker_typing = false;
+                } else {
+                    self.close_source_picker();
+                }
             }
             KeyCode::Enter => {
                 self.apply_source_picker(store, engine, provider);
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ') if !self.source_picker_typing => {
                 self.toggle_source_picker_row();
             }
+            KeyCode::Char('/') if !self.source_picker_typing => {
+                self.source_picker_typing = true;
+            }
+            KeyCode::Char(c)
+                if !self.source_picker_typing && self.toggle_source_picker_digit(c) => {}
             KeyCode::Up => self.handle_scroll_up(store),
             KeyCode::Down => self.handle_scroll_down(store),
-            KeyCode::Backspace if self.source_picker_cursor > 0 => {
+            KeyCode::Backspace if self.source_picker_typing && self.source_picker_cursor > 0 => {
                 let prev = self.source_picker_query[..self.source_picker_cursor]
                     .char_indices()
                     .last()
@@ -847,7 +926,7 @@ impl App {
                 self.source_picker_selected = 0;
                 self.clamp_source_picker_selected();
             }
-            KeyCode::Left if self.source_picker_cursor > 0 => {
+            KeyCode::Left if self.source_picker_typing && self.source_picker_cursor > 0 => {
                 let prev = self.source_picker_query[..self.source_picker_cursor]
                     .char_indices()
                     .last()
@@ -855,7 +934,10 @@ impl App {
                     .unwrap_or(0);
                 self.source_picker_cursor = prev;
             }
-            KeyCode::Right if self.source_picker_cursor < self.source_picker_query.len() => {
+            KeyCode::Right
+                if self.source_picker_typing
+                    && self.source_picker_cursor < self.source_picker_query.len() =>
+            {
                 let next = self.source_picker_query[self.source_picker_cursor..]
                     .char_indices()
                     .nth(1)
@@ -863,13 +945,14 @@ impl App {
                     .unwrap_or(self.source_picker_query.len());
                 self.source_picker_cursor = next;
             }
-            KeyCode::Home => {
+            KeyCode::Home if self.source_picker_typing => {
                 self.source_picker_cursor = 0;
             }
-            KeyCode::End => {
+            KeyCode::End if self.source_picker_typing => {
                 self.source_picker_cursor = self.source_picker_query.len();
             }
             KeyCode::Char(c) => {
+                self.source_picker_typing = true;
                 self.source_picker_query.insert(self.source_picker_cursor, c);
                 self.source_picker_cursor += c.len_utf8();
                 self.source_picker_selected = 0;
@@ -879,11 +962,18 @@ impl App {
         }
     }
 
+    fn open_filters(&mut self) {
+        self.mode = AppMode::Filters;
+        self.filters_editing_source = false;
+    }
+
     fn open_source_picker(&mut self) {
-        self.mode = AppMode::SourcePicker;
+        self.mode = AppMode::Filters;
+        self.filters_editing_source = true;
         self.source_picker_query.clear();
         self.source_picker_cursor = 0;
         self.source_picker_selected = 0;
+        self.source_picker_typing = false;
         self.source_picker_selection =
             self.normalized_source_selection(&self.source_filter_selection);
         if let Some(selected_source) = self.source_picker_selection.first() {
@@ -904,10 +994,11 @@ impl App {
     }
 
     fn close_source_picker(&mut self) {
-        self.mode = AppMode::Search;
+        self.filters_editing_source = false;
         self.source_picker_query.clear();
         self.source_picker_cursor = 0;
         self.source_picker_selected = 0;
+        self.source_picker_typing = false;
         self.source_picker_selection.clear();
         self.source_picker_dirty = false;
     }
@@ -923,9 +1014,11 @@ impl App {
         self.source_picker_query.clear();
         self.source_picker_cursor = 0;
         self.source_picker_selected = 0;
+        self.source_picker_typing = false;
         self.source_picker_selection.clear();
         self.source_picker_dirty = false;
-        self.apply_filter_change(store, engine, provider);
+        self.filters_editing_source = false;
+        self.refresh_after_filter_change(store, engine, provider);
     }
 
     fn commit_source_picker_filter(&mut self) {
@@ -977,6 +1070,43 @@ impl App {
         self.source_picker_dirty = true;
     }
 
+    fn toggle_source_picker_digit(&mut self, key: char) -> bool {
+        let Some(slot) = source_digit_slot(key) else {
+            return false;
+        };
+        let Some(row_index) = self
+            .source_picker_rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, SourcePickerRow::Source(_)))
+            .nth(slot)
+            .map(|(index, _)| index)
+        else {
+            return false;
+        };
+
+        self.source_picker_selected = row_index;
+        self.toggle_source_picker_row();
+        true
+    }
+
+    pub fn source_picker_row_key(&self, row_index: usize) -> Option<char> {
+        let row = self.source_picker_rows().get(row_index).copied()?;
+        if !matches!(row, SourcePickerRow::Source(_)) {
+            return None;
+        }
+
+        let source_slot = self
+            .source_picker_rows()
+            .iter()
+            .take(row_index + 1)
+            .filter(|row| matches!(row, SourcePickerRow::Source(_)))
+            .count()
+            .saturating_sub(1);
+
+        source_digit_key(source_slot)
+    }
+
     fn clear_filters(&mut self) {
         self.source_filter_selection.clear();
         self.time_filter = TimeRange::All;
@@ -984,13 +1114,12 @@ impl App {
         self.filter_focus = FilterFocus::Source;
     }
 
-    fn apply_filter_change(
+    fn refresh_after_filter_change(
         &mut self,
         store: &Store,
         engine: &SearchEngine,
         provider: &mut Option<EmbeddingProvider>,
     ) {
-        self.mode = AppMode::Search;
         self.update_scope_metrics(store);
         if self.query.is_empty() {
             self.load_recent(store);
@@ -1124,10 +1253,6 @@ impl App {
 
     pub fn enabled_sources(&self) -> Vec<&(String, String)> {
         self.all_sources.iter().filter(|(id, _)| self.config.is_source_enabled(id)).collect()
-    }
-
-    pub fn source_hotbar_sources(&self) -> Vec<&(String, String)> {
-        self.enabled_sources().into_iter().take(9).collect()
     }
 
     pub fn source_is_selected(&self, source_id: &str) -> bool {
@@ -1428,59 +1553,6 @@ impl App {
     fn apply_sort(&self, results: &mut [SearchResult]) {
         if self.sort_order == SortOrder::Newest {
             results.sort_by_key(|b| std::cmp::Reverse(b.session.started_at));
-        }
-    }
-
-    fn cycle_filter(
-        &mut self,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
-        match self.filter_focus {
-            FilterFocus::Source => {
-                let next_source = {
-                    let enabled = self.enabled_sources();
-                    if self.source_filter_selection.len() == 1 {
-                        enabled
-                            .iter()
-                            .position(|(id, _)| id == &self.source_filter_selection[0])
-                            .and_then(|index| enabled.get(index + 1).map(|(id, _)| (*id).clone()))
-                    } else {
-                        enabled.first().map(|(id, _)| (*id).clone())
-                    }
-                };
-
-                if let Some(source_id) = next_source {
-                    self.source_filter_selection = vec![source_id];
-                } else {
-                    self.source_filter_selection.clear();
-                }
-                self.filter_focus = FilterFocus::Time;
-            }
-            FilterFocus::Time => {
-                self.time_filter = match self.time_filter {
-                    TimeRange::All => TimeRange::Today,
-                    TimeRange::Today => TimeRange::Week,
-                    TimeRange::Week => TimeRange::Month,
-                    TimeRange::Month => TimeRange::All,
-                };
-                self.filter_focus = FilterFocus::Sort;
-            }
-            FilterFocus::Sort => {
-                self.sort_order = match self.sort_order {
-                    SortOrder::Relevance => SortOrder::Newest,
-                    SortOrder::Newest => SortOrder::Relevance,
-                };
-                self.filter_focus = FilterFocus::Source;
-            }
-        }
-        if !self.query.is_empty() {
-            self.update_scope_metrics(store);
-            self.do_search(store, engine, provider);
-        } else {
-            self.update_scope_metrics(store);
-            self.load_recent(store);
         }
     }
 }

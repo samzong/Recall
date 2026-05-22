@@ -5,9 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::db::search::TimeRange;
 use crate::tui::app::{
-    App, AppMode, PanelFocus, ResumeOrigin, SanitizedLine, SortOrder, SourcePickerRow,
+    App, AppMode, FilterFocus, PanelFocus, ResumeOrigin, SanitizedLine, SourcePickerRow,
 };
 use crate::types::{MatchSource, Role};
 
@@ -63,13 +62,9 @@ pub fn render(f: &mut Frame, app: &App) {
     match app.mode {
         AppMode::Search => render_search(f, app),
         AppMode::Viewing => render_viewing(f, app),
-        AppMode::FilterHotbar => {
+        AppMode::Filters => {
             render_search(f, app);
-            render_filter_hotbar(f, app);
-        }
-        AppMode::SourcePicker => {
-            render_search(f, app);
-            render_source_picker(f, app);
+            render_filter_picker(f, app);
         }
         AppMode::ExportInput => {
             render_viewing(f, app);
@@ -166,60 +161,76 @@ fn render_filters(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn hotbar_item(label: String, active: bool) -> Span<'static> {
-    let style = if active {
-        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+fn render_filter_picker(f: &mut Frame, app: &App) {
+    if app.filters_editing_source {
+        render_source_picker(f, app);
     } else {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-    };
-    Span::styled(label, style)
-}
-
-fn hotbar_text(text: &'static str) -> Span<'static> {
-    Span::styled(text, Style::default().fg(Color::DarkGray))
-}
-
-fn render_filter_hotbar(f: &mut Frame, app: &App) {
-    let area = f.area();
-    let height = area.height.min(2);
-    let row = Rect::new(area.x, area.bottom().saturating_sub(height), area.width, height);
-
-    let mut source_spans = vec![Span::styled(
-        " Source: ",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )];
-
-    source_spans.push(hotbar_item("a All".to_string(), app.source_filter_selection.is_empty()));
-    source_spans.push(Span::raw("  "));
-    for (index, (source_id, label)) in app.source_hotbar_sources().iter().enumerate() {
-        let key = index + 1;
-        source_spans.push(hotbar_item(format!("{key} {label}"), app.source_is_selected(source_id)));
-        source_spans.push(Span::raw(" "));
+        render_filter_overview(f, app);
     }
-    source_spans.push(hotbar_text(" / More  "));
-    source_spans.push(hotbar_item("c Clear".to_string(), false));
+}
 
-    let mode_spans = vec![
-        Span::styled(" Time: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        hotbar_item("d Today".to_string(), app.time_filter == TimeRange::Today),
-        Span::raw(" "),
-        hotbar_item("w 7d".to_string(), app.time_filter == TimeRange::Week),
-        Span::raw(" "),
-        hotbar_item("m 30d".to_string(), app.time_filter == TimeRange::Month),
-        Span::raw(" "),
-        hotbar_item("l All".to_string(), app.time_filter == TimeRange::All),
-        hotbar_text(" | Sort: "),
-        hotbar_item("r Rel".to_string(), app.sort_order == SortOrder::Relevance),
-        Span::raw(" "),
-        hotbar_item("n New".to_string(), app.sort_order == SortOrder::Newest),
-        hotbar_text(" | "),
-        hotbar_item("Esc".to_string(), false),
-        hotbar_text(" cancel"),
-    ];
+fn render_filter_overview(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let width = area.width.min(68);
+    let available_height = area.height.saturating_sub(2);
+    let height = if available_height == 0 { 1 } else { available_height.min(9) };
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
 
-    let lines = vec![Line::from(source_spans), Line::from(mode_spans)];
-    f.render_widget(Clear, row);
-    f.render_widget(Paragraph::new(lines), row);
+    let block = Block::default()
+        .title(" Filters ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let mut lines = vec![Line::from("")];
+    lines.push(filter_overview_line(
+        "Source",
+        &app.source_filter_label(),
+        "Enter",
+        app.filter_focus == FilterFocus::Source,
+    ));
+    lines.push(filter_overview_line(
+        "Time Range",
+        app.time_filter_label(),
+        "d/w/m/l",
+        app.filter_focus == FilterFocus::Time,
+    ));
+    lines.push(filter_overview_line(
+        "Sort",
+        app.sort_label(),
+        "r/n",
+        app.filter_focus == FilterFocus::Sort,
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
+        Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter/Space", Style::default().fg(Color::Yellow)),
+        Span::styled(" edit/toggle  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("c", Style::default().fg(Color::Yellow)),
+        Span::styled(" clear  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::styled(" close", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(Clear, popup);
+    f.render_widget(widget, popup);
+}
+
+fn filter_overview_line(
+    label: &'static str,
+    value: &str,
+    hint: &'static str,
+    selected: bool,
+) -> Line<'static> {
+    let style = if selected {
+        Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    Line::from(Span::styled(format!(" {label:<12} {value:<22} {hint}"), style))
 }
 
 fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
@@ -489,23 +500,22 @@ fn render_source_picker(f: &mut Frame, app: &App) {
     let area = f.area();
     let width = area.width.min(76);
     let rows = app.source_picker_rows();
-    let desired_height = rows.len() as u16 + 6;
+    let desired_height = rows.len() as u16 + 7;
     let height = desired_height.clamp(8, area.height.saturating_sub(2).max(8));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
 
     let block = Block::default()
-        .title(" Filter Sources ")
+        .title(" Filters > Source ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Black));
+        .border_style(Style::default().fg(Color::Cyan));
 
-    let selected_style = Style::default().bg(Color::Yellow).fg(Color::Black);
+    let selected_style = Style::default().bg(Color::Cyan).fg(Color::Black);
     let normal_style = Style::default().fg(Color::White);
     let muted_style = Style::default().fg(Color::DarkGray);
 
-    let visible_rows = height.saturating_sub(6) as usize;
+    let visible_rows = height.saturating_sub(7) as usize;
     let start = if visible_rows == 0 || app.source_picker_selected < visible_rows {
         0
     } else {
@@ -514,9 +524,14 @@ fn render_source_picker(f: &mut Frame, app: &App) {
     let end = (start + visible_rows).min(rows.len());
 
     let mut lines = Vec::new();
+    let filter_value = if app.source_picker_query.is_empty() && !app.source_picker_typing {
+        Span::styled("press / to filter", muted_style)
+    } else {
+        Span::styled(app.source_picker_query.clone(), normal_style)
+    };
     lines.push(Line::from(vec![
-        Span::styled(" > ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(app.source_picker_query.clone(), normal_style),
+        Span::styled(" Filter: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        filter_value,
     ]));
     lines.push(Line::from(""));
 
@@ -531,7 +546,7 @@ fn render_source_picker(f: &mut Frame, app: &App) {
             let text = match *row {
                 SourcePickerRow::All => {
                     let marker = if app.source_picker_selection.is_empty() { "(*)" } else { "( )" };
-                    format!(" {marker} All enabled sources")
+                    format!(" {marker}      All enabled sources")
                 }
                 SourcePickerRow::Source(index) => {
                     let Some((source_id, label)) = app.all_sources.get(index) else {
@@ -539,7 +554,10 @@ fn render_source_picker(f: &mut Frame, app: &App) {
                     };
                     let marker =
                         if app.source_is_selected_in_picker(source_id) { "[x]" } else { "[ ]" };
-                    format!(" {marker} {label} ({source_id})")
+                    match app.source_picker_row_key(row_index) {
+                        Some(key) => format!(" {marker} [{key}] {label} ({source_id})"),
+                        None => format!(" {marker}     {label} ({source_id})"),
+                    }
                 }
             };
             lines.push(Line::from(Span::styled(text, style)));
@@ -548,24 +566,34 @@ fn render_source_picker(f: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(" Space", Style::default().fg(Color::Yellow)),
-        Span::styled(" multi-select  ", muted_style),
+        Span::styled(" 1-9/0", Style::default().fg(Color::Yellow)),
+        Span::styled(" toggle  ", muted_style),
+        Span::styled("/", Style::default().fg(Color::Yellow)),
+        Span::styled(" filter  ", muted_style),
+        Span::styled("Space", Style::default().fg(Color::Yellow)),
+        Span::styled(" current  ", muted_style),
         Span::styled("Enter", Style::default().fg(Color::Yellow)),
         Span::styled(" apply  ", muted_style),
-        Span::styled("Ctrl+U", Style::default().fg(Color::Yellow)),
-        Span::styled(" clear input  ", muted_style),
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
-        Span::styled(" cancel", muted_style),
+        Span::styled(" back", muted_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Ctrl+A", Style::default().fg(Color::Yellow)),
+        Span::styled(" all  ", muted_style),
+        Span::styled("Ctrl+U", Style::default().fg(Color::Yellow)),
+        Span::styled(" clear input", muted_style),
     ]));
 
     let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(Clear, popup);
     f.render_widget(widget, popup);
 
-    let cursor_x = popup.x
-        + 4
-        + UnicodeWidthStr::width(&app.source_picker_query[..app.source_picker_cursor]) as u16;
-    f.set_cursor_position((cursor_x.min(popup.right().saturating_sub(2)), popup.y + 1));
+    if app.source_picker_typing {
+        let cursor_x = popup.x
+            + 9
+            + UnicodeWidthStr::width(&app.source_picker_query[..app.source_picker_cursor]) as u16;
+        f.set_cursor_position((cursor_x.min(popup.right().saturating_sub(2)), popup.y + 1));
+    }
 }
 
 fn render_export_input(f: &mut Frame, app: &App) {
