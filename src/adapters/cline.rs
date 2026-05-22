@@ -217,9 +217,10 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
                 }
             }
             "ask" => {
+                // "ask" is AI's response to user (e.g., plan_mode_respond, completion_result)
                 if let Some(text) = extract_text(&msg) {
                     let timestamp = msg.get("ts").and_then(|v| v.as_i64());
-                    result.push(RawMessage { role: Role::User, content: text, timestamp });
+                    result.push(RawMessage { role: Role::Assistant, content: text, timestamp });
                 }
             }
             "question" => {
