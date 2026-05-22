@@ -196,11 +196,7 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
                                 continue;
                             }
                             let timestamp = msg.get("ts").and_then(|v| v.as_i64());
-                            result.push(RawMessage {
-                                role: Role::Assistant,
-                                content,
-                                timestamp,
-                            });
+                            result.push(RawMessage { role: Role::Assistant, content, timestamp });
                         }
                     }
                     "reasoning" | "command" | "completion_result" | "task_progress" => {
@@ -228,7 +224,9 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
             }
             "question" => {
                 // AI asking user a question, e.g., {"type": "question", "question": "请问你xxxx"}
-                if let Some(text) = msg.get("question").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                if let Some(text) =
+                    msg.get("question").and_then(|v| v.as_str()).map(|s| s.to_string())
+                {
                     let timestamp = msg.get("ts").and_then(|v| v.as_i64());
                     result.push(RawMessage { role: Role::Assistant, content: text, timestamp });
                 }
@@ -281,12 +279,11 @@ fn extract_directory(messages_path: &Path) -> Option<String> {
     let content = fs::read_to_string(&metadata_path).ok()?;
     let meta: Value = serde_json::from_str(&content).ok()?;
     let files = meta.get("files_in_context").and_then(|v| v.as_array())?;
-    if let Some(first_file) = files.first() {
-        if let Some(path_str) = first_file.get("path").and_then(|v| v.as_str()) {
-            if let Some(parent) = Path::new(path_str).parent() {
-                return Some(parent.to_string_lossy().to_string());
-            }
-        }
+    if let Some(first_file) = files.first()
+        && let Some(path_str) = first_file.get("path").and_then(|v| v.as_str())
+        && let Some(parent) = Path::new(path_str).parent()
+    {
+        return Some(parent.to_string_lossy().to_string());
     }
     None
 }
