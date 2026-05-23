@@ -8,10 +8,11 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SourceScanSummary, SyncScanResult,
     SyncScanStats,
 };
-use crate::db::store::Store;
-use crate::types::Role;
+use crate::db::store::{Store, UsageSessionStateMeta};
+use crate::types::{RawUsageEvent, Role, TokenSource};
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
+const USAGE_PARSER_VERSION: u32 = 1;
 const PARSED_PART_FILTER_SQL: &str = "
     json_valid(m.data)
     AND json_valid(p.data)
@@ -49,6 +50,10 @@ impl SourceAdapter for OpenCodeAdapter {
             program: "opencode".to_string(),
             args: vec!["--session".to_string(), source_id.to_string()],
         })
+    }
+
+    fn usage_parser_version(&self) -> Option<u32> {
+        Some(USAGE_PARSER_VERSION)
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
@@ -179,26 +184,32 @@ fn scan_session_messages(
 
     let session_ids: Vec<String> = sessions.iter().map(|session| session.id.clone()).collect();
     let mut session_messages: HashMap<String, Vec<RawMessage>> = HashMap::new();
+    let mut session_usage_events: HashMap<String, Vec<RawUsageEvent>> = HashMap::new();
 
     for chunk in session_ids.chunks(MAX_SQL_VARS_PER_BATCH) {
         load_message_chunk(conn, chunk, &mut session_messages)?;
+        load_usage_chunk(conn, chunk, &mut session_usage_events)?;
     }
 
     let mut raw_sessions = Vec::new();
     for session in sessions {
         let messages = session_messages.remove(&session.id).unwrap_or_default();
-        if messages.is_empty() {
+        let usage_events = session_usage_events.remove(&session.id).unwrap_or_default();
+        if messages.is_empty() && usage_events.is_empty() {
             continue;
         }
 
-        raw_sessions.push(RawSession::search_only(
-            session.id,
-            Some(session.directory),
-            session.time_created,
-            session.time_updated,
-            None,
-            messages,
-        ));
+        raw_sessions.push(
+            RawSession::search_only(
+                session.id,
+                Some(session.directory),
+                session.time_created,
+                session.time_updated,
+                None,
+                messages,
+            )
+            .with_usage(usage_events, USAGE_PARSER_VERSION),
+        );
     }
 
     Ok(raw_sessions)
@@ -245,6 +256,101 @@ fn load_message_chunk(
     }
 
     Ok(())
+}
+
+fn load_usage_chunk(
+    conn: &Connection,
+    session_ids: &[String],
+    session_usage_events: &mut HashMap<String, Vec<RawUsageEvent>>,
+) -> anyhow::Result<()> {
+    let placeholders = std::iter::repeat_n("?", session_ids.len()).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT CAST(id AS TEXT), session_id, data, time_created
+         FROM message
+         WHERE session_id IN ({placeholders})
+           AND json_valid(data)
+           AND json_extract(data, '$.role') = 'assistant'
+           AND json_type(data, '$.tokens') = 'object'
+         ORDER BY time_created, id"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (message_id, session_id, data, timestamp) = row?;
+        let events = session_usage_events.entry(session_id).or_default();
+        if let Some(event) = parse_usage_event(&message_id, &data, timestamp, events.len() as u32) {
+            events.push(event);
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_usage_event(
+    message_id: &str,
+    message_data: &str,
+    timestamp: i64,
+    event_seq: u32,
+) -> Option<RawUsageEvent> {
+    let message: Value = serde_json::from_str(message_data).ok()?;
+    let tokens = message.get("tokens")?;
+    let provider = message
+        .get("providerID")
+        .and_then(|provider| provider.as_str())
+        .filter(|provider| !provider.trim().is_empty())
+        .unwrap_or("unknown");
+    let model = message
+        .get("modelID")
+        .and_then(|model| model.as_str())
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or("unknown");
+
+    Some(RawUsageEvent {
+        event_key: format!("message:{message_id}"),
+        event_seq,
+        message_seq: None,
+        timestamp,
+        model: model.to_string(),
+        provider: provider.to_string(),
+        input_tokens: token_count(tokens, "input"),
+        output_tokens: token_count(tokens, "output"),
+        cache_read_tokens: cache_token_count(tokens, "read"),
+        cache_write_tokens: cache_token_count(tokens, "write"),
+        reasoning_tokens: token_count(tokens, "reasoning"),
+        token_source: TokenSource::Observed,
+        parser_version: USAGE_PARSER_VERSION,
+        source_path: None,
+        raw_usage_json: Some(
+            serde_json::json!({
+                "providerID": provider,
+                "modelID": model,
+                "tokens": tokens,
+            })
+            .to_string(),
+        ),
+    })
+}
+
+fn token_count(tokens: &Value, key: &str) -> i64 {
+    tokens.get(key).and_then(|value| value.as_i64()).unwrap_or(0).max(0)
+}
+
+fn cache_token_count(tokens: &Value, key: &str) -> i64 {
+    tokens
+        .get("cache")
+        .and_then(|cache| cache.get(key))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0)
+        .max(0)
 }
 
 fn load_message_counts(
@@ -316,6 +422,7 @@ fn scan_for_sync_conn(
     let filtered_sessions = count_filtered_sessions(conn, since_ts)?;
     let sessions = load_session_rows(conn, since_ts)?;
     let existing = store.session_meta_map(source_id)?;
+    let usage_state = store.usage_state_meta_map(source_id)?;
     let current_counts = load_message_counts(
         conn,
         &sessions.iter().map(|session| session.id.clone()).collect::<Vec<_>>(),
@@ -327,7 +434,12 @@ fn scan_for_sync_conn(
     for session in sessions {
         if let Some(&(old_updated_at, old_message_count)) = existing.get(&session.id) {
             let current_message_count = current_counts.get(&session.id).copied().unwrap_or(0);
-            if session.time_updated == old_updated_at && current_message_count == old_message_count
+            if session.time_updated == old_updated_at
+                && current_message_count == old_message_count
+                && usage_state_is_current(
+                    usage_state.get(&session.id).copied(),
+                    session.time_updated,
+                )
             {
                 stats.skipped_sessions += 1;
                 continue;
@@ -338,6 +450,15 @@ fn scan_for_sync_conn(
 
     let sessions = scan_session_messages(conn, candidates)?;
     Ok(SyncScanResult { sessions, stats })
+}
+
+fn usage_state_is_current(
+    state: Option<UsageSessionStateMeta>,
+    source_updated_at: Option<i64>,
+) -> bool {
+    state.is_some_and(|state| {
+        state.parser_version >= USAGE_PARSER_VERSION && state.source_updated_at == source_updated_at
+    })
 }
 
 #[cfg(test)]
@@ -430,6 +551,18 @@ mod tests {
         .unwrap();
     }
 
+    fn mark_usage_current(store: &Store, source_id: &str, updated_at: Option<i64>) {
+        store
+            .persist_usage_events_for_existing_session(
+                "opencode",
+                source_id,
+                &[],
+                USAGE_PARSER_VERSION,
+                updated_at,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn incremental_scan_skips_sessions_with_matching_updated_at_and_message_count() {
         let (path, conn) = setup_opencode_db();
@@ -437,6 +570,7 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
+        mark_usage_current(&store, "s1", Some(200));
 
         let result = scan_for_sync_conn(&conn, &store, None, "opencode").unwrap();
         assert!(result.sessions.is_empty());
@@ -475,6 +609,7 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
         store.insert_session(&make_session("local-s2", "s2", Some(150), 1)).unwrap();
+        mark_usage_current(&store, "s2", Some(150));
 
         let result = scan_for_sync_conn(&conn, &store, None, "opencode").unwrap();
         assert_eq!(result.stats.skipped_sessions, 1);
