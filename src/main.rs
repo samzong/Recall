@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::info;
@@ -646,37 +648,49 @@ fn cmd_usage(json: bool, source_filter: Option<&str>, time_filter: Option<&str>)
         return Ok(());
     }
 
-    println!("Usage");
-    println!("  Total tokens  {}", format_usage_number(report.summary.tokens.total_tokens));
-    println!("  Sessions      {}", report.summary.sessions);
+    print!("{}", format_usage_report_text(&report));
+
+    Ok(())
+}
+
+fn format_usage_report_text(report: &usage::UsageReport) -> String {
+    let mut out = String::new();
+    writeln!(out, "Usage").unwrap();
+    writeln!(out, "  Total tokens  {}", format_usage_number(report.summary.tokens.total_tokens))
+        .unwrap();
+    writeln!(out, "  Sessions      {}", report.summary.sessions).unwrap();
 
     if !report.by_source.is_empty() {
-        println!();
-        println!("By source");
+        writeln!(out).unwrap();
+        writeln!(out, "By source").unwrap();
         for source in report.by_source.iter().take(10) {
-            println!(
+            writeln!(
+                out,
                 "  {:<14} {:>12} tokens  {:>4} sessions",
                 source.source,
                 format_usage_number(source.tokens.total_tokens),
                 source.sessions
-            );
+            )
+            .unwrap();
         }
     }
 
     if !report.by_model.is_empty() {
-        println!();
-        println!("By model");
+        writeln!(out).unwrap();
+        writeln!(out, "By model").unwrap();
         for model in report.by_model.iter().take(10) {
-            println!(
-                "  {:<12} {:<18} {:>12} tokens",
+            writeln!(
+                out,
+                "  {:<12} {:<24} {:>12} tokens",
                 model.source,
-                truncate_usage_label(&model.model, 18),
+                truncate_usage_label(&model.model, 24),
                 format_usage_number(model.tokens.total_tokens)
-            );
+            )
+            .unwrap();
         }
     }
 
-    Ok(())
+    out
 }
 
 fn resolve_source_filter(

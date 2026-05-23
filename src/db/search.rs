@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use chrono::{Local, TimeZone};
 use rusqlite::Connection;
 
 use crate::types::{MatchSource, SearchResult, Session};
@@ -25,11 +26,18 @@ pub enum TimeRange {
 
 impl TimeRange {
     pub fn millis_ago(&self) -> Option<i64> {
-        let now = chrono::Utc::now().timestamp_millis();
+        self.cutoff_millis_at(Local::now())
+    }
+
+    fn cutoff_millis_at(&self, now: chrono::DateTime<Local>) -> Option<i64> {
         match self {
-            TimeRange::Today => Some(now - 24 * 3600 * 1000),
-            TimeRange::Week => Some(now - 7 * 24 * 3600 * 1000),
-            TimeRange::Month => Some(now - 30 * 24 * 3600 * 1000),
+            TimeRange::Today => now
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .and_then(|start| Local.from_local_datetime(&start).earliest())
+                .map(|start| start.timestamp_millis()),
+            TimeRange::Week => Some(now.timestamp_millis() - 7 * 24 * 3600 * 1000),
+            TimeRange::Month => Some(now.timestamp_millis() - 30 * 24 * 3600 * 1000),
             TimeRange::All => None,
         }
     }
