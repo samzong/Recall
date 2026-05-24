@@ -12,9 +12,13 @@ use crate::embedding::EmbeddingProvider;
 use crate::types::{
     BackgroundJobStatus, MatchSource, Message, Role, SearchResult, SemanticProgress,
 };
+use crate::usage::{self, UsageFilters, UsageReport};
+
+const USAGE_LOADING_MIN_MS: u128 = 75;
 
 pub enum AppMode {
     Search,
+    Usage,
     Viewing,
     ExportInput,
     Settings,
@@ -81,6 +85,11 @@ mod tests {
             source_picker_dirty: false,
             source_picker_typing: false,
             filters_editing_source: false,
+            usage_report: None,
+            usage_year_report: None,
+            usage_error: None,
+            usage_time_filter: TimeRange::All,
+            usage_refresh_requested_at: None,
         }
     }
 
@@ -235,6 +244,11 @@ pub struct App {
     pub source_picker_dirty: bool,
     pub source_picker_typing: bool,
     pub filters_editing_source: bool,
+    pub usage_report: Option<UsageReport>,
+    pub usage_year_report: Option<UsageReport>,
+    pub usage_error: Option<String>,
+    pub usage_time_filter: TimeRange,
+    pub usage_refresh_requested_at: Option<Instant>,
 }
 
 impl App {
@@ -291,6 +305,11 @@ impl App {
             source_picker_dirty: false,
             source_picker_typing: false,
             filters_editing_source: false,
+            usage_report: None,
+            usage_year_report: None,
+            usage_error: None,
+            usage_time_filter: TimeRange::All,
+            usage_refresh_requested_at: None,
         };
         app.reset_search_defaults();
         app.update_scope_metrics(store);
@@ -348,6 +367,15 @@ impl App {
         }
     }
 
+    pub fn usage_time_label(&self) -> &'static str {
+        match self.usage_time_filter {
+            TimeRange::Today => "Today",
+            TimeRange::Week => "7d",
+            TimeRange::Month => "30d",
+            TimeRange::All => "All day",
+        }
+    }
+
     pub fn sort_label(&self) -> &'static str {
         match self.sort_order {
             SortOrder::Relevance => "Relevance",
@@ -392,6 +420,7 @@ impl App {
 
         match self.mode {
             AppMode::Search => self.handle_search_key(key, store, engine, provider),
+            AppMode::Usage => self.handle_usage_key(key, store),
             AppMode::Viewing => self.handle_viewing_key(key),
             AppMode::ExportInput => self.handle_export_key(key),
             AppMode::Settings => self.handle_settings_key(key, store, engine, provider),
@@ -558,6 +587,27 @@ impl App {
             }
             KeyCode::Tab => {
                 self.open_filters();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_usage_key(&mut self, key: KeyEvent, _store: &Store) {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.should_quit = true;
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                self.cycle_usage_time(false);
+                self.request_usage_refresh();
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.cycle_usage_source(false);
+                self.request_usage_refresh();
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.reset_usage_dashboard();
+                self.request_usage_refresh();
             }
             _ => {}
         }
@@ -1121,11 +1171,64 @@ impl App {
         provider: &mut Option<EmbeddingProvider>,
     ) {
         self.update_scope_metrics(store);
+        self.refresh_usage(store);
         if self.query.is_empty() {
             self.load_recent(store);
         } else {
             self.do_search(store, engine, provider);
         }
+    }
+
+    pub fn refresh_usage(&mut self, store: &Store) {
+        self.usage_refresh_requested_at = None;
+        self.usage_error = None;
+        let sources = self.source_filter_ids();
+        let current_filters =
+            UsageFilters { sources: sources.clone(), time_range: self.usage_time_filter };
+        match usage::build_usage_report(store, &current_filters) {
+            Ok(report) => {
+                self.usage_report = Some(report);
+            }
+            Err(err) => {
+                self.usage_report = None;
+                self.usage_error = Some(format!("Usage unavailable: {err}"));
+            }
+        }
+
+        let year_filters = UsageFilters { sources, time_range: TimeRange::All };
+        match usage::build_usage_report(store, &year_filters) {
+            Ok(report) => {
+                self.usage_year_report = Some(report);
+            }
+            Err(err) => {
+                self.usage_year_report = None;
+                if self.usage_error.is_none() {
+                    self.usage_error = Some(format!("Usage unavailable: {err}"));
+                }
+            }
+        }
+    }
+
+    pub fn request_usage_refresh(&mut self) {
+        self.usage_error = None;
+        self.usage_refresh_requested_at = Some(Instant::now());
+    }
+
+    pub fn usage_is_loading(&self) -> bool {
+        self.usage_refresh_requested_at.is_some()
+    }
+
+    pub fn usage_refresh_is_due(&self) -> bool {
+        self.usage_refresh_requested_at
+            .map(|requested_at| requested_at.elapsed().as_millis() >= USAGE_LOADING_MIN_MS)
+            .unwrap_or(false)
+    }
+
+    pub fn fail_usage_refresh(&mut self, error: impl std::fmt::Display) {
+        self.usage_refresh_requested_at = None;
+        self.usage_report = None;
+        self.usage_year_report = None;
+        self.usage_error = Some(format!("Usage unavailable: {error}"));
     }
 
     pub fn try_search(
@@ -1313,6 +1416,59 @@ impl App {
     fn reset_search_defaults(&mut self) {
         self.source_filter_selection.clear();
         self.time_filter = self.config.sync_window.to_time_range();
+    }
+
+    fn reset_usage_dashboard(&mut self) {
+        self.source_filter_selection.clear();
+        self.usage_time_filter = TimeRange::All;
+    }
+
+    fn cycle_usage_time(&mut self, reverse: bool) {
+        self.usage_time_filter = if reverse {
+            match self.usage_time_filter {
+                TimeRange::Today => TimeRange::All,
+                TimeRange::Week => TimeRange::Today,
+                TimeRange::Month => TimeRange::Week,
+                TimeRange::All => TimeRange::Month,
+            }
+        } else {
+            match self.usage_time_filter {
+                TimeRange::Today => TimeRange::Week,
+                TimeRange::Week => TimeRange::Month,
+                TimeRange::Month => TimeRange::All,
+                TimeRange::All => TimeRange::Today,
+            }
+        };
+    }
+
+    fn cycle_usage_source(&mut self, reverse: bool) {
+        let enabled: Vec<String> =
+            self.enabled_sources().into_iter().map(|(id, _)| id.clone()).collect();
+        if enabled.is_empty() {
+            self.source_filter_selection.clear();
+            return;
+        }
+
+        let current = self.normalized_source_selection(&self.source_filter_selection);
+        let next = if current.len() == 1 {
+            let current_index = enabled.iter().position(|id| id == &current[0]);
+            match (current_index, reverse) {
+                (Some(0), true) => None,
+                (Some(index), true) => enabled.get(index - 1).cloned(),
+                (Some(index), false) if index + 1 < enabled.len() => {
+                    enabled.get(index + 1).cloned()
+                }
+                (Some(_), false) => None,
+                (None, true) => enabled.last().cloned(),
+                (None, false) => enabled.first().cloned(),
+            }
+        } else if reverse {
+            enabled.last().cloned()
+        } else {
+            enabled.first().cloned()
+        };
+
+        self.source_filter_selection = next.into_iter().collect();
     }
 
     fn settings_row_count(&self) -> usize {

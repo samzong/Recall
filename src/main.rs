@@ -96,7 +96,7 @@ fn main() -> Result<()> {
         Some(Commands::Usage { json, source, time }) => {
             cmd_usage(json, source.as_deref(), time.as_deref())?
         }
-        None => cmd_tui()?,
+        None => cmd_tui(None)?,
     }
 
     Ok(())
@@ -633,10 +633,16 @@ fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str
 }
 
 fn cmd_usage(json: bool, source_filter: Option<&str>, time_filter: Option<&str>) -> Result<()> {
-    run_usage_sync_job()?;
+    let sources = usage_source_labels();
 
+    if !json {
+        let usage_source_filter = resolve_source_filter(source_filter, &sources)?;
+        let usage_time_filter = time_filter.map(|_| parse_time_range(time_filter));
+        return cmd_tui(Some((usage_source_filter, usage_time_filter)));
+    }
+
+    run_usage_sync_job()?;
     let store = Store::open()?;
-    let sources = adapters::source_labels();
     let filters = UsageFilters {
         sources: resolve_source_filter(source_filter, &sources)?,
         time_range: parse_time_range(time_filter),
@@ -709,6 +715,13 @@ fn resolve_source_filter(
     Ok(Some(vec![resolved]))
 }
 
+fn usage_source_labels() -> Vec<(String, String)> {
+    ["codex", "claude-code", "opencode"]
+        .into_iter()
+        .map(|source| (source.to_string(), source.to_string()))
+        .collect()
+}
+
 fn parse_time_range(time_filter: Option<&str>) -> TimeRange {
     match time_filter.map(|t| t.to_lowercase()) {
         Some(ref t) if t == "today" => TimeRange::Today,
@@ -754,7 +767,7 @@ fn truncate_usage_label(value: &str, max_chars: usize) -> String {
     out.push_str(suffix);
     out
 }
-fn cmd_tui() -> Result<()> {
+fn cmd_tui(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Result<()> {
     use std::io;
     use std::time::Duration;
 
@@ -765,13 +778,15 @@ fn cmd_tui() -> Result<()> {
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
 
-    use recall::tui::app::App;
+    use recall::tui::app::{App, AppMode};
     use recall::tui::event::{AppEvent, poll_event};
     use recall::tui::ui;
 
+    let usage_mode = usage_start.is_some();
     let store = Store::open()?;
     semantic::ensure_background_worker(true)?;
-    let sources = adapters::source_labels();
+    let sources =
+        if usage_start.is_some() { usage_source_labels() } else { adapters::source_labels() };
 
     struct TerminalGuard;
     impl Drop for TerminalGuard {
@@ -796,6 +811,15 @@ fn cmd_tui() -> Result<()> {
     config.normalize_sources(&sources);
 
     let mut app = App::new(&store, sources, config);
+    if let Some((source_filter, time_filter)) = usage_start {
+        app.source_filter_selection = source_filter.unwrap_or_default();
+        if let Some(time_filter) = time_filter {
+            app.usage_time_filter = time_filter;
+        }
+        app.mode = AppMode::Usage;
+        app.request_usage_refresh();
+    }
+    let mut usage_sync_pending = usage_mode;
     let tick_rate = Duration::from_millis(50);
 
     loop {
@@ -808,6 +832,22 @@ fn cmd_tui() -> Result<()> {
             AppEvent::ScrollUp => app.handle_scroll_up(&store),
             AppEvent::ScrollDown => app.handle_scroll_down(&store),
             AppEvent::Tick => {}
+        }
+
+        if app.should_quit {
+            break;
+        }
+
+        if app.usage_refresh_is_due() {
+            if usage_sync_pending {
+                usage_sync_pending = false;
+                match run_usage_sync_job() {
+                    Ok(()) => app.refresh_usage(&store),
+                    Err(err) => app.fail_usage_refresh(err),
+                }
+            } else {
+                app.refresh_usage(&store);
+            }
         }
 
         app.try_search(&store, &engine, &mut provider);
