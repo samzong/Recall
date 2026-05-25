@@ -716,9 +716,10 @@ fn resolve_source_filter(
 }
 
 fn usage_source_labels() -> Vec<(String, String)> {
-    ["codex", "claude-code", "opencode"]
+    adapters::all_adapters()
         .into_iter()
-        .map(|source| (source.to_string(), source.to_string()))
+        .filter(|adapter| adapter.usage_parser_version().is_some())
+        .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
         .collect()
 }
 

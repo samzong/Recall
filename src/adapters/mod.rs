@@ -8,6 +8,7 @@ pub mod file_scan;
 pub mod gemini;
 pub mod kiro;
 pub mod opencode;
+pub mod pi;
 
 use crate::db::store::Store;
 use crate::types::{RawUsageEvent, Role};
@@ -117,6 +118,7 @@ pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(claude_code::ClaudeCodeAdapter),
         Box::new(opencode::OpenCodeAdapter),
         Box::new(codex::CodexAdapter),
+        Box::new(pi::PiAdapter),
         Box::new(antigravity::AntigravityAdapter),
         Box::new(gemini::GeminiAdapter),
         Box::new(kiro::KiroAdapter),
