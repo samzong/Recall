@@ -114,6 +114,22 @@ pub struct UsageEventRecord {
     pub token_source: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionUsageEventRecord {
+    pub event_key: String,
+    pub event_seq: u32,
+    pub message_seq: Option<u32>,
+    pub timestamp: i64,
+    pub model: String,
+    pub provider: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub token_source: String,
+}
+
 #[derive(Debug)]
 pub enum MatchSource {
     Fts,

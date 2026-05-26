@@ -10,6 +10,7 @@ use recall::db;
 use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
 use recall::db::store::{Store, UsageSessionStateMeta};
 use recall::embedding::EmbeddingProvider;
+use recall::export::ExportOptions;
 use recall::semantic;
 use recall::types::{self, Message, Role, Session};
 use recall::usage::{self, UsageFilters};
@@ -57,6 +58,8 @@ enum Commands {
         source: Option<String>,
         #[arg(long)]
         time: Option<String>,
+        #[arg(long, help = "Filter by project directory, including child paths")]
+        project: Option<String>,
     },
     Usage {
         #[arg(long, help = "Output usage report as JSON")]
@@ -65,6 +68,18 @@ enum Commands {
         source: Option<String>,
         #[arg(long)]
         time: Option<String>,
+    },
+    Export {
+        #[arg(long, help = "Output session records as JSON Lines")]
+        jsonl: bool,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        time: Option<String>,
+        #[arg(long, help = "Filter by project directory, including child paths")]
+        project: Option<String>,
+        #[arg(long, default_value_t = 100, help = "Maximum sessions to export; 0 means all")]
+        limit: usize,
     },
 }
 
@@ -90,11 +105,14 @@ fn main() -> Result<()> {
             recall::bench::run_eval(dataset.as_deref(), verbose)?
         }
         Some(Commands::BenchDumpSessions) => recall::bench::dump_sessions()?,
-        Some(Commands::Search { query, source, time }) => {
-            cmd_search(&query, source.as_deref(), time.as_deref())?
+        Some(Commands::Search { query, source, time, project }) => {
+            cmd_search(&query, source.as_deref(), time.as_deref(), project.as_deref())?
         }
         Some(Commands::Usage { json, source, time }) => {
             cmd_usage(json, source.as_deref(), time.as_deref())?
+        }
+        Some(Commands::Export { jsonl, source, time, project, limit }) => {
+            cmd_export(jsonl, source.as_deref(), time.as_deref(), project.as_deref(), limit)?
         }
         None => cmd_tui(None)?,
     }
@@ -558,7 +576,12 @@ fn cmd_background_worker(sync_first: bool) -> Result<()> {
     semantic::run_background_worker(sync_first, || run_sync_job(false, false))
 }
 
-fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str>) -> Result<()> {
+fn cmd_search(
+    query: &str,
+    source_filter: Option<&str>,
+    time_filter: Option<&str>,
+    project_filter: Option<&str>,
+) -> Result<()> {
     let store = Store::open()?;
     let engine = SearchEngine::new(&store.conn);
     let sources = adapters::source_labels();
@@ -597,7 +620,11 @@ fn cmd_search(query: &str, source_filter: Option<&str>, time_filter: Option<&str
         _ => TimeRange::All,
     };
 
-    let filters = SearchFilters { sources: resolved_source, time_range, directory: None };
+    let filters = SearchFilters {
+        sources: resolved_source,
+        time_range,
+        directory: project_filter.map(String::from),
+    };
 
     let results = engine.hybrid_search(query, query_embedding.as_deref(), &filters, 20, 3)?;
 
@@ -657,6 +684,30 @@ fn cmd_usage(json: bool, source_filter: Option<&str>, time_filter: Option<&str>)
     print!("{}", format_usage_report_text(&report));
 
     Ok(())
+}
+
+fn cmd_export(
+    jsonl: bool,
+    source_filter: Option<&str>,
+    time_filter: Option<&str>,
+    project_filter: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    if !jsonl {
+        anyhow::bail!("export requires --jsonl");
+    }
+
+    let store = Store::open()?;
+    let sources = adapters::source_labels();
+    let options = ExportOptions {
+        sources: resolve_source_filter(source_filter, &sources)?,
+        time_range: parse_time_range(time_filter),
+        project: project_filter.map(String::from),
+        limit: if limit == 0 { None } else { Some(limit) },
+    };
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    recall::export::write_jsonl(&store, &options, &mut handle)
 }
 
 fn format_usage_report_text(report: &usage::UsageReport) -> String {

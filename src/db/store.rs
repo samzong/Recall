@@ -8,7 +8,7 @@ use rusqlite::OptionalExtension;
 use crate::db::search::TimeRange;
 use crate::types::{
     BackgroundJobStatus, Message, RawUsageEvent, Role, SemanticProgress, SemanticSessionJob,
-    Session, UsageEventRecord,
+    Session, SessionUsageEventRecord, UsageEventRecord,
 };
 use crate::utils::f32_slice_to_bytes;
 
@@ -815,6 +815,37 @@ impl Store {
         Ok(messages)
     }
 
+    pub fn list_usage_events_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionUsageEventRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_key, event_seq, message_seq, timestamp, model, provider,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    reasoning_tokens, token_source
+             FROM usage_events
+             WHERE session_id = ?1
+             ORDER BY event_seq ASC, event_key ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+            Ok(SessionUsageEventRecord {
+                event_key: row.get(0)?,
+                event_seq: row.get(1)?,
+                message_seq: row.get(2)?,
+                timestamp: row.get(3)?,
+                model: row.get(4)?,
+                provider: row.get(5)?,
+                input_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+                cache_read_tokens: row.get(8)?,
+                cache_write_tokens: row.get(9)?,
+                reasoning_tokens: row.get(10)?,
+                token_source: row.get(11)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn stats(&self) -> Result<(u64, u64)> {
         self.stats_for_scope(None, TimeRange::All)
     }
@@ -914,6 +945,45 @@ impl Store {
             sessions.push(row?);
         }
         Ok(sessions)
+    }
+
+    pub fn list_export_sessions(
+        &self,
+        sources: Option<&[String]>,
+        time_range: TimeRange,
+        directory: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Session>> {
+        let mut sql = String::from(
+            "SELECT id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint
+             FROM sessions s
+             WHERE 1=1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, directory);
+        sql.push_str(" ORDER BY started_at DESC, source ASC, source_id ASC");
+        if let Some(limit) = limit {
+            sql.push_str(&format!(" LIMIT ?{param_idx}"));
+            params.push(Box::new(limit as i64));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(Session {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                source_id: row.get(2)?,
+                title: row.get(3)?,
+                directory: row.get(4)?,
+                started_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                message_count: row.get(7)?,
+                entrypoint: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn list_project_directories(&self) -> Result<Vec<ProjectDirectory>> {

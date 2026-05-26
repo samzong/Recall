@@ -3,6 +3,7 @@ pub mod bench;
 pub mod config;
 pub mod db;
 pub mod embedding;
+pub mod export;
 pub mod semantic;
 pub mod tui;
 pub mod types;

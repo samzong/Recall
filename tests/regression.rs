@@ -5,6 +5,7 @@ use recall::config::AppConfig;
 use recall::db::schema;
 use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
 use recall::db::store::Store;
+use recall::export::{ExportOptions, write_jsonl};
 use recall::types::{Message, RawUsageEvent, Role, Session, TokenSource};
 use recall::usage::{UsageFilters, build_usage_report};
 
@@ -191,6 +192,89 @@ fn delete_session_cascades_usage_events() {
         .query_row("SELECT COUNT(*) FROM usage_session_state", [], |row| row.get(0))
         .unwrap();
     assert_eq!(state_count, 0, "usage parser state must follow session lifecycle");
+}
+
+#[test]
+fn export_jsonl_emits_session_messages_and_usage_events() {
+    let store = setup();
+    let mut session = make_session("s1", "codex", "raw1", "Export session");
+    session.started_at = 1_800_000_000_000;
+    session.updated_at = Some(1_800_000_001_000);
+    session.message_count = 2;
+    session.entrypoint = Some("codex resume raw1".to_string());
+    let messages = vec![
+        make_message("s1", Role::User, "hello", 0),
+        make_message("s1", Role::Assistant, "hi", 1),
+    ];
+    let usage = vec![make_usage_event("evt-1", 1_800_000_001_000, "gpt-5")];
+    store.persist_session_with_usage(&session, &messages, &usage, Some(1)).unwrap();
+
+    let options =
+        ExportOptions { sources: None, time_range: TimeRange::All, project: None, limit: Some(10) };
+    let mut out = Vec::new();
+    write_jsonl(&store, &options, &mut out).unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 1);
+    let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["record_type"], "session");
+    assert_eq!(value["session"]["source"], "codex");
+    assert_eq!(value["session"]["source_id"], "raw1");
+    assert_eq!(value["session"]["directory"], "/tmp/test");
+    assert_eq!(value["messages"][0]["seq"], 0);
+    assert_eq!(value["messages"][0]["role"], "user");
+    assert_eq!(value["messages"][1]["seq"], 1);
+    assert_eq!(value["messages"][1]["role"], "assistant");
+    assert_eq!(value["usage_events"][0]["event_key"], "evt-1");
+    assert_eq!(value["usage_events"][0]["message_seq"], 1);
+    assert_eq!(value["usage_events"][0]["model"], "gpt-5");
+    assert_eq!(value["usage_events"][0]["token_source"], "observed");
+    assert!(value["usage_events"][0].get("raw_usage_json").is_none());
+}
+
+#[test]
+fn export_jsonl_applies_source_time_project_and_limit_filters() {
+    let store = setup();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut newest = make_session("s-newest", "codex", "raw-newest", "Newest Codex");
+    newest.started_at = now;
+    newest.directory = Some("/tmp/project".to_string());
+    let mut recent = make_session("s-recent", "codex", "raw-recent", "Recent Codex");
+    recent.started_at = now - 1_000;
+    recent.directory = Some("/tmp/project/subdir".to_string());
+    let mut old = make_session("s-old", "codex", "raw-old", "Old Codex");
+    old.started_at = now - 40 * 24 * 60 * 60 * 1_000;
+    old.directory = Some("/tmp/project".to_string());
+    let mut sibling = make_session("s-sibling", "codex", "raw-sibling", "Sibling Project");
+    sibling.started_at = now + 2_000;
+    sibling.directory = Some("/tmp/project-sibling".to_string());
+    let mut other_source = make_session("s-other", "claude-code", "raw-other", "Other Source");
+    other_source.started_at = now + 1_000;
+    other_source.directory = Some("/tmp/project".to_string());
+
+    for session in [&newest, &recent, &old, &sibling, &other_source] {
+        store.insert_session(session).unwrap();
+        store.insert_messages(&[make_message(&session.id, Role::User, &session.title, 0)]).unwrap();
+    }
+
+    let options = ExportOptions {
+        sources: Some(vec!["codex".to_string()]),
+        time_range: TimeRange::Month,
+        project: Some("/tmp/project".to_string()),
+        limit: Some(1),
+    };
+    let mut out = Vec::new();
+    write_jsonl(&store, &options, &mut out).unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 1);
+    let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(value["session"]["id"], "s-newest");
+    assert_eq!(value["session"]["source"], "codex");
 }
 
 #[test]
