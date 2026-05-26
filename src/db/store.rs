@@ -16,6 +16,13 @@ pub struct Store {
     pub conn: Connection,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDirectory {
+    pub directory: String,
+    pub sessions: u64,
+    pub last_seen: i64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct UsageSessionStateMeta {
     pub parser_version: u32,
@@ -637,6 +644,15 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
     ) -> Result<SemanticProgress> {
+        self.semantic_progress_for_search_scope(sources, time_range, None)
+    }
+
+    pub fn semantic_progress_for_search_scope(
+        &self,
+        sources: Option<&[String]>,
+        time_range: TimeRange,
+        directory: Option<&str>,
+    ) -> Result<SemanticProgress> {
         let mut sql = String::from(
             "SELECT
                 COUNT(*),
@@ -650,7 +666,7 @@ impl Store {
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
-        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range);
+        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, directory);
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
 
@@ -679,6 +695,7 @@ impl Store {
             &mut current_param_idx,
             sources,
             time_range,
+            directory,
         );
         current_sql.push_str(" ORDER BY COALESCE(s.updated_at, s.started_at) DESC LIMIT 1");
         let current_param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -807,6 +824,15 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
     ) -> Result<(u64, u64)> {
+        self.stats_for_search_scope(sources, time_range, None)
+    }
+
+    pub fn stats_for_search_scope(
+        &self,
+        sources: Option<&[String]>,
+        time_range: TimeRange,
+        directory: Option<&str>,
+    ) -> Result<(u64, u64)> {
         let mut session_sql = String::from("SELECT COUNT(*) FROM sessions s WHERE 1=1");
         let mut session_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut session_param_idx = 1;
@@ -816,6 +842,7 @@ impl Store {
             &mut session_param_idx,
             sources,
             time_range,
+            directory,
         );
         let session_param_refs: Vec<&dyn rusqlite::types::ToSql> =
             session_params.iter().map(|p| p.as_ref()).collect();
@@ -836,6 +863,7 @@ impl Store {
             &mut message_param_idx,
             sources,
             time_range,
+            directory,
         );
         let message_param_refs: Vec<&dyn rusqlite::types::ToSql> =
             message_params.iter().map(|p| p.as_ref()).collect();
@@ -845,11 +873,30 @@ impl Store {
     }
 
     pub fn list_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare(
+        self.list_recent_sessions_for_search_scope(None, TimeRange::All, None, limit)
+    }
+
+    pub fn list_recent_sessions_for_search_scope(
+        &self,
+        sources: Option<&[String]>,
+        time_range: TimeRange,
+        directory: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Session>> {
+        let mut sql = String::from(
             "SELECT id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint
-             FROM sessions ORDER BY started_at DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+             FROM sessions s
+             WHERE 1=1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, directory);
+        sql.push_str(&format!(" ORDER BY started_at DESC LIMIT ?{param_idx}"));
+        params.push(Box::new(limit as i64));
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(Session {
                 id: row.get(0)?,
                 source: row.get(1)?,
@@ -868,6 +915,24 @@ impl Store {
         }
         Ok(sessions)
     }
+
+    pub fn list_project_directories(&self) -> Result<Vec<ProjectDirectory>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT directory, COUNT(*) AS sessions, MAX(COALESCE(updated_at, started_at)) AS last_seen
+             FROM sessions
+             WHERE directory IS NOT NULL AND directory != ''
+             GROUP BY directory
+             ORDER BY last_seen DESC, sessions DESC, directory ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ProjectDirectory {
+                directory: row.get(0)?,
+                sessions: row.get::<_, i64>(1)? as u64,
+                last_seen: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn apply_scope_filters(
@@ -876,6 +941,7 @@ fn apply_scope_filters(
     param_idx: &mut usize,
     sources: Option<&[String]>,
     time_range: TimeRange,
+    directory: Option<&str>,
 ) {
     if let Some(sources) = sources
         && !sources.is_empty()
@@ -894,4 +960,19 @@ fn apply_scope_filters(
         params.push(Box::new(min_ts));
         *param_idx += 1;
     }
+
+    if let Some(dir) = directory {
+        sql.push_str(&format!(
+            " AND (s.directory = ?{} OR s.directory LIKE ?{})",
+            *param_idx,
+            *param_idx + 1
+        ));
+        params.push(Box::new(dir.to_string()));
+        params.push(Box::new(directory_child_pattern(dir)));
+        *param_idx += 2;
+    }
+}
+
+fn directory_child_pattern(dir: &str) -> String {
+    if dir.ends_with('/') { format!("{dir}%") } else { format!("{dir}/%") }
 }

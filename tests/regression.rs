@@ -321,6 +321,61 @@ fn search_with_source_filter() {
 }
 
 #[test]
+fn search_with_directory_filter_respects_project_boundary() {
+    let store = setup();
+    let mut exact = make_session("s1", "codex", "raw1", "Exact project");
+    exact.directory = Some("/tmp/project".to_string());
+    let mut child = make_session("s2", "opencode", "raw2", "Child project path");
+    child.directory = Some("/tmp/project/subdir".to_string());
+    let mut sibling = make_session("s3", "claude-code", "raw3", "Sibling prefix");
+    sibling.directory = Some("/tmp/project-sibling".to_string());
+    let mut missing = make_session("s4", "gemini-cli", "raw4", "Missing directory");
+    missing.directory = None;
+
+    for session in [&exact, &child, &sibling, &missing] {
+        store.insert_session(session).unwrap();
+    }
+    let messages = vec![
+        make_message("s1", Role::User, "fix the parser", 0),
+        make_message("s2", Role::User, "fix the parser", 0),
+        make_message("s3", Role::User, "fix the parser", 0),
+        make_message("s4", Role::User, "fix the parser", 0),
+    ];
+    store.insert_messages(&messages).unwrap();
+
+    let engine = SearchEngine::new(&store.conn);
+    let filters = SearchFilters {
+        sources: None,
+        time_range: TimeRange::All,
+        directory: Some("/tmp/project".to_string()),
+    };
+    let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
+    let mut ids: Vec<String> = results.into_iter().map(|result| result.session.id).collect();
+    ids.sort();
+
+    assert_eq!(ids, vec!["s1".to_string(), "s2".to_string()]);
+}
+
+#[test]
+fn recent_sessions_with_directory_filter_respects_project_boundary() {
+    let store = setup();
+    let mut exact = make_session("s1", "codex", "raw1", "Exact project");
+    exact.directory = Some("/tmp/project".to_string());
+    let mut sibling = make_session("s2", "opencode", "raw2", "Sibling prefix");
+    sibling.directory = Some("/tmp/project-sibling".to_string());
+
+    store.insert_session(&exact).unwrap();
+    store.insert_session(&sibling).unwrap();
+
+    let sessions = store
+        .list_recent_sessions_for_search_scope(None, TimeRange::All, Some("/tmp/project"), 10)
+        .unwrap();
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "s1");
+}
+
+#[test]
 fn role_fromstr() {
     assert_eq!("user".parse::<Role>(), Ok(Role::User));
     assert_eq!("assistant".parse::<Role>(), Ok(Role::Assistant));

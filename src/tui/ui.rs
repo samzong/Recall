@@ -10,7 +10,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::db::search::TimeRange;
 use crate::tui::app::{
-    App, AppMode, FilterFocus, PanelFocus, ResumeOrigin, SanitizedLine, SourcePickerRow,
+    App, AppMode, FilterFocus, PanelFocus, ProjectPickerRow, ResumeOrigin, SanitizedLine,
+    SourcePickerRow,
 };
 use crate::types::{MatchSource, Role};
 use crate::usage::{TokenTotals, UsageReport};
@@ -589,6 +590,18 @@ fn truncate_label(label: &str, max_chars: usize) -> String {
     format!("{}…", label.chars().take(max_chars - 1).collect::<String>())
 }
 
+fn truncate_start(label: &str, max_chars: usize) -> String {
+    let char_count = label.chars().count();
+    if char_count <= max_chars {
+        return label.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let tail: String = label.chars().skip(char_count - max_chars + 1).collect();
+    format!("…{tail}")
+}
+
 fn format_count(value: usize) -> String {
     format_compact(value as i64)
 }
@@ -658,26 +671,32 @@ fn render_search_box(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_filters(f: &mut Frame, app: &App, area: Rect) {
     let source_label = app.source_filter_label();
+    let project_label = truncate_label(&app.project_filter_label(), 20);
     let time_label = app.time_filter_label();
     let sort_label = app.sort_label();
 
     let line = Line::from(vec![
-        Span::styled("  Scope: Source ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" S:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("[{source_label}]"),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  Time ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  P:", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("[{project_label}]"),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  T:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("[{time_label}]"),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  Sort ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  Sort:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("[{sort_label}]"),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  (Ctrl+F)", Style::default().fg(Color::DarkGray)),
+        Span::styled("  Ctrl+F", Style::default().fg(Color::DarkGray)),
     ]);
 
     f.render_widget(Paragraph::new(line), area);
@@ -686,6 +705,8 @@ fn render_filters(f: &mut Frame, app: &App, area: Rect) {
 fn render_filter_picker(f: &mut Frame, app: &App) {
     if app.filters_editing_source {
         render_source_picker(f, app);
+    } else if app.filters_editing_project {
+        render_project_picker(f, app);
     } else {
         render_filter_overview(f, app);
     }
@@ -711,6 +732,12 @@ fn render_filter_overview(f: &mut Frame, app: &App) {
         &app.source_filter_label(),
         "Enter",
         app.filter_focus == FilterFocus::Source,
+    ));
+    lines.push(filter_overview_line(
+        "Project",
+        &app.project_filter_label(),
+        "Enter",
+        app.filter_focus == FilterFocus::Project,
     ));
     lines.push(filter_overview_line(
         "Time Range",
@@ -752,7 +779,10 @@ fn filter_overview_line(
     } else {
         Style::default().fg(Color::White)
     };
-    Line::from(Span::styled(format!(" {label:<12} {value:<22} {hint}"), style))
+    Line::from(Span::styled(
+        format!(" {label:<12} {:<22} {hint}", truncate_label(value, 22)),
+        style,
+    ))
 }
 
 fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
@@ -1068,7 +1098,7 @@ fn render_source_picker(f: &mut Frame, app: &App) {
             let text = match *row {
                 SourcePickerRow::All => {
                     let marker = if app.source_picker_selection.is_empty() { "(*)" } else { "( )" };
-                    format!(" {marker}      All enabled sources")
+                    format!(" {marker} All enabled sources")
                 }
                 SourcePickerRow::Source(index) => {
                     let Some((source_id, label)) = app.all_sources.get(index) else {
@@ -1076,10 +1106,7 @@ fn render_source_picker(f: &mut Frame, app: &App) {
                     };
                     let marker =
                         if app.source_is_selected_in_picker(source_id) { "[x]" } else { "[ ]" };
-                    match app.source_picker_row_key(row_index) {
-                        Some(key) => format!(" {marker} [{key}] {label} ({source_id})"),
-                        None => format!(" {marker}     {label} ({source_id})"),
-                    }
+                    format!(" {marker} {label} ({source_id})")
                 }
             };
             lines.push(Line::from(Span::styled(text, style)));
@@ -1088,12 +1115,10 @@ fn render_source_picker(f: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(" 1-9/0", Style::default().fg(Color::Yellow)),
-        Span::styled(" toggle  ", muted_style),
+        Span::styled(" Space", Style::default().fg(Color::Yellow)),
+        Span::styled(" select/clear  ", muted_style),
         Span::styled("/", Style::default().fg(Color::Yellow)),
         Span::styled(" filter  ", muted_style),
-        Span::styled("Space", Style::default().fg(Color::Yellow)),
-        Span::styled(" current  ", muted_style),
         Span::styled("Enter", Style::default().fg(Color::Yellow)),
         Span::styled(" apply  ", muted_style),
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
@@ -1114,6 +1139,111 @@ fn render_source_picker(f: &mut Frame, app: &App) {
         let cursor_x = popup.x
             + 9
             + UnicodeWidthStr::width(&app.source_picker_query[..app.source_picker_cursor]) as u16;
+        f.set_cursor_position((cursor_x.min(popup.right().saturating_sub(2)), popup.y + 1));
+    }
+}
+
+fn render_project_picker(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let width = area.width.min(92);
+    let rows = app.project_picker_rows();
+    let desired_height = rows.len() as u16 + 7;
+    let height = desired_height.clamp(8, area.height.saturating_sub(2).max(8));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .title(" Filters > Project ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let selected_style = Style::default().bg(Color::Cyan).fg(Color::Black);
+    let normal_style = Style::default().fg(Color::White);
+    let muted_style = Style::default().fg(Color::DarkGray);
+
+    let visible_rows = height.saturating_sub(7) as usize;
+    let start = if visible_rows == 0 || app.project_picker_selected < visible_rows {
+        0
+    } else {
+        app.project_picker_selected + 1 - visible_rows
+    };
+    let end = (start + visible_rows).min(rows.len());
+
+    let mut lines = Vec::new();
+    let filter_value = if app.project_picker_query.is_empty() && !app.project_picker_typing {
+        Span::styled("type to filter paths", muted_style)
+    } else {
+        Span::styled(app.project_picker_query.clone(), normal_style)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Filter: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        filter_value,
+    ]));
+    lines.push(Line::from(""));
+
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(" No matching projects", muted_style)));
+    } else {
+        let path_width = width.saturating_sub(30) as usize;
+        for (offset, row) in rows[start..end].iter().enumerate() {
+            let row_index = start + offset;
+            let style = if row_index == app.project_picker_selected {
+                selected_style
+            } else {
+                normal_style
+            };
+
+            let text = match *row {
+                ProjectPickerRow::All => {
+                    let marker = if app.project_picker_selection.is_none() { "(*)" } else { "( )" };
+                    format!(" {marker} All projects")
+                }
+                ProjectPickerRow::Project(index) => {
+                    let Some(project) = app.project_directories.get(index) else {
+                        continue;
+                    };
+                    let marker = if app.project_picker_selection.as_deref()
+                        == Some(project.directory.as_str())
+                    {
+                        "(*)"
+                    } else {
+                        "( )"
+                    };
+                    let path = truncate_start(&project.directory, path_width);
+                    format!(" {marker} {path}  {}", project.sessions)
+                }
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" Space", Style::default().fg(Color::Yellow)),
+        Span::styled(" select/clear  ", muted_style),
+        Span::styled("/", Style::default().fg(Color::Yellow)),
+        Span::styled(" filter  ", muted_style),
+        Span::styled("Enter", Style::default().fg(Color::Yellow)),
+        Span::styled(" apply  ", muted_style),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::styled(" back", muted_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Ctrl+A", Style::default().fg(Color::Yellow)),
+        Span::styled(" all  ", muted_style),
+        Span::styled("Ctrl+U", Style::default().fg(Color::Yellow)),
+        Span::styled(" clear input", muted_style),
+    ]));
+
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(Clear, popup);
+    f.render_widget(widget, popup);
+
+    if app.project_picker_typing {
+        let cursor_x = popup.x
+            + 9
+            + UnicodeWidthStr::width(&app.project_picker_query[..app.project_picker_cursor]) as u16;
         f.set_cursor_position((cursor_x.min(popup.right().saturating_sub(2)), popup.y + 1));
     }
 }

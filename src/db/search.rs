@@ -231,10 +231,19 @@ fn apply_filters(
         *param_idx += 1;
     }
     if let Some(ref dir) = filters.directory {
-        sql.push_str(&format!(" AND s.directory LIKE ?{}", *param_idx));
-        params.push(Box::new(format!("{dir}%")));
-        *param_idx += 1;
+        sql.push_str(&format!(
+            " AND (s.directory = ?{} OR s.directory LIKE ?{})",
+            *param_idx,
+            *param_idx + 1
+        ));
+        params.push(Box::new(dir.clone()));
+        params.push(Box::new(directory_child_pattern(dir)));
+        *param_idx += 2;
     }
+}
+
+fn directory_child_pattern(dir: &str) -> String {
+    if dir.ends_with('/') { format!("{dir}%") } else { format!("{dir}/%") }
 }
 
 fn rrf_merge(fts_hits: &[Hit], vec_hits: &[Hit], k: u32) -> Vec<(String, f64, MatchSource)> {

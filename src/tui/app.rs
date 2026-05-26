@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::adapters::{ResumeCommand, resume_command_for};
 use crate::config::AppConfig;
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
-use crate::db::store::Store;
+use crate::db::store::{ProjectDirectory, Store};
 use crate::embedding::EmbeddingProvider;
 use crate::types::{
     BackgroundJobStatus, MatchSource, Message, Role, SearchResult, SemanticProgress,
@@ -53,6 +53,8 @@ mod tests {
             ],
             config: AppConfig::default(),
             source_filter_selection: Vec::new(),
+            project_directories: Vec::new(),
+            project_filter: None,
             time_filter: TimeRange::All,
             filter_focus: FilterFocus::Source,
             should_quit: false,
@@ -85,6 +87,13 @@ mod tests {
             source_picker_dirty: false,
             source_picker_typing: false,
             filters_editing_source: false,
+            project_picker_query: String::new(),
+            project_picker_cursor: 0,
+            project_picker_selected: 0,
+            project_picker_selection: None,
+            project_picker_dirty: false,
+            project_picker_typing: false,
+            filters_editing_project: false,
             usage_report: None,
             usage_year_report: None,
             usage_error: None,
@@ -102,6 +111,96 @@ mod tests {
         app.commit_source_picker_filter();
 
         assert_eq!(app.source_filter_selection, vec!["claude".to_string(), "cursor".to_string()]);
+    }
+
+    #[test]
+    fn project_picker_filters_by_path_tokens() {
+        let mut app = app_with_sources();
+        app.project_directories = vec![
+            ProjectDirectory {
+                directory: "/Users/x/git/samzong/Recall".to_string(),
+                sessions: 10,
+                last_seen: 2,
+            },
+            ProjectDirectory {
+                directory: "/Users/x/git/openclaw".to_string(),
+                sessions: 20,
+                last_seen: 1,
+            },
+        ];
+        app.project_picker_query = "sam recall".to_string();
+
+        let rows = app.project_picker_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0], ProjectPickerRow::Project(0)));
+    }
+
+    #[test]
+    fn project_picker_space_toggles_pending_selection_without_committing() {
+        let mut app = app_with_sources();
+        app.project_directories = vec![ProjectDirectory {
+            directory: "/Users/x/git/samzong/Recall".to_string(),
+            sessions: 10,
+            last_seen: 2,
+        }];
+        app.project_picker_query = "recall".to_string();
+
+        app.toggle_project_picker_row();
+
+        assert_eq!(app.project_picker_selection, Some("/Users/x/git/samzong/Recall".to_string()));
+        assert!(app.project_picker_dirty);
+        assert_eq!(app.project_filter, None);
+    }
+
+    #[test]
+    fn source_picker_space_toggles_while_filtering() {
+        let mut app = app_with_sources();
+        app.source_picker_query = "cod".to_string();
+        app.source_picker_typing = true;
+
+        app.toggle_source_picker_row();
+        app.commit_source_picker_filter();
+
+        assert_eq!(app.source_filter_selection, vec!["codex".to_string()]);
+    }
+
+    #[test]
+    fn applying_project_picker_closes_filters_window() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let engine = SearchEngine::new(&store.conn);
+        let mut provider = None;
+        let mut app = app_with_sources();
+        app.mode = AppMode::Filters;
+        app.filters_editing_project = true;
+        app.project_picker_selection = Some("/Users/x/git/samzong/Recall".to_string());
+        app.project_picker_dirty = true;
+
+        app.apply_project_picker(&store, &engine, &mut provider);
+
+        assert!(matches!(app.mode, AppMode::Search));
+        assert!(!app.filters_editing_project);
+        assert_eq!(app.project_filter, Some("/Users/x/git/samzong/Recall".to_string()));
+    }
+
+    #[test]
+    fn applying_source_picker_closes_filters_window() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let engine = SearchEngine::new(&store.conn);
+        let mut provider = None;
+        let mut app = app_with_sources();
+        app.mode = AppMode::Filters;
+        app.filters_editing_source = true;
+        app.source_picker_selection = vec!["codex".to_string()];
+        app.source_picker_dirty = true;
+
+        app.apply_source_picker(&store, &engine, &mut provider);
+
+        assert!(matches!(app.mode, AppMode::Search));
+        assert!(!app.filters_editing_source);
+        assert_eq!(app.source_filter_selection, vec!["codex".to_string()]);
     }
 }
 
@@ -148,6 +247,7 @@ pub enum PanelFocus {
 #[derive(Clone, Copy, PartialEq)]
 pub enum FilterFocus {
     Source,
+    Project,
     Time,
     Sort,
 }
@@ -155,7 +255,8 @@ pub enum FilterFocus {
 impl FilterFocus {
     fn next(self) -> Self {
         match self {
-            Self::Source => Self::Time,
+            Self::Source => Self::Project,
+            Self::Project => Self::Time,
             Self::Time => Self::Sort,
             Self::Sort => Self::Source,
         }
@@ -164,7 +265,8 @@ impl FilterFocus {
     fn previous(self) -> Self {
         match self {
             Self::Source => Self::Sort,
-            Self::Time => Self::Source,
+            Self::Project => Self::Source,
+            Self::Time => Self::Project,
             Self::Sort => Self::Time,
         }
     }
@@ -176,20 +278,10 @@ pub enum SourcePickerRow {
     Source(usize),
 }
 
-fn source_digit_slot(key: char) -> Option<usize> {
-    match key {
-        '1'..='9' => Some(key as usize - '1' as usize),
-        '0' => Some(9),
-        _ => None,
-    }
-}
-
-fn source_digit_key(slot: usize) -> Option<char> {
-    match slot {
-        0..=8 => char::from_digit((slot + 1) as u32, 10),
-        9 => Some('0'),
-        _ => None,
-    }
+#[derive(Clone, Copy)]
+pub enum ProjectPickerRow {
+    All,
+    Project(usize),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -244,6 +336,15 @@ pub struct App {
     pub source_picker_dirty: bool,
     pub source_picker_typing: bool,
     pub filters_editing_source: bool,
+    pub project_directories: Vec<ProjectDirectory>,
+    pub project_filter: Option<String>,
+    pub project_picker_query: String,
+    pub project_picker_cursor: usize,
+    pub project_picker_selected: usize,
+    pub project_picker_selection: Option<String>,
+    pub project_picker_dirty: bool,
+    pub project_picker_typing: bool,
+    pub filters_editing_project: bool,
     pub usage_report: Option<UsageReport>,
     pub usage_year_report: Option<UsageReport>,
     pub usage_error: Option<String>,
@@ -305,6 +406,15 @@ impl App {
             source_picker_dirty: false,
             source_picker_typing: false,
             filters_editing_source: false,
+            project_directories: store.list_project_directories().unwrap_or_default(),
+            project_filter: None,
+            project_picker_query: String::new(),
+            project_picker_cursor: 0,
+            project_picker_selected: 0,
+            project_picker_selection: None,
+            project_picker_dirty: false,
+            project_picker_typing: false,
+            filters_editing_project: false,
             usage_report: None,
             usage_year_report: None,
             usage_error: None,
@@ -383,6 +493,13 @@ impl App {
         }
     }
 
+    pub fn project_filter_label(&self) -> String {
+        self.project_filter
+            .as_deref()
+            .map(short_project_label)
+            .unwrap_or_else(|| "All projects".to_string())
+    }
+
     pub fn source_label_for<'a>(&'a self, source_id: &'a str) -> &'a str {
         self.all_sources
             .iter()
@@ -393,10 +510,16 @@ impl App {
 
     pub fn load_recent(&mut self, store: &Store) {
         let source_ids = self.source_filter_ids();
-        let recent = store.list_recent_sessions(200).unwrap_or_default();
+        let recent = store
+            .list_recent_sessions_for_search_scope(
+                source_ids.as_deref(),
+                self.time_filter,
+                self.project_filter.as_deref(),
+                200,
+            )
+            .unwrap_or_default();
         self.results = recent
             .into_iter()
-            .filter(|session| self.session_matches_filters(session, source_ids.as_deref()))
             .map(|session| SearchResult { session, match_source: MatchSource::Fts, snippet: None })
             .collect();
         self.selected_index = 0;
@@ -453,7 +576,12 @@ impl App {
             AppMode::Filters if self.filters_editing_source && self.source_picker_selected > 0 => {
                 self.source_picker_selected -= 1;
             }
-            AppMode::Filters if !self.filters_editing_source => {
+            AppMode::Filters
+                if self.filters_editing_project && self.project_picker_selected > 0 =>
+            {
+                self.project_picker_selected -= 1;
+            }
+            AppMode::Filters if !self.filters_editing_source && !self.filters_editing_project => {
                 self.filter_focus = self.filter_focus.previous();
             }
             _ => {}
@@ -487,7 +615,13 @@ impl App {
             {
                 self.source_picker_selected += 1;
             }
-            AppMode::Filters if !self.filters_editing_source => {
+            AppMode::Filters
+                if self.filters_editing_project
+                    && self.project_picker_selected + 1 < self.project_picker_rows().len() =>
+            {
+                self.project_picker_selected += 1;
+            }
+            AppMode::Filters if !self.filters_editing_source && !self.filters_editing_project => {
                 self.filter_focus = self.filter_focus.next();
             }
             _ => {}
@@ -852,6 +986,10 @@ impl App {
             self.handle_source_picker_key(key, store, engine, provider);
             return;
         }
+        if self.filters_editing_project {
+            self.handle_project_picker_key(key, store, engine, provider);
+            return;
+        }
 
         match key.code {
             KeyCode::Esc => {
@@ -904,6 +1042,9 @@ impl App {
             FilterFocus::Source => {
                 self.open_source_picker();
             }
+            FilterFocus::Project => {
+                self.open_project_picker(store);
+            }
             FilterFocus::Time => {
                 self.time_filter = match self.time_filter {
                     TimeRange::All => TimeRange::Today,
@@ -955,14 +1096,12 @@ impl App {
             KeyCode::Enter => {
                 self.apply_source_picker(store, engine, provider);
             }
-            KeyCode::Char(' ') if !self.source_picker_typing => {
+            KeyCode::Char(' ') => {
                 self.toggle_source_picker_row();
             }
             KeyCode::Char('/') if !self.source_picker_typing => {
                 self.source_picker_typing = true;
             }
-            KeyCode::Char(c)
-                if !self.source_picker_typing && self.toggle_source_picker_digit(c) => {}
             KeyCode::Up => self.handle_scroll_up(store),
             KeyCode::Down => self.handle_scroll_down(store),
             KeyCode::Backspace if self.source_picker_typing && self.source_picker_cursor > 0 => {
@@ -1015,11 +1154,13 @@ impl App {
     fn open_filters(&mut self) {
         self.mode = AppMode::Filters;
         self.filters_editing_source = false;
+        self.filters_editing_project = false;
     }
 
     fn open_source_picker(&mut self) {
         self.mode = AppMode::Filters;
         self.filters_editing_source = true;
+        self.filters_editing_project = false;
         self.source_picker_query.clear();
         self.source_picker_cursor = 0;
         self.source_picker_selected = 0;
@@ -1053,6 +1194,183 @@ impl App {
         self.source_picker_dirty = false;
     }
 
+    fn handle_project_picker_key(
+        &mut self,
+        key: KeyEvent,
+        store: &Store,
+        engine: &SearchEngine,
+        provider: &mut Option<EmbeddingProvider>,
+    ) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+            self.project_picker_query.clear();
+            self.project_picker_cursor = 0;
+            self.project_picker_selected = 0;
+            self.project_picker_typing = true;
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+            self.project_picker_selection = None;
+            self.project_picker_dirty = true;
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                if self.project_picker_typing {
+                    self.project_picker_typing = false;
+                } else {
+                    self.close_project_picker();
+                }
+            }
+            KeyCode::Enter => {
+                self.apply_project_picker(store, engine, provider);
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_project_picker_row();
+            }
+            KeyCode::Char('/') if !self.project_picker_typing => {
+                self.project_picker_typing = true;
+            }
+            KeyCode::Up => self.handle_scroll_up(store),
+            KeyCode::Down => self.handle_scroll_down(store),
+            KeyCode::Backspace if self.project_picker_typing && self.project_picker_cursor > 0 => {
+                let prev = self.project_picker_query[..self.project_picker_cursor]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.project_picker_query.replace_range(prev..self.project_picker_cursor, "");
+                self.project_picker_cursor = prev;
+                self.project_picker_selected = 0;
+                self.clamp_project_picker_selected();
+            }
+            KeyCode::Left if self.project_picker_typing && self.project_picker_cursor > 0 => {
+                let prev = self.project_picker_query[..self.project_picker_cursor]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.project_picker_cursor = prev;
+            }
+            KeyCode::Right
+                if self.project_picker_typing
+                    && self.project_picker_cursor < self.project_picker_query.len() =>
+            {
+                let next = self.project_picker_query[self.project_picker_cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| self.project_picker_cursor + i)
+                    .unwrap_or(self.project_picker_query.len());
+                self.project_picker_cursor = next;
+            }
+            KeyCode::Home if self.project_picker_typing => {
+                self.project_picker_cursor = 0;
+            }
+            KeyCode::End if self.project_picker_typing => {
+                self.project_picker_cursor = self.project_picker_query.len();
+            }
+            KeyCode::Char(c) => {
+                self.project_picker_typing = true;
+                self.project_picker_query.insert(self.project_picker_cursor, c);
+                self.project_picker_cursor += c.len_utf8();
+                self.project_picker_selected = 0;
+                self.clamp_project_picker_selected();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_project_picker(&mut self, store: &Store) {
+        self.project_directories = store.list_project_directories().unwrap_or_default();
+        self.mode = AppMode::Filters;
+        self.filters_editing_source = false;
+        self.filters_editing_project = true;
+        self.project_picker_query.clear();
+        self.project_picker_cursor = 0;
+        self.project_picker_selected = 0;
+        self.project_picker_selection = self.project_filter.clone();
+        self.project_picker_dirty = false;
+        self.project_picker_typing = false;
+        if let Some(selected_project) = self.project_filter.as_ref() {
+            self.project_picker_selected = self
+                .project_picker_rows()
+                .iter()
+                .position(|row| match row {
+                    ProjectPickerRow::All => false,
+                    ProjectPickerRow::Project(index) => self
+                        .project_directories
+                        .get(*index)
+                        .map(|project| &project.directory == selected_project)
+                        .unwrap_or(false),
+                })
+                .unwrap_or(0);
+        }
+    }
+
+    fn close_project_picker(&mut self) {
+        self.filters_editing_project = false;
+        self.project_picker_query.clear();
+        self.project_picker_cursor = 0;
+        self.project_picker_selected = 0;
+        self.project_picker_selection = None;
+        self.project_picker_dirty = false;
+        self.project_picker_typing = false;
+    }
+
+    fn apply_project_picker(
+        &mut self,
+        store: &Store,
+        engine: &SearchEngine,
+        provider: &mut Option<EmbeddingProvider>,
+    ) {
+        self.commit_project_picker_filter();
+        self.close_project_picker();
+        self.mode = AppMode::Search;
+        self.refresh_after_filter_change(store, engine, provider);
+    }
+
+    fn commit_project_picker_filter(&mut self) {
+        if self.project_picker_dirty {
+            self.project_filter = self.project_picker_selection.clone();
+        } else if let Some(row) = self.project_picker_rows().get(self.project_picker_selected) {
+            match *row {
+                ProjectPickerRow::All => {
+                    self.project_filter = None;
+                }
+                ProjectPickerRow::Project(index) => {
+                    if let Some(project) = self.project_directories.get(index) {
+                        self.project_filter = Some(project.directory.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn toggle_project_picker_row(&mut self) {
+        let Some(row) = self.project_picker_rows().get(self.project_picker_selected).copied()
+        else {
+            return;
+        };
+
+        match row {
+            ProjectPickerRow::All => {
+                self.project_picker_selection = None;
+            }
+            ProjectPickerRow::Project(index) => {
+                let Some(project) = self.project_directories.get(index) else {
+                    return;
+                };
+                if self.project_picker_selection.as_deref() == Some(project.directory.as_str()) {
+                    self.project_picker_selection = None;
+                } else {
+                    self.project_picker_selection = Some(project.directory.clone());
+                }
+            }
+        }
+        self.project_picker_dirty = true;
+    }
+
     fn apply_source_picker(
         &mut self,
         store: &Store,
@@ -1068,6 +1386,7 @@ impl App {
         self.source_picker_selection.clear();
         self.source_picker_dirty = false;
         self.filters_editing_source = false;
+        self.mode = AppMode::Search;
         self.refresh_after_filter_change(store, engine, provider);
     }
 
@@ -1120,45 +1439,9 @@ impl App {
         self.source_picker_dirty = true;
     }
 
-    fn toggle_source_picker_digit(&mut self, key: char) -> bool {
-        let Some(slot) = source_digit_slot(key) else {
-            return false;
-        };
-        let Some(row_index) = self
-            .source_picker_rows()
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| matches!(row, SourcePickerRow::Source(_)))
-            .nth(slot)
-            .map(|(index, _)| index)
-        else {
-            return false;
-        };
-
-        self.source_picker_selected = row_index;
-        self.toggle_source_picker_row();
-        true
-    }
-
-    pub fn source_picker_row_key(&self, row_index: usize) -> Option<char> {
-        let row = self.source_picker_rows().get(row_index).copied()?;
-        if !matches!(row, SourcePickerRow::Source(_)) {
-            return None;
-        }
-
-        let source_slot = self
-            .source_picker_rows()
-            .iter()
-            .take(row_index + 1)
-            .filter(|row| matches!(row, SourcePickerRow::Source(_)))
-            .count()
-            .saturating_sub(1);
-
-        source_digit_key(source_slot)
-    }
-
     fn clear_filters(&mut self) {
         self.source_filter_selection.clear();
+        self.project_filter = None;
         self.time_filter = TimeRange::All;
         self.sort_order = SortOrder::Relevance;
         self.filter_focus = FilterFocus::Source;
@@ -1303,7 +1586,7 @@ impl App {
         let filters = SearchFilters {
             sources: self.source_filter_ids(),
             time_range: self.time_filter,
-            directory: None,
+            directory: self.project_filter.clone(),
         };
 
         match engine.hybrid_search(query, embedding, &filters, 200, 3) {
@@ -1338,15 +1621,19 @@ impl App {
     }
 
     fn update_scope_metrics(&mut self, store: &Store) {
-        if let Ok((sessions, messages)) =
-            store.stats_for_scope(self.source_filter_ids().as_deref(), self.time_filter)
-        {
+        if let Ok((sessions, messages)) = store.stats_for_search_scope(
+            self.source_filter_ids().as_deref(),
+            self.time_filter,
+            self.project_filter.as_deref(),
+        ) {
             self.total_sessions = sessions;
             self.total_messages = messages;
         }
-        if let Ok(progress) =
-            store.semantic_progress_for_scope(self.source_filter_ids().as_deref(), self.time_filter)
-        {
+        if let Ok(progress) = store.semantic_progress_for_search_scope(
+            self.source_filter_ids().as_deref(),
+            self.time_filter,
+            self.project_filter.as_deref(),
+        ) {
             self.semantic_progress = progress;
         }
         if let Ok(status) = store.background_job_status("pipeline") {
@@ -1393,12 +1680,37 @@ impl App {
         rows
     }
 
+    pub fn project_picker_rows(&self) -> Vec<ProjectPickerRow> {
+        let query = self.project_picker_query.trim().to_lowercase();
+        let mut rows = Vec::new();
+        if query.is_empty() {
+            rows.push(ProjectPickerRow::All);
+        }
+
+        for (index, project) in self.project_directories.iter().enumerate() {
+            if query.is_empty() || project_matches_query(&project.directory, &query) {
+                rows.push(ProjectPickerRow::Project(index));
+            }
+        }
+
+        rows
+    }
+
     fn clamp_source_picker_selected(&mut self) {
         let row_count = self.source_picker_rows().len();
         if row_count == 0 {
             self.source_picker_selected = 0;
         } else if self.source_picker_selected >= row_count {
             self.source_picker_selected = row_count - 1;
+        }
+    }
+
+    fn clamp_project_picker_selected(&mut self) {
+        let row_count = self.project_picker_rows().len();
+        if row_count == 0 {
+            self.project_picker_selected = 0;
+        } else if self.project_picker_selected >= row_count {
+            self.project_picker_selected = row_count - 1;
         }
     }
 
@@ -1415,6 +1727,7 @@ impl App {
 
     fn reset_search_defaults(&mut self) {
         self.source_filter_selection.clear();
+        self.project_filter = None;
         self.time_filter = self.config.sync_window.to_time_range();
     }
 
@@ -1511,23 +1824,6 @@ impl App {
             self.load_recent(store);
         } else {
             self.do_search(store, engine, provider);
-        }
-    }
-
-    fn session_matches_filters(
-        &self,
-        session: &crate::types::Session,
-        sources: Option<&[String]>,
-    ) -> bool {
-        if let Some(sources) = sources
-            && !sources.iter().any(|source| source == &session.source)
-        {
-            return false;
-        }
-
-        match self.time_filter.millis_ago() {
-            Some(min_ts) => session.started_at >= min_ts,
-            None => true,
         }
     }
 
@@ -1711,4 +2007,18 @@ impl App {
             results.sort_by_key(|b| std::cmp::Reverse(b.session.started_at));
         }
     }
+}
+
+fn short_project_label(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    match parts.len() {
+        0 => path.to_string(),
+        1 => parts[0].to_string(),
+        len => format!("{}/{}", parts[len - 2], parts[len - 1]),
+    }
+}
+
+fn project_matches_query(path: &str, query: &str) -> bool {
+    let path = path.to_lowercase();
+    query.split_whitespace().all(|part| path.contains(part))
 }
