@@ -34,6 +34,10 @@ impl SourceAdapter for CodexAdapter {
         })
     }
 
+    fn app_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        Some(open_url_command(codex_thread_url(source_id)))
+    }
+
     fn usage_parser_version(&self) -> Option<u32> {
         Some(USAGE_PARSER_VERSION)
     }
@@ -69,6 +73,28 @@ impl SourceAdapter for CodexAdapter {
         let result = scan_for_sync_impl(&codex_dir, store, since_ts, include_events)?;
         Ok(Some(result))
     }
+}
+
+fn codex_thread_url(source_id: &str) -> String {
+    format!("codex://threads/{source_id}")
+}
+
+#[cfg(target_os = "macos")]
+fn open_url_command(url: String) -> ResumeCommand {
+    ResumeCommand { program: "open".to_string(), args: vec![url] }
+}
+
+#[cfg(target_os = "windows")]
+fn open_url_command(url: String) -> ResumeCommand {
+    ResumeCommand {
+        program: "cmd".to_string(),
+        args: vec!["/C".to_string(), "start".to_string(), String::new(), url],
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn open_url_command(url: String) -> ResumeCommand {
+    ResumeCommand { program: "xdg-open".to_string(), args: vec![url] }
 }
 
 fn resolve_codex_dir() -> anyhow::Result<Option<PathBuf>> {
@@ -844,6 +870,18 @@ mod tests {
     fn setup_store() -> Store {
         schema::register_sqlite_vec();
         Store::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn codex_app_command_opens_thread_deeplink() {
+        let command = CodexAdapter.app_command("019e6d8d-588b-7fd2-a326-c525469ed120").unwrap();
+
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg == "codex://threads/019e6d8d-588b-7fd2-a326-c525469ed120")
+        );
     }
 
     fn temp_codex_root(label: &str) -> PathBuf {

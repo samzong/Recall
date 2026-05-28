@@ -10,8 +10,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::db::search::TimeRange;
 use crate::tui::app::{
-    App, AppMode, FilterFocus, PanelFocus, ProjectPickerRow, ResumeOrigin, SanitizedLine,
-    SourcePickerRow,
+    App, AppMode, FilterFocus, PanelFocus, PendingCommandAction, ProjectPickerRow, ResumeOrigin,
+    SanitizedLine, SourcePickerRow,
 };
 use crate::types::{MatchSource, Role};
 use crate::usage::{TokenTotals, UsageReport};
@@ -1006,6 +1006,8 @@ fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" export  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Ctrl+R", Style::default().fg(Color::Yellow)),
         Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Ctrl+O", Style::default().fg(Color::Yellow)),
+        Span::styled(" app  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
         Span::styled(" back  ", Style::default().fg(Color::DarkGray)),
         Span::styled("q", Style::default().fg(Color::Yellow)),
@@ -1323,8 +1325,17 @@ fn render_confirm_resume(f: &mut Frame, app: &App) {
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
 
+    let block_title = match pending.action {
+        PendingCommandAction::Resume => " Resume session ",
+        PendingCommandAction::OpenApp => " Open in app ",
+    };
+    let confirm_label = match pending.action {
+        PendingCommandAction::Resume => "confirm & exec     ",
+        PendingCommandAction::OpenApp => "confirm & open     ",
+    };
+
     let block = Block::default()
-        .title(" Resume session ")
+        .title(block_title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
         .style(Style::default().bg(Color::Black));
@@ -1369,7 +1380,7 @@ fn render_confirm_resume(f: &mut Frame, app: &App) {
         Line::from(""),
         Line::from(vec![
             Span::styled("  [Y] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("confirm & exec     ", Style::default().fg(Color::White)),
+            Span::styled(confirm_label, Style::default().fg(Color::White)),
             Span::styled("[N] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::White)),
         ]),
@@ -1425,6 +1436,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" filter  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Ctrl+R", Style::default().fg(Color::Yellow)),
                     Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Ctrl+O", Style::default().fg(Color::Yellow)),
+                    Span::styled(" app  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Ctrl+S", Style::default().fg(Color::Yellow)),
                     Span::styled(" settings  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),

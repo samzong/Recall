@@ -33,6 +33,9 @@ pub trait SourceAdapter {
         Ok(None)
     }
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand>;
+    fn app_command(&self, _source_id: &str) -> Option<ResumeCommand> {
+        None
+    }
 }
 
 pub struct RawSession {
@@ -142,6 +145,10 @@ pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
 
 pub fn resume_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {
     all_adapters().iter().find(|a| a.id() == source).and_then(|a| a.resume_command(source_id))
+}
+
+pub fn app_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {
+    all_adapters().iter().find(|a| a.id() == source).and_then(|a| a.app_command(source_id))
 }
 
 pub fn source_labels() -> Vec<(String, String)> {

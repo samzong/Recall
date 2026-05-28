@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::adapters::{ResumeCommand, resume_command_for};
+use crate::adapters::{ResumeCommand, app_command_for, resume_command_for};
 use crate::config::AppConfig;
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::{ProjectDirectory, Store};
@@ -100,6 +100,52 @@ mod tests {
             usage_time_filter: TimeRange::All,
             usage_refresh_requested_at: None,
         }
+    }
+
+    fn codex_search_result() -> SearchResult {
+        SearchResult {
+            session: crate::types::Session {
+                id: "session1".to_string(),
+                source: "codex".to_string(),
+                source_id: "019e6d8d-588b-7fd2-a326-c525469ed120".to_string(),
+                title: "Codex thread".to_string(),
+                directory: Some("/tmp/project".to_string()),
+                started_at: 0,
+                updated_at: None,
+                message_count: 1,
+                entrypoint: None,
+            },
+            match_source: MatchSource::Fts,
+            snippet: None,
+        }
+    }
+
+    #[test]
+    fn ctrl_o_from_search_confirms_codex_app_open() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let engine = SearchEngine::new(&store.conn);
+        let mut provider = None;
+        let mut app = app_with_sources();
+        app.results = vec![codex_search_result()];
+
+        app.handle_search_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &store,
+            &engine,
+            &mut provider,
+        );
+
+        assert!(matches!(app.mode, AppMode::ConfirmResume));
+        let pending = app.pending_resume.as_ref().unwrap();
+        assert!(matches!(pending.action, PendingCommandAction::OpenApp));
+        assert!(
+            pending
+                .command
+                .args
+                .iter()
+                .any(|arg| arg == "codex://threads/019e6d8d-588b-7fd2-a326-c525469ed120")
+        );
     }
 
     #[test]
@@ -210,8 +256,15 @@ pub enum ResumeOrigin {
     Viewing,
 }
 
+#[derive(Clone, Copy)]
+pub enum PendingCommandAction {
+    Resume,
+    OpenApp,
+}
+
 pub struct PendingResume {
     pub command: ResumeCommand,
+    pub action: PendingCommandAction,
     pub source_label: String,
     pub session_title: String,
     pub cwd: Option<String>,
@@ -651,6 +704,11 @@ impl App {
             return;
         }
 
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+            self.start_app_open_confirmation(ResumeOrigin::Search);
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q')
                 if self.query.is_empty() && self.panel_focus == PanelFocus::SessionList =>
@@ -755,6 +813,10 @@ impl App {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
             self.start_resume_confirmation(ResumeOrigin::Viewing);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+            self.start_app_open_confirmation(ResumeOrigin::Viewing);
             return;
         }
         match key.code {
@@ -915,16 +977,34 @@ impl App {
     }
 
     fn start_resume_confirmation(&mut self, origin: ResumeOrigin) {
+        self.start_command_confirmation(origin, PendingCommandAction::Resume);
+    }
+
+    fn start_app_open_confirmation(&mut self, origin: ResumeOrigin) {
+        self.start_command_confirmation(origin, PendingCommandAction::OpenApp);
+    }
+
+    fn start_command_confirmation(&mut self, origin: ResumeOrigin, action: PendingCommandAction) {
         let Some(result) = self.results.get(self.selected_index) else {
             return;
         };
         let session = &result.session;
-        let Some(command) = resume_command_for(&session.source, &session.source_id) else {
-            self.status_message = Some(format!("Resume not supported for {}", session.source));
+        let command = match action {
+            PendingCommandAction::Resume => resume_command_for(&session.source, &session.source_id),
+            PendingCommandAction::OpenApp => app_command_for(&session.source, &session.source_id),
+        };
+        let Some(command) = command else {
+            let action_label = match action {
+                PendingCommandAction::Resume => "Resume",
+                PendingCommandAction::OpenApp => "Open in app",
+            };
+            self.status_message =
+                Some(format!("{action_label} not supported for {}", session.source));
             return;
         };
         self.pending_resume = Some(PendingResume {
             command,
+            action,
             source_label: self.source_label_for(&session.source).to_string(),
             session_title: session.title.clone(),
             cwd: session.directory.clone(),
