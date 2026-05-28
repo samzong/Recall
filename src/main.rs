@@ -8,7 +8,7 @@ use recall::adapters;
 use recall::config::AppConfig;
 use recall::db;
 use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
-use recall::db::store::{Store, UsageSessionStateMeta};
+use recall::db::store::{EventSessionStateMeta, Store, UsageSessionStateMeta};
 use recall::embedding::EmbeddingProvider;
 use recall::export::ExportOptions;
 use recall::semantic;
@@ -333,6 +333,19 @@ struct SyncRunOptions {
     usage_only: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackfillPlan {
+    usage: bool,
+    events: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingSessionAction {
+    Skip,
+    BackfillOnly(BackfillPlan),
+    RefreshSession,
+}
+
 fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
     let store = Store::open()?;
     let all = adapters::all_adapters();
@@ -369,7 +382,7 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
         let optimized = if options.force {
             None
         } else {
-            match adapter.scan_for_sync(&store, since_ts) {
+            match adapter.scan_for_sync(&store, since_ts, !options.usage_only) {
                 Ok(scan) => scan,
                 Err(e) => {
                     if options.emit {
@@ -404,6 +417,11 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
 
         let mut existing_meta = store.session_meta_map(source_id)?;
         let mut existing_usage_meta = store.usage_state_meta_map(source_id)?;
+        let mut existing_event_meta = if options.usage_only {
+            Default::default()
+        } else {
+            store.event_state_meta_map(source_id)?
+        };
 
         for raw in raw_sessions {
             if let Some(cutoff) = since_ts {
@@ -414,45 +432,88 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 }
             }
 
+            let raw_source_id = raw.source_id.clone();
             let msg_count = raw.messages.len() as u32;
             let usage_backfill_needed = raw.usage_parser_version.is_some_and(|version| {
                 !usage_state_is_current(
                     version,
-                    existing_usage_meta.get(&raw.source_id).copied(),
+                    existing_usage_meta.get(&raw_source_id).copied(),
                     raw.updated_at,
                 )
             });
+            let event_backfill_needed = !options.usage_only
+                && raw.event_parser_version.is_some_and(|version| {
+                    !event_state_is_current(
+                        version,
+                        existing_event_meta.get(&raw_source_id).copied(),
+                        raw.updated_at,
+                    )
+                });
 
-            match existing_meta.get(&raw.source_id) {
+            match existing_meta.get(&raw_source_id) {
                 Some(&(old_updated_at, old_msg_count)) => {
                     let content_changed = old_msg_count != msg_count
                         || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
-                    if !content_changed && usage_backfill_needed && !options.force {
-                        if let Some(parser_version) = raw.usage_parser_version
-                            && store.persist_usage_events_for_existing_session(
-                                source_id,
-                                &raw.source_id,
-                                &raw.usage_events,
-                                parser_version,
-                                raw.updated_at,
-                            )?
-                        {
-                            existing_usage_meta.insert(
-                                raw.source_id.clone(),
-                                UsageSessionStateMeta {
-                                    parser_version,
-                                    source_updated_at: raw.updated_at,
-                                },
-                            );
-                            reprocessed_sessions += 1;
+                    match decide_existing_session_action(
+                        options.usage_only,
+                        options.force,
+                        content_changed,
+                        usage_backfill_needed,
+                        event_backfill_needed,
+                    ) {
+                        ExistingSessionAction::Skip => {
+                            skipped += 1;
+                            continue;
                         }
-                        continue;
+                        ExistingSessionAction::BackfillOnly(plan) => {
+                            let mut reprocessed = false;
+                            if plan.usage
+                                && let Some(parser_version) = raw.usage_parser_version
+                                && store.persist_usage_events_for_existing_session(
+                                    source_id,
+                                    &raw_source_id,
+                                    &raw.usage_events,
+                                    parser_version,
+                                    raw.updated_at,
+                                )?
+                            {
+                                existing_usage_meta.insert(
+                                    raw.source_id.clone(),
+                                    UsageSessionStateMeta {
+                                        parser_version,
+                                        source_updated_at: raw.updated_at,
+                                    },
+                                );
+                                reprocessed = true;
+                            }
+                            if plan.events
+                                && let Some(parser_version) = raw.event_parser_version
+                                && store.persist_session_events_for_existing_session(
+                                    source_id,
+                                    &raw_source_id,
+                                    &raw.events,
+                                    parser_version,
+                                    raw.updated_at,
+                                )?
+                            {
+                                existing_event_meta.insert(
+                                    raw.source_id.clone(),
+                                    EventSessionStateMeta {
+                                        parser_version,
+                                        source_updated_at: raw.updated_at,
+                                    },
+                                );
+                                reprocessed = true;
+                            }
+                            if reprocessed {
+                                reprocessed_sessions += 1;
+                            }
+                            continue;
+                        }
+                        ExistingSessionAction::RefreshSession => {}
                     }
-                    if !content_changed && !options.force {
-                        skipped += 1;
-                        continue;
-                    }
-                    store.delete_session_data(source_id, &raw.source_id)?;
+                    store.delete_session_data(source_id, &raw_source_id)?;
+                    existing_event_meta.remove(&raw_source_id);
                     if content_changed {
                         updated_sessions += 1;
                     } else {
@@ -492,11 +553,19 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 })
                 .collect();
 
-            store.persist_session_with_usage(
+            let (events, event_parser_version) = if options.usage_only {
+                (Vec::new(), None)
+            } else {
+                (raw.events, raw.event_parser_version)
+            };
+
+            store.persist_session_with_usage_and_events(
                 &session,
                 &messages,
                 &raw.usage_events,
                 raw.usage_parser_version,
+                &events,
+                event_parser_version,
             )?;
             existing_meta
                 .insert(session.source_id.clone(), (session.updated_at, session.message_count));
@@ -504,6 +573,12 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 existing_usage_meta.insert(
                     session.source_id.clone(),
                     UsageSessionStateMeta { parser_version, source_updated_at: session.updated_at },
+                );
+            }
+            if let Some(parser_version) = event_parser_version {
+                existing_event_meta.insert(
+                    session.source_id.clone(),
+                    EventSessionStateMeta { parser_version, source_updated_at: session.updated_at },
                 );
             }
             total_messages += msg_count;
@@ -570,6 +645,46 @@ fn usage_state_is_current(
         state.parser_version >= required_parser_version
             && state.source_updated_at == source_updated_at
     })
+}
+
+fn event_state_is_current(
+    required_parser_version: u32,
+    state: Option<EventSessionStateMeta>,
+    source_updated_at: Option<i64>,
+) -> bool {
+    state.is_some_and(|state| {
+        state.parser_version >= required_parser_version
+            && state.source_updated_at == source_updated_at
+    })
+}
+
+fn decide_existing_session_action(
+    usage_only: bool,
+    force: bool,
+    content_changed: bool,
+    usage_backfill_needed: bool,
+    event_backfill_needed: bool,
+) -> ExistingSessionAction {
+    if usage_only {
+        return if usage_backfill_needed {
+            ExistingSessionAction::BackfillOnly(BackfillPlan { usage: true, events: false })
+        } else {
+            ExistingSessionAction::Skip
+        };
+    }
+
+    if !content_changed && !force {
+        return if usage_backfill_needed || event_backfill_needed {
+            ExistingSessionAction::BackfillOnly(BackfillPlan {
+                usage: usage_backfill_needed,
+                events: event_backfill_needed,
+            })
+        } else {
+            ExistingSessionAction::Skip
+        };
+    }
+
+    ExistingSessionAction::RefreshSession
 }
 
 fn cmd_background_worker(sync_first: bool) -> Result<()> {
@@ -952,4 +1067,41 @@ fn generate_title(messages: &[adapters::RawMessage]) -> String {
     let user_contents: Vec<&str> =
         messages.iter().filter(|m| m.role == Role::User).map(|m| m.content.as_str()).collect();
     utils::title_from_user_messages(&user_contents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackfillPlan, ExistingSessionAction, decide_existing_session_action};
+
+    #[test]
+    fn usage_only_never_refreshes_existing_session() {
+        assert_eq!(
+            decide_existing_session_action(true, false, true, true, true),
+            ExistingSessionAction::BackfillOnly(BackfillPlan { usage: true, events: false })
+        );
+        assert_eq!(
+            decide_existing_session_action(true, false, true, false, true),
+            ExistingSessionAction::Skip
+        );
+    }
+
+    #[test]
+    fn full_sync_refreshes_changed_existing_session() {
+        assert_eq!(
+            decide_existing_session_action(false, false, true, true, true),
+            ExistingSessionAction::RefreshSession
+        );
+    }
+
+    #[test]
+    fn full_sync_backfills_unchanged_existing_session_in_place() {
+        assert_eq!(
+            decide_existing_session_action(false, false, false, true, true),
+            ExistingSessionAction::BackfillOnly(BackfillPlan { usage: true, events: true })
+        );
+        assert_eq!(
+            decide_existing_session_action(false, false, false, false, false),
+            ExistingSessionAction::Skip
+        );
+    }
 }

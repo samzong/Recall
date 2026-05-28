@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub fn register_sqlite_vec() {
@@ -24,6 +24,9 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
     }
     if version < 4 {
         migrate_v4(conn)?;
+    }
+    if version < 5 {
+        migrate_v5(conn)?;
     }
     Ok(())
 }
@@ -190,6 +193,60 @@ fn migrate_v4(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch("ALTER TABLE usage_events DROP COLUMN cost_source;")?;
     }
     conn.execute_batch("PRAGMA user_version = 4;")?;
+    Ok(())
+}
+
+fn migrate_v5(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS session_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            source TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            event_seq INTEGER NOT NULL,
+            timestamp INTEGER,
+            kind TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            name TEXT,
+            status TEXT,
+            target TEXT,
+            message_seq INTEGER,
+            summary TEXT,
+            source_path TEXT,
+            source_event_id TEXT,
+            attrs_json TEXT,
+            parser_version INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            UNIQUE(session_id, event_seq)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_events_session
+            ON session_events(session_id, event_seq);
+        CREATE INDEX IF NOT EXISTS idx_session_events_kind_time
+            ON session_events(kind, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_session_events_source_time
+            ON session_events(source, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_session_events_target
+            ON session_events(target);
+
+        CREATE TABLE IF NOT EXISTS event_session_state (
+            session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            source TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            parser_version INTEGER NOT NULL,
+            source_updated_at INTEGER,
+            event_count INTEGER NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+            synced_at INTEGER NOT NULL,
+            UNIQUE(source, source_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_session_state_source
+            ON event_session_state(source, source_id);
+
+        PRAGMA user_version = 5;
+        ",
+    )?;
     Ok(())
 }
 

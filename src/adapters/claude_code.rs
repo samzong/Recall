@@ -7,16 +7,18 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
 use crate::db::store::Store;
-use crate::types::{RawUsageEvent, Role, TokenSource};
+use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
 
 pub struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 4;
+const EVENT_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &str {
@@ -51,7 +53,7 @@ impl SourceAdapter for ClaudeCodeAdapter {
             let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
                 continue;
             };
-            if let Some(raw) = parse_claude_session_file(entry, mtime_ms, &session_index)? {
+            if let Some(raw) = parse_claude_session_file(entry, mtime_ms, &session_index, true)? {
                 sessions.push(raw);
             }
         }
@@ -63,11 +65,12 @@ impl SourceAdapter for ClaudeCodeAdapter {
         &self,
         store: &Store,
         since_ts: Option<i64>,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(claude_dir) = resolve_claude_dir()? else {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
         };
-        let result = scan_for_sync_impl(&claude_dir, store, since_ts)?;
+        let result = scan_for_sync_impl(&claude_dir, store, since_ts, include_events)?;
         Ok(Some(result))
     }
 }
@@ -92,6 +95,7 @@ fn scan_for_sync_impl(
     claude_dir: &Path,
     store: &Store,
     since_ts: Option<i64>,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let session_index = load_session_index(claude_dir);
     let mut entries = collect_project_entries(claude_dir, &session_index);
@@ -101,9 +105,14 @@ fn scan_for_sync_impl(
         store,
         "claude-code",
         since_ts,
-        file_scan::FileScanOptions { usage_parser_version: Some(USAGE_PARSER_VERSION) },
+        file_scan::FileScanOptions {
+            usage_parser_version: Some(USAGE_PARSER_VERSION),
+            event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+        },
         entries,
-        |entry, mtime_ms| parse_claude_session_file(entry, mtime_ms, &session_index),
+        |entry, mtime_ms| {
+            parse_claude_session_file(entry, mtime_ms, &session_index, include_events)
+        },
     )
 }
 
@@ -237,8 +246,9 @@ fn parse_claude_session_file(
     entry: FileScanEntry,
     mtime_ms: i64,
     session_index: &HashMap<String, SessionMeta>,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    let parsed = match parse_conversation_jsonl(&entry.stat_target, mtime_ms) {
+    let parsed = match parse_conversation_jsonl(&entry.stat_target, mtime_ms, include_events) {
         Ok(parsed) => parsed,
         Err(e) => {
             debug!("failed to parse {}: {e}", entry.stat_target.display());
@@ -258,7 +268,6 @@ fn parse_claude_session_file(
         .unwrap_or(0);
     let directory = meta.and_then(|m| m.cwd.clone()).or(entry.directory);
     let entrypoint = meta.and_then(|m| m.entrypoint.clone());
-
     Ok(Some(RawSession {
         source_id: entry.session_id,
         directory,
@@ -268,22 +277,27 @@ fn parse_claude_session_file(
         messages: parsed.messages,
         usage_events: parsed.usage_events,
         usage_parser_version: Some(USAGE_PARSER_VERSION),
+        events: parsed.events,
+        event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
     }))
 }
 
 struct ParsedConversation {
     messages: Vec<RawMessage>,
     usage_events: Vec<RawUsageEvent>,
+    events: Vec<RawSessionEvent>,
 }
 
 fn parse_conversation_jsonl(
     path: &Path,
     fallback_timestamp: i64,
+    include_events: bool,
 ) -> anyhow::Result<ParsedConversation> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
     let mut usage_events: Vec<RawUsageEvent> = Vec::new();
+    let mut events = Vec::new();
     let mut usage_index: HashMap<String, usize> = HashMap::new();
     let source_path = path.to_string_lossy().to_string();
 
@@ -319,6 +333,17 @@ fn parse_conversation_jsonl(
             .map(|dt| dt.timestamp_millis());
 
         let message_seq = if !text.is_empty() { Some(messages.len() as u32) } else { None };
+        if include_events {
+            collect_claude_content_events(
+                message.get("content"),
+                role.clone(),
+                timestamp,
+                &source_path,
+                line_index,
+                message_seq,
+                &mut events,
+            );
+        }
         if role == Role::Assistant
             && let Some(event) = extract_claude_usage_event(
                 &v,
@@ -342,7 +367,59 @@ fn parse_conversation_jsonl(
         }
     }
 
-    Ok(ParsedConversation { messages, usage_events })
+    Ok(ParsedConversation { messages, usage_events, events })
+}
+
+fn collect_claude_content_events(
+    content: Option<&Value>,
+    role: Role,
+    timestamp: Option<i64>,
+    source_path: &str,
+    line_index: usize,
+    message_seq: Option<u32>,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let Some(Value::Array(arr)) = content else {
+        return;
+    };
+    for (item_index, item) in arr.iter().enumerate() {
+        match item.get("type").and_then(|t| t.as_str()) {
+            Some("tool_use") if role == Role::Assistant => {
+                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
+                events_out.push(events::tool_call_event(
+                    events::EventContext {
+                        event_seq: events_out.len() as u32,
+                        timestamp,
+                        source_path: Some(source_path.to_string()),
+                        source_event_id: Some(format!("{line_index}:{item_index}")),
+                        message_seq,
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    name,
+                    item.get("input"),
+                ));
+            }
+            Some("tool_result") => {
+                let summary = item.get("content").map(|content| match content {
+                    Value::String(text) => text.to_string(),
+                    other => other.to_string(),
+                });
+                events_out.push(events::tool_result_event(
+                    events::EventContext {
+                        event_seq: events_out.len() as u32,
+                        timestamp,
+                        source_path: Some(source_path.to_string()),
+                        source_event_id: Some(format!("{line_index}:{item_index}")),
+                        message_seq,
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    item.get("tool_use_id").and_then(|id| id.as_str()).map(String::from),
+                    summary,
+                ));
+            }
+            _ => {}
+        }
+    }
 }
 
 fn extract_claude_usage_event(
@@ -501,6 +578,61 @@ mod tests {
         path
     }
 
+    #[test]
+    fn parse_claude_session_file_extracts_structured_tool_events() {
+        let root = temp_claude_root("events");
+        let project = root.join("projects").join("-tmp-foo");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("tool-session.jsonl");
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"path": "src/main.rs"}}
+                ]
+            }
+        });
+        let user = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-04-13T10:00:01Z",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "file body"}
+                ]
+            }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{assistant}").unwrap();
+        writeln!(f, "{user}").unwrap();
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let entry = FileScanEntry {
+            session_id: "tool-session".to_string(),
+            stat_target: path.clone(),
+            directory: Some("/tmp/foo".to_string()),
+        };
+        let raw = parse_claude_session_file(entry, mtime, &HashMap::new(), true).unwrap().unwrap();
+
+        assert_eq!(raw.events.len(), 2);
+        assert_eq!(raw.events[0].kind, "file_read");
+        assert_eq!(raw.events[0].name.as_deref(), Some("Read"));
+        assert_eq!(raw.events[0].target.as_deref(), Some("src/main.rs"));
+        assert_eq!(raw.events[1].kind, "tool_result");
+
+        let entry = FileScanEntry {
+            session_id: "tool-session".to_string(),
+            stat_target: path,
+            directory: Some("/tmp/foo".to_string()),
+        };
+        let raw = parse_claude_session_file(entry, mtime, &HashMap::new(), false).unwrap().unwrap();
+
+        assert!(raw.events.is_empty());
+        assert_eq!(raw.event_parser_version, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn write_usage_jsonl(project_dir: &Path, session_id: &str) -> PathBuf {
         fs::create_dir_all(project_dir).unwrap();
         let path = project_dir.join(format!("{session_id}.jsonl"));
@@ -593,7 +725,7 @@ mod tests {
             directory: Some("/tmp/foo".to_string()),
         };
         let session_index = HashMap::new();
-        let raw = parse_claude_session_file(entry, mtime, &session_index).unwrap().unwrap();
+        let raw = parse_claude_session_file(entry, mtime, &session_index, true).unwrap().unwrap();
 
         assert_eq!(raw.source_id, "abc-123");
         assert_eq!(raw.updated_at, Some(mtime));
@@ -617,7 +749,7 @@ mod tests {
             directory: Some("/tmp/foo".to_string()),
         };
         let session_index = HashMap::new();
-        let raw = parse_claude_session_file(entry, mtime, &session_index).unwrap().unwrap();
+        let raw = parse_claude_session_file(entry, mtime, &session_index, true).unwrap().unwrap();
 
         assert_eq!(raw.usage_events.len(), 1);
         let event = &raw.usage_events[0];
@@ -646,7 +778,7 @@ mod tests {
             directory: Some("/tmp/foo".to_string()),
         };
         let session_index = HashMap::new();
-        let raw = parse_claude_session_file(entry, mtime, &session_index).unwrap().unwrap();
+        let raw = parse_claude_session_file(entry, mtime, &session_index, true).unwrap().unwrap();
 
         assert!(raw.messages.is_empty());
         assert_eq!(raw.started_at, 1_776_074_400_000);
@@ -684,7 +816,7 @@ mod tests {
             stat_target: path,
             directory: Some("/tmp/foo".to_string()),
         };
-        let raw = parse_claude_session_file(entry, mtime, &HashMap::new()).unwrap().unwrap();
+        let raw = parse_claude_session_file(entry, mtime, &HashMap::new(), true).unwrap().unwrap();
 
         assert_eq!(raw.usage_events.len(), 1);
         assert_eq!(raw.usage_events[0].model, "gpt-5.5");
@@ -733,8 +865,17 @@ mod tests {
                 Some(mtime),
             )
             .unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "claude-code",
+                "sess-skip",
+                &[],
+                EVENT_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 
@@ -753,7 +894,7 @@ mod tests {
             .insert_session(&make_existing_session("sess-stale", actual_mtime - 1_000, 1))
             .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "sess-stale");
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -770,7 +911,7 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "sess-fresh");
         assert_eq!(result.stats.skipped_sessions, 0);

@@ -98,6 +98,23 @@ pub struct RawUsageEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct RawSessionEvent {
+    pub event_seq: u32,
+    pub timestamp: Option<i64>,
+    pub kind: String,
+    pub actor: String,
+    pub name: Option<String>,
+    pub status: Option<String>,
+    pub target: Option<String>,
+    pub message_seq: Option<u32>,
+    pub summary: Option<String>,
+    pub source_path: Option<String>,
+    pub source_event_id: Option<String>,
+    pub attrs_json: Option<String>,
+    pub parser_version: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct UsageEventRecord {
     pub session_id: String,
     pub source: String,
@@ -112,6 +129,21 @@ pub struct UsageEventRecord {
     pub cache_write_tokens: i64,
     pub reasoning_tokens: i64,
     pub token_source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionEventRecord {
+    pub event_seq: u32,
+    pub timestamp: Option<i64>,
+    pub kind: String,
+    pub actor: String,
+    pub name: Option<String>,
+    pub status: Option<String>,
+    pub target: Option<String>,
+    pub message_seq: Option<u32>,
+    pub summary: Option<String>,
+    pub source_path: Option<String>,
+    pub source_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

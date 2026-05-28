@@ -49,8 +49,8 @@ recall info          # index stats and worker status
 
 `recall export --jsonl` writes one JSON object per indexed session. Each record
 includes `schema_version`, `record_type`, `session`, `messages`, and
-`usage_events`. Optional fields are emitted as `null`; raw source-specific JSON
-is not part of the public export contract.
+`usage_events`, and `events`. Optional fields are emitted as `null`; raw
+source-specific JSON is not part of the public export contract.
 
 ## License
 

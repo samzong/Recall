@@ -45,6 +45,7 @@ impl SourceAdapter for ClineAdapter {
         &self,
         store: &Store,
         since_ts: Option<i64>,
+        _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(tasks_dir) = resolve_tasks_dir()? else {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));

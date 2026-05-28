@@ -4,15 +4,17 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde_json::Value;
 use tracing::debug;
 
+use crate::adapters::events;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SourceScanSummary, SyncScanResult,
     SyncScanStats,
 };
-use crate::db::store::{Store, UsageSessionStateMeta};
-use crate::types::{RawUsageEvent, Role, TokenSource};
+use crate::db::store::{EventSessionStateMeta, Store, UsageSessionStateMeta};
+use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
 const USAGE_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 2;
 const PARSED_PART_FILTER_SQL: &str = "
     json_valid(m.data)
     AND json_valid(p.data)
@@ -24,6 +26,11 @@ const PARSED_PART_FILTER_SQL: &str = "
             AND json_type(p.data, '$.input') IS NOT NULL)
         OR (json_extract(p.data, '$.type') = 'tool-result'
             AND json_type(p.data, '$.result') IS NOT NULL)
+        OR (json_extract(p.data, '$.type') = 'tool'
+            AND (json_type(p.data, '$.state.input') IS NOT NULL
+                OR json_type(p.data, '$.state.output') IS NOT NULL))
+        OR (json_extract(p.data, '$.type') = 'patch'
+            AND json_type(p.data, '$.files') = 'array')
     )
 ";
 
@@ -61,7 +68,7 @@ impl SourceAdapter for OpenCodeAdapter {
             return Ok(vec![]);
         };
         let sessions = load_session_rows(&conn, None)?;
-        scan_session_messages(&conn, sessions)
+        scan_session_messages(&conn, sessions, true)
     }
 
     fn scan_summary(&self) -> anyhow::Result<Option<SourceScanSummary>> {
@@ -89,12 +96,13 @@ impl SourceAdapter for OpenCodeAdapter {
         &self,
         store: &Store,
         since_ts: Option<i64>,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_opencode_db()? else {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
         };
 
-        Ok(Some(scan_for_sync_conn(&conn, store, since_ts, self.id())?))
+        Ok(Some(scan_for_sync_conn(&conn, store, since_ts, self.id(), include_events)?))
     }
 }
 
@@ -177,6 +185,7 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
 fn scan_session_messages(
     conn: &Connection,
     sessions: Vec<SessionRow>,
+    include_events: bool,
 ) -> anyhow::Result<Vec<RawSession>> {
     if sessions.is_empty() {
         return Ok(vec![]);
@@ -185,34 +194,190 @@ fn scan_session_messages(
     let session_ids: Vec<String> = sessions.iter().map(|session| session.id.clone()).collect();
     let mut session_messages: HashMap<String, Vec<RawMessage>> = HashMap::new();
     let mut session_usage_events: HashMap<String, Vec<RawUsageEvent>> = HashMap::new();
+    let mut session_events: HashMap<String, Vec<RawSessionEvent>> = HashMap::new();
 
     for chunk in session_ids.chunks(MAX_SQL_VARS_PER_BATCH) {
         load_message_chunk(conn, chunk, &mut session_messages)?;
         load_usage_chunk(conn, chunk, &mut session_usage_events)?;
+        if include_events {
+            load_event_chunk(conn, chunk, &mut session_events)?;
+        }
     }
 
     let mut raw_sessions = Vec::new();
     for session in sessions {
         let messages = session_messages.remove(&session.id).unwrap_or_default();
         let usage_events = session_usage_events.remove(&session.id).unwrap_or_default();
-        if messages.is_empty() && usage_events.is_empty() {
+        let events = session_events.remove(&session.id).unwrap_or_default();
+        if messages.is_empty() && usage_events.is_empty() && events.is_empty() {
             continue;
         }
 
-        raw_sessions.push(
-            RawSession::search_only(
-                session.id,
-                Some(session.directory),
-                session.time_created,
-                session.time_updated,
-                None,
-                messages,
-            )
-            .with_usage(usage_events, USAGE_PARSER_VERSION),
-        );
+        let raw = RawSession::search_only(
+            session.id,
+            Some(session.directory),
+            session.time_created,
+            session.time_updated,
+            None,
+            messages,
+        )
+        .with_usage(usage_events, USAGE_PARSER_VERSION);
+        raw_sessions.push(if include_events {
+            raw.with_events(events, EVENT_PARSER_VERSION)
+        } else {
+            raw
+        });
     }
 
     Ok(raw_sessions)
+}
+
+fn load_event_chunk(
+    conn: &Connection,
+    session_ids: &[String],
+    session_events: &mut HashMap<String, Vec<RawSessionEvent>>,
+) -> anyhow::Result<()> {
+    let placeholders = std::iter::repeat_n("?", session_ids.len()).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT m.session_id, CAST(p.id AS TEXT), p.data, m.time_created
+         FROM message m
+         JOIN part p ON p.message_id = m.id
+         WHERE m.session_id IN ({placeholders})
+           AND json_valid(m.data)
+           AND json_valid(p.data)
+           AND json_extract(m.data, '$.role') = 'assistant'
+           AND json_extract(p.data, '$.type') IN ('tool-invocation', 'tool-result', 'tool', 'patch')
+         ORDER BY m.time_created, p.id"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (session_id, part_id, part_data, timestamp) = row?;
+        let events = session_events.entry(session_id).or_default();
+        let part_events = parse_part_events(&part_id, &part_data, timestamp, events.len() as u32);
+        events.extend(part_events);
+    }
+
+    Ok(())
+}
+
+fn parse_part_events(
+    part_id: &str,
+    part_data: &str,
+    timestamp: Option<i64>,
+    event_seq: u32,
+) -> Vec<RawSessionEvent> {
+    let Some(part) = serde_json::from_str::<Value>(part_data).ok() else {
+        return Vec::new();
+    };
+    match part.get("type").and_then(|t| t.as_str()) {
+        Some("tool-invocation") => {
+            let name = part.get("toolName").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
+            vec![events::tool_call_event(
+                events::EventContext {
+                    event_seq,
+                    timestamp,
+                    source_path: None,
+                    source_event_id: Some(part_id.to_string()),
+                    message_seq: None,
+                    parser_version: EVENT_PARSER_VERSION,
+                },
+                name,
+                part.get("input"),
+            )]
+        }
+        Some("tool-result") => {
+            let name = part.get("toolName").and_then(|n| n.as_str()).map(String::from);
+            let summary = part.get("result").map(|result| result.to_string());
+            vec![events::tool_result_event(
+                events::EventContext {
+                    event_seq,
+                    timestamp,
+                    source_path: None,
+                    source_event_id: Some(part_id.to_string()),
+                    message_seq: None,
+                    parser_version: EVENT_PARSER_VERSION,
+                },
+                name,
+                summary,
+            )]
+        }
+        Some("tool") => {
+            let name = opencode_tool_name(&part);
+            let Some(state) = part.get("state") else {
+                return Vec::new();
+            };
+            let status = state.get("status").and_then(|status| status.as_str()).map(String::from);
+            let mut part_events = Vec::new();
+
+            if let Some(input) = state.get("input") {
+                let mut event = events::tool_call_event(
+                    events::EventContext {
+                        event_seq,
+                        timestamp,
+                        source_path: None,
+                        source_event_id: Some(format!("{part_id}:input")),
+                        message_seq: None,
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    name.clone(),
+                    Some(input),
+                );
+                event.status = status.clone();
+                part_events.push(event);
+            }
+
+            if let Some(output) = state.get("output") {
+                let mut event = events::tool_result_event(
+                    events::EventContext {
+                        event_seq: event_seq + part_events.len() as u32,
+                        timestamp,
+                        source_path: None,
+                        source_event_id: Some(format!("{part_id}:output")),
+                        message_seq: None,
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    Some(name),
+                    Some(display_json_value(output)),
+                );
+                event.status = status;
+                part_events.push(event);
+            }
+
+            part_events
+        }
+        Some("patch") => {
+            let files = patch_files(&part);
+            let target = files.first().cloned();
+            let summary =
+                if files.is_empty() { None } else { Some(format!("[patch] {}", files.join(", "))) };
+            vec![RawSessionEvent {
+                event_seq,
+                timestamp,
+                kind: "file_write".to_string(),
+                actor: "assistant".to_string(),
+                name: Some("patch".to_string()),
+                status: None,
+                target,
+                message_seq: None,
+                summary,
+                source_path: None,
+                source_event_id: Some(part_id.to_string()),
+                attrs_json: Some(part.to_string()),
+                parser_version: EVENT_PARSER_VERSION,
+            }]
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn load_message_chunk(
@@ -409,7 +574,51 @@ fn parse_part_content(part_data: &str) -> Option<String> {
                 part.get("result").map(|result| format!("[{name}] {result}"))
             }
         }
+        "tool" => {
+            let name = opencode_tool_name(&part);
+            let state = part.get("state")?;
+            match (state.get("input"), state.get("output")) {
+                (Some(input), Some(output)) => Some(format!(
+                    "[{name}] input: {}\noutput: {}",
+                    display_json_value(input),
+                    display_json_value(output)
+                )),
+                (Some(input), None) => Some(format!("[{name}] {}", display_json_value(input))),
+                (None, Some(output)) => Some(format!("[{name}] {}", display_json_value(output))),
+                (None, None) => None,
+            }
+        }
+        "patch" => {
+            let files = patch_files(&part);
+            if files.is_empty() { None } else { Some(format!("[patch] {}", files.join(", "))) }
+        }
         _ => None,
+    }
+}
+
+fn opencode_tool_name(part: &Value) -> String {
+    part.get("tool")
+        .or_else(|| part.get("toolName"))
+        .and_then(|name| name.as_str())
+        .unwrap_or("tool")
+        .to_string()
+}
+
+fn patch_files(part: &Value) -> Vec<String> {
+    part.get("files")
+        .and_then(|files| files.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file.as_str())
+        .filter(|file| !file.trim().is_empty())
+        .map(|file| file.trim().to_string())
+        .collect()
+}
+
+fn display_json_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -418,11 +627,14 @@ fn scan_for_sync_conn(
     store: &Store,
     since_ts: Option<i64>,
     source_id: &str,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let filtered_sessions = count_filtered_sessions(conn, since_ts)?;
     let sessions = load_session_rows(conn, since_ts)?;
     let existing = store.session_meta_map(source_id)?;
     let usage_state = store.usage_state_meta_map(source_id)?;
+    let event_state =
+        if include_events { store.event_state_meta_map(source_id)? } else { Default::default() };
     let current_counts = load_message_counts(
         conn,
         &sessions.iter().map(|session| session.id.clone()).collect::<Vec<_>>(),
@@ -440,6 +652,11 @@ fn scan_for_sync_conn(
                     usage_state.get(&session.id).copied(),
                     session.time_updated,
                 )
+                && (!include_events
+                    || event_state_is_current(
+                        event_state.get(&session.id).copied(),
+                        session.time_updated,
+                    ))
             {
                 stats.skipped_sessions += 1;
                 continue;
@@ -448,7 +665,7 @@ fn scan_for_sync_conn(
         candidates.push(session);
     }
 
-    let sessions = scan_session_messages(conn, candidates)?;
+    let sessions = scan_session_messages(conn, candidates, include_events)?;
     Ok(SyncScanResult { sessions, stats })
 }
 
@@ -458,6 +675,15 @@ fn usage_state_is_current(
 ) -> bool {
     state.is_some_and(|state| {
         state.parser_version >= USAGE_PARSER_VERSION && state.source_updated_at == source_updated_at
+    })
+}
+
+fn event_state_is_current(
+    state: Option<EventSessionStateMeta>,
+    source_updated_at: Option<i64>,
+) -> bool {
+    state.is_some_and(|state| {
+        state.parser_version >= EVENT_PARSER_VERSION && state.source_updated_at == source_updated_at
     })
 }
 
@@ -563,6 +789,18 @@ mod tests {
             .unwrap();
     }
 
+    fn mark_event_current(store: &Store, source_id: &str, updated_at: Option<i64>) {
+        store
+            .persist_session_events_for_existing_session(
+                "opencode",
+                source_id,
+                &[],
+                EVENT_PARSER_VERSION,
+                updated_at,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn incremental_scan_skips_sessions_with_matching_updated_at_and_message_count() {
         let (path, conn) = setup_opencode_db();
@@ -571,8 +809,25 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
         mark_usage_current(&store, "s1", Some(200));
+        mark_event_current(&store, "s1", Some(200));
 
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode").unwrap();
+        let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
+        assert!(result.sessions.is_empty());
+        assert_eq!(result.stats.skipped_sessions, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn usage_only_incremental_scan_skips_missing_event_state() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "s1", 200, 100, "hello");
+
+        let store = setup_store();
+        store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
+        mark_usage_current(&store, "s1", Some(200));
+
+        let result = scan_for_sync_conn(&conn, &store, None, "opencode", false).unwrap();
         assert!(result.sessions.is_empty());
         assert_eq!(result.stats.skipped_sessions, 1);
         drop(conn);
@@ -591,7 +846,7 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
 
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode").unwrap();
+        let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
         assert_eq!(result.stats.skipped_sessions, 0);
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "s1");
@@ -610,8 +865,9 @@ mod tests {
         store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
         store.insert_session(&make_session("local-s2", "s2", Some(150), 1)).unwrap();
         mark_usage_current(&store, "s2", Some(150));
+        mark_event_current(&store, "s2", Some(150));
 
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode").unwrap();
+        let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
         assert_eq!(result.stats.skipped_sessions, 1);
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "s1");
@@ -627,7 +883,7 @@ mod tests {
         insert_session_with_message(&conn, "new", 220, 200, "new");
 
         let store = setup_store();
-        let result = scan_for_sync_conn(&conn, &store, Some(200), "opencode").unwrap();
+        let result = scan_for_sync_conn(&conn, &store, Some(200), "opencode", true).unwrap();
 
         assert_eq!(result.stats.filtered_sessions, 1);
         assert_eq!(result.sessions.len(), 1);
@@ -686,7 +942,7 @@ mod tests {
         .unwrap();
 
         let store = setup_store();
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode").unwrap();
+        let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
 
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "good");
@@ -717,5 +973,157 @@ mod tests {
         let parsed = parse_part_content("{\"type\":\"text\",\"text\":\"  hello  \"}");
         assert_eq!(parsed.as_deref(), Some("  hello  "));
         assert_eq!(parse_part_content("{\"type\":\"text\",\"text\":\"   \"}"), None);
+    }
+
+    #[test]
+    fn parse_part_content_includes_current_tool_input_and_output() {
+        let parsed = parse_part_content(
+            r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"needle result"}}"#,
+        );
+
+        let content = parsed.unwrap();
+        assert!(content.contains("\"filePath\":\"src/main.rs\""));
+        assert!(content.contains("needle result"));
+    }
+
+    #[test]
+    fn scan_session_messages_extracts_structured_tool_events() {
+        let (path, conn) = setup_opencode_db();
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('s1', 'Test', '/tmp/project', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (session_id, data, time_created)
+             VALUES ('s1', '{\"role\":\"assistant\"}', 110)",
+            [],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data)
+             VALUES (NULL, ?1, ?2)",
+            rusqlite::params![
+                message_id,
+                r#"{"type":"tool-invocation","toolName":"readFile","input":{"path":"src/main.rs"}}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data)
+             VALUES (NULL, ?1, ?2)",
+            rusqlite::params![
+                message_id,
+                r#"{"type":"tool-result","toolName":"readFile","result":"file body"}"#
+            ],
+        )
+        .unwrap();
+
+        let sessions = load_session_rows(&conn, None).unwrap();
+        let raw = scan_session_messages(&conn, sessions, true).unwrap();
+
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].events.len(), 2);
+        assert_eq!(raw[0].events[0].kind, "file_read");
+        assert_eq!(raw[0].events[0].name.as_deref(), Some("readFile"));
+        assert_eq!(raw[0].events[0].target.as_deref(), Some("src/main.rs"));
+        assert_eq!(raw[0].events[1].kind, "tool_result");
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scan_session_messages_extracts_current_tool_and_patch_events() {
+        let (path, conn) = setup_opencode_db();
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('s1', 'Test', '/tmp/project', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (session_id, data, time_created)
+             VALUES ('s1', '{\"role\":\"assistant\"}', 110)",
+            [],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data)
+             VALUES (NULL, ?1, ?2)",
+            rusqlite::params![
+                message_id,
+                r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"file body"}}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data)
+             VALUES (NULL, ?1, ?2)",
+            rusqlite::params![
+                message_id,
+                r#"{"type":"patch","hash":"abc","files":["src/main.rs","README.md"]}"#
+            ],
+        )
+        .unwrap();
+
+        let sessions = load_session_rows(&conn, None).unwrap();
+        let raw = scan_session_messages(&conn, sessions, true).unwrap();
+
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].messages.len(), 2);
+        assert_eq!(raw[0].events.len(), 3);
+        assert_eq!(raw[0].events[0].kind, "file_read");
+        assert_eq!(raw[0].events[0].name.as_deref(), Some("read"));
+        assert_eq!(raw[0].events[0].status.as_deref(), Some("completed"));
+        assert_eq!(raw[0].events[0].target.as_deref(), Some("src/main.rs"));
+        assert_eq!(raw[0].events[1].kind, "tool_result");
+        assert_eq!(raw[0].events[1].name.as_deref(), Some("read"));
+        assert_eq!(raw[0].events[1].status.as_deref(), Some("completed"));
+        assert_eq!(raw[0].events[1].summary.as_deref(), Some("file body"));
+        assert_eq!(raw[0].events[2].kind, "file_write");
+        assert_eq!(raw[0].events[2].name.as_deref(), Some("patch"));
+        assert_eq!(raw[0].events[2].target.as_deref(), Some("src/main.rs"));
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scan_for_sync_omits_events_when_disabled() {
+        let (path, conn) = setup_opencode_db();
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('s1', 'Test', '/tmp/project', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (session_id, data, time_created)
+             VALUES ('s1', '{\"role\":\"assistant\"}', 110)",
+            [],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data)
+             VALUES (NULL, ?1, ?2)",
+            rusqlite::params![
+                message_id,
+                r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"file body"}}"#
+            ],
+        )
+        .unwrap();
+        let store = setup_store();
+
+        let result = scan_for_sync_conn(&conn, &store, None, "opencode", false).unwrap();
+
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].messages.len(), 1);
+        assert!(result.sessions[0].events.is_empty());
+        assert_eq!(result.sessions[0].event_parser_version, None);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -4,6 +4,7 @@ pub mod cline;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
+pub mod events;
 pub mod file_scan;
 pub mod gemini;
 pub mod kiro;
@@ -11,7 +12,7 @@ pub mod opencode;
 pub mod pi;
 
 use crate::db::store::Store;
-use crate::types::{RawUsageEvent, Role};
+use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 pub trait SourceAdapter {
     fn id(&self) -> &str;
@@ -27,6 +28,7 @@ pub trait SourceAdapter {
         &self,
         _store: &Store,
         _since_ts: Option<i64>,
+        _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         Ok(None)
     }
@@ -42,6 +44,8 @@ pub struct RawSession {
     pub messages: Vec<RawMessage>,
     pub usage_events: Vec<RawUsageEvent>,
     pub usage_parser_version: Option<u32>,
+    pub events: Vec<RawSessionEvent>,
+    pub event_parser_version: Option<u32>,
 }
 
 impl RawSession {
@@ -62,12 +66,20 @@ impl RawSession {
             messages,
             usage_events: Vec::new(),
             usage_parser_version: None,
+            events: Vec::new(),
+            event_parser_version: None,
         }
     }
 
     pub fn with_usage(mut self, usage_events: Vec<RawUsageEvent>, parser_version: u32) -> Self {
         self.usage_events = usage_events;
         self.usage_parser_version = Some(parser_version);
+        self
+    }
+
+    pub fn with_events(mut self, events: Vec<RawSessionEvent>, parser_version: u32) -> Self {
+        self.events = events;
+        self.event_parser_version = Some(parser_version);
         self
     }
 }

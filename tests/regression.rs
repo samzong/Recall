@@ -6,7 +6,7 @@ use recall::db::schema;
 use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
 use recall::db::store::Store;
 use recall::export::{ExportOptions, write_jsonl};
-use recall::types::{Message, RawUsageEvent, Role, Session, TokenSource};
+use recall::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource};
 use recall::usage::{UsageFilters, build_usage_report};
 
 fn setup() -> Store {
@@ -55,6 +55,24 @@ fn make_usage_event(key: &str, timestamp: i64, model: &str) -> RawUsageEvent {
         parser_version: 1,
         source_path: Some("/tmp/source.jsonl".to_string()),
         raw_usage_json: Some(r#"{"input_tokens":10}"#.to_string()),
+    }
+}
+
+fn make_session_event(kind: &str, name: Option<&str>, target: Option<&str>) -> RawSessionEvent {
+    RawSessionEvent {
+        event_seq: 0,
+        timestamp: Some(1_800_000_001_000),
+        kind: kind.to_string(),
+        actor: "assistant".to_string(),
+        name: name.map(String::from),
+        status: None,
+        target: target.map(String::from),
+        message_seq: Some(1),
+        summary: Some("event summary".to_string()),
+        source_path: Some("/tmp/source.jsonl".to_string()),
+        source_event_id: Some("42".to_string()),
+        attrs_json: Some(r#"{"path":"src/main.rs"}"#.to_string()),
+        parser_version: 1,
     }
 }
 
@@ -195,6 +213,33 @@ fn delete_session_cascades_usage_events() {
 }
 
 #[test]
+fn persist_session_writes_session_events_and_state() {
+    let store = setup();
+    let session = make_session("s1", "codex", "raw1", "Event session");
+    let messages = vec![make_message("s1", Role::Assistant, "[read_file] src/main.rs", 0)];
+    let events = vec![make_session_event("file_read", Some("read_file"), Some("src/main.rs"))];
+
+    store
+        .persist_session_with_usage_and_events(&session, &messages, &[], None, &events, Some(1))
+        .unwrap();
+
+    let count: i64 =
+        store.conn.query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0)).unwrap();
+    assert_eq!(count, 1);
+    let state_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM event_session_state", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(state_count, 1);
+
+    let loaded = store.list_session_events_for_session("s1").unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].kind, "file_read");
+    assert_eq!(loaded[0].name.as_deref(), Some("read_file"));
+    assert_eq!(loaded[0].target.as_deref(), Some("src/main.rs"));
+}
+
+#[test]
 fn export_jsonl_emits_session_messages_and_usage_events() {
     let store = setup();
     let mut session = make_session("s1", "codex", "raw1", "Export session");
@@ -207,7 +252,17 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
         make_message("s1", Role::Assistant, "hi", 1),
     ];
     let usage = vec![make_usage_event("evt-1", 1_800_000_001_000, "gpt-5")];
-    store.persist_session_with_usage(&session, &messages, &usage, Some(1)).unwrap();
+    let events = vec![make_session_event("file_read", Some("read_file"), Some("src/main.rs"))];
+    store
+        .persist_session_with_usage_and_events(
+            &session,
+            &messages,
+            &usage,
+            Some(1),
+            &events,
+            Some(1),
+        )
+        .unwrap();
 
     let options =
         ExportOptions { sources: None, time_range: TimeRange::All, project: None, limit: Some(10) };
@@ -218,7 +273,7 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     let lines: Vec<_> = text.lines().collect();
     assert_eq!(lines.len(), 1);
     let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["record_type"], "session");
     assert_eq!(value["session"]["source"], "codex");
     assert_eq!(value["session"]["source_id"], "raw1");
@@ -232,6 +287,11 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     assert_eq!(value["usage_events"][0]["model"], "gpt-5");
     assert_eq!(value["usage_events"][0]["token_source"], "observed");
     assert!(value["usage_events"][0].get("raw_usage_json").is_none());
+    assert_eq!(value["events"][0]["kind"], "file_read");
+    assert_eq!(value["events"][0]["name"], "read_file");
+    assert_eq!(value["events"][0]["target"], "src/main.rs");
+    assert_eq!(value["events"][0]["message_seq"], 1);
+    assert!(value["events"][0].get("attrs_json").is_none());
 }
 
 #[test]

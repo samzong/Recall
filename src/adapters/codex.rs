@@ -6,16 +6,18 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
 use crate::db::store::Store;
-use crate::types::{RawUsageEvent, Role, TokenSource};
+use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
 
 pub struct CodexAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 4;
+const EVENT_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for CodexAdapter {
     fn id(&self) -> &str {
@@ -48,7 +50,7 @@ impl SourceAdapter for CodexAdapter {
             let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
                 continue;
             };
-            if let Some(raw) = parse_codex_session_for_entry(entry, mtime_ms)? {
+            if let Some(raw) = parse_codex_session_for_entry(entry, mtime_ms, true)? {
                 sessions.push(raw);
             }
         }
@@ -59,11 +61,12 @@ impl SourceAdapter for CodexAdapter {
         &self,
         store: &Store,
         since_ts: Option<i64>,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(codex_dir) = resolve_codex_dir()? else {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
         };
-        let result = scan_for_sync_impl(&codex_dir, store, since_ts)?;
+        let result = scan_for_sync_impl(&codex_dir, store, since_ts, include_events)?;
         Ok(Some(result))
     }
 }
@@ -82,6 +85,7 @@ fn scan_for_sync_impl(
     codex_dir: &Path,
     store: &Store,
     since_ts: Option<i64>,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let sessions_dir = codex_dir.join("sessions");
     let archived_dir = codex_dir.join("archived_sessions");
@@ -90,9 +94,21 @@ fn scan_for_sync_impl(
         store,
         "codex",
         since_ts,
-        file_scan::FileScanOptions { usage_parser_version: Some(USAGE_PARSER_VERSION) },
+        file_scan::FileScanOptions {
+            usage_parser_version: Some(USAGE_PARSER_VERSION),
+            event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+        },
         entries,
-        parse_codex_session_for_entry,
+        |entry, mtime_ms| {
+            let Some(session) = parse_codex_session_for_entry(entry, mtime_ms, include_events)?
+            else {
+                return Ok(None);
+            };
+            if !include_events && session.messages.is_empty() && session.usage_events.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(session))
+        },
     )
 }
 
@@ -131,8 +147,9 @@ fn collect_codex_entries(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
 fn parse_codex_session_for_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    let mut raw = match parse_codex_session(&entry.stat_target) {
+    let mut raw = match parse_codex_session_with_options(&entry.stat_target, include_events) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
         Err(e) => {
@@ -156,7 +173,15 @@ fn extract_session_id_from_filename(stem: &str) -> Option<String> {
     uuid::Uuid::try_parse(tail).ok().map(|_| tail.to_string())
 }
 
+#[cfg(test)]
 fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
+    parse_codex_session_with_options(path, true)
+}
+
+fn parse_codex_session_with_options(
+    path: &Path,
+    include_events: bool,
+) -> anyhow::Result<Option<RawSession>> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let fallback_timestamp = file_scan::stat_mtime_ms(path).unwrap_or(0);
@@ -165,6 +190,7 @@ fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
     let mut meta_timestamp: Option<i64> = None;
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
+    let mut events = Vec::new();
     let mut current_model: Option<String> = None;
     let mut provider: Option<String> = None;
     let mut previous_totals: Option<CodexUsageTotals> = None;
@@ -337,6 +363,18 @@ fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
                     && payload.get("role").and_then(|r| r.as_str()) == Some("assistant")
                 {
                     let text = extract_content_array(payload.get("content"));
+                    let message_seq =
+                        if text.is_empty() { None } else { Some(messages.len() as u32) };
+                    if include_events {
+                        collect_codex_content_events(
+                            payload.get("content"),
+                            parse_timestamp(&v),
+                            &source_path,
+                            line_index,
+                            message_seq,
+                            &mut events,
+                        );
+                    }
                     if !text.is_empty() {
                         let ts = parse_timestamp(&v);
                         messages.push(RawMessage {
@@ -346,12 +384,21 @@ fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
                         });
                     }
                 }
+                if include_events && let Some(payload) = v.get("payload") {
+                    collect_codex_response_item_event(
+                        payload,
+                        parse_timestamp(&v),
+                        &source_path,
+                        line_index,
+                        &mut events,
+                    );
+                }
             }
             _ => {}
         }
     }
 
-    if messages.is_empty() && usage_events.is_empty() {
+    if messages.is_empty() && usage_events.is_empty() && events.is_empty() {
         return Ok(None);
     }
 
@@ -362,6 +409,7 @@ fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
     let started_at = meta_timestamp
         .or_else(|| messages.first().and_then(|m| m.timestamp))
         .or_else(|| usage_events.first().map(|event| event.timestamp))
+        .or_else(|| events.first().and_then(|event| event.timestamp))
         .unwrap_or(0);
 
     Ok(Some(RawSession {
@@ -371,12 +419,159 @@ fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
         updated_at: messages
             .last()
             .and_then(|m| m.timestamp)
-            .or_else(|| usage_events.last().map(|event| event.timestamp)),
+            .or_else(|| usage_events.last().map(|event| event.timestamp))
+            .or_else(|| events.last().and_then(|event| event.timestamp)),
         entrypoint: None,
         messages,
         usage_events,
         usage_parser_version: Some(USAGE_PARSER_VERSION),
+        events,
+        event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
     }))
+}
+
+fn collect_codex_response_item_event(
+    payload: &Value,
+    timestamp: Option<i64>,
+    source_path: &str,
+    line_index: usize,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let Some(payload_type) = payload.get("type").and_then(|t| t.as_str()) else {
+        return;
+    };
+    let source_event_id = payload
+        .get("call_id")
+        .and_then(|id| id.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| line_index.to_string());
+
+    if payload_type.ends_with("_output") {
+        let mut event = events::tool_result_event(
+            events::EventContext {
+                event_seq: events_out.len() as u32,
+                timestamp,
+                source_path: Some(source_path.to_string()),
+                source_event_id: Some(source_event_id),
+                message_seq: None,
+                parser_version: EVENT_PARSER_VERSION,
+            },
+            payload.get("name").and_then(|name| name.as_str()).map(String::from),
+            codex_output_summary(payload),
+        );
+        event.status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
+        events_out.push(event);
+        return;
+    }
+
+    if payload_type.ends_with("_call") {
+        let name = codex_call_name(payload_type, payload);
+        let mut event = match codex_call_args(payload) {
+            Some(Value::String(text)) => events::tool_call_event_from_text(
+                events::EventContext {
+                    event_seq: events_out.len() as u32,
+                    timestamp,
+                    source_path: Some(source_path.to_string()),
+                    source_event_id: Some(source_event_id.clone()),
+                    message_seq: None,
+                    parser_version: EVENT_PARSER_VERSION,
+                },
+                name,
+                Some(text),
+            ),
+            args => events::tool_call_event(
+                events::EventContext {
+                    event_seq: events_out.len() as u32,
+                    timestamp,
+                    source_path: Some(source_path.to_string()),
+                    source_event_id: Some(source_event_id),
+                    message_seq: None,
+                    parser_version: EVENT_PARSER_VERSION,
+                },
+                name,
+                args,
+            ),
+        };
+        event.status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
+        events_out.push(event);
+    }
+}
+
+fn codex_call_name(payload_type: &str, payload: &Value) -> String {
+    payload.get("name").and_then(|name| name.as_str()).map(String::from).unwrap_or_else(|| {
+        match payload_type {
+            "function_call" | "custom_tool_call" => "tool".to_string(),
+            _ => payload_type.strip_suffix("_call").unwrap_or(payload_type).to_string(),
+        }
+    })
+}
+
+fn codex_call_args(payload: &Value) -> Option<&Value> {
+    payload
+        .get("arguments")
+        .or_else(|| payload.get("input"))
+        .or_else(|| payload.get("action"))
+        .or_else(|| payload.get("revised_prompt"))
+}
+
+fn codex_output_summary(payload: &Value) -> Option<String> {
+    ["output", "result", "content", "tools"]
+        .iter()
+        .find_map(|key| payload.get(*key))
+        .map(codex_value_summary)
+}
+
+fn codex_value_summary(value: &Value) -> String {
+    value.as_str().map(String::from).unwrap_or_else(|| value.to_string())
+}
+
+fn collect_codex_content_events(
+    content: Option<&Value>,
+    timestamp: Option<i64>,
+    source_path: &str,
+    line_index: usize,
+    message_seq: Option<u32>,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let Some(Value::Array(arr)) = content else {
+        return;
+    };
+    for (item_index, item) in arr.iter().enumerate() {
+        match item.get("type").and_then(|t| t.as_str()) {
+            Some("function_call") => {
+                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
+                let args = item.get("arguments").and_then(|a| a.as_str());
+                events_out.push(events::tool_call_event_from_text(
+                    events::EventContext {
+                        event_seq: events_out.len() as u32,
+                        timestamp,
+                        source_path: Some(source_path.to_string()),
+                        source_event_id: Some(format!("{line_index}:{item_index}")),
+                        message_seq,
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    name,
+                    args,
+                ));
+            }
+            Some("function_call_output") => {
+                let output = item.get("output").and_then(|o| o.as_str()).map(String::from);
+                events_out.push(events::tool_result_event(
+                    events::EventContext {
+                        event_seq: events_out.len() as u32,
+                        timestamp,
+                        source_path: Some(source_path.to_string()),
+                        source_event_id: Some(format!("{line_index}:{item_index}")),
+                        message_seq,
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    None,
+                    output,
+                ));
+            }
+            _ => {}
+        }
+    }
 }
 
 fn extract_content_array(content: Option<&Value>) -> String {
@@ -687,6 +882,329 @@ mod tests {
         path
     }
 
+    fn write_codex_event_only_rollout(sessions_dir: &Path, session_uuid: &str) -> PathBuf {
+        fs::create_dir_all(sessions_dir).unwrap();
+        let filename = format!("rollout-2026-04-13T10-00-00-{session_uuid}.jsonl");
+        let path = sessions_dir.join(filename);
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "payload": {
+                "id": session_uuid,
+                "timestamp": "2026-04-13T10:00:00Z",
+                "cwd": "/tmp/foo"
+            }
+        });
+        let web_search = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:01Z",
+            "payload": {
+                "type": "web_search_call",
+                "status": "completed",
+                "call_id": "web_123",
+                "action": {
+                    "type": "search",
+                    "query": "rust sqlite json_extract"
+                }
+            }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{meta}").unwrap();
+        writeln!(f, "{web_search}").unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_codex_session_extracts_structured_tool_events() {
+        let root = temp_codex_root("events");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2391";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "payload": {
+                "id": uuid,
+                "timestamp": "2026-04-13T10:00:00Z",
+                "cwd": "/tmp/foo"
+            }
+        });
+        let tool_call = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:01Z",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"sed -n '1,220p' CLAUDE.md\",\"workdir\":\"/tmp/foo\",\"yield_time_ms\":1000}",
+                "call_id": "call_123"
+            }
+        });
+        let tool_result = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:02Z",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_123",
+                "output": "file body"
+            }
+        });
+        let custom_call = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:03Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "status": "completed",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch"
+            }
+        });
+        let custom_result = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:04Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_patch",
+                "output": "{\"output\":\"Success\"}"
+            }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{meta}").unwrap();
+        writeln!(f, "{tool_call}").unwrap();
+        writeln!(f, "{tool_result}").unwrap();
+        writeln!(f, "{custom_call}").unwrap();
+        writeln!(f, "{custom_result}").unwrap();
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+
+        assert_eq!(raw.events.len(), 4);
+        assert_eq!(raw.events[0].kind, "command");
+        assert_eq!(raw.events[0].name.as_deref(), Some("exec_command"));
+        assert_eq!(raw.events[0].target.as_deref(), Some("sed -n '1,220p' CLAUDE.md"));
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("call_123"));
+        assert_eq!(raw.events[1].kind, "tool_result");
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("call_123"));
+        assert_eq!(raw.events[2].kind, "tool_call");
+        assert_eq!(raw.events[2].name.as_deref(), Some("apply_patch"));
+        assert_eq!(raw.events[2].status.as_deref(), Some("completed"));
+        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("call_patch"));
+        assert_eq!(raw.events[3].kind, "tool_result");
+        assert_eq!(raw.events[3].source_event_id.as_deref(), Some("call_patch"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_extracts_array_shell_command_target() {
+        let root = temp_codex_root("array-command-events");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2392";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "payload": {
+                "id": uuid,
+                "timestamp": "2026-04-13T10:00:00Z",
+                "cwd": "/tmp/foo"
+            }
+        });
+        let tool_call = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:01Z",
+            "payload": {
+                "type": "function_call",
+                "name": "shell",
+                "arguments": "{\"command\":[\"bash\",\"-lc\",\"cd /tmp/foo && git status -sb\"]}",
+                "call_id": "call_shell"
+            }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{meta}").unwrap();
+        writeln!(f, "{tool_call}").unwrap();
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+
+        assert_eq!(raw.events[0].kind, "command");
+        assert_eq!(raw.events[0].target.as_deref(), Some("cd /tmp/foo && git status -sb"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_does_not_reference_missing_message_for_empty_tool_content() {
+        let root = temp_codex_root("empty-tool-content");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2393";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "payload": {
+                "id": uuid,
+                "timestamp": "2026-04-13T10:00:00Z",
+                "cwd": "/tmp/foo"
+            }
+        });
+        let tool_call = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:01Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "function_call",
+                        "name": "shell",
+                        "call_id": "call_empty"
+                    }
+                ]
+            }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{meta}").unwrap();
+        writeln!(f, "{tool_call}").unwrap();
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+
+        assert!(raw.messages.is_empty());
+        assert_eq!(raw.events[0].kind, "command");
+        assert_eq!(raw.events[0].message_seq, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_without_events_ignores_event_only_lines() {
+        let root = temp_codex_root("no-events");
+        let sessions_dir = root.join("sessions");
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2394";
+        let path = write_codex_event_only_rollout(&sessions_dir, uuid);
+
+        assert!(parse_codex_session_with_options(&path, false).unwrap().is_none());
+
+        let raw = parse_codex_session_with_options(&path, true).unwrap().unwrap();
+        assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
+        assert!(raw.events.iter().any(|event| event.kind == "search"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_extracts_non_function_response_item_events() {
+        let root = temp_codex_root("nonfunction-events");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2392";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "payload": {
+                "id": uuid,
+                "timestamp": "2026-04-13T10:00:00Z",
+                "cwd": "/tmp/foo"
+            }
+        });
+        let web_search = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:01Z",
+            "payload": {
+                "type": "web_search_call",
+                "status": "completed",
+                "call_id": "web_123",
+                "action": {
+                    "type": "search",
+                    "query": "rust sqlite json_extract"
+                }
+            }
+        });
+        let tool_search = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:02Z",
+            "payload": {
+                "type": "tool_search_call",
+                "status": "completed",
+                "call_id": "tool_search_123",
+                "arguments": {
+                    "query": "serena initial_instructions",
+                    "limit": 5
+                }
+            }
+        });
+        let tool_search_output = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:03Z",
+            "payload": {
+                "type": "tool_search_output",
+                "call_id": "tool_search_123",
+                "tools": [
+                    {"name": "mcp__serena__initial_instructions"}
+                ]
+            }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{meta}").unwrap();
+        writeln!(f, "{web_search}").unwrap();
+        writeln!(f, "{tool_search}").unwrap();
+        writeln!(f, "{tool_search_output}").unwrap();
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+
+        assert_eq!(raw.events.len(), 3);
+        assert_eq!(raw.events[0].kind, "search");
+        assert_eq!(raw.events[0].name.as_deref(), Some("web_search"));
+        assert_eq!(raw.events[0].target.as_deref(), Some("rust sqlite json_extract"));
+        assert_eq!(raw.events[0].status.as_deref(), Some("completed"));
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("web_123"));
+        assert_eq!(raw.events[1].kind, "search");
+        assert_eq!(raw.events[1].name.as_deref(), Some("tool_search"));
+        assert_eq!(raw.events[1].target.as_deref(), Some("serena initial_instructions"));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("tool_search_123"));
+        assert_eq!(raw.events[2].kind, "tool_result");
+        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("tool_search_123"));
+        assert!(raw.events[2].summary.as_deref().unwrap_or("").contains("mcp__serena"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_ignores_metadata_only_rollout() {
+        let root = temp_codex_root("metadata-only");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2393";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "payload": {
+                "id": uuid,
+                "timestamp": "2026-04-13T10:00:00Z",
+                "cwd": "/tmp/foo",
+                "model": "gpt-5.5"
+            }
+        });
+        let turn = serde_json::json!({
+            "type": "turn_context",
+            "timestamp": "2026-04-13T10:00:01Z",
+            "payload": {
+                "cwd": "/tmp/foo",
+                "model": "gpt-5.5"
+            }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{meta}").unwrap();
+        writeln!(f, "{turn}").unwrap();
+
+        assert!(parse_codex_session(&path).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn write_codex_usage_rollout(sessions_dir: &Path, session_uuid: &str) -> PathBuf {
         fs::create_dir_all(sessions_dir).unwrap();
         let filename = format!("rollout-2026-04-13T10-00-00-{session_uuid}.jsonl");
@@ -954,10 +1472,66 @@ mod tests {
                 Some(mtime),
             )
             .unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "codex",
+                uuid,
+                &[],
+                EVENT_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn usage_only_scan_skips_unchanged_session_without_event_state() {
+        let root = temp_codex_root("usage-only-skip");
+        let sessions_dir = root.join("sessions");
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b237e";
+        let path = write_codex_rollout(&sessions_dir, uuid, "hello");
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let store = setup_store();
+        store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "codex",
+                uuid,
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+
+        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        assert_eq!(result.sessions.len(), 0);
+        assert_eq!(result.stats.skipped_sessions, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn usage_only_scan_skips_event_only_session() {
+        let root = temp_codex_root("usage-only-event-only");
+        let sessions_dir = root.join("sessions");
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2381";
+        write_codex_event_only_rollout(&sessions_dir, uuid);
+        let store = setup_store();
+
+        let usage_result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        assert!(usage_result.sessions.is_empty());
+
+        let full_result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        assert_eq!(full_result.sessions.len(), 1);
+        assert!(full_result.sessions[0].messages.is_empty());
+        assert!(full_result.sessions[0].usage_events.is_empty());
+        assert!(full_result.sessions[0].events.iter().any(|event| event.kind == "search"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -973,7 +1547,7 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, actual_mtime - 1_000, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -1000,7 +1574,7 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, good_uuid);
 
@@ -1016,7 +1590,7 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.stats.skipped_sessions, 0);

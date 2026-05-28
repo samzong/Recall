@@ -10,6 +10,7 @@ use crate::db::store::Store;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FileScanOptions {
     pub usage_parser_version: Option<u32>,
+    pub event_parser_version: Option<u32>,
 }
 
 pub struct FileScanEntry {
@@ -56,6 +57,10 @@ where
         Some(_) => store.usage_state_meta_map(source_id)?,
         None => Default::default(),
     };
+    let event_state = match options.event_parser_version {
+        Some(_) => store.event_state_meta_map(source_id)?,
+        None => Default::default(),
+    };
     let mut sessions = Vec::new();
     let mut stats = SyncScanStats::default();
 
@@ -78,6 +83,11 @@ where
                 usage_state.get(&entry.session_id).copied(),
                 mtime_ms,
             )
+            && event_state_is_current(
+                options.event_parser_version,
+                event_state.get(&entry.session_id).copied(),
+                mtime_ms,
+            )
         {
             stats.skipped_sessions += 1;
             continue;
@@ -94,6 +104,20 @@ where
 fn usage_state_is_current(
     required_parser_version: Option<u32>,
     state: Option<crate::db::store::UsageSessionStateMeta>,
+    mtime_ms: i64,
+) -> bool {
+    let Some(required_parser_version) = required_parser_version else {
+        return true;
+    };
+    let Some(state) = state else {
+        return false;
+    };
+    state.parser_version >= required_parser_version && state.source_updated_at == Some(mtime_ms)
+}
+
+fn event_state_is_current(
+    required_parser_version: Option<u32>,
+    state: Option<crate::db::store::EventSessionStateMeta>,
     mtime_ms: i64,
 ) -> bool {
     let Some(required_parser_version) = required_parser_version else {
@@ -241,7 +265,7 @@ mod tests {
             &store,
             "test-source",
             None,
-            FileScanOptions { usage_parser_version: Some(1) },
+            FileScanOptions { usage_parser_version: Some(1), event_parser_version: None },
             vec![entry],
             |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
         )
@@ -267,9 +291,61 @@ mod tests {
             &store,
             "test-source",
             None,
-            FileScanOptions { usage_parser_version: Some(1) },
+            FileScanOptions { usage_parser_version: Some(1), event_parser_version: None },
             vec![entry],
             |_, _| panic!("current usage state should skip parsing"),
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 0);
+        assert_eq!(result.stats.skipped_sessions, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn matching_mtime_reparses_until_event_state_is_current() {
+        let store = setup_store();
+        let path = temp_file_with_mtime("event-backfill");
+        let mtime_ms = stat_mtime_ms(&path).unwrap();
+        store.insert_session(&make_session("s1", "sess-event", Some(mtime_ms), 1)).unwrap();
+
+        let entry = FileScanEntry {
+            session_id: "sess-event".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+        let result = run_file_scan_with_options(
+            &store,
+            "test-source",
+            None,
+            FileScanOptions { usage_parser_version: None, event_parser_version: Some(1) },
+            vec![entry],
+            |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.stats.skipped_sessions, 0);
+
+        store
+            .persist_session_events_for_existing_session(
+                "test-source",
+                "sess-event",
+                &[],
+                1,
+                Some(mtime_ms),
+            )
+            .unwrap();
+        let entry = FileScanEntry {
+            session_id: "sess-event".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+        let result = run_file_scan_with_options(
+            &store,
+            "test-source",
+            None,
+            FileScanOptions { usage_parser_version: None, event_parser_version: Some(1) },
+            vec![entry],
+            |_, _| panic!("current event state should skip parsing"),
         )
         .unwrap();
         assert_eq!(result.sessions.len(), 0);

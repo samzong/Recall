@@ -51,6 +51,7 @@ impl SourceAdapter for CursorAdapter {
         &self,
         store: &Store,
         since_ts: Option<i64>,
+        _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(projects_dir) = resolve_projects_dir()? else {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));

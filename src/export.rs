@@ -5,9 +5,9 @@ use serde::Serialize;
 
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
-use crate::types::{Message, Role, Session, SessionUsageEventRecord};
+use crate::types::{Message, Role, Session, SessionEventRecord, SessionUsageEventRecord};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const RECORD_TYPE: &str = "session";
 
 pub struct ExportOptions {
@@ -24,6 +24,7 @@ struct ExportSessionRecord {
     session: ExportSession,
     messages: Vec<ExportMessage>,
     usage_events: Vec<ExportUsageEvent>,
+    events: Vec<ExportEvent>,
 }
 
 #[derive(Serialize)]
@@ -63,6 +64,21 @@ struct ExportUsageEvent {
     token_source: String,
 }
 
+#[derive(Serialize)]
+struct ExportEvent {
+    event_seq: u32,
+    timestamp: Option<i64>,
+    kind: String,
+    actor: String,
+    name: Option<String>,
+    status: Option<String>,
+    target: Option<String>,
+    message_seq: Option<u32>,
+    summary: Option<String>,
+    source_path: Option<String>,
+    source_event_id: Option<String>,
+}
+
 pub fn write_jsonl<W: Write>(store: &Store, options: &ExportOptions, mut writer: W) -> Result<()> {
     let sessions = store.list_export_sessions(
         options.sources.as_deref(),
@@ -74,12 +90,14 @@ pub fn write_jsonl<W: Write>(store: &Store, options: &ExportOptions, mut writer:
     for session in sessions {
         let messages = store.get_messages(&session.id)?;
         let usage_events = store.list_usage_events_for_session(&session.id)?;
+        let events = store.list_session_events_for_session(&session.id)?;
         let record = ExportSessionRecord {
             schema_version: SCHEMA_VERSION,
             record_type: RECORD_TYPE,
             session: session.into(),
             messages: messages.into_iter().map(Into::into).collect(),
             usage_events: usage_events.into_iter().map(Into::into).collect(),
+            events: events.into_iter().map(Into::into).collect(),
         };
         serde_json::to_writer(&mut writer, &record)?;
         writer.write_all(b"\n")?;
@@ -129,6 +147,24 @@ impl From<SessionUsageEventRecord> for ExportUsageEvent {
             cache_write_tokens: event.cache_write_tokens,
             reasoning_tokens: event.reasoning_tokens,
             token_source: event.token_source,
+        }
+    }
+}
+
+impl From<SessionEventRecord> for ExportEvent {
+    fn from(event: SessionEventRecord) -> Self {
+        Self {
+            event_seq: event.event_seq,
+            timestamp: event.timestamp,
+            kind: event.kind,
+            actor: event.actor,
+            name: event.name,
+            status: event.status,
+            target: event.target,
+            message_seq: event.message_seq,
+            summary: event.summary,
+            source_path: event.source_path,
+            source_event_id: event.source_event_id,
         }
     }
 }

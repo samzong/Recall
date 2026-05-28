@@ -61,6 +61,7 @@ impl SourceAdapter for PiAdapter {
         &self,
         store: &Store,
         since_ts: Option<i64>,
+        _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let session_dirs = resolve_pi_session_dirs()?;
         if session_dirs.is_empty() {
@@ -178,7 +179,10 @@ fn scan_for_sync_impl(
         store,
         "pi",
         since_ts,
-        file_scan::FileScanOptions { usage_parser_version: Some(USAGE_PARSER_VERSION) },
+        file_scan::FileScanOptions {
+            usage_parser_version: Some(USAGE_PARSER_VERSION),
+            event_parser_version: None,
+        },
         entries,
         parse_pi_session_file,
     )
@@ -270,6 +274,8 @@ fn parse_pi_session_file(
         messages: parsed.messages,
         usage_events: parsed.usage_events,
         usage_parser_version: Some(USAGE_PARSER_VERSION),
+        events: Vec::new(),
+        event_parser_version: None,
     }))
 }
 
