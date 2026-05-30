@@ -313,7 +313,14 @@ fn format_date_range(oldest: Option<i64>, newest: Option<i64>) -> String {
 fn cmd_sync(force: bool, verbose: bool, source_filter: Option<&str>) -> Result<()> {
     let labels = adapters::source_labels();
     let sources = resolve_source_filter(source_filter, &labels)?;
-    run_sync_job_inner(SyncRunOptions { force, verbose, emit: true, usage_only: false, sources })?;
+    run_sync_job_inner(SyncRunOptions {
+        force,
+        verbose,
+        emit: true,
+        usage_only: false,
+        backfill_events: false,
+        sources,
+    })?;
     semantic::ensure_background_worker(false)?;
     Ok(())
 }
@@ -328,6 +335,18 @@ fn run_usage_sync_job() -> Result<()> {
         verbose: false,
         emit: false,
         usage_only: true,
+        backfill_events: false,
+        sources: None,
+    })
+}
+
+fn run_dashboard_sync_job() -> Result<()> {
+    run_sync_job_inner(SyncRunOptions {
+        force: false,
+        verbose: false,
+        emit: false,
+        usage_only: true,
+        backfill_events: true,
         sources: None,
     })
 }
@@ -338,6 +357,7 @@ struct SyncRunOptions {
     verbose: bool,
     emit: bool,
     usage_only: bool,
+    backfill_events: bool,
     sources: Option<Vec<String>>,
 }
 
@@ -373,7 +393,12 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
         let source_id = adapter.id();
         let label = adapter.label();
 
-        if options.usage_only && adapter.usage_parser_version().is_none() {
+        if options.usage_only
+            && !adapters::adapter_supports_usage_dashboard(
+                adapter.as_ref(),
+                options.backfill_events,
+            )
+        {
             continue;
         }
 
@@ -393,10 +418,11 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
         if options.verbose {
             println!("Scanning {label}...");
         }
+        let include_events = !options.usage_only || options.backfill_events;
         let optimized = if options.force {
             None
         } else {
-            match adapter.scan_for_sync(&store, since_ts, !options.usage_only) {
+            match adapter.scan_for_sync(&store, since_ts, include_events) {
                 Ok(scan) => scan,
                 Err(e) => {
                     if options.emit {
@@ -431,7 +457,7 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
 
         let mut existing_meta = store.session_meta_map(source_id)?;
         let mut existing_usage_meta = store.usage_state_meta_map(source_id)?;
-        let mut existing_event_meta = if options.usage_only {
+        let mut existing_event_meta = if options.usage_only && !options.backfill_events {
             Default::default()
         } else {
             store.event_state_meta_map(source_id)?
@@ -455,7 +481,7 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                     raw.updated_at,
                 )
             });
-            let event_backfill_needed = !options.usage_only
+            let event_backfill_needed = (options.backfill_events || !options.usage_only)
                 && raw.event_parser_version.is_some_and(|version| {
                     !event_state_is_current(
                         version,
@@ -470,6 +496,7 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                         || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
                     match decide_existing_session_action(
                         options.usage_only,
+                        options.backfill_events,
                         options.force,
                         content_changed,
                         usage_backfill_needed,
@@ -567,10 +594,11 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 })
                 .collect();
 
-            let (events, event_parser_version) = if options.usage_only {
-                (Vec::new(), None)
-            } else {
+            let persist_events = !options.usage_only || options.backfill_events;
+            let (events, event_parser_version) = if persist_events {
                 (raw.events, raw.event_parser_version)
+            } else {
+                (Vec::new(), None)
             };
 
             store.persist_session_with_usage_and_events(
@@ -674,14 +702,20 @@ fn event_state_is_current(
 
 fn decide_existing_session_action(
     usage_only: bool,
+    backfill_events: bool,
     force: bool,
     content_changed: bool,
     usage_backfill_needed: bool,
     event_backfill_needed: bool,
 ) -> ExistingSessionAction {
     if usage_only {
-        return if usage_backfill_needed {
-            ExistingSessionAction::BackfillOnly(BackfillPlan { usage: true, events: false })
+        let needs_usage = usage_backfill_needed;
+        let needs_events = backfill_events && event_backfill_needed;
+        return if needs_usage || needs_events {
+            ExistingSessionAction::BackfillOnly(BackfillPlan {
+                usage: needs_usage,
+                events: needs_events,
+            })
         } else {
             ExistingSessionAction::Skip
         };
@@ -966,8 +1000,11 @@ fn cmd_tui(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Res
     let usage_mode = usage_start.is_some();
     let store = Store::open()?;
     semantic::ensure_background_worker(true)?;
-    let sources =
-        if usage_start.is_some() { usage_source_labels() } else { adapters::source_labels() };
+    let sources = if usage_start.is_some() {
+        adapters::dashboard_source_labels()
+    } else {
+        adapters::source_labels()
+    };
 
     struct TerminalGuard;
     impl Drop for TerminalGuard {
@@ -1022,7 +1059,7 @@ fn cmd_tui(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Res
         if app.usage_refresh_is_due() {
             if usage_sync_pending {
                 usage_sync_pending = false;
-                match run_usage_sync_job() {
+                match run_dashboard_sync_job() {
                     Ok(()) => app.refresh_usage(&store),
                     Err(err) => app.fail_usage_refresh(err),
                 }
@@ -1086,23 +1123,54 @@ fn generate_title(messages: &[adapters::RawMessage]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{BackfillPlan, ExistingSessionAction, decide_existing_session_action};
+    use recall::adapters::{
+        adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
+    };
+
+    #[test]
+    fn dashboard_sync_skips_sources_without_usage_or_events() {
+        for adapter in all_adapters() {
+            let id = adapter.id();
+            if matches!(id, "cline" | "antigravity-cli" | "kiro-cli") {
+                assert!(
+                    !adapter_supports_usage_dashboard(adapter.as_ref(), true),
+                    "{id} should be skipped during dashboard sync"
+                );
+            }
+            if source_supports_event_backfill(id) {
+                assert!(adapter_supports_usage_dashboard(adapter.as_ref(), true));
+            }
+        }
+    }
 
     #[test]
     fn usage_only_never_refreshes_existing_session() {
         assert_eq!(
-            decide_existing_session_action(true, false, true, true, true),
+            decide_existing_session_action(true, false, false, true, true, true),
             ExistingSessionAction::BackfillOnly(BackfillPlan { usage: true, events: false })
         );
         assert_eq!(
-            decide_existing_session_action(true, false, true, false, true),
+            decide_existing_session_action(true, false, false, true, false, true),
             ExistingSessionAction::Skip
+        );
+    }
+
+    #[test]
+    fn usage_only_can_backfill_events_without_refresh() {
+        assert_eq!(
+            decide_existing_session_action(true, true, false, true, false, true),
+            ExistingSessionAction::BackfillOnly(BackfillPlan { usage: false, events: true })
+        );
+        assert_eq!(
+            decide_existing_session_action(true, true, false, true, true, true),
+            ExistingSessionAction::BackfillOnly(BackfillPlan { usage: true, events: true })
         );
     }
 
     #[test]
     fn full_sync_refreshes_changed_existing_session() {
         assert_eq!(
-            decide_existing_session_action(false, false, true, true, true),
+            decide_existing_session_action(false, false, false, true, true, true),
             ExistingSessionAction::RefreshSession
         );
     }
@@ -1110,11 +1178,11 @@ mod tests {
     #[test]
     fn full_sync_backfills_unchanged_existing_session_in_place() {
         assert_eq!(
-            decide_existing_session_action(false, false, false, true, true),
+            decide_existing_session_action(false, false, false, false, true, true),
             ExistingSessionAction::BackfillOnly(BackfillPlan { usage: true, events: true })
         );
         assert_eq!(
-            decide_existing_session_action(false, false, false, false, false),
+            decide_existing_session_action(false, false, false, false, false, false),
             ExistingSessionAction::Skip
         );
     }

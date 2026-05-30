@@ -154,3 +154,25 @@ pub fn app_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {
 pub fn source_labels() -> Vec<(String, String)> {
     all_adapters().iter().map(|a| (a.id().to_string(), a.label().to_string())).collect()
 }
+
+pub fn source_supports_event_backfill(source_id: &str) -> bool {
+    matches!(source_id, "codex" | "claude-code" | "cursor" | "copilot-cli" | "opencode")
+}
+
+pub fn adapter_supports_usage_dashboard(
+    adapter: &dyn SourceAdapter,
+    backfill_events: bool,
+) -> bool {
+    if adapter.usage_parser_version().is_some() {
+        return true;
+    }
+    backfill_events && source_supports_event_backfill(adapter.id())
+}
+
+pub fn dashboard_source_labels() -> Vec<(String, String)> {
+    all_adapters()
+        .iter()
+        .filter(|adapter| adapter_supports_usage_dashboard(adapter.as_ref(), true))
+        .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
+        .collect()
+}
