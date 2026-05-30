@@ -6,14 +6,17 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tracing::debug;
 
-use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::events;
+use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
 use crate::db::store::Store;
-use crate::types::Role;
+use crate::types::{RawSessionEvent, Role};
 
 pub struct CopilotAdapter;
+
+const EVENT_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for CopilotAdapter {
     fn id(&self) -> &str {
@@ -40,7 +43,7 @@ impl SourceAdapter for CopilotAdapter {
             let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
                 continue;
             };
-            if let Some(raw) = parse_copilot_session_for_entry(entry, mtime_ms)? {
+            if let Some(raw) = parse_copilot_session_for_entry(entry, mtime_ms, true)? {
                 sessions.push(raw);
             }
         }
@@ -51,12 +54,12 @@ impl SourceAdapter for CopilotAdapter {
         &self,
         store: &Store,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(sessions_dir) = resolve_copilot_dir()? else {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
         };
-        let result = scan_for_sync_impl(&sessions_dir, store, since_ts)?;
+        let result = scan_for_sync_impl(&sessions_dir, store, since_ts, include_events)?;
         Ok(Some(result))
     }
 }
@@ -75,14 +78,19 @@ fn scan_for_sync_impl(
     sessions_dir: &Path,
     store: &Store,
     since_ts: Option<i64>,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let entries = collect_copilot_entries(sessions_dir);
-    file_scan::run_file_scan(
+    file_scan::run_file_scan_with_options(
         store,
         "copilot-cli",
         since_ts,
+        FileScanOptions {
+            usage_parser_version: None,
+            event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+        },
         entries,
-        parse_copilot_session_for_entry,
+        |entry, mtime_ms| parse_copilot_session_for_entry(entry, mtime_ms, include_events),
     )
 }
 
@@ -146,6 +154,7 @@ fn peek_copilot_session_id(events_path: &Path) -> Option<String> {
 fn parse_copilot_session_for_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let file = match fs::File::open(&entry.stat_target) {
         Ok(f) => f,
@@ -155,7 +164,13 @@ fn parse_copilot_session_for_entry(
         }
     };
     let lines = BufReader::new(file).lines();
-    let mut raw = match parse_copilot_events_from_lines(lines, &entry.session_id) {
+    let source_path = entry.stat_target.display().to_string();
+    let mut raw = match parse_copilot_events_from_lines(
+        lines,
+        &entry.session_id,
+        include_events,
+        Some(source_path),
+    ) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
         Err(e) => {
@@ -175,12 +190,16 @@ pub fn parse_copilot_events(
     parse_copilot_events_from_lines(
         content.lines().map(|s| io::Result::Ok(s.to_string())),
         fallback_id,
+        true,
+        None,
     )
 }
 
 fn parse_copilot_events_from_lines<I>(
     lines: I,
     fallback_id: &str,
+    include_events: bool,
+    source_path: Option<String>,
 ) -> anyhow::Result<Option<RawSession>>
 where
     I: IntoIterator<Item = io::Result<String>>,
@@ -190,6 +209,7 @@ where
     let mut meta_started_at: Option<i64> = None;
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut messages = Vec::new();
+    let mut session_events = Vec::new();
 
     for line in lines {
         let line = line?;
@@ -204,6 +224,7 @@ where
 
         let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let timestamp = parse_timestamp(&v);
+        let line_id = v.get("id").and_then(|id| id.as_str()).map(str::to_string);
 
         match event_type {
             "session.start" => {
@@ -241,6 +262,17 @@ where
                     (true, false) => tool_text,
                     (false, false) => format!("{prose}\n{tool_text}"),
                 };
+                let message_seq = messages.len() as u32;
+                if include_events {
+                    collect_tool_request_events(
+                        data.get("toolRequests"),
+                        timestamp,
+                        source_path.as_deref(),
+                        line_id.as_deref(),
+                        message_seq,
+                        &mut session_events,
+                    );
+                }
                 messages.push(RawMessage { role: Role::Assistant, content, timestamp });
             }
             "tool.execution_start" => {
@@ -263,6 +295,36 @@ where
                     .unwrap_or("")
                     .trim()
                     .to_string();
+                if include_events {
+                    let tool_name = data
+                        .get("toolCallId")
+                        .and_then(|s| s.as_str())
+                        .and_then(|id| tool_names.get(id).cloned())
+                        .or_else(|| {
+                            data.get("toolName").and_then(|s| s.as_str()).map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "tool".to_string());
+                    let summary = if text.is_empty() { None } else { Some(text.clone()) };
+                    let mut event = events::tool_result_event(
+                        events::EventContext {
+                            event_seq: session_events.len() as u32,
+                            timestamp,
+                            source_path: source_path.clone(),
+                            source_event_id: line_id.clone().or_else(|| {
+                                data.get("toolCallId").and_then(|s| s.as_str()).map(str::to_string)
+                            }),
+                            message_seq: None,
+                            parser_version: EVENT_PARSER_VERSION,
+                        },
+                        Some(tool_name),
+                        summary,
+                    );
+                    if let Some(success) = data.get("success").and_then(|value| value.as_bool()) {
+                        event.status =
+                            Some(if success { "success".to_string() } else { "error".to_string() });
+                    }
+                    session_events.push(event);
+                }
                 if text.is_empty() {
                     continue;
                 }
@@ -281,7 +343,7 @@ where
         }
     }
 
-    if messages.is_empty() {
+    if messages.is_empty() && session_events.is_empty() {
         return Ok(None);
     }
 
@@ -290,7 +352,44 @@ where
         meta_started_at.or_else(|| messages.first().and_then(|m| m.timestamp)).unwrap_or(0);
     let updated_at = messages.last().and_then(|m| m.timestamp);
 
-    Ok(Some(RawSession::search_only(source_id, directory, started_at, updated_at, None, messages)))
+    let mut session =
+        RawSession::search_only(source_id, directory, started_at, updated_at, None, messages);
+    if include_events {
+        session = session.with_events(session_events, EVENT_PARSER_VERSION);
+    }
+    Ok(Some(session))
+}
+
+fn collect_tool_request_events(
+    tool_requests: Option<&Value>,
+    timestamp: Option<i64>,
+    source_path: Option<&str>,
+    source_event_id: Option<&str>,
+    message_seq: u32,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let Some(requests) = tool_requests.and_then(|value| value.as_array()) else {
+        return;
+    };
+    for (index, request) in requests.iter().enumerate() {
+        let name =
+            request.get("name").and_then(|value| value.as_str()).unwrap_or("tool").to_string();
+        let call_id =
+            request.get("toolCallId").and_then(|value| value.as_str()).map(str::to_string);
+        events_out.push(events::tool_call_event(
+            events::EventContext {
+                event_seq: events_out.len() as u32,
+                timestamp,
+                source_path: source_path.map(str::to_string),
+                source_event_id: call_id
+                    .or_else(|| source_event_id.map(|id| format!("{id}:tool:{index}"))),
+                message_seq: Some(message_seq),
+                parser_version: EVENT_PARSER_VERSION,
+            },
+            name,
+            request.get("arguments"),
+        ));
+    }
 }
 
 fn extract_tool_requests(tool_requests: Option<&Value>) -> String {
@@ -437,6 +536,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_copilot_events_extracts_tool_events() {
+        let jsonl = r##"{"type":"session.start","data":{"sessionId":"sess-2","startTime":"2026-04-13T10:00:00Z","context":{"cwd":"/proj"}},"id":"e1","timestamp":"2026-04-13T10:00:00Z","parentId":null}
+{"type":"assistant.message","data":{"messageId":"m1","content":"Let me read the file.","toolRequests":[{"toolCallId":"tc1","name":"read_file","arguments":{"path":"/tmp/README.md"},"type":"function"}]},"id":"e2","timestamp":"2026-04-13T10:00:05Z","parentId":"e1"}
+{"type":"tool.execution_complete","data":{"toolCallId":"tc1","toolName":"read_file","success":true,"result":{"content":"short summary","detailedContent":"# My Project\nHello world."}},"id":"e4","timestamp":"2026-04-13T10:00:06Z","parentId":"e3"}"##;
+
+        let session = parse_copilot_events(jsonl, "fallback").unwrap().unwrap();
+        assert_eq!(session.events.len(), 2);
+        assert_eq!(session.events[0].kind, "file_read");
+        assert_eq!(session.events[0].name.as_deref(), Some("read_file"));
+        assert_eq!(session.events[0].target.as_deref(), Some("/tmp/README.md"));
+        assert_eq!(session.events[1].kind, "tool_result");
+        assert_eq!(session.events[1].status.as_deref(), Some("success"));
+        assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
+    }
+
+    #[test]
     fn scan_for_sync_skips_unchanged_session() {
         let root = temp_copilot_root("skip");
         let sessions_dir = root.join("session-state");
@@ -446,8 +561,17 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "copilot-cli",
+                uuid,
+                &[],
+                EVENT_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
 
-        let result = scan_for_sync_impl(&sessions_dir, &store, None).unwrap();
+        let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 
@@ -465,7 +589,7 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, actual_mtime - 1_000, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&sessions_dir, &store, None).unwrap();
+        let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -483,7 +607,7 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&sessions_dir, &store, None).unwrap();
+        let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.stats.skipped_sessions, 0);
@@ -508,7 +632,7 @@ mod tests {
         writeln!(f, "{user}").unwrap();
 
         let store = setup_store();
-        let result = scan_for_sync_impl(&sessions_dir, &store, None).unwrap();
+        let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, dir_name);
 
@@ -530,7 +654,7 @@ mod tests {
         f.write_all(&[0xFF, 0xFE, 0xFD, 0xFC]).unwrap();
 
         let store = setup_store();
-        let result = scan_for_sync_impl(&sessions_dir, &store, None).unwrap();
+        let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, good_uuid);
 

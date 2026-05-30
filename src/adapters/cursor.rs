@@ -9,15 +9,17 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::events;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
-use crate::db::store::{Store, UsageSessionStateMeta};
-use crate::types::{RawUsageEvent, Role, TokenSource};
+use crate::db::store::{EventSessionStateMeta, Store, UsageSessionStateMeta};
+use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
 
 pub struct CursorAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 2;
+const EVENT_PARSER_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 struct ComposerMeta {
@@ -31,6 +33,7 @@ struct ComposerMeta {
 struct ParsedComposerSession {
     messages: Vec<RawMessage>,
     usage_events: Vec<RawUsageEvent>,
+    events: Vec<RawSessionEvent>,
     started_at: i64,
     updated_at: Option<i64>,
     entrypoint: Option<String>,
@@ -55,14 +58,14 @@ impl SourceAdapter for CursorAdapter {
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        scan_cursor_sessions(None)
+        scan_cursor_sessions(None, true)
     }
 
     fn scan_for_sync(
         &self,
         store: &Store,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_global_db()? else {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
@@ -70,6 +73,8 @@ impl SourceAdapter for CursorAdapter {
 
         let existing = store.session_meta_map(self.id())?;
         let usage_state = store.usage_state_meta_map(self.id())?;
+        let event_state =
+            if include_events { store.event_state_meta_map(self.id())? } else { HashMap::new() };
         let global_mtime = global_db_mtime();
         let composer_ids = discover_composer_ids(&conn)?;
         let transcript_paths = collect_agent_transcript_paths();
@@ -89,13 +94,20 @@ impl SourceAdapter for CursorAdapter {
             let source_updated_at = updated_at.or(global_mtime);
             if let Some((old_updated_at, _)) = existing.get(&composer_id)
                 && *old_updated_at == source_updated_at
-                && usage_state_is_current(usage_state.get(&composer_id).copied(), source_updated_at)
+                && session_state_is_current(
+                    usage_state.get(&composer_id).copied(),
+                    event_state.get(&composer_id).copied(),
+                    source_updated_at,
+                    include_events,
+                )
             {
                 stats.skipped_sessions += 1;
                 continue;
             }
 
-            if let Some(raw) = build_raw_session(&conn, &composer_id, &meta, &transcript_paths)? {
+            if let Some(raw) =
+                build_raw_session(&conn, &composer_id, &meta, &transcript_paths, include_events)?
+            {
                 sessions.push(raw);
             }
         }
@@ -104,9 +116,12 @@ impl SourceAdapter for CursorAdapter {
     }
 }
 
-fn scan_cursor_sessions(since_ts: Option<i64>) -> anyhow::Result<Vec<RawSession>> {
+fn scan_cursor_sessions(
+    since_ts: Option<i64>,
+    include_events: bool,
+) -> anyhow::Result<Vec<RawSession>> {
     let Some(conn) = open_global_db()? else {
-        return scan_transcript_only_sessions(since_ts);
+        return scan_transcript_only_sessions(since_ts, include_events);
     };
 
     let transcript_paths = collect_agent_transcript_paths();
@@ -119,14 +134,19 @@ fn scan_cursor_sessions(since_ts: Option<i64>) -> anyhow::Result<Vec<RawSession>
                 continue;
             }
         }
-        if let Some(raw) = build_raw_session(&conn, &composer_id, &meta, &transcript_paths)? {
+        if let Some(raw) =
+            build_raw_session(&conn, &composer_id, &meta, &transcript_paths, include_events)?
+        {
             sessions.push(raw);
         }
     }
     Ok(sessions)
 }
 
-fn scan_transcript_only_sessions(since_ts: Option<i64>) -> anyhow::Result<Vec<RawSession>> {
+fn scan_transcript_only_sessions(
+    since_ts: Option<i64>,
+    include_events: bool,
+) -> anyhow::Result<Vec<RawSession>> {
     let Some(projects_dir) = resolve_projects_dir()? else {
         return Ok(vec![]);
     };
@@ -141,7 +161,7 @@ fn scan_transcript_only_sessions(since_ts: Option<i64>) -> anyhow::Result<Vec<Ra
         {
             continue;
         }
-        let mut raw = match parse_agent_transcript(&path)? {
+        let mut raw = match parse_agent_transcript(&path, include_events)? {
             Some(raw) => raw,
             None => continue,
         };
@@ -159,15 +179,23 @@ fn build_raw_session(
     composer_id: &str,
     meta: &ComposerMeta,
     transcript_paths: &HashMap<String, PathBuf>,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    let parsed = match parse_composer_session(conn, composer_id, meta)? {
-        Some(parsed) if !parsed.messages.is_empty() || !parsed.usage_events.is_empty() => parsed,
+    let parsed = match parse_composer_session(conn, composer_id, meta, include_events)? {
+        Some(parsed)
+            if !parsed.messages.is_empty()
+                || !parsed.usage_events.is_empty()
+                || !parsed.events.is_empty() =>
+        {
+            parsed
+        }
         _ => {
             let Some(path) = transcript_paths.get(composer_id) else {
                 return Ok(None);
             };
             let mtime_ms = stat_mtime_ms(path).unwrap_or(0);
-            let raw = parse_agent_transcript(path)?.filter(|raw| !raw.messages.is_empty());
+            let raw = parse_agent_transcript(path, include_events)?
+                .filter(|raw| !raw.messages.is_empty() || !raw.events.is_empty());
             let Some(mut raw) = raw else {
                 return Ok(None);
             };
@@ -180,23 +208,26 @@ fn build_raw_session(
         }
     };
 
-    Ok(Some(
-        RawSession::search_only(
-            composer_id.to_string(),
-            parsed.directory.or(meta.directory.clone()),
-            parsed.started_at,
-            parsed.updated_at,
-            parsed.entrypoint.or(meta.unified_mode.clone()),
-            parsed.messages,
-        )
-        .with_usage(parsed.usage_events, USAGE_PARSER_VERSION),
-    ))
+    let mut session = RawSession::search_only(
+        composer_id.to_string(),
+        parsed.directory.or(meta.directory.clone()),
+        parsed.started_at,
+        parsed.updated_at,
+        parsed.entrypoint.or(meta.unified_mode.clone()),
+        parsed.messages,
+    )
+    .with_usage(parsed.usage_events, USAGE_PARSER_VERSION);
+    if include_events {
+        session = session.with_events(parsed.events, EVENT_PARSER_VERSION);
+    }
+    Ok(Some(session))
 }
 
 fn parse_composer_session(
     conn: &Connection,
     composer_id: &str,
     meta: &ComposerMeta,
+    include_events: bool,
 ) -> anyhow::Result<Option<ParsedComposerSession>> {
     let Some(raw_json) = read_disk_kv(conn, &format!("composerData:{composer_id}")) else {
         return Ok(None);
@@ -219,6 +250,8 @@ fn parse_composer_session(
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
     let mut bubble_usage_events = Vec::new();
+    let mut session_events = Vec::new();
+    let source_path = format!("composer:{composer_id}");
 
     for (index, header) in headers.iter().enumerate() {
         let bubble_id = header.get("bubbleId").and_then(|value| value.as_str());
@@ -248,7 +281,22 @@ fn parse_composer_session(
                     .and_then(|value| json_i64(value.get("createdAt")))
             });
 
-        messages.push(RawMessage { role, content, timestamp });
+        messages.push(RawMessage { role: role.clone(), content, timestamp });
+
+        if include_events
+            && matches!(role, Role::Assistant)
+            && let Some(bubble) = bubble.as_ref()
+        {
+            let message_seq = (messages.len() - 1) as u32;
+            collect_bubble_tool_events(
+                bubble,
+                bubble_id.unwrap_or("unknown"),
+                &source_path,
+                timestamp,
+                message_seq,
+                &mut session_events,
+            );
+        }
 
         if let Some(bubble) = bubble.as_ref()
             && let Some(event) = extract_bubble_usage_event(
@@ -270,7 +318,7 @@ fn parse_composer_session(
         usage_events.push(event);
     }
 
-    if messages.is_empty() && usage_events.is_empty() {
+    if messages.is_empty() && usage_events.is_empty() && session_events.is_empty() {
         return Ok(None);
     }
 
@@ -286,6 +334,7 @@ fn parse_composer_session(
     Ok(Some(ParsedComposerSession {
         messages,
         usage_events,
+        events: session_events,
         started_at,
         updated_at,
         entrypoint: data
@@ -475,6 +524,96 @@ fn render_bubble_content(bubble: &Value, role: &Role) -> String {
     parts.join("\n")
 }
 
+fn collect_bubble_tool_events(
+    bubble: &Value,
+    bubble_id: &str,
+    source_path: &str,
+    timestamp: Option<i64>,
+    message_seq: u32,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let Some(tool_data) = bubble.get("toolFormerData") else {
+        return;
+    };
+    let name = tool_data.get("name").and_then(|value| value.as_str()).unwrap_or("tool").to_string();
+    let source_event_id = Some(bubble_id.to_string());
+
+    if let Some(params) = tool_data.get("params") {
+        events_out.push(events::tool_call_event(
+            events::EventContext {
+                event_seq: events_out.len() as u32,
+                timestamp,
+                source_path: Some(source_path.to_string()),
+                source_event_id: source_event_id.clone(),
+                message_seq: Some(message_seq),
+                parser_version: EVENT_PARSER_VERSION,
+            },
+            name.clone(),
+            Some(params),
+        ));
+    } else if let Some(raw_args) = tool_data.get("rawArgs") {
+        match raw_args {
+            Value::String(text) => {
+                events_out.push(events::tool_call_event_from_text(
+                    events::EventContext {
+                        event_seq: events_out.len() as u32,
+                        timestamp,
+                        source_path: Some(source_path.to_string()),
+                        source_event_id: source_event_id.clone(),
+                        message_seq: Some(message_seq),
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    name.clone(),
+                    Some(text.as_str()),
+                ));
+            }
+            other => {
+                events_out.push(events::tool_call_event(
+                    events::EventContext {
+                        event_seq: events_out.len() as u32,
+                        timestamp,
+                        source_path: Some(source_path.to_string()),
+                        source_event_id: source_event_id.clone(),
+                        message_seq: Some(message_seq),
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    name.clone(),
+                    Some(other),
+                ));
+            }
+        }
+    } else {
+        events_out.push(events::tool_call_event(
+            events::EventContext {
+                event_seq: events_out.len() as u32,
+                timestamp,
+                source_path: Some(source_path.to_string()),
+                source_event_id: source_event_id.clone(),
+                message_seq: Some(message_seq),
+                parser_version: EVENT_PARSER_VERSION,
+            },
+            name.clone(),
+            None,
+        ));
+    }
+
+    if let Some(result) = tool_data.get("result") {
+        let summary = render_json_fragment(result).filter(|text| !text.is_empty());
+        events_out.push(events::tool_result_event(
+            events::EventContext {
+                event_seq: events_out.len() as u32,
+                timestamp,
+                source_path: Some(source_path.to_string()),
+                source_event_id,
+                message_seq: Some(message_seq),
+                parser_version: EVENT_PARSER_VERSION,
+            },
+            Some(name),
+            summary,
+        ));
+    }
+}
+
 fn render_legacy_bubble(value: &Value, role: &Role) -> String {
     if let Some(text) = non_empty_str(value.get("text")) {
         let normalized = if matches!(role, Role::User) {
@@ -638,12 +777,14 @@ fn bubble_role(header_type: Option<i64>) -> Option<Role> {
     }
 }
 
-fn parse_agent_transcript(path: &Path) -> anyhow::Result<Option<RawSession>> {
+fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<Option<RawSession>> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
+    let mut session_events = Vec::new();
+    let source_path = path.display().to_string();
 
-    for line in reader.lines() {
+    for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
         let line = line.trim();
         if line.is_empty() {
@@ -664,6 +805,16 @@ fn parse_agent_transcript(path: &Path) -> anyhow::Result<Option<RawSession>> {
             continue;
         };
         let is_user = matches!(role, Role::User);
+        if include_events && matches!(role, Role::Assistant) {
+            let message_seq = if messages.is_empty() { None } else { Some(messages.len() as u32) };
+            collect_transcript_content_events(
+                items,
+                &source_path,
+                line_index,
+                message_seq,
+                &mut session_events,
+            );
+        }
         let content = render_transcript_content_items(items, is_user);
         if content.is_empty() {
             continue;
@@ -671,18 +822,43 @@ fn parse_agent_transcript(path: &Path) -> anyhow::Result<Option<RawSession>> {
         messages.push(RawMessage { role, content, timestamp: None });
     }
 
-    if messages.is_empty() {
+    if messages.is_empty() && session_events.is_empty() {
         return Ok(None);
     }
 
-    Ok(Some(RawSession::search_only(
-        String::new(),
-        None,
-        0,
-        None,
-        Some("agent".to_string()),
-        messages,
-    )))
+    let mut session =
+        RawSession::search_only(String::new(), None, 0, None, Some("agent".to_string()), messages);
+    if include_events {
+        session = session.with_events(session_events, EVENT_PARSER_VERSION);
+    }
+    Ok(Some(session))
+}
+
+fn collect_transcript_content_events(
+    items: &[Value],
+    source_path: &str,
+    line_index: usize,
+    message_seq: Option<u32>,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    for (item_index, item) in items.iter().enumerate() {
+        if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+            continue;
+        }
+        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
+        events_out.push(events::tool_call_event(
+            events::EventContext {
+                event_seq: events_out.len() as u32,
+                timestamp: None,
+                source_path: Some(source_path.to_string()),
+                source_event_id: Some(format!("{line_index}:{item_index}")),
+                message_seq,
+                parser_version: EVENT_PARSER_VERSION,
+            },
+            name,
+            item.get("input"),
+        ));
+    }
 }
 
 fn render_transcript_content_items(items: &[Value], is_user: bool) -> String {
@@ -810,6 +986,31 @@ fn usage_state_is_current(
         return false;
     };
     state.parser_version >= USAGE_PARSER_VERSION && state.source_updated_at == source_updated_at
+}
+
+fn event_state_is_current(
+    state: Option<EventSessionStateMeta>,
+    source_updated_at: Option<i64>,
+) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    state.parser_version >= EVENT_PARSER_VERSION && state.source_updated_at == source_updated_at
+}
+
+fn session_state_is_current(
+    usage_state: Option<UsageSessionStateMeta>,
+    event_state: Option<EventSessionStateMeta>,
+    source_updated_at: Option<i64>,
+    include_events: bool,
+) -> bool {
+    if !usage_state_is_current(usage_state, source_updated_at) {
+        return false;
+    }
+    if include_events && !event_state_is_current(event_state, source_updated_at) {
+        return false;
+    }
+    true
 }
 
 fn build_agent_cwd_map(db_path: Option<&Path>) -> HashMap<String, String> {
@@ -1035,7 +1236,7 @@ mod tests {
         let bubble_id = uuid::Uuid::new_v4().to_string();
         let conn = seed_global_db(&root, &composer_id, &bubble_id);
         let meta = load_composer_meta(&conn, &composer_id);
-        let parsed = parse_composer_session(&conn, &composer_id, &meta).unwrap().unwrap();
+        let parsed = parse_composer_session(&conn, &composer_id, &meta, false).unwrap().unwrap();
         assert_eq!(parsed.messages.len(), 1);
         assert_eq!(parsed.messages[0].content, "hello cursor");
         assert_eq!(parsed.usage_events.len(), 1);
@@ -1085,11 +1286,77 @@ mod tests {
         .unwrap();
 
         let meta = load_composer_meta(&conn, &composer_id);
-        let parsed = parse_composer_session(&conn, &composer_id, &meta).unwrap().unwrap();
+        let parsed = parse_composer_session(&conn, &composer_id, &meta, false).unwrap().unwrap();
         assert_eq!(parsed.usage_events.len(), 1);
         assert_eq!(parsed.usage_events[0].token_source, TokenSource::Observed);
         assert_eq!(parsed.usage_events[0].input_tokens, 12);
         assert_eq!(parsed.usage_events[0].output_tokens, 34);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_composer_session_extracts_tool_events() {
+        let root = temp_root("tool-events");
+        let composer_id = uuid::Uuid::new_v4().to_string();
+        let bubble_id = uuid::Uuid::new_v4().to_string();
+        let conn = seed_global_db(&root, &composer_id, &bubble_id);
+        let composer_data = serde_json::json!({
+            "composerId": composer_id,
+            "createdAt": 1_700_000_000_000_i64,
+            "lastUpdatedAt": 1_700_000_100_000_i64,
+            "unifiedMode": "chat",
+            "modelConfig": { "modelName": "claude-sonnet-4" },
+            "fullConversationHeadersOnly": [
+                { "bubbleId": bubble_id, "type": 2 },
+            ]
+        });
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
+            rusqlite::params![composer_data.to_string(), format!("composerData:{composer_id}"),],
+        )
+        .unwrap();
+        let bubble = serde_json::json!({
+            "type": 2,
+            "text": "",
+            "createdAt": 1_700_000_050_000_i64,
+            "toolFormerData": {
+                "name": "grep",
+                "rawArgs": "{\"pattern\":\"usage\"}",
+                "result": "{\"matches\":1}"
+            }
+        });
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
+            rusqlite::params![bubble.to_string(), format!("bubbleId:{composer_id}:{bubble_id}"),],
+        )
+        .unwrap();
+
+        let meta = load_composer_meta(&conn, &composer_id);
+        let parsed = parse_composer_session(&conn, &composer_id, &meta, true).unwrap().unwrap();
+        assert_eq!(parsed.events.len(), 2);
+        assert_eq!(parsed.events[0].kind, "search");
+        assert_eq!(parsed.events[0].name.as_deref(), Some("grep"));
+        assert_eq!(parsed.events[1].kind, "tool_result");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_agent_transcript_extracts_tool_use_events() {
+        let root = temp_root("transcript-events");
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let jsonl_path = root.join(format!("{uuid}.jsonl"));
+        write_jsonl(
+            &jsonl_path,
+            &[
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nhello\n</user_query>"}]}}"#,
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"searching"},{"type":"tool_use","name":"Glob","input":{"glob_pattern":"*.rs"}}]}}"#,
+            ],
+        );
+        let raw = parse_agent_transcript(&jsonl_path, true).unwrap().unwrap();
+        assert_eq!(raw.events.len(), 1);
+        assert_eq!(raw.events[0].kind, "search");
+        assert_eq!(raw.events[0].name.as_deref(), Some("Glob"));
+        assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1105,7 +1372,7 @@ mod tests {
                 r#"{"role":"assistant","message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Glob","input":{"glob_pattern":"*.rs"}}]}}"#,
             ],
         );
-        let raw = parse_agent_transcript(&jsonl_path).unwrap().unwrap();
+        let raw = parse_agent_transcript(&jsonl_path, true).unwrap().unwrap();
         assert_eq!(raw.messages.len(), 2);
         assert_eq!(raw.messages[0].content, "hello");
         assert!(raw.messages[1].content.contains("[tool_use:Glob]"));
