@@ -9,12 +9,19 @@ use crate::config::AppConfig;
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::{ProjectDirectory, Store};
 use crate::embedding::EmbeddingProvider;
+use crate::skill_audit::{self, SkillAuditFilters, SkillAuditReport};
 use crate::types::{
     BackgroundJobStatus, MatchSource, Message, Role, SearchResult, SemanticProgress,
 };
 use crate::usage::{self, UsageFilters, UsageReport};
 
 const USAGE_LOADING_MIN_MS: u128 = 75;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageTab {
+    Tokens,
+    Skills,
+}
 
 pub enum AppMode {
     Search,
@@ -100,6 +107,10 @@ mod tests {
             usage_time_filter: TimeRange::All,
             usage_refresh_requested_at: None,
             usage_breakdown_scroll: 0,
+            usage_tab: UsageTab::Tokens,
+            skill_audit_report: None,
+            skill_audit_error: None,
+            skill_audit_selected: 0,
         }
     }
 
@@ -405,6 +416,10 @@ pub struct App {
     pub usage_time_filter: TimeRange,
     pub usage_refresh_requested_at: Option<Instant>,
     pub usage_breakdown_scroll: u16,
+    pub usage_tab: UsageTab,
+    pub skill_audit_report: Option<SkillAuditReport>,
+    pub skill_audit_error: Option<String>,
+    pub skill_audit_selected: usize,
 }
 
 impl App {
@@ -476,6 +491,10 @@ impl App {
             usage_time_filter: TimeRange::All,
             usage_refresh_requested_at: None,
             usage_breakdown_scroll: 0,
+            usage_tab: UsageTab::Tokens,
+            skill_audit_report: None,
+            skill_audit_error: None,
+            skill_audit_selected: 0,
         };
         app.reset_search_defaults();
         app.update_scope_metrics(store);
@@ -640,8 +659,15 @@ impl App {
             AppMode::Filters if !self.filters_editing_source && !self.filters_editing_project => {
                 self.filter_focus = self.filter_focus.previous();
             }
-            AppMode::Usage if self.usage_breakdown_scroll > 0 => {
+            AppMode::Usage
+                if self.usage_tab == UsageTab::Tokens && self.usage_breakdown_scroll > 0 =>
+            {
                 self.usage_breakdown_scroll -= 1;
+            }
+            AppMode::Usage
+                if self.usage_tab == UsageTab::Skills && self.skill_audit_selected > 0 =>
+            {
+                self.skill_audit_selected -= 1;
             }
             _ => {}
         }
@@ -683,8 +709,14 @@ impl App {
             AppMode::Filters if !self.filters_editing_source && !self.filters_editing_project => {
                 self.filter_focus = self.filter_focus.next();
             }
-            AppMode::Usage => {
+            AppMode::Usage if self.usage_tab == UsageTab::Tokens => {
                 self.usage_breakdown_scroll = self.usage_breakdown_scroll.saturating_add(1);
+            }
+            AppMode::Usage
+                if self.usage_tab == UsageTab::Skills
+                    && self.skill_audit_selected + 1 < self.skill_audit_entry_count() =>
+            {
+                self.skill_audit_selected += 1;
             }
             _ => {}
         }
@@ -793,10 +825,18 @@ impl App {
         }
     }
 
-    fn handle_usage_key(&mut self, key: KeyEvent, _store: &Store) {
+    fn handle_usage_key(&mut self, key: KeyEvent, store: &Store) {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                self.usage_tab = match self.usage_tab {
+                    UsageTab::Tokens => UsageTab::Skills,
+                    UsageTab::Skills => UsageTab::Tokens,
+                };
+                self.usage_breakdown_scroll = 0;
+                self.skill_audit_selected = 0;
             }
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 self.cycle_usage_time(false);
@@ -810,8 +850,11 @@ impl App {
                 self.reset_usage_dashboard();
                 self.request_usage_refresh();
             }
-            KeyCode::Up => self.handle_scroll_up(_store),
-            KeyCode::Down => self.handle_scroll_down(_store),
+            KeyCode::Enter if self.usage_tab == UsageTab::Skills => {
+                self.open_skill_sessions(store);
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.handle_scroll_up(store),
+            KeyCode::Down | KeyCode::Char('j') => self.handle_scroll_down(store),
             _ => {}
         }
     }
@@ -1556,7 +1599,9 @@ impl App {
     pub fn refresh_usage(&mut self, store: &Store) {
         self.usage_refresh_requested_at = None;
         self.usage_error = None;
+        self.skill_audit_error = None;
         self.usage_breakdown_scroll = 0;
+        self.skill_audit_selected = 0;
         let sources = self.source_filter_ids();
         let current_filters =
             UsageFilters { sources: sources.clone(), time_range: self.usage_time_filter };
@@ -1582,6 +1627,20 @@ impl App {
                 }
             }
         }
+
+        let skill_filters = SkillAuditFilters {
+            sources: self.source_filter_ids(),
+            time_range: self.usage_time_filter,
+        };
+        match skill_audit::build_skill_audit_report(store, &skill_filters) {
+            Ok(report) => {
+                self.skill_audit_report = Some(report);
+            }
+            Err(err) => {
+                self.skill_audit_report = None;
+                self.skill_audit_error = Some(format!("Skill audit unavailable: {err}"));
+            }
+        }
     }
 
     pub fn request_usage_refresh(&mut self) {
@@ -1603,7 +1662,9 @@ impl App {
         self.usage_refresh_requested_at = None;
         self.usage_report = None;
         self.usage_year_report = None;
+        self.skill_audit_report = None;
         self.usage_error = Some(format!("Usage unavailable: {error}"));
+        self.skill_audit_error = Some(format!("Skill audit unavailable: {error}"));
     }
 
     pub fn try_search(
@@ -1827,6 +1888,66 @@ impl App {
         self.source_filter_selection.clear();
         self.usage_time_filter = TimeRange::All;
         self.usage_breakdown_scroll = 0;
+        self.skill_audit_selected = 0;
+    }
+
+    pub fn usage_tab_label(&self) -> &'static str {
+        match self.usage_tab {
+            UsageTab::Tokens => "tokens",
+            UsageTab::Skills => "skills",
+        }
+    }
+
+    pub fn skill_audit_entry_count(&self) -> usize {
+        let Some(report) = self.skill_audit_report.as_ref() else {
+            return 0;
+        };
+        report.core.len() + report.occasional.len() + report.dormant.len()
+    }
+
+    fn open_skill_sessions(&mut self, store: &Store) {
+        let Some(report) = self.skill_audit_report.as_ref() else {
+            return;
+        };
+        let entries: Vec<_> =
+            report.core.iter().chain(&report.occasional).chain(&report.dormant).collect();
+        let Some(entry) = entries.get(self.skill_audit_selected) else {
+            return;
+        };
+        let skill_id = entry.id.clone();
+        let session_ids = entry.session_ids.clone();
+        if session_ids.is_empty() {
+            self.status_message =
+                Some(format!("No indexed sessions for skill '{skill_id}' in this range"));
+            return;
+        }
+        match store.list_sessions_by_ids(&session_ids) {
+            Ok(sessions) if sessions.is_empty() => {
+                self.status_message =
+                    Some(format!("Sessions for '{skill_id}' are no longer in index"));
+            }
+            Ok(sessions) => {
+                let count = sessions.len();
+                self.results = sessions
+                    .into_iter()
+                    .map(|session| SearchResult {
+                        session,
+                        match_source: MatchSource::Fts,
+                        snippet: None,
+                    })
+                    .collect();
+                self.selected_index = 0;
+                self.panel_focus = PanelFocus::SessionList;
+                self.mode = AppMode::Search;
+                self.query = format!("skill:{skill_id}");
+                self.cursor_pos = self.query.len();
+                self.load_preview(store);
+                self.status_message = Some(format!("{count} sessions used skill '{skill_id}'"));
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Failed to load sessions: {err}"));
+            }
+        }
     }
 
     fn cycle_usage_time(&mut self, reverse: bool) {

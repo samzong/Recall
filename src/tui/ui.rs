@@ -9,9 +9,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::db::search::TimeRange;
+use crate::skill_audit::{SkillTier, SkillUsageEntry, format_last_used, format_signals};
 use crate::tui::app::{
     App, AppMode, FilterFocus, PanelFocus, PendingCommandAction, ProjectPickerRow, ResumeOrigin,
-    SanitizedLine, SourcePickerRow,
+    SanitizedLine, SourcePickerRow, UsageTab,
 };
 use crate::types::{MatchSource, Role};
 use crate::usage::{TokenTotals, UsageReport};
@@ -92,6 +93,13 @@ pub fn render(f: &mut Frame, app: &App) {
 }
 
 fn render_usage_dashboard(f: &mut Frame, app: &App) {
+    match app.usage_tab {
+        UsageTab::Tokens => render_tokens_dashboard(f, app),
+        UsageTab::Skills => render_skill_audit_dashboard(f, app),
+    }
+}
+
+fn render_tokens_dashboard(f: &mut Frame, app: &App) {
     let area = f.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -112,7 +120,7 @@ fn render_usage_dashboard(f: &mut Frame, app: &App) {
         .split(outer[2]);
     render_daily_token_chart(f, app, main[0]);
     render_usage_breakdown(f, app, main[1]);
-    render_usage_status(f, outer[3]);
+    render_usage_status(f, app, outer[3]);
 }
 
 fn render_usage_header(f: &mut Frame, app: &App, area: Rect) {
@@ -130,7 +138,7 @@ fn render_usage_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" source ", muted),
         Span::styled(format!("[{}]", app.source_filter_label()), chip),
         Span::styled(" metric ", muted),
-        Span::styled("[tokens]", chip),
+        Span::styled(format!("[{}]", app.usage_tab_label()), chip),
     ];
 
     let mut lines = vec![Line::from(control)];
@@ -453,19 +461,39 @@ fn build_usage_model_lines(
     lines
 }
 
-fn render_usage_status(f: &mut Frame, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled("t", Style::default().fg(Color::Yellow)),
-        Span::styled(" time  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("s", Style::default().fg(Color::Yellow)),
-        Span::styled(" source  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("↑↓", Style::default().fg(Color::Yellow)),
-        Span::styled(" breakdown  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("r", Style::default().fg(Color::Yellow)),
-        Span::styled(" reset  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc/q", Style::default().fg(Color::Yellow)),
-        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-    ]);
+fn render_usage_status(f: &mut Frame, app: &App, area: Rect) {
+    let line = match app.usage_tab {
+        UsageTab::Tokens => Line::from(vec![
+            Span::styled("m", Style::default().fg(Color::Yellow)),
+            Span::styled(" tab  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("t", Style::default().fg(Color::Yellow)),
+            Span::styled(" time  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("s", Style::default().fg(Color::Yellow)),
+            Span::styled(" source  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+            Span::styled(" breakdown  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("r", Style::default().fg(Color::Yellow)),
+            Span::styled(" reset  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc/q", Style::default().fg(Color::Yellow)),
+            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        ]),
+        UsageTab::Skills => Line::from(vec![
+            Span::styled("m", Style::default().fg(Color::Yellow)),
+            Span::styled(" tab  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("t", Style::default().fg(Color::Yellow)),
+            Span::styled(" time  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("s", Style::default().fg(Color::Yellow)),
+            Span::styled(" source  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+            Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled(" sessions  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("r", Style::default().fg(Color::Yellow)),
+            Span::styled(" reset  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc/q", Style::default().fg(Color::Yellow)),
+            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        ]),
+    };
     f.render_widget(Paragraph::new(line), area);
 }
 
@@ -622,6 +650,235 @@ fn token_mix_lines(tokens: &TokenTotals, width: usize) -> Vec<Line<'static>> {
     .into_iter()
     .map(|(label, value, color)| usage_bar_line(label, value, max_value, width, color))
     .collect()
+}
+
+fn render_skill_audit_dashboard(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(8), Constraint::Length(1)])
+        .split(area);
+
+    render_skill_audit_header(f, app, outer[0]);
+    render_skill_audit_list(f, app, outer[1]);
+    render_usage_status(f, app, outer[2]);
+}
+
+fn render_skill_audit_header(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Recall Skill Audit ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let chip = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(Color::DarkGray);
+
+    let control = vec![
+        Span::styled(" range ", muted),
+        Span::styled(format!("[{}]", app.usage_time_label()), chip),
+        Span::styled(" source ", muted),
+        Span::styled(format!("[{}]", app.source_filter_label()), chip),
+        Span::styled(" tab ", muted),
+        Span::styled(format!("[{}]", app.usage_tab_label()), chip),
+    ];
+
+    let mut lines = vec![Line::from(control)];
+
+    if app.usage_is_loading() {
+        lines.push(Line::from(Span::styled(
+            " Loading skill audit...",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+    } else if let Some(error) = app.skill_audit_error.as_ref() {
+        lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))));
+    } else if let Some(report) = app.skill_audit_report.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled(" installed ", muted),
+            Span::styled(
+                format_count(report.summary.installed),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" core ", muted),
+            Span::styled(
+                format_count(report.summary.core),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" occasional ", muted),
+            Span::styled(format_count(report.summary.occasional), Style::default().fg(Color::Cyan)),
+            Span::styled(" dormant ", muted),
+            Span::styled(
+                format_count(report.summary.dormant),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            " core ≥10 calls · occasional 1-9 · dormant installed but unused in range",
+            Style::default().fg(Color::DarkGray),
+        )));
+        if let Some(note) = report.coverage_note.as_ref() {
+            lines.push(Line::from(Span::styled(note.clone(), Style::default().fg(Color::Yellow))));
+        }
+    } else {
+        lines.push(Line::from(Span::styled("No skill audit loaded", muted)));
+    }
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_skill_audit_list(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Skills ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    if app.usage_is_loading() {
+        f.render_widget(
+            Paragraph::new("Loading skill audit...")
+                .style(Style::default().fg(Color::Yellow))
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    let Some(report) = app.skill_audit_report.as_ref() else {
+        f.render_widget(
+            Paragraph::new("No skill audit data")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block),
+            area,
+        );
+        return;
+    };
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let inner_width = inner.width as usize;
+    let (lines, selected_line) =
+        build_skill_audit_lines(report, app.skill_audit_selected, inner_width);
+    let visible_height = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let scroll = selected_line.saturating_sub(visible_height.saturating_sub(1)).min(max_scroll);
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
+}
+
+fn build_skill_audit_lines(
+    report: &crate::skill_audit::SkillAuditReport,
+    selected: usize,
+    inner_width: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let cols = skill_audit_columns(inner_width);
+    let mut lines = Vec::new();
+    let mut selected_line = 0usize;
+    let mut entry_index = 0usize;
+    let mut header_added = false;
+
+    let sections = [
+        ("CORE", SkillTier::Core, &report.core),
+        ("OCCASIONAL", SkillTier::Occasional, &report.occasional),
+        ("DORMANT", SkillTier::Dormant, &report.dormant),
+    ];
+
+    for (title, tier, entries) in sections {
+        if entries.is_empty() {
+            continue;
+        }
+        if !header_added {
+            lines.push(skill_audit_table_header(&cols));
+            lines.push(skill_audit_metrics_legend());
+            header_added = true;
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" {title} ({})", entries.len()),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )));
+        for entry in entries {
+            if entry_index == selected {
+                selected_line = lines.len();
+            }
+            lines.push(skill_audit_entry_line(entry, tier, entry_index == selected, &cols));
+            entry_index += 1;
+        }
+        lines.push(Line::from(""));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No personal skills found in ~/.claude/skills, ~/.codex/skills, or ~/.agents/skills",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    (lines, selected_line)
+}
+
+struct SkillAuditColumns {
+    skill: usize,
+    calls: usize,
+    last: usize,
+    via: usize,
+}
+
+fn skill_audit_columns(width: usize) -> SkillAuditColumns {
+    let calls = 5;
+    let last = 8;
+    let via = 6;
+    let gaps = 3;
+    let skill = width.saturating_sub(calls + last + via + gaps + 2).max(16);
+    SkillAuditColumns { skill, calls, last, via }
+}
+
+fn skill_audit_table_header(cols: &SkillAuditColumns) -> Line<'static> {
+    let style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled(format!("  {:<skill_w$}", "SKILL", skill_w = cols.skill), style),
+        Span::styled(format!(" {:>calls_w$}", "CALLS", calls_w = cols.calls), style),
+        Span::styled(format!(" {:>last_w$}", "LAST", last_w = cols.last), style),
+        Span::styled(format!(" {:>via_w$}", "VIA", via_w = cols.via), style),
+    ])
+}
+
+fn skill_audit_metrics_legend() -> Line<'static> {
+    Line::from(Span::styled(
+        "  CALLS session uses · LAST last use · VIA invoke/read/both",
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+fn skill_audit_entry_line(
+    entry: &SkillUsageEntry,
+    tier: SkillTier,
+    selected: bool,
+    cols: &SkillAuditColumns,
+) -> Line<'static> {
+    let base = if selected {
+        Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let muted = if selected {
+        Style::default().fg(Color::Black).bg(Color::Magenta)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let skill = truncate_label(&entry.id, cols.skill);
+    let (calls, last, via) = if tier == SkillTier::Dormant {
+        ("-".to_string(), "never".to_string(), "-".to_string())
+    } else {
+        (
+            format!("{}", entry.invocations),
+            format_last_used(entry.last_used),
+            format_signals(&entry.signals).to_string(),
+        )
+    };
+
+    Line::from(vec![
+        Span::styled(format!("  {:<skill_w$}", skill, skill_w = cols.skill), base),
+        Span::styled(format!(" {:>calls_w$}", calls, calls_w = cols.calls), base),
+        Span::styled(format!(" {:>last_w$}", last, last_w = cols.last), muted),
+        Span::styled(format!(" {:>via_w$}", via, via_w = cols.via), muted),
+    ])
 }
 
 fn truncate_label(label: &str, max_chars: usize) -> String {
