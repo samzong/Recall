@@ -7,9 +7,11 @@ use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
-use crate::types::Role;
+use crate::types::{RawUsageEvent, Role, TokenSource};
 
 pub struct GeminiAdapter;
+
+const USAGE_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for GeminiAdapter {
     fn id(&self) -> &str {
@@ -24,6 +26,10 @@ impl SourceAdapter for GeminiAdapter {
             program: "gemini".to_string(),
             args: vec!["--resume".to_string(), source_id.to_string()],
         })
+    }
+
+    fn usage_parser_version(&self) -> Option<u32> {
+        Some(USAGE_PARSER_VERSION)
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
@@ -67,15 +73,19 @@ fn parse_gemini_session_file(path: &Path) -> anyhow::Result<Option<RawSession>> 
     let reader = BufReader::new(file);
     let doc: Value = serde_json::from_reader(reader)?;
     let fallback_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
-    parse_gemini_session_value(doc, fallback_id)
+    parse_gemini_session_value(doc, fallback_id, Some(path.display().to_string()))
 }
 
 pub fn parse_gemini_session(json: &str, fallback_id: &str) -> anyhow::Result<Option<RawSession>> {
     let doc: Value = serde_json::from_str(json)?;
-    parse_gemini_session_value(doc, fallback_id)
+    parse_gemini_session_value(doc, fallback_id, None)
 }
 
-fn parse_gemini_session_value(doc: Value, fallback_id: &str) -> anyhow::Result<Option<RawSession>> {
+fn parse_gemini_session_value(
+    doc: Value,
+    fallback_id: &str,
+    source_path: Option<String>,
+) -> anyhow::Result<Option<RawSession>> {
     let session_id =
         doc.get("sessionId").and_then(|s| s.as_str()).unwrap_or(fallback_id).to_string();
 
@@ -98,8 +108,9 @@ fn parse_gemini_session_value(doc: Value, fallback_id: &str) -> anyhow::Result<O
     };
 
     let mut messages = Vec::new();
+    let mut usage_events = Vec::new();
 
-    for msg in messages_arr {
+    for (index, msg) in messages_arr.iter().enumerate() {
         let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let role = match msg_type {
             "user" => Role::User,
@@ -128,14 +139,90 @@ fn parse_gemini_session_value(doc: Value, fallback_id: &str) -> anyhow::Result<O
             (false, false) => format!("{prose}\n{tool_text}"),
         };
 
+        let message_seq = messages.len() as u32;
         messages.push(RawMessage { role, content, timestamp });
+
+        if msg_type == "gemini"
+            && let Some(event) = extract_gemini_usage_event(
+                msg,
+                index as u32,
+                message_seq,
+                timestamp.unwrap_or(started_at),
+                source_path.as_deref(),
+            )
+        {
+            usage_events.push(event);
+        }
     }
 
-    if messages.is_empty() {
+    if messages.is_empty() && usage_events.is_empty() {
         return Ok(None);
     }
 
-    Ok(Some(RawSession::search_only(session_id, None, started_at, updated_at, None, messages)))
+    let mut session = RawSession::search_only(session_id, None, started_at, updated_at, None, messages);
+    if !usage_events.is_empty() {
+        session = session.with_usage(usage_events, USAGE_PARSER_VERSION);
+    }
+    Ok(Some(session))
+}
+
+fn extract_gemini_usage_event(
+    msg: &Value,
+    event_seq: u32,
+    message_seq: u32,
+    timestamp: i64,
+    source_path: Option<&str>,
+) -> Option<RawUsageEvent> {
+    let tokens = msg.get("tokens")?;
+    let input_tokens = json_i64(tokens.get("input")).unwrap_or(0).max(0);
+    let output_tokens = json_i64(tokens.get("output")).unwrap_or(0).max(0);
+    let cache_read_tokens = json_i64(tokens.get("cached")).unwrap_or(0).max(0);
+    let reasoning_tokens = json_i64(tokens.get("thoughts")).unwrap_or(0).max(0);
+    if input_tokens == 0
+        && output_tokens == 0
+        && cache_read_tokens == 0
+        && reasoning_tokens == 0
+    {
+        return None;
+    }
+
+    let model = msg
+        .get("model")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    let event_key = msg
+        .get("id")
+        .map(|value| format!("message:{value}"))
+        .unwrap_or_else(|| format!("line:{event_seq}"));
+
+    Some(RawUsageEvent {
+        event_key,
+        event_seq,
+        message_seq: Some(message_seq),
+        timestamp,
+        model: model.clone(),
+        provider: "google".to_string(),
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens: 0,
+        reasoning_tokens,
+        token_source: TokenSource::Observed,
+        parser_version: USAGE_PARSER_VERSION,
+        source_path: source_path.map(str::to_string),
+        raw_usage_json: Some(tokens.to_string()),
+    })
+}
+
+fn json_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().map(|v| v as i64))
+            .or_else(|| value.as_f64().map(|v| v as i64))
+    })
 }
 
 fn extract_tool_calls(tool_calls: Option<&Value>) -> String {
@@ -174,4 +261,39 @@ fn extract_tool_result(result: Option<&Value>) -> String {
         }
     }
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_gemini_session_extracts_usage_events() {
+        let json = r#"{
+            "sessionId": "abc-123",
+            "startTime": "2025-11-13T13:48:00.000Z",
+            "messages": [
+                {"id": 0, "type": "user", "content": "hello", "timestamp": "2025-11-13T13:48:05.000Z"},
+                {
+                    "id": 1,
+                    "type": "gemini",
+                    "content": "hi there",
+                    "timestamp": "2025-11-13T13:48:10.000Z",
+                    "model": "gemini-2.5-pro",
+                    "tokens": { "input": 100, "output": 20, "cached": 30, "thoughts": 5 }
+                }
+            ]
+        }"#;
+
+        let session = parse_gemini_session(json, "fallback").unwrap().unwrap();
+        assert_eq!(session.usage_events.len(), 1);
+        let event = &session.usage_events[0];
+        assert_eq!(event.model, "gemini-2.5-pro");
+        assert_eq!(event.provider, "google");
+        assert_eq!(event.input_tokens, 100);
+        assert_eq!(event.output_tokens, 20);
+        assert_eq!(event.cache_read_tokens, 30);
+        assert_eq!(event.reasoning_tokens, 5);
+        assert_eq!(event.token_source, TokenSource::Observed);
+    }
 }
