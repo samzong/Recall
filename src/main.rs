@@ -31,6 +31,8 @@ enum Commands {
         force: bool,
         #[arg(short, long, help = "Show per-source scan progress and settings")]
         verbose: bool,
+        #[arg(long, help = "Sync only this source (id or label, e.g. cursor or CUR)")]
+        source: Option<String>,
     },
     #[command(hide = true, name = "__background-worker")]
     BackgroundWorker {
@@ -97,7 +99,9 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Info) => cmd_info()?,
-        Some(Commands::Sync { force, verbose }) => cmd_sync(force, verbose)?,
+        Some(Commands::Sync { force, verbose, source }) => {
+            cmd_sync(force, verbose, source.as_deref())?
+        }
         Some(Commands::BackgroundWorker { sync_first }) => cmd_background_worker(sync_first)?,
         Some(Commands::BenchSemantic) => recall::bench::run_semantic()?,
         Some(Commands::BenchSearch { query }) => recall::bench::run_search(&query)?,
@@ -306,14 +310,22 @@ fn format_date_range(oldest: Option<i64>, newest: Option<i64>) -> String {
     format!("{oldest} -> {newest}")
 }
 
-fn cmd_sync(force: bool, verbose: bool) -> Result<()> {
-    run_sync_job(force, verbose)?;
+fn cmd_sync(force: bool, verbose: bool, source_filter: Option<&str>) -> Result<()> {
+    let labels = adapters::source_labels();
+    let sources = resolve_source_filter(source_filter, &labels)?;
+    run_sync_job_inner(SyncRunOptions {
+        force,
+        verbose,
+        emit: true,
+        usage_only: false,
+        sources,
+    })?;
     semantic::ensure_background_worker(false)?;
     Ok(())
 }
 
 fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
-    run_sync_job_inner(SyncRunOptions { force, verbose, emit: true, usage_only: false })
+    cmd_sync(force, verbose, None)
 }
 
 fn run_usage_sync_job() -> Result<()> {
@@ -322,15 +334,17 @@ fn run_usage_sync_job() -> Result<()> {
         verbose: false,
         emit: false,
         usage_only: true,
+        sources: None,
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SyncRunOptions {
     force: bool,
     verbose: bool,
     emit: bool,
     usage_only: bool,
+    sources: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,6 +380,12 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
         let label = adapter.label();
 
         if options.usage_only && adapter.usage_parser_version().is_none() {
+            continue;
+        }
+
+        if let Some(sources) = &options.sources
+            && !sources.iter().any(|id| id == source_id)
+        {
             continue;
         }
 
