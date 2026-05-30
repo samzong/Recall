@@ -17,7 +17,7 @@ use crate::types::{RawUsageEvent, Role, TokenSource};
 
 pub struct CursorAdapter;
 
-const USAGE_PARSER_VERSION: u32 = 1;
+const USAGE_PARSER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 struct ComposerMeta {
@@ -269,10 +269,10 @@ fn parse_composer_session(
         }
     }
 
-    if let Some(event) = extract_session_usage_event(composer_id, &data, meta) {
-        usage_events.push(event);
-    } else {
+    if !bubble_usage_events.is_empty() {
         usage_events.extend(bubble_usage_events);
+    } else if let Some(event) = extract_session_usage_event(composer_id, &data, meta) {
+        usage_events.push(event);
     }
 
     if messages.is_empty() && usage_events.is_empty() {
@@ -532,43 +532,54 @@ fn extract_session_usage_event(
     composer_data: &Value,
     meta: &ComposerMeta,
 ) -> Option<RawUsageEvent> {
-    let breakdown = composer_data.get("promptTokenBreakdown")?;
-    let total_used = json_i64(breakdown.get("totalUsedTokens")).unwrap_or(0).max(0);
-    if total_used == 0 {
-        let total_used = json_i64(composer_data.get("contextTokensUsed")).unwrap_or(0).max(0);
+    if let Some(breakdown) = composer_data.get("promptTokenBreakdown") {
+        let total_used = json_i64(breakdown.get("totalUsedTokens")).unwrap_or(0).max(0);
         if total_used == 0 {
             return None;
         }
+        let (input_tokens, cache_read_tokens) = map_context_breakdown(breakdown, total_used);
         return Some(build_session_usage_event(
             composer_id,
             composer_data,
             meta,
-            total_used,
-            0,
+            input_tokens,
+            cache_read_tokens,
             breakdown,
         ));
     }
 
-    let conversation_tokens = breakdown
-        .get("categories")
-        .and_then(|value| value.as_array())
-        .and_then(|categories| {
-            categories.iter().find(|category| {
-                category.get("id").and_then(|value| value.as_str()) == Some("conversation")
-            })
-        })
-        .and_then(|category| json_i64(category.get("estimatedTokens")))
-        .unwrap_or(0)
-        .max(0);
-    let input_tokens = total_used.saturating_sub(conversation_tokens);
+    let total_used = json_i64(composer_data.get("contextTokensUsed")).unwrap_or(0).max(0);
+    if total_used == 0 {
+        return None;
+    }
     Some(build_session_usage_event(
         composer_id,
         composer_data,
         meta,
-        input_tokens,
-        conversation_tokens,
-        breakdown,
+        total_used,
+        0,
+        &Value::Null,
     ))
+}
+
+fn map_context_breakdown(breakdown: &Value, total_used: i64) -> (i64, i64) {
+    let mut conversation_tokens = 0;
+    let mut prompt_tokens = 0;
+    if let Some(categories) = breakdown.get("categories").and_then(|value| value.as_array()) {
+        for category in categories {
+            let id = category.get("id").and_then(|value| value.as_str()).unwrap_or("");
+            let estimated = json_i64(category.get("estimatedTokens")).unwrap_or(0).max(0);
+            match id {
+                "conversation" | "summarized_conversation" => conversation_tokens += estimated,
+                _ => prompt_tokens += estimated,
+            }
+        }
+    }
+    let categorized = conversation_tokens + prompt_tokens;
+    if categorized < total_used {
+        prompt_tokens += total_used - categorized;
+    }
+    (prompt_tokens, conversation_tokens)
 }
 
 fn build_session_usage_event(
@@ -576,7 +587,7 @@ fn build_session_usage_event(
     composer_data: &Value,
     meta: &ComposerMeta,
     input_tokens: i64,
-    output_tokens: i64,
+    cache_read_tokens: i64,
     breakdown: &Value,
 ) -> RawUsageEvent {
     let model = model_from_composer(composer_data);
@@ -593,14 +604,18 @@ fn build_session_usage_event(
         model: model.clone(),
         provider: infer_cursor_provider(&model),
         input_tokens,
-        output_tokens,
-        cache_read_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens,
         cache_write_tokens: 0,
         reasoning_tokens: 0,
         token_source: TokenSource::Derived,
         parser_version: USAGE_PARSER_VERSION,
         source_path: Some(format!("composer:{composer_id}")),
-        raw_usage_json: Some(breakdown.to_string()),
+        raw_usage_json: if breakdown.is_null() {
+            None
+        } else {
+            Some(breakdown.to_string())
+        },
     }
 }
 
@@ -1044,7 +1059,62 @@ mod tests {
         assert_eq!(parsed.messages[0].content, "hello cursor");
         assert_eq!(parsed.usage_events.len(), 1);
         assert_eq!(parsed.usage_events[0].token_source, TokenSource::Derived);
+        assert_eq!(parsed.usage_events[0].input_tokens, 900);
+        assert_eq!(parsed.usage_events[0].cache_read_tokens, 300);
+        assert_eq!(parsed.usage_events[0].output_tokens, 0);
         assert_eq!(parsed.directory.as_deref(), Some("/Users/x/project"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_composer_session_prefers_bubble_usage_over_context_breakdown() {
+        let root = temp_root("bubble-usage");
+        let composer_id = uuid::Uuid::new_v4().to_string();
+        let bubble_id = uuid::Uuid::new_v4().to_string();
+        let conn = seed_global_db(&root, &composer_id, &bubble_id);
+        let composer_data = serde_json::json!({
+            "composerId": composer_id,
+            "createdAt": 1_700_000_000_000_i64,
+            "lastUpdatedAt": 1_700_000_100_000_i64,
+            "unifiedMode": "chat",
+            "modelConfig": { "modelName": "claude-sonnet-4" },
+            "promptTokenBreakdown": {
+                "totalUsedTokens": 1200,
+                "categories": [{ "id": "conversation", "estimatedTokens": 300 }]
+            },
+            "fullConversationHeadersOnly": [
+                { "bubbleId": bubble_id, "type": 2 },
+            ]
+        });
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
+            rusqlite::params![
+                composer_data.to_string(),
+                format!("composerData:{composer_id}"),
+            ],
+        )
+        .unwrap();
+        let bubble = serde_json::json!({
+            "type": 2,
+            "text": "assistant reply",
+            "createdAt": 1_700_000_050_000_i64,
+            "tokenCount": { "inputTokens": 12, "outputTokens": 34 }
+        });
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
+            rusqlite::params![
+                bubble.to_string(),
+                format!("bubbleId:{composer_id}:{bubble_id}"),
+            ],
+        )
+        .unwrap();
+
+        let meta = load_composer_meta(&conn, &composer_id);
+        let parsed = parse_composer_session(&conn, &composer_id, &meta).unwrap().unwrap();
+        assert_eq!(parsed.usage_events.len(), 1);
+        assert_eq!(parsed.usage_events[0].token_source, TokenSource::Observed);
+        assert_eq!(parsed.usage_events[0].input_tokens, 12);
+        assert_eq!(parsed.usage_events[0].output_tokens, 34);
         let _ = fs::remove_dir_all(root);
     }
 
