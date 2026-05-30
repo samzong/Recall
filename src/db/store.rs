@@ -35,6 +35,16 @@ pub struct EventSessionStateMeta {
     pub source_updated_at: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SkillAuditEventRow {
+    pub session_id: String,
+    pub source: String,
+    pub timestamp: Option<i64>,
+    pub name: Option<String>,
+    pub target: Option<String>,
+    pub attrs_json: Option<String>,
+}
+
 impl Store {
     pub fn open() -> Result<Self> {
         let data_dir = dirs::data_dir()
@@ -884,6 +894,98 @@ impl Store {
             })
         })?;
 
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_skill_audit_events(
+        &self,
+        sources: Option<&[String]>,
+        time_range: TimeRange,
+    ) -> Result<Vec<SkillAuditEventRow>> {
+        let mut sql = String::from(
+            "SELECT e.session_id, e.source,
+                    COALESCE(e.timestamp, s.updated_at, s.started_at) AS timestamp,
+                    e.name, e.target, e.attrs_json
+             FROM session_events e
+             JOIN sessions s ON s.id = e.session_id
+             WHERE (LOWER(e.name) IN ('skill', 'use_skill') OR e.target LIKE '%/skills/%/SKILL.md%'
+                    OR e.target LIKE '%/skills/%/references/%')",
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+
+        if let Some(cutoff) = time_range.millis_ago() {
+            sql.push_str(&format!(
+                " AND COALESCE(e.timestamp, s.updated_at, s.started_at) >= ?{param_idx}"
+            ));
+            params.push(Box::new(cutoff));
+            param_idx += 1;
+        }
+
+        if let Some(source_ids) = sources
+            && !source_ids.is_empty()
+        {
+            sql.push_str(" AND e.source IN (");
+            for (i, source_id) in source_ids.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!("?{param_idx}"));
+                params.push(Box::new(source_id.clone()));
+                param_idx += 1;
+            }
+            sql.push(')');
+        }
+
+        sql.push_str(
+            " ORDER BY COALESCE(e.timestamp, s.updated_at, s.started_at) ASC, e.session_id ASC, e.event_seq ASC",
+        );
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(SkillAuditEventRow {
+                session_id: row.get(0)?,
+                source: row.get(1)?,
+                timestamp: row.get(2)?,
+                name: row.get(3)?,
+                target: row.get(4)?,
+                attrs_json: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_sessions_by_ids(&self, session_ids: &[String]) -> Result<Vec<Session>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders =
+            std::iter::repeat_n("?", session_ids.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint
+             FROM sessions
+             WHERE id IN ({placeholders})
+             ORDER BY started_at DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            session_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(Session {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                source_id: row.get(2)?,
+                title: row.get(3)?,
+                directory: row.get(4)?,
+                started_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                message_count: row.get(7)?,
+                entrypoint: row.get(8)?,
+            })
+        })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
