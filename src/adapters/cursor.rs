@@ -89,10 +89,7 @@ impl SourceAdapter for CursorAdapter {
             let source_updated_at = updated_at.or(global_mtime);
             if let Some((old_updated_at, _)) = existing.get(&composer_id)
                 && *old_updated_at == source_updated_at
-                && usage_state_is_current(
-                    usage_state.get(&composer_id).copied(),
-                    source_updated_at,
-                )
+                && usage_state_is_current(usage_state.get(&composer_id).copied(), source_updated_at)
             {
                 stats.skipped_sessions += 1;
                 continue;
@@ -244,10 +241,8 @@ fn parse_composer_session(
             continue;
         }
 
-        let timestamp = bubble
-            .as_ref()
-            .and_then(|value| json_i64(value.get("createdAt")))
-            .or_else(|| {
+        let timestamp =
+            bubble.as_ref().and_then(|value| json_i64(value.get("createdAt"))).or_else(|| {
                 conversation_map
                     .and_then(|map| bubble_id.and_then(|id| map.get(id)))
                     .and_then(|value| json_i64(value.get("createdAt")))
@@ -415,7 +410,8 @@ fn load_composer_meta(conn: &Connection, composer_id: &str) -> ComposerMeta {
     }
 
     if meta.directory.is_none()
-        && let Some(path) = build_agent_cwd_map(resolve_global_state_db_path().as_deref()).get(composer_id)
+        && let Some(path) =
+            build_agent_cwd_map(resolve_global_state_db_path().as_deref()).get(composer_id)
     {
         meta.directory = Some(path.clone());
     }
@@ -461,7 +457,8 @@ fn render_bubble_content(bubble: &Value, role: &Role) -> String {
         } else {
             parts.push(format!("[tool:{name}]"));
         }
-        if let Some(result) = tool_data.get("result").and_then(render_json_fragment).filter(|s| !s.is_empty())
+        if let Some(result) =
+            tool_data.get("result").and_then(render_json_fragment).filter(|s| !s.is_empty())
         {
             parts.push(format!("[tool_result:{name}] {result}"));
         }
@@ -501,8 +498,10 @@ fn extract_bubble_usage_event(
     composer_data: &Value,
 ) -> Option<RawUsageEvent> {
     let token_count = bubble.get("tokenCount")?;
-    let input_tokens = token_count.get("inputTokens").and_then(|value| json_i64(Some(value))).unwrap_or(0).max(0);
-    let output_tokens = token_count.get("outputTokens").and_then(|value| json_i64(Some(value))).unwrap_or(0).max(0);
+    let input_tokens =
+        token_count.get("inputTokens").and_then(|value| json_i64(Some(value))).unwrap_or(0).max(0);
+    let output_tokens =
+        token_count.get("outputTokens").and_then(|value| json_i64(Some(value))).unwrap_or(0).max(0);
     if input_tokens == 0 && output_tokens == 0 {
         return None;
     }
@@ -552,14 +551,7 @@ fn extract_session_usage_event(
     if total_used == 0 {
         return None;
     }
-    Some(build_session_usage_event(
-        composer_id,
-        composer_data,
-        meta,
-        total_used,
-        0,
-        &Value::Null,
-    ))
+    Some(build_session_usage_event(composer_id, composer_data, meta, total_used, 0, &Value::Null))
 }
 
 fn map_context_breakdown(breakdown: &Value, total_used: i64) -> (i64, i64) {
@@ -611,11 +603,7 @@ fn build_session_usage_event(
         token_source: TokenSource::Derived,
         parser_version: USAGE_PARSER_VERSION,
         source_path: Some(format!("composer:{composer_id}")),
-        raw_usage_json: if breakdown.is_null() {
-            None
-        } else {
-            Some(breakdown.to_string())
-        },
+        raw_usage_json: if breakdown.is_null() { None } else { Some(breakdown.to_string()) },
     }
 }
 
@@ -637,8 +625,6 @@ fn infer_cursor_provider(model: &str) -> String {
         "openai".to_string()
     } else if lower.starts_with("gemini") {
         "google".to_string()
-    } else if lower.contains("composer") || lower == "default" {
-        "cursor".to_string()
     } else {
         "cursor".to_string()
     }
@@ -743,9 +729,7 @@ fn collect_agent_transcript_paths() -> HashMap<String, PathBuf> {
     let Some(projects_dir) = resolve_projects_dir().ok().flatten() else {
         return HashMap::new();
     };
-    collect_agent_transcript_paths_from_dir(&projects_dir)
-        .into_iter()
-        .collect()
+    collect_agent_transcript_paths_from_dir(&projects_dir).into_iter().collect()
 }
 
 fn collect_agent_transcript_paths_from_dir(projects_dir: &Path) -> Vec<(String, PathBuf)> {
@@ -806,9 +790,12 @@ fn open_global_db() -> anyhow::Result<Option<Connection>> {
         debug!("Cursor global state DB not found, skipping composer sessions");
         return Ok(None);
     };
-    Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .map(Some)
-        .map_err(Into::into)
+    Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map(Some)
+    .map_err(Into::into)
 }
 
 fn global_db_mtime() -> Option<i64> {
@@ -1000,10 +987,7 @@ mod tests {
         });
         conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
-            [
-                format!("composerData:{composer_id}"),
-                composer_data.to_string(),
-            ],
+            [format!("composerData:{composer_id}"), composer_data.to_string()],
         )
         .unwrap();
 
@@ -1015,10 +999,7 @@ mod tests {
         });
         conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
-            [
-                format!("bubbleId:{composer_id}:{bubble_id}"),
-                bubble.to_string(),
-            ],
+            [format!("bubbleId:{composer_id}:{bubble_id}"), bubble.to_string()],
         )
         .unwrap();
 
@@ -1088,10 +1069,7 @@ mod tests {
         });
         conn.execute(
             "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
-            rusqlite::params![
-                composer_data.to_string(),
-                format!("composerData:{composer_id}"),
-            ],
+            rusqlite::params![composer_data.to_string(), format!("composerData:{composer_id}"),],
         )
         .unwrap();
         let bubble = serde_json::json!({
@@ -1102,10 +1080,7 @@ mod tests {
         });
         conn.execute(
             "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
-            rusqlite::params![
-                bubble.to_string(),
-                format!("bubbleId:{composer_id}:{bubble_id}"),
-            ],
+            rusqlite::params![bubble.to_string(), format!("bubbleId:{composer_id}:{bubble_id}"),],
         )
         .unwrap();
 

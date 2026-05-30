@@ -159,7 +159,8 @@ fn parse_gemini_session_value(
         return Ok(None);
     }
 
-    let mut session = RawSession::search_only(session_id, None, started_at, updated_at, None, messages);
+    let mut session =
+        RawSession::search_only(session_id, None, started_at, updated_at, None, messages);
     if !usage_events.is_empty() {
         session = session.with_usage(usage_events, USAGE_PARSER_VERSION);
     }
@@ -178,11 +179,7 @@ fn extract_gemini_usage_event(
     let output_tokens = json_i64(tokens.get("output")).unwrap_or(0).max(0);
     let cache_read_tokens = json_i64(tokens.get("cached")).unwrap_or(0).max(0);
     let reasoning_tokens = json_i64(tokens.get("thoughts")).unwrap_or(0).max(0);
-    if input_tokens == 0
-        && output_tokens == 0
-        && cache_read_tokens == 0
-        && reasoning_tokens == 0
-    {
+    if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 && reasoning_tokens == 0 {
         return None;
     }
 

@@ -378,22 +378,20 @@ fn render_usage_breakdown(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(build_usage_source_lines(app, report, inner_width)),
         sections[0],
     );
-    f.render_widget(
-        Paragraph::new(build_usage_token_mix_lines(report, inner_width)),
-        sections[1],
-    );
+    f.render_widget(Paragraph::new(build_usage_token_mix_lines(report, inner_width)), sections[1]);
 
     let model_lines = build_usage_model_lines(app, report, inner_width);
     let visible_height = sections[2].height as usize;
     let max_scroll = model_lines.len().saturating_sub(visible_height);
     let scroll = app.usage_breakdown_scroll.min(max_scroll as u16) as usize;
-    f.render_widget(
-        Paragraph::new(model_lines).scroll((scroll as u16, 0)),
-        sections[2],
-    );
+    f.render_widget(Paragraph::new(model_lines).scroll((scroll as u16, 0)), sections[2]);
 }
 
-fn build_usage_source_lines(app: &App, report: &UsageReport, inner_width: usize) -> Vec<Line<'static>> {
+fn build_usage_source_lines(
+    app: &App,
+    report: &UsageReport,
+    inner_width: usize,
+) -> Vec<Line<'static>> {
     let source_max =
         report.by_source.iter().map(|source| source.tokens.total_tokens).max().unwrap_or(0);
     let mut lines = vec![Line::from(Span::styled(
@@ -427,7 +425,11 @@ fn build_usage_token_mix_lines(report: &UsageReport, inner_width: usize) -> Vec<
     lines
 }
 
-fn build_usage_model_lines(app: &App, report: &UsageReport, inner_width: usize) -> Vec<Line<'static>> {
+fn build_usage_model_lines(
+    app: &App,
+    report: &UsageReport,
+    inner_width: usize,
+) -> Vec<Line<'static>> {
     let model_max =
         report.by_model.iter().map(|model| model.tokens.total_tokens).max().unwrap_or(0);
     let mut lines = vec![Line::from(Span::styled(

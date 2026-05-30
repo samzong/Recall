@@ -313,13 +313,7 @@ fn format_date_range(oldest: Option<i64>, newest: Option<i64>) -> String {
 fn cmd_sync(force: bool, verbose: bool, source_filter: Option<&str>) -> Result<()> {
     let labels = adapters::source_labels();
     let sources = resolve_source_filter(source_filter, &labels)?;
-    run_sync_job_inner(SyncRunOptions {
-        force,
-        verbose,
-        emit: true,
-        usage_only: false,
-        sources,
-    })?;
+    run_sync_job_inner(SyncRunOptions { force, verbose, emit: true, usage_only: false, sources })?;
     semantic::ensure_background_worker(false)?;
     Ok(())
 }
