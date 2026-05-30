@@ -359,17 +359,49 @@ fn render_usage_breakdown(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let inner_width = inner.width as usize;
+    let source_rows = report.by_source.len().max(1) as u16 + 2;
+    let token_mix_rows = 7;
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(source_rows),
+            Constraint::Length(token_mix_rows),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(build_usage_source_lines(app, report, inner_width)),
+        sections[0],
+    );
+    f.render_widget(
+        Paragraph::new(build_usage_token_mix_lines(report, inner_width)),
+        sections[1],
+    );
+
+    let model_lines = build_usage_model_lines(app, report, inner_width);
+    let visible_height = sections[2].height as usize;
+    let max_scroll = model_lines.len().saturating_sub(visible_height);
+    let scroll = app.usage_breakdown_scroll.min(max_scroll as u16) as usize;
+    f.render_widget(
+        Paragraph::new(model_lines).scroll((scroll as u16, 0)),
+        sections[2],
+    );
+}
+
+fn build_usage_source_lines(app: &App, report: &UsageReport, inner_width: usize) -> Vec<Line<'static>> {
     let source_max =
         report.by_source.iter().map(|source| source.tokens.total_tokens).max().unwrap_or(0);
-    let model_max =
-        report.by_model.iter().map(|model| model.tokens.total_tokens).max().unwrap_or(0);
     let mut lines = vec![Line::from(Span::styled(
-        " Sources",
+        format!(" Sources ({})", report.by_source.len()),
         Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
     ))];
 
-    for source in report.by_source.iter().take(5) {
+    for source in &report.by_source {
         lines.push(usage_bar_line(
             app.source_label_for(&source.source),
             source.tokens.total_tokens,
@@ -381,13 +413,29 @@ fn render_usage_breakdown(f: &mut Frame, app: &App, area: Rect) {
     if report.by_source.is_empty() {
         lines.push(Line::from(Span::styled("  -", Style::default().fg(Color::DarkGray))));
     }
-
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " Models",
+    lines
+}
+
+fn build_usage_token_mix_lines(report: &UsageReport, inner_width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        " Token Mix",
         Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-    )));
-    for model in report.by_model.iter().take(6) {
+    ))];
+    lines.extend(token_mix_lines(&report.summary.tokens, inner_width));
+    lines.push(Line::from(""));
+    lines
+}
+
+fn build_usage_model_lines(app: &App, report: &UsageReport, inner_width: usize) -> Vec<Line<'static>> {
+    let model_max =
+        report.by_model.iter().map(|model| model.tokens.total_tokens).max().unwrap_or(0);
+    let mut lines = vec![Line::from(Span::styled(
+        format!(" Models ({})", report.by_model.len()),
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+    ))];
+
+    for model in &report.by_model {
         let label = format!("{}:{}", app.source_label_for(&model.source), model.model);
         lines.push(usage_bar_line(
             &label,
@@ -400,15 +448,7 @@ fn render_usage_breakdown(f: &mut Frame, app: &App, area: Rect) {
     if report.by_model.is_empty() {
         lines.push(Line::from(Span::styled("  -", Style::default().fg(Color::DarkGray))));
     }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " Token Mix",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-    )));
-    lines.extend(token_mix_lines(&report.summary.tokens, inner_width));
-
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    lines
 }
 
 fn render_usage_status(f: &mut Frame, area: Rect) {
@@ -417,6 +457,8 @@ fn render_usage_status(f: &mut Frame, area: Rect) {
         Span::styled(" time  ", Style::default().fg(Color::DarkGray)),
         Span::styled("s", Style::default().fg(Color::Yellow)),
         Span::styled(" source  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+        Span::styled(" breakdown  ", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::Yellow)),
         Span::styled(" reset  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Esc/q", Style::default().fg(Color::Yellow)),

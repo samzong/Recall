@@ -99,6 +99,7 @@ mod tests {
             usage_error: None,
             usage_time_filter: TimeRange::All,
             usage_refresh_requested_at: None,
+            usage_breakdown_scroll: 0,
         }
     }
 
@@ -403,6 +404,7 @@ pub struct App {
     pub usage_error: Option<String>,
     pub usage_time_filter: TimeRange,
     pub usage_refresh_requested_at: Option<Instant>,
+    pub usage_breakdown_scroll: u16,
 }
 
 impl App {
@@ -473,6 +475,7 @@ impl App {
             usage_error: None,
             usage_time_filter: TimeRange::All,
             usage_refresh_requested_at: None,
+            usage_breakdown_scroll: 0,
         };
         app.reset_search_defaults();
         app.update_scope_metrics(store);
@@ -637,6 +640,9 @@ impl App {
             AppMode::Filters if !self.filters_editing_source && !self.filters_editing_project => {
                 self.filter_focus = self.filter_focus.previous();
             }
+            AppMode::Usage if self.usage_breakdown_scroll > 0 => {
+                self.usage_breakdown_scroll -= 1;
+            }
             _ => {}
         }
     }
@@ -676,6 +682,9 @@ impl App {
             }
             AppMode::Filters if !self.filters_editing_source && !self.filters_editing_project => {
                 self.filter_focus = self.filter_focus.next();
+            }
+            AppMode::Usage => {
+                self.usage_breakdown_scroll = self.usage_breakdown_scroll.saturating_add(1);
             }
             _ => {}
         }
@@ -801,6 +810,8 @@ impl App {
                 self.reset_usage_dashboard();
                 self.request_usage_refresh();
             }
+            KeyCode::Up => self.handle_scroll_up(_store),
+            KeyCode::Down => self.handle_scroll_down(_store),
             _ => {}
         }
     }
@@ -1545,6 +1556,7 @@ impl App {
     pub fn refresh_usage(&mut self, store: &Store) {
         self.usage_refresh_requested_at = None;
         self.usage_error = None;
+        self.usage_breakdown_scroll = 0;
         let sources = self.source_filter_ids();
         let current_filters =
             UsageFilters { sources: sources.clone(), time_range: self.usage_time_filter };
@@ -1814,6 +1826,7 @@ impl App {
     fn reset_usage_dashboard(&mut self) {
         self.source_filter_selection.clear();
         self.usage_time_filter = TimeRange::All;
+        self.usage_breakdown_scroll = 0;
     }
 
     fn cycle_usage_time(&mut self, reverse: bool) {
