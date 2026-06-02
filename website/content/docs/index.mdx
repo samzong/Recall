@@ -1,0 +1,27 @@
+---
+title: Recall
+description: Local-first search across AI coding sessions
+---
+
+Recall indexes local AI coding sessions so you can sync once, search everywhere, inspect usage, and jump back into the original CLI context.
+
+## Install
+
+```bash
+brew install samzong/tap/recall
+```
+
+From a source checkout:
+
+```bash
+make install
+```
+
+## Start
+
+```bash
+recall sync
+recall
+```
+
+Use `recall sync --force` after changing the embedding model or when you want to reprocess every session.
