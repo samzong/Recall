@@ -1,0 +1,526 @@
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+use tracing::debug;
+
+use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::{
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
+};
+use crate::db::store::Store;
+use crate::types::Role;
+
+pub struct GrokAdapter;
+
+impl SourceAdapter for GrokAdapter {
+    fn id(&self) -> &str {
+        "grok"
+    }
+
+    fn label(&self) -> &str {
+        "GRK"
+    }
+
+    fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        Some(ResumeCommand {
+            program: "grok".to_string(),
+            args: vec!["--resume".to_string(), source_id.to_string()],
+        })
+    }
+
+    fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
+        let Some(sessions_dir) = resolve_grok_sessions_dir()? else {
+            return Ok(vec![]);
+        };
+
+        let mut sessions = Vec::new();
+        for entry in collect_grok_entries(&sessions_dir) {
+            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+                continue;
+            };
+            if let Some(raw) = parse_grok_session_for_entry(&entry, mtime_ms)? {
+                sessions.push(raw);
+            }
+        }
+        Ok(sessions)
+    }
+
+    fn scan_for_sync(
+        &self,
+        store: &Store,
+        since_ts: Option<i64>,
+        _include_events: bool,
+    ) -> anyhow::Result<Option<SyncScanResult>> {
+        let Some(sessions_dir) = resolve_grok_sessions_dir()? else {
+            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+        };
+        Ok(Some(scan_for_sync_impl(&sessions_dir, store, since_ts)?))
+    }
+}
+
+struct GrokSummary {
+    session_id: String,
+    directory: Option<String>,
+    started_at: i64,
+    updated_at: Option<i64>,
+}
+
+fn resolve_grok_sessions_dir() -> anyhow::Result<Option<PathBuf>> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    let dir = home.join(".grok").join("sessions");
+    if !dir.exists() {
+        debug!("~/.grok/sessions not found, skipping Grok");
+        return Ok(None);
+    }
+    Ok(Some(dir))
+}
+
+fn scan_for_sync_impl(
+    sessions_dir: &Path,
+    store: &Store,
+    since_ts: Option<i64>,
+) -> anyhow::Result<SyncScanResult> {
+    let entries = collect_grok_entries(sessions_dir);
+    file_scan::run_file_scan(store, "grok", since_ts, entries, |entry, mtime_ms| {
+        parse_grok_session_for_entry(&entry, mtime_ms)
+    })
+}
+
+fn collect_grok_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
+    let mut entries = Vec::new();
+
+    let workspace_dirs = match fs::read_dir(sessions_dir) {
+        Ok(dirs) => dirs,
+        Err(err) => {
+            debug!("cannot read Grok sessions dir: {err}");
+            return entries;
+        }
+    };
+
+    for workspace_entry in workspace_dirs.flatten() {
+        let workspace_path = workspace_entry.path();
+        if !workspace_path.is_dir() {
+            continue;
+        }
+        let workspace_name =
+            workspace_path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        if workspace_name == "session_search.sqlite" {
+            continue;
+        }
+
+        let fallback_directory = decode_grok_workspace_dir(workspace_name);
+
+        let session_dirs = match fs::read_dir(&workspace_path) {
+            Ok(dirs) => dirs,
+            Err(_) => continue,
+        };
+
+        for session_entry in session_dirs.flatten() {
+            let session_path = session_entry.path();
+            if !session_path.is_dir() {
+                continue;
+            }
+            let session_id = match session_path.file_name().and_then(|name| name.to_str()) {
+                Some(id) if is_grok_session_id(id) => id.to_string(),
+                _ => continue,
+            };
+
+            let updates_path = session_path.join("updates.jsonl");
+            if !updates_path.is_file() {
+                continue;
+            }
+
+            let directory = load_summary_directory(&session_path).or(fallback_directory.clone());
+
+            entries.push(FileScanEntry { session_id, stat_target: updates_path, directory });
+        }
+    }
+
+    entries
+}
+
+fn load_summary_directory(session_dir: &Path) -> Option<String> {
+    let summary_path = session_dir.join("summary.json");
+    let content = fs::read_to_string(summary_path).ok()?;
+    let doc: Value = serde_json::from_str(&content).ok()?;
+    doc.get("info")
+        .and_then(|info| info.get("cwd"))
+        .and_then(|cwd| cwd.as_str())
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_string)
+}
+
+fn is_grok_session_id(id: &str) -> bool {
+    uuid::Uuid::try_parse(id).is_ok()
+}
+
+fn decode_grok_workspace_dir(encoded: &str) -> Option<String> {
+    let mut out = String::with_capacity(encoded.len());
+    let bytes = encoded.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &encoded[index + 1..index + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte as char);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index] as char);
+        index += 1;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+fn parse_grok_session_for_entry(
+    entry: &FileScanEntry,
+    mtime_ms: i64,
+) -> anyhow::Result<Option<RawSession>> {
+    let session_dir = entry
+        .stat_target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("grok updates path has no parent"))?;
+
+    let summary = match load_grok_summary(session_dir, &entry.session_id) {
+        Ok(summary) => summary,
+        Err(err) => {
+            debug!("failed to read Grok summary for {}: {err}", entry.session_id);
+            return Ok(None);
+        }
+    };
+
+    let messages = match parse_grok_updates(&entry.stat_target) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            debug!("failed to parse Grok updates {}: {err}", entry.stat_target.display());
+            return Ok(None);
+        }
+    };
+
+    if messages.is_empty() {
+        return Ok(None);
+    }
+
+    let started_at =
+        summary.started_at.max(messages.first().and_then(|message| message.timestamp).unwrap_or(0));
+
+    let mut session = RawSession::search_only(
+        summary.session_id,
+        summary.directory.or(entry.directory.clone()),
+        started_at,
+        summary.updated_at.or(Some(mtime_ms)),
+        None,
+        messages,
+    );
+
+    session.updated_at = Some(mtime_ms);
+    Ok(Some(session))
+}
+
+fn load_grok_summary(session_dir: &Path, fallback_id: &str) -> anyhow::Result<GrokSummary> {
+    let summary_path = session_dir.join("summary.json");
+    let content = fs::read_to_string(&summary_path)?;
+    let doc: Value = serde_json::from_str(&content)?;
+
+    let session_id = doc
+        .get("info")
+        .and_then(|info| info.get("id"))
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback_id.to_string());
+
+    let directory = doc
+        .get("info")
+        .and_then(|info| info.get("cwd"))
+        .and_then(|cwd| cwd.as_str())
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_string);
+
+    let started_at = parse_rfc3339_ms(doc.get("created_at")).unwrap_or(0);
+    let updated_at = parse_rfc3339_ms(doc.get("updated_at"));
+    Ok(GrokSummary { session_id, directory, started_at, updated_at })
+}
+
+fn parse_grok_updates(updates_path: &Path) -> anyhow::Result<Vec<RawMessage>> {
+    let file = fs::File::open(updates_path)?;
+    parse_grok_updates_reader(BufReader::new(file))
+}
+
+fn parse_grok_updates_reader<R: BufRead>(reader: R) -> anyhow::Result<Vec<RawMessage>> {
+    let mut messages = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let Ok(doc) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+
+        let params = match doc.get("params") {
+            Some(params) => params,
+            None => continue,
+        };
+        let update = match params.get("update") {
+            Some(update) => update,
+            None => continue,
+        };
+        let session_update =
+            update.get("sessionUpdate").and_then(|value| value.as_str()).unwrap_or("");
+        let timestamp_ms = doc.get("timestamp").and_then(json_i64).map(|ts| ts * 1000);
+
+        match session_update {
+            "user_message_chunk" => {
+                let content = extract_update_text(update.get("content"));
+                if !content.is_empty() {
+                    messages.push(RawMessage {
+                        role: Role::User,
+                        content,
+                        timestamp: timestamp_ms,
+                    });
+                }
+            }
+            "agent_message_chunk" => {
+                let content = extract_update_text(update.get("content"));
+                if !content.is_empty() {
+                    messages.push(RawMessage {
+                        role: Role::Assistant,
+                        content,
+                        timestamp: timestamp_ms,
+                    });
+                }
+            }
+            "tool_call" => {
+                if let Some(content) = format_tool_call(update) {
+                    messages.push(RawMessage {
+                        role: Role::Assistant,
+                        content,
+                        timestamp: timestamp_ms,
+                    });
+                }
+            }
+            "tool_call_update" => {
+                if update.get("status").and_then(|status| status.as_str()) == Some("completed")
+                    && let Some(content) = format_tool_call_result(update)
+                {
+                    messages.push(RawMessage {
+                        role: Role::Assistant,
+                        content,
+                        timestamp: timestamp_ms,
+                    });
+                }
+            }
+            "agent_thought_chunk" | "available_commands_update" => {}
+            _ => {}
+        }
+    }
+
+    Ok(messages)
+}
+
+fn extract_update_text(content: Option<&Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.trim().to_string();
+    }
+    if let Some(text) = content.get("text").and_then(|text| text.as_str()) {
+        return text.trim().to_string();
+    }
+    if let Some(parts) = content.as_array() {
+        let mut out = Vec::new();
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(|text| text.as_str()) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    out.push(text);
+                }
+            }
+        }
+        return out.join("\n");
+    }
+    String::new()
+}
+
+fn format_tool_call(update: &Value) -> Option<String> {
+    let title = update.get("title").and_then(|title| title.as_str()).unwrap_or("tool");
+    let raw_input = update
+        .get("rawInput")
+        .map(|input| serde_json::to_string(input).unwrap_or_default())
+        .unwrap_or_default();
+    if raw_input.is_empty() {
+        return Some(format!("[{title}]"));
+    }
+    Some(format!("[{title}] {raw_input}"))
+}
+
+fn format_tool_call_result(update: &Value) -> Option<String> {
+    let title = update.get("title").and_then(|title| title.as_str()).unwrap_or("tool");
+    let content = update
+        .get("content")
+        .and_then(|content| content.as_array())
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("content"))
+        .and_then(|content| content.get("text"))
+        .and_then(|text| text.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let text = extract_update_text(update.get("content"));
+            (!text.is_empty()).then_some(text)
+        })?;
+
+    let mut out = format!("[{title}] -> ");
+    const MAX_CHARS: usize = 500;
+    if content.chars().count() > MAX_CHARS {
+        out.push_str(&content.chars().take(MAX_CHARS).collect::<String>());
+        out.push_str("...");
+    } else {
+        out.push_str(&content);
+    }
+    Some(out)
+}
+
+fn parse_rfc3339_ms(value: Option<&Value>) -> Option<i64> {
+    let text = value.and_then(|value| value.as_str())?;
+    chrono::DateTime::parse_from_rfc3339(text).ok().map(|dt| dt.timestamp_millis())
+}
+
+fn json_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|value| value as i64))
+        .or_else(|| value.as_f64().map(|value| value as i64))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::db::{schema, store::Store};
+    use crate::types::Session;
+
+    fn setup_store() -> Store {
+        schema::register_sqlite_vec();
+        Store::open_in_memory().unwrap()
+    }
+
+    fn temp_grok_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "recall-grok-test-{}-{}",
+            label,
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_grok_session(
+        root: &Path,
+        workspace_encoded: &str,
+        session_id: &str,
+        summary: &str,
+        updates: &str,
+    ) -> PathBuf {
+        let session_dir = root.join(workspace_encoded).join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("summary.json"), summary).unwrap();
+        let updates_path = session_dir.join("updates.jsonl");
+        fs::write(&updates_path, updates).unwrap();
+        updates_path
+    }
+
+    fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
+        Session {
+            id: format!("internal-{source_id}"),
+            source: "grok".to_string(),
+            source_id: source_id.to_string(),
+            title: "existing".to_string(),
+            directory: None,
+            started_at: 0,
+            updated_at: Some(updated_at),
+            message_count,
+            entrypoint: None,
+        }
+    }
+
+    #[test]
+    fn decode_grok_workspace_dir_decodes_percent_encoding() {
+        assert_eq!(
+            decode_grok_workspace_dir("%2FUsers%2Fx%2Fgit%2Fsamzong%2FRecall").as_deref(),
+            Some("/Users/x/git/samzong/Recall")
+        );
+    }
+
+    #[test]
+    fn parse_grok_updates_extracts_messages() {
+        let jsonl = r#"{"timestamp":10,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hello"}},"_meta":{"totalTokens":100,"turnStartMs":1000}}}
+{"timestamp":11,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}},"_meta":{"totalTokens":250,"turnStartMs":1000}}}
+{"timestamp":20,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"next"}},"_meta":{"totalTokens":260,"turnStartMs":2000}}}
+{"timestamp":21,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}},"_meta":{"totalTokens":400,"turnStartMs":2000}}}
+"#;
+
+        let messages = parse_grok_updates_reader(Cursor::new(jsonl)).unwrap();
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[1].content, "hi");
+    }
+
+    #[test]
+    fn collect_grok_entries_reads_summary_cwd() {
+        let root = temp_grok_root("collect");
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            session_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/from-summary"},"created_at":"2026-06-04T00:00:00Z"}"#,
+            r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hey"}}}}"#,
+        );
+
+        let entries = collect_grok_entries(&root);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, session_id);
+        assert_eq!(entries[0].directory.as_deref(), Some("/tmp/from-summary"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_skips_unchanged_session() {
+        let root = temp_grok_root("skip");
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let updates_path = write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            session_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z"}"#,
+            r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hey"}}}}"#,
+        );
+        let mtime = file_scan::stat_mtime_ms(&updates_path).unwrap();
+        let store = setup_store();
+        store.insert_session(&make_existing_session(session_id, mtime, 1)).unwrap();
+
+        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        assert_eq!(result.sessions.len(), 0);
+        assert_eq!(result.stats.skipped_sessions, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}

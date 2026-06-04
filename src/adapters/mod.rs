@@ -7,6 +7,7 @@ pub mod cursor;
 pub mod events;
 pub mod file_scan;
 pub mod gemini;
+pub mod grok;
 pub mod kiro;
 pub mod opencode;
 pub mod pi;
@@ -136,6 +137,7 @@ pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(pi::PiAdapter),
         Box::new(antigravity::AntigravityAdapter),
         Box::new(gemini::GeminiAdapter),
+        Box::new(grok::GrokAdapter),
         Box::new(kiro::KiroAdapter),
         Box::new(copilot::CopilotAdapter),
         Box::new(cursor::CursorAdapter),
