@@ -67,6 +67,17 @@ struct GrokSummary {
     updated_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentChunkKey {
+    prompt_id: Option<String>,
+    turn_start_ms: Option<i64>,
+}
+
+struct PendingAgentMessage {
+    key: AgentChunkKey,
+    message_index: usize,
+}
+
 fn resolve_grok_sessions_dir() -> anyhow::Result<Option<PathBuf>> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
     let dir = home.join(".grok").join("sessions");
@@ -257,6 +268,7 @@ fn parse_grok_updates(updates_path: &Path) -> anyhow::Result<Vec<RawMessage>> {
 
 fn parse_grok_updates_reader<R: BufRead>(reader: R) -> anyhow::Result<Vec<RawMessage>> {
     let mut messages = Vec::new();
+    let mut pending_agent: Option<PendingAgentMessage> = None;
     for line in reader.lines() {
         let line = line?;
         let line = line.trim();
@@ -282,6 +294,7 @@ fn parse_grok_updates_reader<R: BufRead>(reader: R) -> anyhow::Result<Vec<RawMes
 
         match session_update {
             "user_message_chunk" => {
+                pending_agent = None;
                 let content = extract_update_text(update.get("content"));
                 if !content.is_empty() {
                     messages.push(RawMessage {
@@ -292,13 +305,15 @@ fn parse_grok_updates_reader<R: BufRead>(reader: R) -> anyhow::Result<Vec<RawMes
                 }
             }
             "agent_message_chunk" => {
-                let content = extract_update_text(update.get("content"));
-                if !content.is_empty() {
-                    messages.push(RawMessage {
-                        role: Role::Assistant,
+                let content = extract_update_chunk_text(update.get("content"));
+                if !content.trim().is_empty() {
+                    push_or_append_agent_message(
+                        &mut messages,
+                        &mut pending_agent,
+                        agent_chunk_key(params),
                         content,
-                        timestamp: timestamp_ms,
-                    });
+                        timestamp_ms,
+                    );
                 }
             }
             "tool_call" => {
@@ -329,6 +344,38 @@ fn parse_grok_updates_reader<R: BufRead>(reader: R) -> anyhow::Result<Vec<RawMes
     Ok(messages)
 }
 
+fn agent_chunk_key(params: &Value) -> AgentChunkKey {
+    let meta = params.get("_meta");
+    AgentChunkKey {
+        prompt_id: meta
+            .and_then(|meta| meta.get("promptId"))
+            .and_then(|prompt| prompt.as_str())
+            .filter(|prompt| !prompt.is_empty())
+            .map(str::to_string),
+        turn_start_ms: meta.and_then(|meta| meta.get("turnStartMs")).and_then(json_i64),
+    }
+}
+
+fn push_or_append_agent_message(
+    messages: &mut Vec<RawMessage>,
+    pending_agent: &mut Option<PendingAgentMessage>,
+    key: AgentChunkKey,
+    content: String,
+    timestamp: Option<i64>,
+) {
+    if let Some(pending) = pending_agent
+        && pending.key == key
+        && let Some(message) = messages.get_mut(pending.message_index)
+    {
+        message.content.push_str(&content);
+        return;
+    }
+
+    let message_index = messages.len();
+    messages.push(RawMessage { role: Role::Assistant, content, timestamp });
+    *pending_agent = Some(PendingAgentMessage { key, message_index });
+}
+
 fn extract_update_text(content: Option<&Value>) -> String {
     let Some(content) = content else {
         return String::new();
@@ -347,6 +394,30 @@ fn extract_update_text(content: Option<&Value>) -> String {
                 if !text.is_empty() {
                     out.push(text);
                 }
+            }
+        }
+        return out.join("\n");
+    }
+    String::new()
+}
+
+fn extract_update_chunk_text(content: Option<&Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    if let Some(text) = content.get("text").and_then(|text| text.as_str()) {
+        return text.to_string();
+    }
+    if let Some(parts) = content.as_array() {
+        let mut out = Vec::new();
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(|text| text.as_str())
+                && !text.trim().is_empty()
+            {
+                out.push(text);
             }
         }
         return out.join("\n");
@@ -469,7 +540,8 @@ mod tests {
     #[test]
     fn parse_grok_updates_extracts_messages() {
         let jsonl = r#"{"timestamp":10,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hello"}},"_meta":{"totalTokens":100,"turnStartMs":1000}}}
-{"timestamp":11,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}},"_meta":{"totalTokens":250,"turnStartMs":1000}}}
+{"timestamp":11,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}},"_meta":{"totalTokens":250,"promptId":"prompt-1","turnStartMs":1000}}}
+{"timestamp":12,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" there"}},"_meta":{"totalTokens":255,"promptId":"prompt-1","turnStartMs":1000}}}
 {"timestamp":20,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"next"}},"_meta":{"totalTokens":260,"turnStartMs":2000}}}
 {"timestamp":21,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}},"_meta":{"totalTokens":400,"turnStartMs":2000}}}
 "#;
@@ -479,7 +551,25 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, Role::User);
         assert_eq!(messages[0].content, "hello");
-        assert_eq!(messages[1].content, "hi");
+        assert_eq!(messages[1].content, "hi there");
+    }
+
+    #[test]
+    fn parse_grok_updates_merges_streamed_agent_chunks() {
+        let jsonl = r#"{"timestamp":10,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hello"}}}}
+{"timestamp":11,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first "}},"_meta":{"promptId":"prompt-1","turnStartMs":1000}}}
+{"timestamp":12,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"response"}},"_meta":{"promptId":"prompt-1","turnStartMs":1000}}}
+{"timestamp":20,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"next"}}}}
+{"timestamp":21,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second"}},"_meta":{"promptId":"prompt-2","turnStartMs":2000}}}
+"#;
+
+        let messages = parse_grok_updates_reader(Cursor::new(jsonl)).unwrap();
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].content, "first response");
+        assert_eq!(messages[1].timestamp, Some(11_000));
+        assert_eq!(messages[3].content, "second");
     }
 
     #[test]
