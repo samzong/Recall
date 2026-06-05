@@ -360,11 +360,7 @@ fn parse_codex_session_with_options(
                                 && !text.is_empty()
                             {
                                 let ts = parse_timestamp(&v);
-                                messages.push(RawMessage {
-                                    role: Role::User,
-                                    content: text.to_string(),
-                                    timestamp: ts,
-                                });
+                                push_codex_message(&mut messages, Role::User, text.to_string(), ts);
                             }
                         }
                         "agent_message" => {
@@ -372,11 +368,12 @@ fn parse_codex_session_with_options(
                                 && !text.is_empty()
                             {
                                 let ts = parse_timestamp(&v);
-                                messages.push(RawMessage {
-                                    role: Role::Assistant,
-                                    content: text.to_string(),
-                                    timestamp: ts,
-                                });
+                                push_codex_message(
+                                    &mut messages,
+                                    Role::Assistant,
+                                    text.to_string(),
+                                    ts,
+                                );
                             }
                         }
                         _ => {}
@@ -403,11 +400,7 @@ fn parse_codex_session_with_options(
                     }
                     if !text.is_empty() {
                         let ts = parse_timestamp(&v);
-                        messages.push(RawMessage {
-                            role: Role::Assistant,
-                            content: text,
-                            timestamp: ts,
-                        });
+                        push_codex_message(&mut messages, Role::Assistant, text, ts);
                     }
                 }
                 if include_events && let Some(payload) = v.get("payload") {
@@ -861,6 +854,20 @@ fn parse_timestamp(v: &Value) -> Option<i64> {
         .and_then(|t| t.as_str())
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         .map(|dt| dt.timestamp_millis())
+}
+
+fn push_codex_message(
+    messages: &mut Vec<RawMessage>,
+    role: Role,
+    content: String,
+    timestamp: Option<i64>,
+) {
+    if role == Role::Assistant
+        && messages.last().is_some_and(|m| m.role == Role::Assistant && m.content == content)
+    {
+        return;
+    }
+    messages.push(RawMessage { role, content, timestamp });
 }
 
 #[cfg(test)]
