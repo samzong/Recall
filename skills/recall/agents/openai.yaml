@@ -1,0 +1,4 @@
+interface:
+  display_name: "Recall"
+  short_description: "Use project memory from AI sessions"
+  default_prompt: "Use $recall to review this project through its local AI session history before drawing conclusions."
