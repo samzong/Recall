@@ -1248,6 +1248,12 @@ fn render_viewing(f: &mut Frame, app: &App) {
         .title(session_info)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
+    let content_area = block.inner(outer[0]);
+    f.render_widget(block, outer[0]);
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(content_area);
 
     let mut lines: Vec<Line> = Vec::new();
     let mut selected_line_start: usize = 0;
@@ -1289,10 +1295,11 @@ fn render_viewing(f: &mut Frame, app: &App) {
         lines.push(Line::from(""));
     }
 
-    let scroll = scroll_offset(selected_line_start, block.inner(outer[0]).height as usize);
+    let scroll = scroll_offset(selected_line_start, content[1].height as usize);
 
-    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll, 0));
-    f.render_widget(p, outer[0]);
+    render_viewing_summary(f, app, content[0]);
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0));
+    f.render_widget(p, content[1]);
 
     let help_spans = vec![
         Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
@@ -1349,6 +1356,76 @@ fn render_viewing(f: &mut Frame, app: &App) {
     }
 
     f.render_widget(Paragraph::new(status_line), outer[1]);
+}
+
+fn render_viewing_summary(f: &mut Frame, app: &App, area: Rect) {
+    let text = viewing_summary_text(app, area.width as usize);
+    let line = Line::from(Span::styled(text, Style::default().fg(Color::Green)));
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn viewing_summary_text(app: &App, width: usize) -> String {
+    let Some(summary) = app.viewing_session_summary.as_ref() else {
+        return fit_summary_text(vec![" tokens - | time - | user msgs -".to_string()], width);
+    };
+
+    let duration = format_duration_minutes(summary.duration_minutes);
+    let user_messages = format!("{}/{}", summary.user_messages, summary.total_messages);
+
+    if summary.usage_events == 0 {
+        return fit_summary_text(
+            vec![
+                format!(" tokens - | time {duration} | user msgs {user_messages}"),
+                format!(" tok - | {duration} | user {user_messages}"),
+            ],
+            width,
+        );
+    }
+
+    let tokens = &summary.tokens;
+    let total = format_compact(tokens.total_tokens);
+    let input = format_compact(tokens.input_tokens);
+    let output = format_compact(tokens.output_tokens);
+    let cache_read = format_compact(tokens.cache_read_tokens);
+    let cache_write = format_compact(tokens.cache_write_tokens);
+    let reasoning = format_compact(tokens.reasoning_tokens);
+
+    fit_summary_text(
+        vec![
+            format!(
+                " tokens {total} input {input} output {output} cache r/w {cache_read}/{cache_write} reasoning {reasoning} | time {duration} | user msgs {user_messages}"
+            ),
+            format!(
+                " tok {total} in {input} out {output} cache {cache_read}/{cache_write} reason {reasoning} | {duration} | user {user_messages}"
+            ),
+            format!(" tok {total} | time {duration} | user {user_messages}"),
+        ],
+        width,
+    )
+}
+
+fn fit_summary_text(variants: Vec<String>, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    for variant in &variants {
+        if UnicodeWidthStr::width(variant.as_str()) <= width {
+            return variant.clone();
+        }
+    }
+    truncate_label(variants.last().map(String::as_str).unwrap_or(""), width)
+}
+
+fn format_duration_minutes(minutes: Option<u32>) -> String {
+    let Some(minutes) = minutes else {
+        return "-".to_string();
+    };
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let remaining = minutes % 60;
+    if remaining == 0 { format!("{hours}h") } else { format!("{hours}h{remaining}m") }
 }
 
 fn render_source_picker(f: &mut Frame, app: &App) {
@@ -1772,4 +1849,84 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         }
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::config::AppConfig;
+    use crate::db::store::Store;
+    use crate::tui::app::ViewingSessionSummary;
+    use crate::types::{Message, SearchResult, Session};
+
+    #[test]
+    fn render_viewing_shows_one_line_session_summary_below_title() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.mode = AppMode::Viewing;
+        app.results = vec![SearchResult {
+            session: Session {
+                id: "session1".to_string(),
+                source: "codex".to_string(),
+                source_id: "source1".to_string(),
+                title: "Test session".to_string(),
+                directory: Some("/tmp/repo".to_string()),
+                started_at: 0,
+                updated_at: Some(120_000),
+                message_count: 1,
+                entrypoint: None,
+                custom_title: None,
+                summary: None,
+                duration_minutes: Some(2),
+            },
+            match_source: MatchSource::Fts,
+            snippet: None,
+        }];
+        app.viewing_messages = vec![Message {
+            session_id: "session1".to_string(),
+            role: Role::User,
+            content: "hello".to_string(),
+            timestamp: Some(0),
+            seq: 0,
+        }];
+        app.viewing_sanitized_lines =
+            vec![vec![SanitizedLine { text: "hello".to_string(), lower: "hello".to_string() }]];
+        app.viewing_session_summary = Some(ViewingSessionSummary {
+            user_messages: 2,
+            total_messages: 3,
+            duration_minutes: Some(2),
+            usage_events: 2,
+            tokens: TokenTotals {
+                input_tokens: 10,
+                output_tokens: 9,
+                cache_read_tokens: 6,
+                cache_write_tokens: 4,
+                reasoning_tokens: 2,
+                total_tokens: 31,
+            },
+        });
+
+        let backend = TestBackend::new(100, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let summary = buffer_row(terminal.backend().buffer(), 1, 100);
+
+        assert!(summary.contains(
+            "tokens 31 input 10 output 9 cache r/w 6/4 reasoning 2 | time 2m | user msgs 2/3"
+        ));
+        assert_eq!(terminal.backend().buffer()[(2, 1)].fg, Color::Green);
+    }
+
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        let mut row = String::new();
+        for x in 0..width {
+            row.push_str(buffer[(x, y)].symbol());
+        }
+        row
+    }
 }

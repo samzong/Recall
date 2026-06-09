@@ -12,8 +12,9 @@ use crate::embedding::EmbeddingProvider;
 use crate::skill_audit::{self, SkillAuditFilters, SkillAuditReport};
 use crate::types::{
     BackgroundJobStatus, MatchSource, Message, Role, SearchResult, SemanticProgress,
+    SessionUsageEventRecord,
 };
-use crate::usage::{self, UsageFilters, UsageReport};
+use crate::usage::{self, TokenTotals, UsageFilters, UsageReport};
 
 const USAGE_LOADING_MIN_MS: u128 = 75;
 
@@ -53,6 +54,7 @@ mod tests {
             preview_selected_msg: 0,
             viewing_messages: Vec::new(),
             viewing_selected_msg: 0,
+            viewing_session_summary: None,
             all_sources: vec![
                 source("claude", "Claude"),
                 source("cursor", "Cursor"),
@@ -133,6 +135,56 @@ mod tests {
             match_source: MatchSource::Fts,
             snippet: None,
         }
+    }
+
+    fn message(role: Role, timestamp: Option<i64>, seq: u32) -> Message {
+        Message {
+            session_id: "session1".to_string(),
+            role,
+            content: "hello".to_string(),
+            timestamp,
+            seq,
+        }
+    }
+
+    fn usage_event(input_tokens: i64, output_tokens: i64) -> SessionUsageEventRecord {
+        SessionUsageEventRecord {
+            event_key: "event1".to_string(),
+            event_seq: 0,
+            message_seq: None,
+            timestamp: 120_000,
+            model: "gpt".to_string(),
+            provider: "openai".to_string(),
+            input_tokens,
+            output_tokens,
+            cache_read_tokens: 3,
+            cache_write_tokens: 2,
+            reasoning_tokens: 1,
+            token_source: "derived".to_string(),
+        }
+    }
+
+    #[test]
+    fn viewing_session_summary_counts_messages_duration_and_tokens() {
+        let messages = vec![
+            message(Role::User, Some(0), 0),
+            message(Role::Assistant, Some(120_000), 1),
+            message(Role::User, None, 2),
+        ];
+        let usage_events = vec![usage_event(10, 5), usage_event(-1, 4)];
+
+        let summary = ViewingSessionSummary::from_session(&messages, None, &usage_events);
+
+        assert_eq!(summary.user_messages, 2);
+        assert_eq!(summary.total_messages, 3);
+        assert_eq!(summary.duration_minutes, Some(2));
+        assert_eq!(summary.usage_events, 2);
+        assert_eq!(summary.tokens.input_tokens, 10);
+        assert_eq!(summary.tokens.output_tokens, 9);
+        assert_eq!(summary.tokens.cache_read_tokens, 6);
+        assert_eq!(summary.tokens.cache_write_tokens, 4);
+        assert_eq!(summary.tokens.reasoning_tokens, 2);
+        assert_eq!(summary.tokens.total_tokens, 31);
     }
 
     #[test]
@@ -306,6 +358,53 @@ fn build_viewing_caches(msgs: &[Message]) -> Vec<Vec<SanitizedLine>> {
         .collect()
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ViewingSessionSummary {
+    pub user_messages: usize,
+    pub total_messages: usize,
+    pub duration_minutes: Option<u32>,
+    pub usage_events: usize,
+    pub tokens: TokenTotals,
+}
+
+impl ViewingSessionSummary {
+    fn from_session(
+        messages: &[Message],
+        duration_minutes: Option<u32>,
+        usage_events: &[SessionUsageEventRecord],
+    ) -> Self {
+        let mut tokens = TokenTotals::default();
+        for event in usage_events {
+            tokens.input_tokens += event.input_tokens.max(0);
+            tokens.output_tokens += event.output_tokens.max(0);
+            tokens.cache_read_tokens += event.cache_read_tokens.max(0);
+            tokens.cache_write_tokens += event.cache_write_tokens.max(0);
+            tokens.reasoning_tokens += event.reasoning_tokens.max(0);
+        }
+        tokens.total_tokens = tokens.input_tokens
+            + tokens.output_tokens
+            + tokens.cache_read_tokens
+            + tokens.cache_write_tokens
+            + tokens.reasoning_tokens;
+
+        Self {
+            user_messages: messages.iter().filter(|msg| msg.role == Role::User).count(),
+            total_messages: messages.len(),
+            duration_minutes: duration_minutes.or_else(|| message_span_minutes(messages)),
+            usage_events: usage_events.len(),
+            tokens,
+        }
+    }
+}
+
+fn message_span_minutes(messages: &[Message]) -> Option<u32> {
+    let mut timestamps = messages.iter().filter_map(|msg| msg.timestamp);
+    let first = timestamps.next()?;
+    let (min_ts, max_ts) =
+        timestamps.fold((first, first), |(min_ts, max_ts), ts| (min_ts.min(ts), max_ts.max(ts)));
+    Some(max_ts.saturating_sub(min_ts).div_euclid(60_000) as u32)
+}
+
 #[derive(PartialEq)]
 pub enum PanelFocus {
     SessionList,
@@ -369,6 +468,7 @@ pub struct App {
     pub preview_selected_msg: usize,
     pub viewing_messages: Vec<Message>,
     pub viewing_selected_msg: usize,
+    pub viewing_session_summary: Option<ViewingSessionSummary>,
     pub all_sources: Vec<(String, String)>,
     pub config: AppConfig,
     pub source_filter_selection: Vec<String>,
@@ -444,6 +544,7 @@ impl App {
             preview_selected_msg: 0,
             viewing_messages: Vec::new(),
             viewing_selected_msg: 0,
+            viewing_session_summary: None,
             all_sources,
             config,
             source_filter_selection: Vec::new(),
@@ -881,6 +982,7 @@ impl App {
                 self.mode = AppMode::Search;
                 self.viewing_messages.clear();
                 self.viewing_selected_msg = 0;
+                self.viewing_session_summary = None;
                 self.viewing_search_query.clear();
                 self.viewing_search_status = None;
                 self.viewing_sanitized_lines.clear();
@@ -2064,6 +2166,13 @@ impl App {
         if let Some(result) = self.results.get(self.selected_index)
             && let Ok(msgs) = store.get_messages(&result.session.id)
         {
+            let usage_events =
+                store.list_usage_events_for_session(&result.session.id).unwrap_or_default();
+            self.viewing_session_summary = Some(ViewingSessionSummary::from_session(
+                &msgs,
+                result.session.duration_minutes,
+                &usage_events,
+            ));
             self.viewing_sanitized_lines = build_viewing_caches(&msgs);
             self.viewing_messages = msgs;
             self.viewing_selected_msg = 0;
