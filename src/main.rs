@@ -26,7 +26,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(about = "Show indexed source and background job status")]
     Info,
+    #[command(about = "Scan configured AI coding session sources")]
     Sync {
         #[arg(long, help = "Reprocess every session, even if unchanged")]
         force: bool,
@@ -43,9 +45,7 @@ enum Commands {
     #[command(hide = true, name = "__bench-semantic")]
     BenchSemantic,
     #[command(hide = true, name = "__bench-search")]
-    BenchSearch {
-        query: String,
-    },
+    BenchSearch { query: String },
     #[command(hide = true, name = "__bench-eval")]
     BenchEval {
         #[arg(long)]
@@ -55,29 +55,31 @@ enum Commands {
     },
     #[command(hide = true, name = "__bench-dump-sessions")]
     BenchDumpSessions,
+    #[command(about = "Search indexed coding sessions")]
     Search {
+        #[arg(help = "Search query text")]
         query: String,
-        #[arg(long)]
+        #[arg(long, help = "Filter by source id or label")]
         source: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Filter by time range")]
         time: Option<String>,
         #[arg(long, help = "Filter by project directory, including child paths")]
         project: Option<String>,
     },
+    #[command(about = "Show token usage reports")]
     Usage {
         #[arg(long, help = "Output usage report as JSON")]
         json: bool,
-        #[arg(long)]
+        #[arg(long, help = "Filter by source id or label")]
         source: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Filter by time range")]
         time: Option<String>,
     },
+    #[command(about = "Export session records as JSON Lines")]
     Export {
-        #[arg(long, help = "Output session records as JSON Lines")]
-        jsonl: bool,
-        #[arg(long)]
+        #[arg(long, help = "Filter by source id or label")]
         source: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Filter by time range")]
         time: Option<String>,
         #[arg(long, help = "Filter by project directory, including child paths")]
         project: Option<String>,
@@ -88,6 +90,7 @@ enum Commands {
         )]
         limit: usize,
     },
+    #[command(about = "Import session records from JSON Lines")]
     Import {
         #[arg(help = "Input file path, or - for stdin")]
         file: String,
@@ -126,8 +129,8 @@ fn main() -> Result<()> {
         Some(Commands::Usage { json, source, time }) => {
             cmd_usage(json, source.as_deref(), time.as_deref())?
         }
-        Some(Commands::Export { jsonl, source, time, project, limit }) => {
-            cmd_export(jsonl, source.as_deref(), time.as_deref(), project.as_deref(), limit)?
+        Some(Commands::Export { source, time, project, limit }) => {
+            cmd_export(source.as_deref(), time.as_deref(), project.as_deref(), limit)?
         }
         Some(Commands::Import { file, dry_run }) => cmd_import(&file, dry_run)?,
         None => cmd_tui(None)?,
@@ -932,16 +935,11 @@ fn cmd_usage(json: bool, source_filter: Option<&str>, time_filter: Option<&str>)
 }
 
 fn cmd_export(
-    jsonl: bool,
     source_filter: Option<&str>,
     time_filter: Option<&str>,
     project_filter: Option<&str>,
     limit: usize,
 ) -> Result<()> {
-    if !jsonl {
-        anyhow::bail!("export requires --jsonl");
-    }
-
     let store = Store::open()?;
     let sources = adapters::source_labels();
     let options = ExportOptions {
@@ -1263,9 +1261,10 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        BackfillPlan, ExistingSessionAction, decide_existing_session_action,
+        BackfillPlan, Cli, Commands, ExistingSessionAction, decide_existing_session_action,
         delete_excluded_sessions_for_source,
     };
+    use clap::{CommandFactory, Parser};
     use recall::adapters::{
         adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
     };
@@ -1294,6 +1293,48 @@ mod tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+        }
+    }
+
+    #[test]
+    fn export_accepts_default_jsonl_without_format_flag() {
+        let cli = Cli::try_parse_from(["recall", "export", "--source", "grok"]).unwrap();
+        match cli.command {
+            Some(Commands::Export { source, .. }) => {
+                assert_eq!(source.as_deref(), Some("grok"));
+            }
+            _ => panic!("expected export command"),
+        }
+    }
+
+    #[test]
+    fn export_rejects_removed_jsonl_flag() {
+        assert!(Cli::try_parse_from(["recall", "export", "--jsonl"]).is_err());
+    }
+
+    #[test]
+    fn top_level_help_describes_public_commands() {
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        assert!(!help.contains("--jsonl"));
+        assert!(help.contains("info    Show indexed source and background job status"));
+        assert!(help.contains("sync    Scan configured AI coding session sources"));
+        assert!(help.contains("search  Search indexed coding sessions"));
+        assert!(help.contains("usage   Show token usage reports"));
+        assert!(help.contains("export  Export session records as JSON Lines"));
+        assert!(help.contains("import  Import session records from JSON Lines"));
+    }
+
+    #[test]
+    fn public_subcommand_help_describes_arguments_and_options() {
+        for subcommand in ["search", "usage", "export", "import"] {
+            let mut command = Cli::command();
+            let command = command.find_subcommand_mut(subcommand).unwrap();
+            let help = command.render_long_help().to_string();
+            assert!(!help.contains("<SOURCE>    "), "{subcommand} source help missing");
+            assert!(!help.contains("<TIME>        "), "{subcommand} time help missing");
+            assert!(!help.contains("<QUERY>  "), "{subcommand} query help missing");
+            assert!(!help.contains("<FILE>  \n"), "{subcommand} file help missing");
         }
     }
 
