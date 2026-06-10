@@ -51,7 +51,7 @@ doc: ## Generate API documentation
 .PHONY: install uninstall
 
 install: ## Install binary to ~/.cargo/bin
-	$(CARGO) install --path .
+	$(CARGO) install --path . --locked
 
 uninstall: ## Remove installed binary
 	$(CARGO) uninstall recall
