@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub fn register_sqlite_vec() {
@@ -33,6 +33,9 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
     }
     if version < 7 {
         migrate_v7(conn)?;
+    }
+    if version < 8 {
+        migrate_v8(conn)?;
     }
     Ok(())
 }
@@ -274,6 +277,15 @@ fn migrate_v7(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn migrate_v8(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE sessions ADD COLUMN is_import INTEGER NOT NULL DEFAULT 0",
+    )?;
+    conn.execute_batch("PRAGMA user_version = 8;")?;
+    Ok(())
+}
+
 fn add_column_if_missing(conn: &Connection, stmt: &str) -> anyhow::Result<()> {
     if let Err(err) = conn.execute(stmt, []) {
         let msg = err.to_string();
@@ -340,6 +352,32 @@ mod tests {
         assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
         conn.prepare("SELECT source_file_path FROM sessions")
             .unwrap_or_else(|e| panic!("column source_file_path missing after migrate_v7: {e}"));
+    }
+
+    #[test]
+    fn migrate_v8_adds_is_import_to_existing_v7_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, source TEXT NOT NULL, source_id TEXT NOT NULL,
+                title TEXT NOT NULL, directory TEXT, started_at INTEGER NOT NULL,
+                updated_at INTEGER, message_count INTEGER NOT NULL DEFAULT 0,
+                entrypoint TEXT, custom_title TEXT, summary TEXT,
+                duration_minutes INTEGER, source_file_path TEXT, UNIQUE(source, source_id)
+            );
+            INSERT INTO sessions (id, source, source_id, title, started_at)
+            VALUES ('s1', 'codex', 'c1', 'existing', 0);
+            PRAGMA user_version = 7;",
+        )
+        .unwrap();
+
+        init(&conn).unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let is_import: i64 = conn
+            .query_row("SELECT is_import FROM sessions WHERE id = 's1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(is_import, 0, "existing local sessions must default to is_import = 0");
     }
 
     #[test]

@@ -70,6 +70,8 @@ pub struct Session {
     pub custom_title: Option<String>,
     pub summary: Option<String>,
     pub duration_minutes: Option<u32>,
+    pub source_file_path: Option<String>,
+    pub is_import: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +149,8 @@ pub struct SessionEventRecord {
     pub summary: Option<String>,
     pub source_path: Option<String>,
     pub source_event_id: Option<String>,
+    pub attrs_json: Option<String>,
+    pub parser_version: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +167,9 @@ pub struct SessionUsageEventRecord {
     pub cache_write_tokens: i64,
     pub reasoning_tokens: i64,
     pub token_source: String,
+    pub parser_version: u32,
+    pub source_path: Option<String>,
+    pub raw_usage_json: Option<String>,
 }
 
 #[derive(Debug)]

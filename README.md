@@ -43,15 +43,37 @@ recall search Q --project /path/to/repo
 recall usage         # usage dashboard
 recall usage --json  # usage report for scripts
 recall export --jsonl --source codex --project /path/to/repo --limit 20
+recall import recall-export.jsonl --dry-run  # preview an import
 recall info          # index stats and worker status
 ```
 
 ## Export
 
 `recall export --jsonl` writes one JSON object per indexed session. Each record
-includes `schema_version`, `record_type`, `session`, `messages`, and
-`usage_events`, and `events`. Optional fields are emitted as `null`; raw
-source-specific JSON is not part of the public export contract.
+includes `schema_version`, `record_type`, `session`, `messages`,
+`usage_events`, and `events`, covering everything Recall stores for a session.
+Optional fields are emitted as `null`. By default all sessions are exported;
+use `--limit N` to truncate. `--time` filters on `started_at`, so prefer a full
+export when moving data between machines.
+
+## Import
+
+`recall import <file>` (or `-` for stdin) loads sessions from an export file
+into the local index. How the file travels between machines is up to you.
+
+```bash
+# machine A
+recall export --jsonl > recall-a.jsonl
+# machine B
+recall import recall-a.jsonl
+```
+
+- Idempotent: a session whose `(source, source_id)` already exists locally is
+  skipped, so re-running an import is safe and local data always wins.
+- Imported sessions are searchable and appear in usage reports, but cannot be
+  resumed on this machine (the source tool's own files were not copied); the
+  TUI explains this if you try.
+- `--dry-run` parses and reports counts without writing anything.
 
 ## License
 

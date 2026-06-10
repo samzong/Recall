@@ -1883,6 +1883,8 @@ mod tests {
                 custom_title: None,
                 summary: None,
                 duration_minutes: Some(2),
+                source_file_path: None,
+                is_import: false,
             },
             match_source: MatchSource::Fts,
             snippet: None,

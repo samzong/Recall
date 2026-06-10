@@ -123,6 +123,8 @@ recall search "migration bug" --project /absolute/project/path
 recall search "migration bug" --project /absolute/project/path --source codex --time 30d
 recall export --jsonl --project /absolute/project/path --limit 0
 recall export --jsonl --project /absolute/project/path --source codex --time 30d --limit 100
+recall import recall-export.jsonl --dry-run
+recall import recall-export.jsonl
 recall usage --json
 ```
 
@@ -141,7 +143,7 @@ Supported source ids include `claude-code`, `opencode`, `codex`, `pi`, `antigrav
 - `usage_events`
 - `events`
 
-The public export contract does not include raw source-specific JSON. Expect optional fields to be `null`.
+Since schema_version 3 the export is lossless against the Recall index: it also carries `session.source_file_path`, usage-event `parser_version` / `source_path` / `raw_usage_json`, and event `attrs_json` / `parser_version`. Expect optional fields to be `null`. `recall import` accepts schema_version 2 and 3 files and skips sessions that already exist locally by `(source, source_id)`.
 
 Important fields:
 
@@ -153,7 +155,7 @@ Important fields:
 - `messages[].role`: `user` or `assistant`.
 - `messages[].content`: the indexed message text.
 - `usage_events[]`: token usage when available.
-- `events[]`: tool/session events when available, without raw event attributes.
+- `events[]`: tool/session events when available, including `attrs_json` raw attributes.
 
 ## Avoid In Agent Tool Calls
 

@@ -131,6 +131,8 @@ mod tests {
                 custom_title: None,
                 summary: None,
                 duration_minutes: None,
+                source_file_path: None,
+                is_import: false,
             },
             match_source: MatchSource::Fts,
             snippet: None,
@@ -161,6 +163,9 @@ mod tests {
             cache_write_tokens: 2,
             reasoning_tokens: 1,
             token_source: "derived".to_string(),
+            parser_version: 1,
+            source_path: None,
+            raw_usage_json: None,
         }
     }
 
@@ -213,6 +218,38 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "codex://threads/019e6d8d-588b-7fd2-a326-c525469ed120")
         );
+    }
+
+    #[test]
+    fn imported_session_suppresses_resume_and_app_open() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let engine = SearchEngine::new(&store.conn);
+        let mut provider = None;
+        let mut app = app_with_sources();
+        let mut result = codex_search_result();
+        result.session.is_import = true;
+        app.results = vec![result];
+
+        for key_char in ['r', 'o'] {
+            app.status_message = None;
+            app.handle_search_key(
+                KeyEvent::new(KeyCode::Char(key_char), KeyModifiers::CONTROL),
+                &store,
+                &engine,
+                &mut provider,
+            );
+
+            assert!(
+                !matches!(app.mode, AppMode::ConfirmResume),
+                "ctrl+{key_char} must not open confirmation for imported session"
+            );
+            assert!(app.pending_resume.is_none());
+            assert!(
+                app.status_message.as_deref().unwrap_or_default().contains("Imported"),
+                "status message must explain why nothing happened"
+            );
+        }
     }
 
     #[test]
@@ -1148,6 +1185,11 @@ impl App {
             return;
         };
         let session = &result.session;
+        if session.is_import {
+            self.status_message =
+                Some("Imported session: not resumable on this machine".to_string());
+            return;
+        }
         let command = match action {
             PendingCommandAction::Resume => resume_command_for(&session.source, &session.source_id),
             PendingCommandAction::OpenApp => app_command_for(&session.source, &session.source_id),

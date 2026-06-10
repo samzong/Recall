@@ -28,6 +28,8 @@ fn make_session(id: &str, source: &str, source_id: &str, title: &str) -> Session
         custom_title: None,
         summary: None,
         duration_minutes: None,
+        source_file_path: None,
+        is_import: false,
     }
 }
 
@@ -279,7 +281,7 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     let lines: Vec<_> = text.lines().collect();
     assert_eq!(lines.len(), 1);
     let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["schema_version"], 3);
     assert_eq!(value["record_type"], "session");
     assert_eq!(value["session"]["source"], "codex");
     assert_eq!(value["session"]["source_id"], "raw1");
@@ -295,12 +297,15 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     assert_eq!(value["usage_events"][0]["message_seq"], 1);
     assert_eq!(value["usage_events"][0]["model"], "gpt-5");
     assert_eq!(value["usage_events"][0]["token_source"], "observed");
-    assert!(value["usage_events"][0].get("raw_usage_json").is_none());
+    assert_eq!(value["usage_events"][0]["parser_version"], 1);
+    assert_eq!(value["usage_events"][0]["source_path"], "/tmp/source.jsonl");
+    assert_eq!(value["usage_events"][0]["raw_usage_json"], r#"{"input_tokens":10}"#);
     assert_eq!(value["events"][0]["kind"], "file_read");
     assert_eq!(value["events"][0]["name"], "read_file");
     assert_eq!(value["events"][0]["target"], "src/main.rs");
     assert_eq!(value["events"][0]["message_seq"], 1);
-    assert!(value["events"][0].get("attrs_json").is_none());
+    assert_eq!(value["events"][0]["parser_version"], 1);
+    assert_eq!(value["events"][0]["attrs_json"], r#"{"path":"src/main.rs"}"#);
 }
 
 #[test]
@@ -575,6 +580,8 @@ fn sync_skips_unchanged_session() {
         custom_title: None,
         summary: None,
         duration_minutes: None,
+        source_file_path: None,
+        is_import: false,
     };
     store.insert_session(&session).unwrap();
 
@@ -598,6 +605,8 @@ fn sync_detects_new_messages() {
         custom_title: None,
         summary: None,
         duration_minutes: None,
+        source_file_path: None,
+        is_import: false,
     };
     store.insert_session(&session).unwrap();
     store.insert_messages(&[make_message("s1", Role::User, "hello", 0)]).unwrap();
@@ -633,6 +642,8 @@ fn sync_detects_updated_timestamp() {
         custom_title: None,
         summary: None,
         duration_minutes: None,
+        source_file_path: None,
+        is_import: false,
     };
     store.insert_session(&session).unwrap();
 

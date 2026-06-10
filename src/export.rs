@@ -7,7 +7,7 @@ use crate::db::search::TimeRange;
 use crate::db::store::Store;
 use crate::types::{Message, Role, Session, SessionEventRecord, SessionUsageEventRecord};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const RECORD_TYPE: &str = "session";
 
 pub struct ExportOptions {
@@ -41,6 +41,7 @@ struct ExportSession {
     custom_title: Option<String>,
     summary: Option<String>,
     duration_minutes: Option<u32>,
+    source_file_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -65,6 +66,9 @@ struct ExportUsageEvent {
     cache_write_tokens: i64,
     reasoning_tokens: i64,
     token_source: String,
+    parser_version: u32,
+    source_path: Option<String>,
+    raw_usage_json: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -80,6 +84,8 @@ struct ExportEvent {
     summary: Option<String>,
     source_path: Option<String>,
     source_event_id: Option<String>,
+    attrs_json: Option<String>,
+    parser_version: u32,
 }
 
 pub fn write_jsonl<W: Write>(store: &Store, options: &ExportOptions, mut writer: W) -> Result<()> {
@@ -124,6 +130,7 @@ impl From<Session> for ExportSession {
             custom_title: session.custom_title,
             summary: session.summary,
             duration_minutes: session.duration_minutes,
+            source_file_path: session.source_file_path,
         }
     }
 }
@@ -153,6 +160,9 @@ impl From<SessionUsageEventRecord> for ExportUsageEvent {
             cache_write_tokens: event.cache_write_tokens,
             reasoning_tokens: event.reasoning_tokens,
             token_source: event.token_source,
+            parser_version: event.parser_version,
+            source_path: event.source_path,
+            raw_usage_json: event.raw_usage_json,
         }
     }
 }
@@ -171,6 +181,8 @@ impl From<SessionEventRecord> for ExportEvent {
             summary: event.summary,
             source_path: event.source_path,
             source_event_id: event.source_event_id,
+            attrs_json: event.attrs_json,
+            parser_version: event.parser_version,
         }
     }
 }

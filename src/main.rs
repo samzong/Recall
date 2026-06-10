@@ -81,8 +81,18 @@ enum Commands {
         time: Option<String>,
         #[arg(long, help = "Filter by project directory, including child paths")]
         project: Option<String>,
-        #[arg(long, default_value_t = 100, help = "Maximum sessions to export; 0 means all")]
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Maximum sessions to export; 0 means all (default)"
+        )]
         limit: usize,
+    },
+    Import {
+        #[arg(help = "Input file path, or - for stdin")]
+        file: String,
+        #[arg(long, help = "Parse and report without writing")]
+        dry_run: bool,
     },
 }
 
@@ -119,6 +129,7 @@ fn main() -> Result<()> {
         Some(Commands::Export { jsonl, source, time, project, limit }) => {
             cmd_export(jsonl, source.as_deref(), time.as_deref(), project.as_deref(), limit)?
         }
+        Some(Commands::Import { file, dry_run }) => cmd_import(&file, dry_run)?,
         None => cmd_tui(None)?,
     }
 
@@ -479,6 +490,7 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
         }
 
         let mut existing_meta = store.session_meta_map(source_id)?;
+        let mut imported_ids = store.imported_source_ids(source_id)?;
         let mut existing_usage_meta = store.usage_state_meta_map(source_id)?;
         let mut existing_event_meta = if options.usage_only && !options.backfill_events {
             Default::default()
@@ -515,7 +527,6 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 continue;
             }
 
-            let raw_source_file_path = raw.source_file_path.clone();
             let msg_count = raw.messages.len() as u32;
             let usage_backfill_needed = raw.usage_parser_version.is_some_and(|version| {
                 !usage_state_is_current(
@@ -535,6 +546,9 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
 
             match existing_meta.get(&raw_source_id) {
                 Some(&(old_updated_at, old_msg_count)) => {
+                    if imported_ids.remove(&raw_source_id) {
+                        store.clear_import_marker(source_id, &raw_source_id)?;
+                    }
                     let content_changed = old_msg_count != msg_count
                         || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
                     match decide_existing_session_action(
@@ -642,6 +656,8 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 custom_title: raw.custom_title,
                 summary: raw.summary,
                 duration_minutes: raw.duration_minutes,
+                source_file_path: raw.source_file_path,
+                is_import: false,
             };
 
             let messages: Vec<Message> = raw
@@ -672,16 +688,6 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 &events,
                 event_parser_version,
             )?;
-            if let Some(source_file_path) = raw_source_file_path.as_deref() {
-                store.update_session_fields(
-                    source_id,
-                    &session.source_id,
-                    None,
-                    None,
-                    None,
-                    Some(source_file_path),
-                )?;
-            }
             existing_meta
                 .insert(session.source_id.clone(), (session.updated_at, session.message_count));
             if let Some(parser_version) = raw.usage_parser_version {
@@ -947,6 +953,25 @@ fn cmd_export(
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     recall::export::write_jsonl(&store, &options, &mut handle)
+}
+
+fn cmd_import(file: &str, dry_run: bool) -> Result<()> {
+    let store = Store::open()?;
+    let summary = if file == "-" {
+        let stdin = std::io::stdin();
+        recall::import::import_jsonl(&store, dry_run, stdin.lock())?
+    } else {
+        let f =
+            std::fs::File::open(file).map_err(|e| anyhow::anyhow!("cannot open {file}: {e}"))?;
+        recall::import::import_jsonl(&store, dry_run, std::io::BufReader::new(f))?
+    };
+
+    let suffix = if dry_run { " (dry-run, nothing written)" } else { "" };
+    println!(
+        "total {} | imported {} | skipped {}{suffix}",
+        summary.total, summary.imported, summary.skipped
+    );
+    Ok(())
 }
 
 fn format_usage_report_text(report: &usage::UsageReport) -> String {
@@ -1267,6 +1292,8 @@ mod tests {
             custom_title: None,
             summary: None,
             duration_minutes: None,
+            source_file_path: None,
+            is_import: false,
         }
     }
 

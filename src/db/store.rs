@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -12,7 +12,7 @@ use crate::types::{
 };
 use crate::utils::f32_slice_to_bytes;
 
-pub(crate) const SESSION_COLUMNS: &str = "id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes";
+pub(crate) const SESSION_COLUMNS: &str = "id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import";
 
 pub(crate) fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -28,6 +28,8 @@ pub(crate) fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sess
         custom_title: row.get(9)?,
         summary: row.get(10)?,
         duration_minutes: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+        source_file_path: row.get(12)?,
+        is_import: row.get(13)?,
     })
 }
 
@@ -162,6 +164,22 @@ impl Store {
         rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
 
+    pub fn imported_source_ids(&self, source: &str) -> Result<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT source_id FROM sessions WHERE source = ?1 AND is_import = 1")?;
+        let rows = stmt.query_map(rusqlite::params![source], |row| row.get(0))?;
+        rows.collect::<Result<HashSet<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn clear_import_marker(&self, source: &str, source_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET is_import = 0 WHERE source = ?1 AND source_id = ?2",
+            rusqlite::params![source, source_id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_session_fields(
         &self,
         source: &str,
@@ -196,8 +214,8 @@ impl Store {
 
     pub fn insert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 session.id,
                 session.source,
@@ -211,6 +229,8 @@ impl Store {
                 session.custom_title,
                 session.summary,
                 session.duration_minutes,
+                session.source_file_path,
+                session.is_import,
             ],
         )?;
         Ok(())
@@ -270,8 +290,8 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         {
             tx.execute(
-                "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
                     session.id,
                     session.source,
@@ -285,6 +305,8 @@ impl Store {
                     session.custom_title,
                     session.summary,
                     session.duration_minutes,
+                    session.source_file_path,
+                    session.is_import,
                 ],
             )?;
 
@@ -1085,7 +1107,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT event_key, event_seq, message_seq, timestamp, model, provider,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    reasoning_tokens, token_source
+                    reasoning_tokens, token_source, parser_version, source_path, raw_usage_json
              FROM usage_events
              WHERE session_id = ?1
              ORDER BY event_seq ASC, event_key ASC",
@@ -1104,6 +1126,9 @@ impl Store {
                 cache_write_tokens: row.get(9)?,
                 reasoning_tokens: row.get(10)?,
                 token_source: row.get(11)?,
+                parser_version: row.get(12)?,
+                source_path: row.get(13)?,
+                raw_usage_json: row.get(14)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1115,7 +1140,7 @@ impl Store {
     ) -> Result<Vec<SessionEventRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_seq, timestamp, kind, actor, name, status, target,
-                    message_seq, summary, source_path, source_event_id
+                    message_seq, summary, source_path, source_event_id, attrs_json, parser_version
              FROM session_events
              WHERE session_id = ?1
              ORDER BY event_seq ASC",
@@ -1133,6 +1158,8 @@ impl Store {
                 summary: row.get(8)?,
                 source_path: row.get(9)?,
                 source_event_id: row.get(10)?,
+                attrs_json: row.get(11)?,
+                parser_version: row.get(12)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1407,7 +1434,27 @@ mod exclusion_tests {
             custom_title: None,
             summary: None,
             duration_minutes: None,
+            source_file_path: None,
+            is_import: false,
         }
+    }
+
+    #[test]
+    fn imported_source_ids_and_clear_import_marker_round_trip() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut imported = sess("a", None);
+        imported.is_import = true;
+        store.insert_session(&imported).unwrap();
+        store.insert_session(&sess("b", None)).unwrap();
+
+        let ids = store.imported_source_ids("claude-code").unwrap();
+        assert_eq!(ids, std::collections::HashSet::from(["src-a".to_string()]));
+
+        store.clear_import_marker("claude-code", "src-a").unwrap();
+        assert!(store.imported_source_ids("claude-code").unwrap().is_empty());
+        let sessions = store.list_recent_sessions(10).unwrap();
+        assert!(sessions.iter().all(|s| !s.is_import));
     }
 
     #[test]

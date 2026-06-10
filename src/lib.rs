@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod embedding;
 pub mod export;
+pub mod import;
 pub mod semantic;
 pub mod skill_audit;
 pub mod tui;

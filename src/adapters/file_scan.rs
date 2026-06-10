@@ -53,6 +53,7 @@ where
     F: Fn(FileScanEntry, i64) -> Result<Option<RawSession>>,
 {
     let existing = store.session_meta_map(source_id)?;
+    let mut imported = store.imported_source_ids(source_id)?;
     let usage_state = match options.usage_parser_version {
         Some(_) => store.usage_state_meta_map(source_id)?,
         None => Default::default(),
@@ -69,17 +70,20 @@ where
             continue;
         };
 
-        if existing.contains_key(&entry.session_id)
-            && let Some(source_file_path) = entry.stat_target.to_str()
-        {
-            store.update_session_fields(
-                source_id,
-                &entry.session_id,
-                None,
-                None,
-                None,
-                Some(source_file_path),
-            )?;
+        if existing.contains_key(&entry.session_id) {
+            if let Some(source_file_path) = entry.stat_target.to_str() {
+                store.update_session_fields(
+                    source_id,
+                    &entry.session_id,
+                    None,
+                    None,
+                    None,
+                    Some(source_file_path),
+                )?;
+            }
+            if imported.remove(&entry.session_id) {
+                store.clear_import_marker(source_id, &entry.session_id)?;
+            }
         }
 
         if let Some(cutoff) = since_ts
@@ -182,6 +186,8 @@ mod tests {
             custom_title: None,
             summary: None,
             duration_minutes: None,
+            source_file_path: None,
+            is_import: false,
         }
     }
 
@@ -265,6 +271,33 @@ mod tests {
         let paths = store.session_paths_for_source("test-source").unwrap();
         let stored = paths.iter().find(|path| path.source_id == "sess-skip").unwrap();
         assert_eq!(stored.source_file_path.as_deref(), path.to_str());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn matching_mtime_skip_still_clears_import_marker() {
+        let store = setup_store();
+        let path = temp_file_with_mtime("import-clear");
+        let mtime_ms = stat_mtime_ms(&path).unwrap();
+        let mut session = make_session("s1", "sess-imported", Some(mtime_ms), 1);
+        session.is_import = true;
+        store.insert_session(&session).unwrap();
+
+        let entry = FileScanEntry {
+            session_id: "sess-imported".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+
+        let result = run_file_scan(&store, "test-source", None, vec![entry], |_, _| {
+            panic!("parse should not be called for skipped entry")
+        })
+        .unwrap();
+
+        assert_eq!(result.stats.skipped_sessions, 1);
+        let sessions = store.list_recent_sessions(10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions[0].is_import, "local raw backing must clear the import marker");
         let _ = fs::remove_file(&path);
     }
 

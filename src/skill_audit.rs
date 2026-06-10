@@ -496,6 +496,8 @@ mod tests {
             custom_title: None,
             summary: None,
             duration_minutes: None,
+            source_file_path: None,
+            is_import: false,
         };
         let event = RawSessionEvent {
             event_seq: 0,
@@ -548,6 +550,8 @@ mod tests {
             custom_title: None,
             summary: None,
             duration_minutes: None,
+            source_file_path: None,
+            is_import: false,
         };
         let event = RawSessionEvent {
             event_seq: 0,
