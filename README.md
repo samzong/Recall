@@ -11,7 +11,7 @@ Jump between Claude Code, Codex, and whatever comes next; Recall pulls those sca
 ```bash
 brew install samzong/tap/recall
 # or
-make install # clone
+make install # from a source checkout
 ```
 
 ## Support
@@ -25,10 +25,10 @@ One index across every AI coding CLI. Sync once, search everywhere, resume right
 | Codex           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Pi              |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Antigravity CLI |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
-| Gemini          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
+| Gemini          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Kiro            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
 | Copilot CLI     |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
-| Cursor          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
+| Cursor          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |   ✅   |
 | Cline           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
 | Grok            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |        |
 
@@ -42,19 +42,26 @@ recall search Q      # one-shot CLI search
 recall search Q --project /path/to/repo
 recall usage         # usage dashboard
 recall usage --json  # usage report for scripts
-recall export --jsonl --source codex --project /path/to/repo --limit 20
+recall export --source codex --project /path/to/repo --limit 20 > recall-export.jsonl
 recall import recall-export.jsonl --dry-run  # preview an import
 recall info          # index stats and worker status
 ```
 
 ## Export
 
-`recall export --jsonl` writes one JSON object per indexed session. Each record
-includes `schema_version`, `record_type`, `session`, `messages`,
-`usage_events`, and `events`, covering everything Recall stores for a session.
-Optional fields are emitted as `null`. By default all sessions are exported;
-use `--limit N` to truncate. `--time` filters on `started_at`, so prefer a full
-export when moving data between machines.
+`recall export` writes JSON Lines to stdout, with one JSON object per indexed
+session. Redirect stdout to save an export file:
+
+```bash
+recall export --source codex --project /path/to/repo > recall-export.jsonl
+```
+
+Each record includes `schema_version`, `record_type`, `session`, `messages`,
+`usage_events`, and `events`. It covers the portable session data Recall can
+import again; derived index state such as FTS rows, embeddings, and background
+job state is rebuilt locally. Optional fields are emitted as `null`. By default
+all sessions are exported; use `--limit N` to truncate. `--time` filters on
+`started_at`, so prefer a full export when moving data between machines.
 
 ## Import
 
@@ -63,7 +70,7 @@ into the local index. How the file travels between machines is up to you.
 
 ```bash
 # machine A
-recall export --jsonl > recall-a.jsonl
+recall export > recall-a.jsonl
 # machine B
 recall import recall-a.jsonl
 ```
