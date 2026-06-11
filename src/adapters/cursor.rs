@@ -40,6 +40,13 @@ struct ParsedComposerSession {
     directory: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct AgentTranscriptPath {
+    session_id: String,
+    path: PathBuf,
+    directory: Option<String>,
+}
+
 impl SourceAdapter for CursorAdapter {
     fn id(&self) -> &str {
         "cursor"
@@ -152,8 +159,9 @@ fn scan_transcript_only_sessions(
     };
     let cwd_map = build_agent_cwd_map(resolve_global_state_db_path().as_deref());
     let mut sessions = Vec::new();
-    for (session_id, path) in collect_agent_transcript_paths_from_dir(&projects_dir) {
-        let Some(mtime_ms) = stat_mtime_ms(&path) else {
+    for transcript in collect_agent_transcript_paths_from_dir(&projects_dir) {
+        let path = &transcript.path;
+        let Some(mtime_ms) = stat_mtime_ms(path) else {
             continue;
         };
         if let Some(cutoff) = since_ts
@@ -161,13 +169,14 @@ fn scan_transcript_only_sessions(
         {
             continue;
         }
-        let mut raw = match parse_agent_transcript(&path, include_events)? {
+        let mut raw = match parse_agent_transcript(path, include_events)? {
             Some(raw) => raw,
             None => continue,
         };
-        raw.source_id = session_id;
-        raw.directory = cwd_map.get(&raw.source_id).cloned();
-        raw.started_at = stat_birth_ms(&path).unwrap_or(mtime_ms);
+        raw.source_id = transcript.session_id;
+        raw.directory =
+            cwd_map.get(&raw.source_id).cloned().or(raw.directory).or(transcript.directory);
+        raw.started_at = stat_birth_ms(path).unwrap_or(mtime_ms);
         raw.updated_at = Some(mtime_ms);
         sessions.push(raw);
     }
@@ -178,7 +187,7 @@ fn build_raw_session(
     conn: &Connection,
     composer_id: &str,
     meta: &ComposerMeta,
-    transcript_paths: &HashMap<String, PathBuf>,
+    transcript_paths: &HashMap<String, AgentTranscriptPath>,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let parsed = match parse_composer_session(conn, composer_id, meta, include_events)? {
@@ -190,9 +199,10 @@ fn build_raw_session(
             parsed
         }
         _ => {
-            let Some(path) = transcript_paths.get(composer_id) else {
+            let Some(transcript) = transcript_paths.get(composer_id) else {
                 return Ok(None);
             };
+            let path = &transcript.path;
             let mtime_ms = stat_mtime_ms(path).unwrap_or(0);
             let raw = parse_agent_transcript(path, include_events)?
                 .filter(|raw| !raw.messages.is_empty() || !raw.events.is_empty());
@@ -200,7 +210,8 @@ fn build_raw_session(
                 return Ok(None);
             };
             raw.source_id = composer_id.to_string();
-            raw.directory = meta.directory.clone().or(raw.directory);
+            raw.directory =
+                meta.directory.clone().or(raw.directory).or_else(|| transcript.directory.clone());
             raw.started_at = stat_birth_ms(path).unwrap_or(mtime_ms);
             raw.updated_at = Some(mtime_ms);
             raw.entrypoint = meta.unified_mode.clone().or(raw.entrypoint);
@@ -387,8 +398,8 @@ fn discover_composer_ids(conn: &Connection) -> anyhow::Result<BTreeSet<String>> 
         }
     }
 
-    for (session_id, _) in collect_agent_transcript_paths() {
-        ids.insert(session_id);
+    for transcript in collect_agent_transcript_paths().values() {
+        ids.insert(transcript.session_id.clone());
     }
 
     Ok(ids)
@@ -901,14 +912,17 @@ fn strip_user_query_envelope(text: &str) -> &str {
     }
 }
 
-fn collect_agent_transcript_paths() -> HashMap<String, PathBuf> {
+fn collect_agent_transcript_paths() -> HashMap<String, AgentTranscriptPath> {
     let Some(projects_dir) = resolve_projects_dir().ok().flatten() else {
         return HashMap::new();
     };
-    collect_agent_transcript_paths_from_dir(&projects_dir).into_iter().collect()
+    collect_agent_transcript_paths_from_dir(&projects_dir)
+        .into_iter()
+        .map(|transcript| (transcript.session_id.clone(), transcript))
+        .collect()
 }
 
-fn collect_agent_transcript_paths_from_dir(projects_dir: &Path) -> Vec<(String, PathBuf)> {
+fn collect_agent_transcript_paths_from_dir(projects_dir: &Path) -> Vec<AgentTranscriptPath> {
     let mut entries = Vec::new();
     for walk_entry in WalkDir::new(projects_dir).into_iter().filter_map(|e| e.ok()) {
         let path = walk_entry.path();
@@ -936,9 +950,58 @@ fn collect_agent_transcript_paths_from_dir(projects_dir: &Path) -> Vec<(String, 
         if grandparent_name != Some("agent-transcripts") {
             continue;
         }
-        entries.push((stem.to_string(), path.to_path_buf()));
+        entries.push(AgentTranscriptPath {
+            session_id: stem.to_string(),
+            path: path.to_path_buf(),
+            directory: agent_transcript_directory_from_path(path),
+        });
     }
     entries
+}
+
+fn agent_transcript_directory_from_path(path: &Path) -> Option<String> {
+    let project_key = path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())?;
+    cursor_project_key_to_existing_path(project_key)
+}
+
+fn cursor_project_key_to_existing_path(key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split('-').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut matches = Vec::new();
+    collect_cursor_project_key_matches(Path::new("/"), &parts, 0, &mut matches);
+    matches.sort();
+    matches.dedup();
+    if matches.len() == 1 { Some(matches.remove(0).to_string_lossy().to_string()) } else { None }
+}
+
+fn collect_cursor_project_key_matches(
+    current: &Path,
+    parts: &[&str],
+    index: usize,
+    matches: &mut Vec<PathBuf>,
+) {
+    if index == parts.len() {
+        if current.is_dir() {
+            matches.push(current.to_path_buf());
+        }
+        return;
+    }
+
+    for end in (index + 1..=parts.len()).rev() {
+        let component = parts[index..end].join("-");
+        let next = current.join(component);
+        if next.is_dir() {
+            collect_cursor_project_key_matches(&next, parts, end, matches);
+        }
+    }
 }
 
 fn resolve_projects_dir() -> anyhow::Result<Option<PathBuf>> {
@@ -1141,6 +1204,16 @@ mod tests {
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }
+    }
+
+    fn cursor_project_key_for_test(path: &Path) -> String {
+        path.components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(part) => part.to_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("-")
     }
 
     fn seed_global_db(root: &Path, composer_id: &str, bubble_id: &str) -> Connection {
@@ -1376,6 +1449,31 @@ mod tests {
         assert_eq!(raw.messages.len(), 2);
         assert_eq!(raw.messages[0].content, "hello");
         assert!(raw.messages[1].content.contains("[tool_use:Glob]"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_transcript_directory_uses_project_folder_when_membership_is_missing() {
+        let root = temp_root("agent-directory");
+        let workspace = root.join("workspace-parent").join("repo-with-dash");
+        fs::create_dir_all(&workspace).unwrap();
+        let projects_dir = root.join(".cursor").join("projects");
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let project_key = cursor_project_key_for_test(&workspace);
+        let jsonl_path = projects_dir
+            .join(project_key)
+            .join("agent-transcripts")
+            .join(&uuid)
+            .join(format!("{uuid}.jsonl"));
+        write_jsonl(
+            &jsonl_path,
+            &[r#"{"role":"user","message":{"content":[{"type":"text","text":"hello"}]}}"#],
+        );
+
+        let entries = collect_agent_transcript_paths_from_dir(&projects_dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, uuid);
+        assert_eq!(entries[0].directory.as_deref(), Some(workspace.to_string_lossy().as_ref()));
         let _ = fs::remove_dir_all(root);
     }
 

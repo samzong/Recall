@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use anyhow::Result;
@@ -493,6 +493,11 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
         }
 
         let mut existing_meta = store.session_meta_map(source_id)?;
+        let mut existing_paths = store
+            .session_paths_for_source(source_id)?
+            .into_iter()
+            .map(|path| (path.source_id, (path.directory, path.source_file_path)))
+            .collect::<HashMap<_, _>>();
         let mut imported_ids = store.imported_source_ids(source_id)?;
         let mut existing_usage_meta = store.usage_state_meta_map(source_id)?;
         let mut existing_event_meta = if options.usage_only && !options.backfill_events {
@@ -521,6 +526,7 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
             {
                 if existing_meta.remove(&raw_source_id).is_some() {
                     store.delete_session_data(source_id, &raw_source_id)?;
+                    existing_paths.remove(&raw_source_id);
                     existing_usage_meta.remove(&raw_source_id);
                     existing_event_meta.remove(&raw_source_id);
                 }
@@ -552,7 +558,17 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                     if imported_ids.remove(&raw_source_id) {
                         store.clear_import_marker(source_id, &raw_source_id)?;
                     }
+                    let metadata_changed = existing_paths.get(&raw_source_id).is_some_and(
+                        |(old_directory, old_source_file_path)| {
+                            raw_session_metadata_changed(
+                                &raw,
+                                old_directory.as_deref(),
+                                old_source_file_path.as_deref(),
+                            )
+                        },
+                    );
                     let content_changed = old_msg_count != msg_count
+                        || metadata_changed
                         || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
                     match decide_existing_session_action(
                         options.usage_only,
@@ -693,6 +709,10 @@ fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
             )?;
             existing_meta
                 .insert(session.source_id.clone(), (session.updated_at, session.message_count));
+            existing_paths.insert(
+                session.source_id.clone(),
+                (session.directory.clone(), session.source_file_path.clone()),
+            );
             if let Some(parser_version) = raw.usage_parser_version {
                 existing_usage_meta.insert(
                     session.source_id.clone(),
@@ -822,6 +842,15 @@ fn decide_existing_session_action(
 
 fn cmd_background_worker(sync_first: bool) -> Result<()> {
     semantic::run_background_worker(sync_first, || run_sync_job(false, false))
+}
+
+fn raw_session_metadata_changed(
+    raw: &adapters::RawSession,
+    old_directory: Option<&str>,
+    old_source_file_path: Option<&str>,
+) -> bool {
+    raw.directory.as_deref().is_some_and(|directory| old_directory != Some(directory))
+        || raw.source_file_path.as_deref().is_some_and(|path| old_source_file_path != Some(path))
 }
 
 fn cmd_search(
@@ -1262,11 +1291,11 @@ mod tests {
 
     use super::{
         BackfillPlan, Cli, Commands, ExistingSessionAction, decide_existing_session_action,
-        delete_excluded_sessions_for_source,
+        delete_excluded_sessions_for_source, raw_session_metadata_changed,
     };
     use clap::{CommandFactory, Parser};
     use recall::adapters::{
-        adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
+        RawSession, adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
     };
     use recall::db::{schema, store::Store};
     use recall::types::Session;
@@ -1396,6 +1425,24 @@ mod tests {
             decide_existing_session_action(false, false, false, false, false, false),
             ExistingSessionAction::Skip
         );
+    }
+
+    #[test]
+    fn full_sync_treats_new_session_metadata_as_changed() {
+        let raw = RawSession::search_only(
+            "raw1",
+            Some("/Users/x/git/samzong/Recall".to_string()),
+            0,
+            Some(1),
+            None,
+            vec![],
+        );
+        assert!(raw_session_metadata_changed(&raw, None, None));
+        assert!(!raw_session_metadata_changed(&raw, Some("/Users/x/git/samzong/Recall"), None));
+
+        let mut raw_with_path = RawSession::search_only("raw1", None, 0, Some(1), None, vec![]);
+        raw_with_path.source_file_path = Some("/tmp/session.jsonl".to_string());
+        assert!(raw_session_metadata_changed(&raw_with_path, None, None));
     }
 
     #[test]
