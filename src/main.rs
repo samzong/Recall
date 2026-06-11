@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::io::Write as _;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -97,6 +99,22 @@ enum Commands {
         #[arg(long, help = "Parse and report without writing")]
         dry_run: bool,
     },
+    #[command(about = "Share session pages")]
+    Share {
+        #[command(subcommand)]
+        command: ShareCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ShareCommands {
+    #[command(about = "Initialize Cloudflare Pages sharing")]
+    Init {
+        #[arg(long, help = "Cloudflare Pages project name")]
+        project_name: Option<String>,
+        #[arg(long, help = "Local directory used for generated share pages")]
+        publish_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -133,6 +151,11 @@ fn main() -> Result<()> {
             cmd_export(source.as_deref(), time.as_deref(), project.as_deref(), limit)?
         }
         Some(Commands::Import { file, dry_run }) => cmd_import(&file, dry_run)?,
+        Some(Commands::Share { command }) => match command {
+            ShareCommands::Init { project_name, publish_dir } => {
+                cmd_share_init(project_name, publish_dir)?
+            }
+        },
         None => cmd_tui(None)?,
     }
 
@@ -1001,6 +1024,73 @@ fn cmd_import(file: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_share_init(project_name: Option<String>, publish_dir: Option<PathBuf>) -> Result<()> {
+    let mut config = AppConfig::load_or_default();
+    let existing = config.share.clone();
+    if let Some(ref share) = existing {
+        println!("Share already initialized");
+        println!("  Provider     {}", share.provider);
+        println!("  Project      {}", share.project_name);
+        println!("  Publish dir  {}", share.publish_dir);
+        println!("  URL base     https://{}.pages.dev", share.project_name);
+        if !prompt_yes_no_default_yes("Reinitialize?")? {
+            return Ok(());
+        }
+    }
+
+    println!("Checking Wrangler and Cloudflare Pages...");
+    recall::share::preflight_cloudflare_pages()?;
+
+    let default_project = existing
+        .as_ref()
+        .map(|share| share.project_name.clone())
+        .unwrap_or_else(|| recall::share::default_project_name().to_string());
+    let project_name = match project_name {
+        Some(name) => name,
+        None => prompt_with_default("Cloudflare Pages project", &default_project)?,
+    };
+
+    let default_dir =
+        existing.as_ref().map(|share| share.publish_dir.clone()).unwrap_or_else(|| {
+            recall::share::default_publish_dir()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "share-pages".to_string())
+        });
+    let publish_dir = match publish_dir {
+        Some(path) => recall::share::expand_path(&path.to_string_lossy()),
+        None => {
+            let input = prompt_with_default("Local share directory", &default_dir)?;
+            recall::share::expand_path(&input)
+        }
+    };
+
+    println!("Configuring Cloudflare Pages share target...");
+    recall::share::init_cloudflare_pages(&mut config, project_name.clone(), publish_dir.clone())?;
+    println!("Share initialized");
+    println!("  Project      {project_name}");
+    println!("  Publish dir  {}", publish_dir.display());
+    println!("  URL base     https://{project_name}.pages.dev");
+    Ok(())
+}
+
+fn prompt_with_default(label: &str, default: &str) -> Result<String> {
+    print!("{label} [{default}]: ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() { Ok(default.to_string()) } else { Ok(trimmed.to_string()) }
+}
+
+fn prompt_yes_no_default_yes(label: &str) -> Result<bool> {
+    print!("{label} [Y/n]: ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim().to_lowercase();
+    Ok(trimmed.is_empty() || trimmed == "y" || trimmed == "yes")
+}
+
 fn format_usage_report_text(report: &usage::UsageReport) -> String {
     let mut out = String::new();
     writeln!(out, "Usage").unwrap();
@@ -1169,6 +1259,7 @@ fn cmd_tui(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Res
     let tick_rate = Duration::from_millis(50);
 
     loop {
+        app.poll_share_publish();
         terminal.draw(|f| ui::render(f, &app))?;
 
         match poll_event(tick_rate)? {
@@ -1290,8 +1381,9 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        BackfillPlan, Cli, Commands, ExistingSessionAction, decide_existing_session_action,
-        delete_excluded_sessions_for_source, raw_session_metadata_changed,
+        BackfillPlan, Cli, Commands, ExistingSessionAction, ShareCommands,
+        decide_existing_session_action, delete_excluded_sessions_for_source,
+        raw_session_metadata_changed,
     };
     use clap::{CommandFactory, Parser};
     use recall::adapters::{
@@ -1342,6 +1434,29 @@ mod tests {
     }
 
     #[test]
+    fn share_init_accepts_project_and_publish_dir() {
+        let cli = Cli::try_parse_from([
+            "recall",
+            "share",
+            "init",
+            "--project-name",
+            "recall-share",
+            "--publish-dir",
+            "/tmp/recall-share",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Share {
+                command: ShareCommands::Init { project_name, publish_dir },
+            }) => {
+                assert_eq!(project_name.as_deref(), Some("recall-share"));
+                assert_eq!(publish_dir.unwrap().to_string_lossy(), "/tmp/recall-share");
+            }
+            _ => panic!("expected share init command"),
+        }
+    }
+
+    #[test]
     fn top_level_help_describes_public_commands() {
         let mut command = Cli::command();
         let help = command.render_long_help().to_string();
@@ -1352,6 +1467,7 @@ mod tests {
         assert!(help.contains("usage   Show token usage reports"));
         assert!(help.contains("export  Export session records as JSON Lines"));
         assert!(help.contains("import  Import session records from JSON Lines"));
+        assert!(help.contains("share   Share session pages"));
     }
 
     #[test]

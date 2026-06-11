@@ -70,6 +70,10 @@ pub fn render(f: &mut Frame, app: &App) {
         AppMode::Search => render_search(f, app),
         AppMode::Usage => render_usage_dashboard(f, app),
         AppMode::Viewing => render_viewing(f, app),
+        AppMode::ShareResult => {
+            render_viewing(f, app);
+            render_share_result(f, app);
+        }
         AppMode::Filters => {
             render_search(f, app);
             render_filter_picker(f, app);
@@ -1312,6 +1316,8 @@ fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" copy  ", Style::default().fg(Color::DarkGray)),
         Span::styled("e", Style::default().fg(Color::Yellow)),
         Span::styled(" export  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("s", Style::default().fg(Color::Yellow)),
+        Span::styled(" share  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Ctrl+R", Style::default().fg(Color::Yellow)),
         Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Ctrl+O", Style::default().fg(Color::Yellow)),
@@ -1691,6 +1697,72 @@ fn render_settings(f: &mut Frame, app: &App) {
     f.render_widget(widget, popup);
 }
 
+fn render_share_result(f: &mut Frame, app: &App) {
+    let Some(popup) = app.share_popup.as_ref() else {
+        return;
+    };
+
+    let area = f.area();
+    let width = area.width.clamp(46, 88);
+    let height: u16 = if popup.url.is_some() { 9 } else { 8 };
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    let border = if popup.is_error { Color::Red } else { Color::Green };
+    let title = if popup.is_error { " Share failed " } else { " Session shared " };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(Color::Black));
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            popup.message.clone(),
+            if popup.is_error {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            },
+        )),
+    ];
+    if let Some(url) = popup.url.as_ref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(url.clone(), Style::default().fg(Color::Cyan))));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(" [C] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("copy URL   ", Style::default().fg(Color::White)),
+            Span::styled(
+                "[Enter/Esc] ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("close", Style::default().fg(Color::White)),
+        ]));
+    } else if popup.is_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                " [Enter/Esc] ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("close", Style::default().fg(Color::White)),
+        ]));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " Publishing with Wrangler...",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(Clear, rect);
+    f.render_widget(widget, rect);
+}
+
 fn render_confirm_resume(f: &mut Frame, app: &App) {
     let Some(pending) = app.pending_resume.as_ref() else {
         return;
@@ -1859,7 +1931,7 @@ mod tests {
 
     use crate::config::AppConfig;
     use crate::db::store::Store;
-    use crate::tui::app::ViewingSessionSummary;
+    use crate::tui::app::{SharePopup, ViewingSessionSummary};
     use crate::types::{Message, SearchResult, Session};
 
     #[test]
@@ -1922,6 +1994,59 @@ mod tests {
             "tokens 31 input 10 output 9 cache r/w 6/4 reasoning 2 | time 2m | user msgs 2/3"
         ));
         assert_eq!(terminal.backend().buffer()[(2, 1)].fg, Color::Green);
+    }
+
+    #[test]
+    fn render_share_result_popup_shows_share_url() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.mode = AppMode::ShareResult;
+        app.results = vec![SearchResult {
+            session: Session {
+                id: "session1".to_string(),
+                source: "codex".to_string(),
+                source_id: "source1".to_string(),
+                title: "Test session".to_string(),
+                directory: None,
+                started_at: 0,
+                updated_at: None,
+                message_count: 1,
+                entrypoint: None,
+                custom_title: None,
+                summary: None,
+                duration_minutes: None,
+                source_file_path: None,
+                is_import: false,
+            },
+            match_source: MatchSource::Fts,
+            snippet: None,
+        }];
+        app.viewing_messages = vec![Message {
+            session_id: "session1".to_string(),
+            role: Role::User,
+            content: "hello".to_string(),
+            timestamp: None,
+            seq: 0,
+        }];
+        app.viewing_sanitized_lines =
+            vec![vec![SanitizedLine { text: "hello".to_string(), lower: "hello".to_string() }]];
+        app.share_popup = Some(SharePopup {
+            url: Some("https://recall-share.pages.dev/source1".to_string()),
+            message: "Session shared".to_string(),
+            is_error: false,
+        });
+
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let rendered = (0..18)
+            .map(|y| buffer_row(terminal.backend().buffer(), y, 100))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("https://recall-share.pages.dev/source1"));
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {

@@ -6,6 +6,7 @@ pub mod embedding;
 pub mod export;
 pub mod import;
 pub mod semantic;
+pub mod share;
 pub mod skill_audit;
 pub mod tui;
 pub mod types;

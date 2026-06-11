@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -28,6 +29,7 @@ pub enum AppMode {
     Search,
     Usage,
     Viewing,
+    ShareResult,
     ExportInput,
     Settings,
     Filters,
@@ -82,6 +84,8 @@ mod tests {
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
             pending_resume: None,
+            share_popup: None,
+            share_publish_rx: None,
             exec_on_exit: None,
             viewing_search_query: String::new(),
             viewing_search_input: None,
@@ -420,6 +424,12 @@ pub struct PendingResume {
     pub origin: ResumeOrigin,
 }
 
+pub struct SharePopup {
+    pub url: Option<String>,
+    pub message: String,
+    pub is_error: bool,
+}
+
 pub struct SanitizedLine {
     pub text: String,
     pub lower: String,
@@ -572,6 +582,8 @@ pub struct App {
     pub semantic_last_refresh: Instant,
     pub settings_selected: usize,
     pub pending_resume: Option<PendingResume>,
+    pub share_popup: Option<SharePopup>,
+    pub share_publish_rx: Option<mpsc::Receiver<Result<String, String>>>,
     pub exec_on_exit: Option<(ResumeCommand, Option<String>)>,
     pub viewing_search_query: String,
     pub viewing_search_input: Option<String>,
@@ -648,6 +660,8 @@ impl App {
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
             pending_resume: None,
+            share_popup: None,
+            share_publish_rx: None,
             exec_on_exit: None,
             viewing_search_query: String::new(),
             viewing_search_input: None,
@@ -806,10 +820,39 @@ impl App {
             AppMode::Search => self.handle_search_key(key, store, engine, provider),
             AppMode::Usage => self.handle_usage_key(key, store),
             AppMode::Viewing => self.handle_viewing_key(key),
+            AppMode::ShareResult => self.handle_share_result_key(key),
             AppMode::ExportInput => self.handle_export_key(key),
             AppMode::Settings => self.handle_settings_key(key, store, engine, provider),
             AppMode::Filters => self.handle_filters_key(key, store, engine, provider),
             AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
+        }
+    }
+
+    pub fn poll_share_publish(&mut self) {
+        let Some(rx) = self.share_publish_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.share_popup = Some(match result {
+                    Ok(url) => SharePopup {
+                        url: Some(url),
+                        message: "Session shared".to_string(),
+                        is_error: false,
+                    },
+                    Err(message) => SharePopup { url: None, message, is_error: true },
+                });
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.share_publish_rx = Some(rx);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.share_popup = Some(SharePopup {
+                    url: None,
+                    message: "Share worker stopped before publishing finished".to_string(),
+                    is_error: true,
+                });
+            }
         }
     }
 
@@ -1069,6 +1112,7 @@ impl App {
                 self.viewing_search_status = None;
                 self.viewing_sanitized_lines.clear();
                 self.viewing_match_cache.clear();
+                self.share_popup = None;
             }
             KeyCode::Up | KeyCode::Char('k') if self.viewing_selected_msg > 0 => {
                 self.viewing_selected_msg -= 1;
@@ -1084,11 +1128,14 @@ impl App {
             KeyCode::End | KeyCode::Char('G') if !self.viewing_messages.is_empty() => {
                 self.viewing_selected_msg = self.viewing_messages.len() - 1;
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') | KeyCode::Char('C') => {
                 self.copy_current_message();
             }
             KeyCode::Char('e') => {
                 self.start_export();
+            }
+            KeyCode::Char('s') => {
+                self.share_current_session();
             }
             KeyCode::Char('/') => {
                 self.viewing_search_input = Some(String::new());
@@ -1100,6 +1147,27 @@ impl App {
             }
             KeyCode::Char('N') => {
                 self.jump_viewing_match(false);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_share_result_key(&mut self, key: KeyEvent) {
+        if self.share_publish_rx.is_some() {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                self.share_popup = None;
+                self.mode = AppMode::Viewing;
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                if let Some(url) = self.share_popup.as_ref().and_then(|popup| popup.url.clone()) {
+                    self.copy_to_clipboard(&url);
+                    if let Some(popup) = self.share_popup.as_mut() {
+                        popup.message = "Copied share URL".to_string();
+                    }
+                }
             }
             _ => {}
         }
@@ -2277,6 +2345,31 @@ impl App {
         if let Some(text) = text {
             self.copy_to_clipboard(&text);
         }
+    }
+
+    fn share_current_session(&mut self) {
+        let Some(result) = self.results.get(self.selected_index) else {
+            return;
+        };
+        if self.share_publish_rx.is_some() {
+            return;
+        }
+        let config = self.config.clone();
+        let session = result.session.clone();
+        let messages = self.viewing_messages.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = crate::share::publish_session(&config, &session, &messages)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.share_publish_rx = Some(rx);
+        self.share_popup = Some(SharePopup {
+            url: None,
+            message: "Sharing session...".to_string(),
+            is_error: false,
+        });
+        self.mode = AppMode::ShareResult;
     }
 
     fn copy_to_clipboard(&mut self, text: &str) {

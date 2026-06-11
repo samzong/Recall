@@ -72,6 +72,15 @@ pub struct AppConfig {
     /// `**/.claude-mem/**`, `**/scratch-*`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<ShareConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShareConfig {
+    pub provider: String,
+    pub project_name: String,
+    pub publish_dir: String,
 }
 
 impl AppConfig {
