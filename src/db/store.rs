@@ -1241,7 +1241,9 @@ impl Store {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
         apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, directory);
-        sql.push_str(&format!(" ORDER BY started_at DESC LIMIT ?{param_idx}"));
+        sql.push_str(&format!(
+            " ORDER BY COALESCE(updated_at, started_at) DESC, started_at DESC, source ASC, source_id ASC LIMIT ?{param_idx}"
+        ));
         params.push(Box::new(limit as i64));
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
@@ -1455,6 +1457,25 @@ mod exclusion_tests {
         assert!(store.imported_source_ids("claude-code").unwrap().is_empty());
         let sessions = store.list_recent_sessions(10).unwrap();
         assert!(sessions.iter().all(|s| !s.is_import));
+    }
+
+    #[test]
+    fn list_recent_sessions_orders_by_latest_activity() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut older_started_recently_active = sess("a", None);
+        older_started_recently_active.started_at = 100;
+        older_started_recently_active.updated_at = Some(1000);
+        let mut newer_started_stale = sess("b", None);
+        newer_started_stale.started_at = 900;
+        newer_started_stale.updated_at = Some(900);
+        store.insert_session(&newer_started_stale).unwrap();
+        store.insert_session(&older_started_recently_active).unwrap();
+
+        let sessions = store.list_recent_sessions(10).unwrap();
+
+        assert_eq!(sessions[0].source_id, "src-a");
+        assert_eq!(sessions[1].source_id, "src-b");
     }
 
     #[test]

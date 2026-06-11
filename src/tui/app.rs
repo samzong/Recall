@@ -72,7 +72,7 @@ mod tests {
             embedding_init_pending: false,
             embedding_unavailable: false,
             status_message: None,
-            sort_order: SortOrder::Relevance,
+            sort_order: SortOrder::Newest,
             export_path: String::new(),
             export_cursor: 0,
             total_sessions: 0,
@@ -137,6 +137,18 @@ mod tests {
             match_source: MatchSource::Fts,
             snippet: None,
         }
+    }
+
+    fn search_result_with_times(
+        source_id: &str,
+        started_at: i64,
+        updated_at: Option<i64>,
+    ) -> SearchResult {
+        let mut result = codex_search_result();
+        result.session.source_id = source_id.to_string();
+        result.session.started_at = started_at;
+        result.session.updated_at = updated_at;
+        result
     }
 
     fn message(role: Role, timestamp: Option<i64>, seq: u32) -> Message {
@@ -316,6 +328,39 @@ mod tests {
     }
 
     #[test]
+    fn app_defaults_to_newest_sort() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let app = App::new(&store, vec![source("codex", "Codex")], AppConfig::default());
+
+        assert_eq!(app.sort_order, SortOrder::Newest);
+    }
+
+    #[test]
+    fn clear_filters_restores_newest_sort() {
+        let mut app = app_with_sources();
+        app.sort_order = SortOrder::Relevance;
+
+        app.clear_filters();
+
+        assert_eq!(app.sort_order, SortOrder::Newest);
+    }
+
+    #[test]
+    fn newest_sort_uses_latest_activity() {
+        let app = app_with_sources();
+        let mut results = vec![
+            search_result_with_times("stale-newer-start", 900, Some(900)),
+            search_result_with_times("active-older-start", 100, Some(1000)),
+        ];
+
+        app.apply_sort(&mut results);
+
+        assert_eq!(results[0].session.source_id, "active-older-start");
+        assert_eq!(results[1].session.source_id, "stale-newer-start");
+    }
+
+    #[test]
     fn applying_project_picker_closes_filters_window() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
@@ -488,7 +533,7 @@ pub enum ProjectPickerRow {
     Project(usize),
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SortOrder {
     Relevance,
     Newest,
@@ -593,7 +638,7 @@ impl App {
             embedding_init_pending: false,
             embedding_unavailable: false,
             status_message: None,
-            sort_order: SortOrder::Relevance,
+            sort_order: SortOrder::Newest,
             export_path: String::new(),
             export_cursor: 0,
             total_sessions,
@@ -1724,7 +1769,7 @@ impl App {
         self.source_filter_selection.clear();
         self.project_filter = None;
         self.time_filter = TimeRange::All;
-        self.sort_order = SortOrder::Relevance;
+        self.sort_order = SortOrder::Newest;
         self.filter_focus = FilterFocus::Source;
     }
 
@@ -2372,7 +2417,12 @@ impl App {
 
     fn apply_sort(&self, results: &mut [SearchResult]) {
         if self.sort_order == SortOrder::Newest {
-            results.sort_by_key(|b| std::cmp::Reverse(b.session.started_at));
+            results.sort_by_key(|b| {
+                std::cmp::Reverse((
+                    b.session.updated_at.unwrap_or(b.session.started_at),
+                    b.session.started_at,
+                ))
+            });
         }
     }
 }
