@@ -1135,6 +1135,9 @@ impl App {
             KeyCode::Char('s') => {
                 self.share_current_session();
             }
+            KeyCode::Char('v') => {
+                self.preview_current_session();
+            }
             KeyCode::Char('/') => {
                 self.viewing_search_input = Some(String::new());
                 self.viewing_search_input_cursor = 0;
@@ -2339,6 +2342,28 @@ impl App {
         }
     }
 
+    fn preview_current_session(&mut self) {
+        let Some(result) = self.results.get(self.selected_index) else {
+            return;
+        };
+        let session = result.session.clone();
+        let messages = self.viewing_messages.clone();
+        let session_id = session.id.clone();
+        let usage_events = crate::db::store::Store::open()
+            .and_then(|store| store.list_usage_events_for_session(&session_id))
+            .unwrap_or_default();
+        match crate::share::open_session_preview(&session, &messages, &usage_events) {
+            Ok(path) => {
+                self.viewing_search_status = None;
+                self.status_message = Some(format!("Opened preview: {}", path.display()));
+            }
+            Err(error) => {
+                self.viewing_search_status = None;
+                self.status_message = Some(format!("Preview failed: {error}"));
+            }
+        }
+    }
+
     fn share_current_session(&mut self) {
         let Some(result) = self.results.get(self.selected_index) else {
             return;
@@ -2349,9 +2374,13 @@ impl App {
         let config = self.config.clone();
         let session = result.session.clone();
         let messages = self.viewing_messages.clone();
+        let session_id = session.id.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = crate::share::publish_session(&config, &session, &messages)
+            let usage_events = crate::db::store::Store::open()
+                .and_then(|store| store.list_usage_events_for_session(&session_id))
+                .unwrap_or_default();
+            let result = crate::share::publish_session(&config, &session, &messages, &usage_events)
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
         });

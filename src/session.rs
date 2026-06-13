@@ -484,13 +484,14 @@ fn cmd_session_share(
     let sources = adapters::source_labels();
     let session = resolve_session_ref(&store, &sources, id, source_filter, source_id)?;
     let messages = store.get_messages(&session.id)?;
+    let usage_events = store.list_usage_events_for_session(&session.id)?;
     let config = AppConfig::load_or_default();
-    let preview = recall::share::preview_session(&config, &session, &messages)?;
+    let preview = recall::share::preview_session(&config, &session, &messages, &usage_events)?;
     let url = if dry_run {
         preview.url.clone()
     } else {
         eprintln!("Sharing session {}...", session.id);
-        recall::share::publish_session(&config, &session, &messages)?
+        recall::share::publish_session(&config, &session, &messages, &usage_events)?
     };
 
     if copy_url {
