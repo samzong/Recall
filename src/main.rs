@@ -1032,7 +1032,7 @@ fn cmd_share_init(project_name: Option<String>, publish_dir: Option<PathBuf>) ->
         println!("  Provider     {}", share.provider);
         println!("  Project      {}", share.project_name);
         println!("  Publish dir  {}", share.publish_dir);
-        println!("  URL base     https://{}.pages.dev", share.project_name);
+        println!("  URL base     https://{}", share.project_domain);
         if !prompt_yes_no_default_yes("Reinitialize?")? {
             return Ok(());
         }
@@ -1044,7 +1044,7 @@ fn cmd_share_init(project_name: Option<String>, publish_dir: Option<PathBuf>) ->
     let default_project = existing
         .as_ref()
         .map(|share| share.project_name.clone())
-        .unwrap_or_else(|| recall::share::default_project_name().to_string());
+        .unwrap_or_else(recall::share::default_project_name);
     let project_name = match project_name {
         Some(name) => name,
         None => prompt_with_default("Cloudflare Pages project", &default_project)?,
@@ -1069,7 +1069,9 @@ fn cmd_share_init(project_name: Option<String>, publish_dir: Option<PathBuf>) ->
     println!("Share initialized");
     println!("  Project      {project_name}");
     println!("  Publish dir  {}", publish_dir.display());
-    println!("  URL base     https://{project_name}.pages.dev");
+    if let Some(share) = config.share.as_ref() {
+        println!("  URL base     https://{}", share.project_domain);
+    }
     Ok(())
 }
 

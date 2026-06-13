@@ -80,6 +80,8 @@ pub struct AppConfig {
 pub struct ShareConfig {
     pub provider: String,
     pub project_name: String,
+    #[serde(default)]
+    pub project_domain: String,
     pub publish_dir: String,
 }
 

@@ -9,12 +9,15 @@ use crate::types::{Message, Role, Session};
 use crate::utils;
 
 const PROVIDER_CLOUDFLARE_PAGES: &str = "cloudflare-pages";
+const PAGES_PROJECT_NAME_FIELD: &str = "Project Name";
+const PAGES_PROJECT_DOMAINS_FIELD: &str = "Project Domains";
 const MAX_PAGES_ASSET_BYTES: usize = 25 * 1024 * 1024;
 const HEADERS: &str = "/*\n  X-Robots-Tag: noindex, nofollow\n  X-Frame-Options: DENY\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: no-referrer\n";
 const ROBOTS: &str = "User-agent: *\nDisallow: /\n";
 
-pub fn default_project_name() -> &'static str {
-    "recall-share"
+pub fn default_project_name() -> String {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    format!("recall-{}", &suffix[..4])
 }
 
 pub fn default_publish_dir() -> Result<PathBuf> {
@@ -53,10 +56,12 @@ pub fn init_cloudflare_pages(
     ensure_wrangler_available()?;
     ensure_wrangler_login()?;
     ensure_pages_project(&project_name)?;
+    let project_domain = resolve_pages_project_domain(&project_name)?;
     init_publish_dir(&publish_dir)?;
     config.share = Some(ShareConfig {
         provider: PROVIDER_CLOUDFLARE_PAGES.to_string(),
         project_name,
+        project_domain,
         publish_dir: publish_dir.to_string_lossy().to_string(),
     });
     config.save()
@@ -75,6 +80,9 @@ pub fn publish_session(
         bail!("unsupported share provider '{}'", share.provider);
     }
     validate_project_name(&share.project_name)?;
+    if share.project_domain.is_empty() {
+        bail!("sharing config is outdated; run `recall share init` to refresh the project domain");
+    }
 
     let publish_dir = expand_path(&share.publish_dir);
     init_publish_dir(&publish_dir)?;
@@ -90,7 +98,7 @@ pub fn publish_session(
         .with_context(|| format!("failed to write {}", file_path.display()))?;
 
     deploy_pages(&publish_dir, &share.project_name)?;
-    Ok(format!("https://{}.pages.dev/{share_id}", share.project_name))
+    Ok(format!("https://{}/{share_id}", share.project_domain))
 }
 
 pub fn share_id_for_session(session: &Session) -> String {
@@ -319,19 +327,35 @@ fn command_output_text(output: &std::process::Output) -> String {
     if stdout.is_empty() { "no output".to_string() } else { stdout }
 }
 
+fn resolve_pages_project_domain(project_name: &str) -> Result<String> {
+    lookup_pages_project_domain(&list_pages_projects()?, project_name).ok_or_else(|| {
+        anyhow!("Cloudflare Pages project '{project_name}' was not found in wrangler project list")
+    })
+}
+
 fn json_has_project_name(value: &serde_json::Value, project_name: &str) -> bool {
-    match value {
-        serde_json::Value::Object(map) => {
-            if map.get("name").and_then(|v| v.as_str()) == Some(project_name) {
-                return true;
-            }
-            map.values().any(|v| json_has_project_name(v, project_name))
+    lookup_pages_project_domain(value, project_name).is_some()
+}
+
+fn lookup_pages_project_domain(value: &serde_json::Value, project_name: &str) -> Option<String> {
+    let projects = value.as_array()?;
+    for project in projects {
+        let name = project.get(PAGES_PROJECT_NAME_FIELD).and_then(|v| v.as_str())?;
+        if name != project_name {
+            continue;
         }
-        serde_json::Value::Array(values) => {
-            values.iter().any(|v| json_has_project_name(v, project_name))
-        }
-        _ => false,
+        let domains = project.get(PAGES_PROJECT_DOMAINS_FIELD).and_then(|v| v.as_str())?;
+        return pages_dev_host_from_domains(domains);
     }
+    None
+}
+
+fn pages_dev_host_from_domains(domains: &str) -> Option<String> {
+    domains
+        .split(',')
+        .map(str::trim)
+        .find(|domain| domain.ends_with(".pages.dev"))
+        .map(str::to_string)
 }
 
 fn validate_project_name(project_name: &str) -> Result<()> {
