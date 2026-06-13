@@ -44,6 +44,9 @@ recall usage         # usage dashboard
 recall usage --json  # usage report for scripts
 recall export --source codex --project /path/to/repo --limit 20 > recall-export.jsonl
 recall import recall-export.jsonl --dry-run  # preview an import
+recall session list --source codex --limit 20  # list sessions for agents/scripts
+recall session show --id <session-id> --include metadata,messages --format json
+recall session share --id <session-id> --format json  # publish one selected session
 recall info          # index stats and worker status
 ```
 
@@ -56,7 +59,7 @@ session. Redirect stdout to save an export file:
 recall export --source codex --project /path/to/repo > recall-export.jsonl
 ```
 
-Each record includes `schema_version`, `record_type`, `session`, `messages`,
+Each session includes `schema_version`, `record_type`, `session`, `messages`,
 `usage_events`, and `events`. It covers the portable session data Recall can
 import again; derived index state such as FTS rows, embeddings, and background
 job state is rebuilt locally. Optional fields are emitted as `null`. By default

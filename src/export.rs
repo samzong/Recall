@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::Serialize;
 
 use crate::db::search::TimeRange;
@@ -11,6 +11,7 @@ const SCHEMA_VERSION: u32 = 3;
 const RECORD_TYPE: &str = "session";
 
 pub struct ExportOptions {
+    pub session_ids: Vec<String>,
     pub sources: Option<Vec<String>>,
     pub time_range: TimeRange,
     pub project: Option<String>,
@@ -89,13 +90,32 @@ struct ExportEvent {
 }
 
 pub fn write_jsonl<W: Write>(store: &Store, options: &ExportOptions, mut writer: W) -> Result<()> {
-    let sessions = store.list_export_sessions(
-        options.sources.as_deref(),
-        options.time_range,
-        options.project.as_deref(),
-        options.limit,
-    )?;
+    let sessions = if options.session_ids.is_empty() {
+        store.list_export_sessions(
+            options.sources.as_deref(),
+            options.time_range,
+            options.project.as_deref(),
+            options.limit,
+        )?
+    } else {
+        let mut sessions = Vec::with_capacity(options.session_ids.len());
+        for session_id in &options.session_ids {
+            let session = store
+                .get_session_by_id(session_id)?
+                .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+            sessions.push(session);
+        }
+        sessions
+    };
 
+    write_jsonl_for_sessions(store, sessions, &mut writer)
+}
+
+fn write_jsonl_for_sessions<W: Write>(
+    store: &Store,
+    sessions: Vec<Session>,
+    mut writer: W,
+) -> Result<()> {
     for session in sessions {
         let messages = store.get_messages(&session.id)?;
         let usage_events = store.list_usage_events_for_session(&session.id)?;

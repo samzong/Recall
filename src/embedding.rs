@@ -123,7 +123,7 @@ fn download_model(show_progress: bool) -> Result<(PathBuf, PathBuf, PathBuf)> {
         api.repo(Repo::with_revision(MODEL_ID.to_string(), RepoType::Model, "main".to_string()));
 
     if show_progress {
-        println!("Downloading model {MODEL_ID} (first run only)...");
+        eprintln!("Downloading model {MODEL_ID} (first run only)...");
     }
 
     let config = repo.get("config.json")?;

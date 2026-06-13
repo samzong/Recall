@@ -272,8 +272,13 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
         )
         .unwrap();
 
-    let options =
-        ExportOptions { sources: None, time_range: TimeRange::All, project: None, limit: Some(10) };
+    let options = ExportOptions {
+        session_ids: Vec::new(),
+        sources: None,
+        time_range: TimeRange::All,
+        project: None,
+        limit: Some(10),
+    };
     let mut out = Vec::new();
     write_jsonl(&store, &options, &mut out).unwrap();
 
@@ -309,6 +314,34 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
 }
 
 #[test]
+fn export_jsonl_can_select_sessions_by_id() {
+    let store = setup();
+    for id in ["s1", "s2", "s3"] {
+        let session = make_session(id, "codex", &format!("raw-{id}"), id);
+        store.insert_session(&session).unwrap();
+        store.insert_messages(&[make_message(id, Role::User, id, 0)]).unwrap();
+    }
+
+    let options = ExportOptions {
+        session_ids: vec!["s3".to_string(), "s1".to_string()],
+        sources: None,
+        time_range: TimeRange::All,
+        project: None,
+        limit: None,
+    };
+    let mut out = Vec::new();
+    write_jsonl(&store, &options, &mut out).unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(first["session"]["id"], "s3");
+    assert_eq!(second["session"]["id"], "s1");
+}
+
+#[test]
 fn export_jsonl_applies_source_time_project_and_limit_filters() {
     let store = setup();
     let now = chrono::Utc::now().timestamp_millis();
@@ -335,6 +368,7 @@ fn export_jsonl_applies_source_time_project_and_limit_filters() {
     }
 
     let options = ExportOptions {
+        session_ids: Vec::new(),
         sources: Some(vec!["codex".to_string()]),
         time_range: TimeRange::Month,
         project: Some("/tmp/project".to_string()),

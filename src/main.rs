@@ -19,6 +19,8 @@ use recall::types::{self, Message, Role, Session};
 use recall::usage::{self, UsageFilters};
 use recall::utils;
 
+mod session;
+
 #[derive(Parser)]
 #[command(name = "recall", version, about = "Search and recall AI coding sessions")]
 struct Cli {
@@ -104,6 +106,11 @@ enum Commands {
         #[command(subcommand)]
         command: ShareCommands,
     },
+    #[command(about = "Operate on indexed sessions")]
+    Session {
+        #[command(subcommand)]
+        command: session::SessionCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -156,6 +163,7 @@ fn main() -> Result<()> {
                 cmd_share_init(project_name, publish_dir)?
             }
         },
+        Some(Commands::Session { command }) => session::cmd_session(command)?,
         None => cmd_tui(None)?,
     }
 
@@ -995,6 +1003,7 @@ fn cmd_export(
     let store = Store::open()?;
     let sources = adapters::source_labels();
     let options = ExportOptions {
+        session_ids: Vec::new(),
         sources: resolve_source_filter(source_filter, &sources)?,
         time_range: parse_time_range(time_filter),
         project: project_filter.map(String::from),
@@ -1462,14 +1471,16 @@ mod tests {
     fn top_level_help_describes_public_commands() {
         let mut command = Cli::command();
         let help = command.render_long_help().to_string();
+        let compact_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(!help.contains("--jsonl"));
-        assert!(help.contains("info    Show indexed source and background job status"));
-        assert!(help.contains("sync    Scan configured AI coding session sources"));
-        assert!(help.contains("search  Search indexed coding sessions"));
-        assert!(help.contains("usage   Show token usage reports"));
-        assert!(help.contains("export  Export session records as JSON Lines"));
-        assert!(help.contains("import  Import session records from JSON Lines"));
-        assert!(help.contains("share   Share session pages"));
+        assert!(compact_help.contains("info Show indexed source and background job status"));
+        assert!(compact_help.contains("sync Scan configured AI coding session sources"));
+        assert!(compact_help.contains("search Search indexed coding sessions"));
+        assert!(compact_help.contains("usage Show token usage reports"));
+        assert!(compact_help.contains("export Export session records as JSON Lines"));
+        assert!(compact_help.contains("import Import session records from JSON Lines"));
+        assert!(compact_help.contains("share Share session pages"));
+        assert!(compact_help.contains("session Operate on indexed sessions"));
     }
 
     #[test]

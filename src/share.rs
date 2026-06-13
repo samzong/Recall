@@ -15,9 +15,21 @@ const MAX_PAGES_ASSET_BYTES: usize = 25 * 1024 * 1024;
 const HEADERS: &str = "/*\n  X-Robots-Tag: noindex, nofollow\n  X-Frame-Options: DENY\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: no-referrer\n";
 const ROBOTS: &str = "User-agent: *\nDisallow: /\n";
 
+#[derive(Debug, Clone)]
+pub struct SharePreview {
+    pub provider: String,
+    pub project_name: String,
+    pub project_domain: String,
+    pub publish_dir: PathBuf,
+    pub file_path: PathBuf,
+    pub share_id: String,
+    pub url: String,
+    pub html_bytes: usize,
+}
+
 pub fn default_project_name() -> String {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    format!("recall-{}", &suffix[..4])
+    format!("recall-share-{}", &suffix[..6])
 }
 
 pub fn default_publish_dir() -> Result<PathBuf> {
@@ -72,6 +84,23 @@ pub fn publish_session(
     session: &Session,
     messages: &[Message],
 ) -> Result<String> {
+    let preview = preview_session(config, session, messages)?;
+    let html = render_session_html(session, messages);
+
+    init_publish_dir(&preview.publish_dir)?;
+
+    fs::write(&preview.file_path, html)
+        .with_context(|| format!("failed to write {}", preview.file_path.display()))?;
+
+    deploy_pages(&preview.publish_dir, &preview.project_name)?;
+    Ok(preview.url)
+}
+
+pub fn preview_session(
+    config: &AppConfig,
+    session: &Session,
+    messages: &[Message],
+) -> Result<SharePreview> {
     let share = config
         .share
         .as_ref()
@@ -80,12 +109,9 @@ pub fn publish_session(
         bail!("unsupported share provider '{}'", share.provider);
     }
     validate_project_name(&share.project_name)?;
-    if share.project_domain.is_empty() {
-        bail!("sharing config is outdated; run `recall share init` to refresh the project domain");
-    }
+    let project_domain = configured_project_domain(share)?;
 
     let publish_dir = expand_path(&share.publish_dir);
-    init_publish_dir(&publish_dir)?;
 
     let share_id = share_id_for_session(session);
     let html = render_session_html(session, messages);
@@ -94,11 +120,31 @@ pub fn publish_session(
     }
 
     let file_path = publish_dir.join(format!("{share_id}.html"));
-    fs::write(&file_path, html)
-        .with_context(|| format!("failed to write {}", file_path.display()))?;
+    Ok(SharePreview {
+        provider: share.provider.clone(),
+        project_name: share.project_name.clone(),
+        project_domain: project_domain.clone(),
+        publish_dir,
+        file_path,
+        share_id: share_id.clone(),
+        url: format!("https://{project_domain}/{share_id}"),
+        html_bytes: html.len(),
+    })
+}
 
-    deploy_pages(&publish_dir, &share.project_name)?;
-    Ok(format!("https://{}/{share_id}", share.project_domain))
+fn configured_project_domain(share: &ShareConfig) -> Result<String> {
+    if share.project_domain.is_empty() {
+        resolve_pages_project_domain(&share.project_name).with_context(|| {
+            format!(
+                "share config is missing project_domain and Cloudflare Pages project '{}' \
+                 was not found in the current account; run `recall share init` to \
+                 create or select a Pages project",
+                share.project_name
+            )
+        })
+    } else {
+        Ok(share.project_domain.clone())
+    }
 }
 
 pub fn share_id_for_session(session: &Session) -> String {
@@ -426,6 +472,33 @@ mod tests {
             share_id_for_session(&session("019e6d8d-588b-7fd2-a326-c525469ed120")),
             "019e6d8d-588b-7fd2-a326-c525469ed120"
         );
+    }
+
+    #[test]
+    fn default_project_name_is_specific_and_valid() {
+        let name = default_project_name();
+        assert!(name.starts_with("recall-share-"));
+        assert_eq!(name.len(), "recall-share-".len() + 6);
+        validate_project_name(&name).unwrap();
+    }
+
+    #[test]
+    fn lookup_pages_project_domain_uses_wrangler_project_domains() {
+        let projects = serde_json::json!([
+            {
+                "Project Name": "other",
+                "Project Domains": "other.pages.dev"
+            },
+            {
+                "Project Name": "recall-share-a1b2c3d4e5f6",
+                "Project Domains": "custom.example.com, recall-share-a1b2c3d4e5f6.pages.dev"
+            }
+        ]);
+        assert_eq!(
+            lookup_pages_project_domain(&projects, "recall-share-a1b2c3d4e5f6").as_deref(),
+            Some("recall-share-a1b2c3d4e5f6.pages.dev")
+        );
+        assert_eq!(lookup_pages_project_domain(&projects, "missing"), None);
     }
 
     #[test]

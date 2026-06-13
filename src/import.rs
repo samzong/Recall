@@ -351,8 +351,13 @@ mod tests {
     }
 
     fn export_all(store: &Store) -> String {
-        let options =
-            ExportOptions { sources: None, time_range: TimeRange::All, project: None, limit: None };
+        let options = ExportOptions {
+            session_ids: Vec::new(),
+            sources: None,
+            time_range: TimeRange::All,
+            project: None,
+            limit: None,
+        };
         let mut out = Vec::new();
         write_jsonl(store, &options, &mut out).unwrap();
         String::from_utf8(out).unwrap()

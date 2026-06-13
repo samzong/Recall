@@ -51,6 +51,13 @@ pub struct SessionPath {
     pub source_file_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionListSort {
+    Newest,
+    Oldest,
+    Updated,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct UsageSessionStateMeta {
     pub parser_version: u32,
@@ -1079,6 +1086,36 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn get_session_by_id(&self, session_id: &str) -> Result<Option<Session>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+                rusqlite::params![session_id],
+                session_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_session_by_source_id(
+        &self,
+        source: &str,
+        source_id: &str,
+    ) -> Result<Option<Session>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {SESSION_COLUMNS}
+                     FROM sessions
+                     WHERE source = ?1 AND source_id = ?2"
+                ),
+                rusqlite::params![source, source_id],
+                session_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
             "SELECT role, content, timestamp, seq FROM messages WHERE session_id = ?1 ORDER BY seq",
@@ -1256,12 +1293,43 @@ impl Store {
         Ok(sessions)
     }
 
+    pub fn list_indexed_sessions(
+        &self,
+        sources: Option<&[String]>,
+        time_range: TimeRange,
+        directory: Option<&str>,
+        limit: Option<usize>,
+        offset: usize,
+        sort: SessionListSort,
+    ) -> Result<Vec<Session>> {
+        self.list_sessions_for_scope(sources, time_range, directory, limit, offset, sort)
+    }
+
     pub fn list_export_sessions(
         &self,
         sources: Option<&[String]>,
         time_range: TimeRange,
         directory: Option<&str>,
         limit: Option<usize>,
+    ) -> Result<Vec<Session>> {
+        self.list_sessions_for_scope(
+            sources,
+            time_range,
+            directory,
+            limit,
+            0,
+            SessionListSort::Newest,
+        )
+    }
+
+    fn list_sessions_for_scope(
+        &self,
+        sources: Option<&[String]>,
+        time_range: TimeRange,
+        directory: Option<&str>,
+        limit: Option<usize>,
+        offset: usize,
+        sort: SessionListSort,
     ) -> Result<Vec<Session>> {
         let mut sql = format!(
             "SELECT {SESSION_COLUMNS}
@@ -1271,10 +1339,25 @@ impl Store {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
         apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, directory);
-        sql.push_str(" ORDER BY started_at DESC, source ASC, source_id ASC");
+        let order_by = match sort {
+            SessionListSort::Newest => "s.started_at DESC, source ASC, source_id ASC",
+            SessionListSort::Oldest => "s.started_at ASC, source ASC, source_id ASC",
+            SessionListSort::Updated => {
+                "COALESCE(s.updated_at, s.started_at) DESC, s.started_at DESC, source ASC, source_id ASC"
+            }
+        };
+        sql.push_str(&format!(" ORDER BY {order_by}"));
         if let Some(limit) = limit {
             sql.push_str(&format!(" LIMIT ?{param_idx}"));
             params.push(Box::new(limit as i64));
+            param_idx += 1;
+            if offset > 0 {
+                sql.push_str(&format!(" OFFSET ?{param_idx}"));
+                params.push(Box::new(offset as i64));
+            }
+        } else if offset > 0 {
+            sql.push_str(&format!(" LIMIT -1 OFFSET ?{param_idx}"));
+            params.push(Box::new(offset as i64));
         }
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
