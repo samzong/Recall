@@ -5,17 +5,21 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::adapters::{ResumeCommand, app_command_for, resume_command_for};
+use crate::adapters::ResumeCommand;
 use crate::config::AppConfig;
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::{ProjectDirectory, Store};
 use crate::embedding::EmbeddingProvider;
+use crate::session_action;
 use crate::skill_audit::{self, SkillAuditFilters, SkillAuditReport};
+use crate::transcript;
 use crate::types::{
     BackgroundJobStatus, MatchSource, Message, Role, SearchResult, SemanticProgress,
     SessionUsageEventRecord,
 };
 use crate::usage::{self, TokenTotals, UsageFilters, UsageReport};
+
+pub use crate::session_action::SessionAction as PendingCommandAction;
 
 const USAGE_LOADING_MIN_MS: u128 = 75;
 
@@ -407,12 +411,6 @@ mod tests {
 pub enum ResumeOrigin {
     Search,
     Viewing,
-}
-
-#[derive(Clone, Copy)]
-pub enum PendingCommandAction {
-    Resume,
-    OpenApp,
 }
 
 pub struct PendingResume {
@@ -1303,17 +1301,11 @@ impl App {
                 Some("Imported session: not resumable on this machine".to_string());
             return;
         }
-        let command = match action {
-            PendingCommandAction::Resume => resume_command_for(&session.source, &session.source_id),
-            PendingCommandAction::OpenApp => app_command_for(&session.source, &session.source_id),
-        };
-        let Some(command) = command else {
-            let action_label = match action {
-                PendingCommandAction::Resume => "Resume",
-                PendingCommandAction::OpenApp => "Open in app",
-            };
+        let Some(command) =
+            session_action::command_for(action, &session.source, &session.source_id)
+        else {
             self.status_message =
-                Some(format!("{action_label} not supported for {}", session.source));
+                Some(format!("{} not supported for {}", action.title(), session.source));
             return;
         };
         self.pending_resume = Some(PendingResume {
@@ -2475,28 +2467,7 @@ impl App {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let mut content = String::new();
-        content.push_str(&format!("Session: {}\n", session.title));
-        content.push_str(&format!("Source: {}\n", session.source));
-        if let Some(ref dir) = session.directory {
-            content.push_str(&format!("Directory: {dir}\n"));
-        }
-        content.push_str(&format!(
-            "Date: {}\n",
-            chrono::DateTime::from_timestamp_millis(session.started_at)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_default()
-        ));
-        content.push_str(&format!("Messages: {}\n", self.viewing_messages.len()));
-        content.push_str("\n---\n\n");
-
-        for msg in &self.viewing_messages {
-            let role = match msg.role {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-            };
-            content.push_str(&format!("## {role}\n\n{}\n\n", msg.content));
-        }
+        let content = transcript::render_plain(session, &self.viewing_messages);
 
         match std::fs::write(path, &content) {
             Ok(_) => {

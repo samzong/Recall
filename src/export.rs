@@ -3,8 +3,10 @@ use std::io::Write;
 use anyhow::{Result, anyhow};
 use serde::Serialize;
 
+use crate::adapters;
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
+use crate::query::{parse_time_range, resolve_source_filter};
 use crate::types::{Message, Role, Session, SessionEventRecord, SessionUsageEventRecord};
 
 const SCHEMA_VERSION: u32 = 3;
@@ -16,6 +18,26 @@ pub struct ExportOptions {
     pub time_range: TimeRange,
     pub project: Option<String>,
     pub limit: Option<usize>,
+}
+
+pub fn run_cli(
+    source_filter: Option<&str>,
+    time_filter: Option<&str>,
+    project_filter: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let store = Store::open()?;
+    let sources = adapters::source_labels();
+    let options = ExportOptions {
+        session_ids: Vec::new(),
+        sources: resolve_source_filter(source_filter, &sources)?,
+        time_range: parse_time_range(time_filter),
+        project: project_filter.map(String::from),
+        limit: if limit == 0 { None } else { Some(limit) },
+    };
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    write_jsonl(&store, &options, &mut handle)
 }
 
 #[derive(Serialize)]
@@ -111,6 +133,15 @@ pub fn write_jsonl<W: Write>(store: &Store, options: &ExportOptions, mut writer:
     write_jsonl_for_sessions(store, sessions, &mut writer)
 }
 
+pub fn session_record_value(
+    session: Session,
+    messages: Vec<Message>,
+    usage_events: Vec<SessionUsageEventRecord>,
+    events: Vec<SessionEventRecord>,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(build_session_record(session, messages, usage_events, events))?)
+}
+
 fn write_jsonl_for_sessions<W: Write>(
     store: &Store,
     sessions: Vec<Session>,
@@ -120,19 +151,28 @@ fn write_jsonl_for_sessions<W: Write>(
         let messages = store.get_messages(&session.id)?;
         let usage_events = store.list_usage_events_for_session(&session.id)?;
         let events = store.list_session_events_for_session(&session.id)?;
-        let record = ExportSessionRecord {
-            schema_version: SCHEMA_VERSION,
-            record_type: RECORD_TYPE,
-            session: session.into(),
-            messages: messages.into_iter().map(Into::into).collect(),
-            usage_events: usage_events.into_iter().map(Into::into).collect(),
-            events: events.into_iter().map(Into::into).collect(),
-        };
+        let record = build_session_record(session, messages, usage_events, events);
         serde_json::to_writer(&mut writer, &record)?;
         writer.write_all(b"\n")?;
     }
 
     Ok(())
+}
+
+fn build_session_record(
+    session: Session,
+    messages: Vec<Message>,
+    usage_events: Vec<SessionUsageEventRecord>,
+    events: Vec<SessionEventRecord>,
+) -> ExportSessionRecord {
+    ExportSessionRecord {
+        schema_version: SCHEMA_VERSION,
+        record_type: RECORD_TYPE,
+        session: session.into(),
+        messages: messages.into_iter().map(Into::into).collect(),
+        usage_events: usage_events.into_iter().map(Into::into).collect(),
+        events: events.into_iter().map(Into::into).collect(),
+    }
 }
 
 impl From<Session> for ExportSession {

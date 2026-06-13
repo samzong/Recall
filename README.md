@@ -46,7 +46,9 @@ recall export --source codex --project /path/to/repo --limit 20 > recall-export.
 recall import recall-export.jsonl --dry-run  # preview an import
 recall session list --source codex --limit 20  # list sessions for agents/scripts
 recall session show --id <session-id> --include metadata,messages --format json
+recall session export --id <session-id> --format jsonl
 recall session share --id <session-id> --format json  # publish one selected session
+recall session resume --id <session-id> --print-command
 recall info          # index stats and worker status
 ```
 

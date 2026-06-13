@@ -5,14 +5,46 @@ use anyhow::Result;
 use chrono::{Datelike, Local, TimeZone};
 use serde::Serialize;
 
+use crate::adapters;
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
+use crate::query::{parse_time_range, resolve_source_filter};
+use crate::sync::run_usage_sync_job;
 use crate::types::UsageEventRecord;
 
 #[derive(Debug, Clone)]
 pub struct UsageFilters {
     pub sources: Option<Vec<String>>,
     pub time_range: TimeRange,
+}
+
+pub fn run_cli(json: bool, source_filter: Option<&str>, time_filter: Option<&str>) -> Result<()> {
+    let sources = usage_source_labels();
+
+    if !json {
+        let usage_source_filter = resolve_source_filter(source_filter, &sources)?;
+        let usage_time_filter = time_filter.map(|_| parse_time_range(time_filter));
+        return crate::tui::runner::run(Some((usage_source_filter, usage_time_filter)));
+    }
+
+    run_usage_sync_job()?;
+    let store = Store::open()?;
+    let filters = UsageFilters {
+        sources: resolve_source_filter(source_filter, &sources)?,
+        time_range: parse_time_range(time_filter),
+    };
+    let report = build_usage_report(&store, &filters)?;
+
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn usage_source_labels() -> Vec<(String, String)> {
+    adapters::all_adapters()
+        .into_iter()
+        .filter(|adapter| adapter.usage_parser_version().is_some())
+        .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

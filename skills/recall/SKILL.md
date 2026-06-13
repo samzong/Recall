@@ -76,7 +76,9 @@ If the user asks for "deep", "full", "comprehensive", or "analyze history", use 
    - Search for both the user's topic and generic project-memory signals such as "failed", "reverted", "decision", "root cause", "regression", "do not", "not again", "unfinished", and "follow-up".
 
 4. Export for deep analysis.
-   - Use `recall export --jsonl --project /absolute/project/path --limit 0` for full project history.
+   - Use `recall export --project /absolute/project/path --limit 0` for full project history.
+   - Use `recall session export --id <session-id> --format jsonl` for selected sessions.
+   - Use `recall session show --id <session-id> --format json --include metadata,messages,usage,events` when one session needs structured inspection.
    - Start with a smaller `--limit` when exploring very large histories.
    - Write temporary analysis artifacts outside the repo unless the user asked for a tracked artifact.
    - Parse JSONL with structured JSON tooling, line by line. Do not parse JSON with grep or ad hoc string splitting.
@@ -121,8 +123,13 @@ recall sync
 recall sync --source codex
 recall search "migration bug" --project /absolute/project/path
 recall search "migration bug" --project /absolute/project/path --source codex --time 30d
-recall export --jsonl --project /absolute/project/path --limit 0
-recall export --jsonl --project /absolute/project/path --source codex --time 30d --limit 100
+recall export --project /absolute/project/path --limit 0
+recall export --project /absolute/project/path --source codex --time 30d --limit 100
+recall session list --project /absolute/project/path --limit 20 --format json
+recall session show --id <session-id> --format json --include metadata,messages,usage,events
+recall session export --id <session-id> --format jsonl
+recall session share --id <session-id> --dry-run --format json
+recall session resume --id <session-id> --print-command
 recall import recall-export.jsonl --dry-run
 recall import recall-export.jsonl
 recall usage --json
@@ -134,7 +141,7 @@ Supported source ids include `claude-code`, `opencode`, `codex`, `pi`, `antigrav
 
 ## Export Schema
 
-`recall export --jsonl` emits one JSON object per indexed session. Each record includes:
+`recall export` and `recall session export --format jsonl` emit one JSON object per indexed session. `recall session show --format json` uses the same top-level record schema for one selected session. Each record includes:
 
 - `schema_version`
 - `record_type`

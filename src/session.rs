@@ -9,12 +9,12 @@ use recall::adapters;
 use recall::config::AppConfig;
 use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
 use recall::db::store::{SessionListSort, Store};
-use recall::embedding::EmbeddingProvider;
 use recall::export::ExportOptions;
+use recall::query::{parse_time_range, query_embedding, resolve_source_filter};
 use recall::semantic;
-use recall::types::{self, MatchSource, Message, Role, Session};
-
-use crate::{SyncRunOptions, parse_time_range, resolve_source_filter, run_sync_job_inner};
+use recall::session_action::{self, SessionAction};
+use recall::types::{MatchSource, Message, Role, Session};
+use recall::{sync::SyncRunOptions, sync::run_sync_job_inner, transcript};
 
 #[derive(Subcommand)]
 pub(crate) enum SessionCommands {
@@ -169,42 +169,10 @@ struct SessionListRow {
     snippet: Option<String>,
 }
 
-struct SessionListOptions<'a> {
-    query: Option<&'a str>,
-    source_filter: Option<&'a str>,
-    time_filter: Option<&'a str>,
-    project_filter: Option<&'a str>,
-    limit: usize,
-    offset: usize,
-    all: bool,
-    sync: bool,
-    sort: Option<SessionSort>,
-    format: SessionListFormat,
-}
-
-struct SessionShowOptions<'a> {
-    id: Option<&'a str>,
-    source_filter: Option<&'a str>,
-    source_id: Option<&'a str>,
-    messages: bool,
-    include: Option<&'a str>,
-    from_seq: Option<u32>,
-    to_seq: Option<u32>,
-    role: SessionRoleFilter,
-    format: SessionDetailFormat,
-}
-
-#[derive(Default)]
 struct SessionIncludes {
     messages: bool,
     usage: bool,
     events: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum PendingCommandAction {
-    Resume,
-    OpenApp,
 }
 
 pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
@@ -220,18 +188,18 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
             sync,
             sort,
             format,
-        } => cmd_session_list(SessionListOptions {
-            query: query.as_deref(),
-            source_filter: source.as_deref(),
-            time_filter: time.as_deref(),
-            project_filter: project.as_deref(),
+        } => cmd_session_list(
+            query.as_deref(),
+            source.as_deref(),
+            time.as_deref(),
+            project.as_deref(),
             limit,
             offset,
             all,
             sync,
             sort,
             format,
-        }),
+        ),
         SessionCommands::Show {
             id,
             source,
@@ -242,17 +210,17 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
             to_seq,
             role,
             format,
-        } => cmd_session_show(SessionShowOptions {
-            id: id.as_deref(),
-            source_filter: source.as_deref(),
-            source_id: source_id.as_deref(),
+        } => cmd_session_show(
+            id.as_deref(),
+            source.as_deref(),
+            source_id.as_deref(),
             messages,
-            include: include.as_deref(),
+            include.as_deref(),
             from_seq,
             to_seq,
             role,
             format,
-        }),
+        ),
         SessionCommands::Export { ids, source, source_id, ids_file, format, output } => {
             cmd_session_export(
                 ids,
@@ -281,7 +249,7 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
                 source_id.as_deref(),
                 print_command,
                 format,
-                PendingCommandAction::Resume,
+                SessionAction::Resume,
             )
         }
         SessionCommands::Open { id, source, source_id, print_command, format } => {
@@ -291,26 +259,25 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
                 source_id.as_deref(),
                 print_command,
                 format,
-                PendingCommandAction::OpenApp,
+                SessionAction::OpenApp,
             )
         }
     }
 }
 
-fn cmd_session_list(options: SessionListOptions<'_>) -> Result<()> {
-    let SessionListOptions {
-        query,
-        source_filter,
-        time_filter,
-        project_filter,
-        limit,
-        offset,
-        all,
-        sync,
-        sort,
-        format,
-    } = options;
-
+#[allow(clippy::too_many_arguments)]
+fn cmd_session_list(
+    query: Option<&str>,
+    source_filter: Option<&str>,
+    time_filter: Option<&str>,
+    project_filter: Option<&str>,
+    limit: usize,
+    offset: usize,
+    all: bool,
+    sync: bool,
+    sort: Option<SessionSort>,
+    format: SessionListFormat,
+) -> Result<()> {
     if all && limit != 50 {
         anyhow::bail!("--all cannot be combined with --limit");
     }
@@ -335,7 +302,7 @@ fn cmd_session_list(options: SessionListOptions<'_>) -> Result<()> {
     let effective_limit = if all { None } else { Some(limit) };
     let rows: Vec<SessionListRow> = if let Some(query) = query.filter(|q| !q.trim().is_empty()) {
         let engine = SearchEngine::new(&store.conn);
-        let embedding = session_query_embedding(&store, query)?;
+        let embedding = query_embedding(&store, query, |message| eprintln!("{message}"))?;
         let filters = SearchFilters {
             sources: resolved_source.clone(),
             time_range,
@@ -397,19 +364,18 @@ fn cmd_session_list(options: SessionListOptions<'_>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_session_show(options: SessionShowOptions<'_>) -> Result<()> {
-    let SessionShowOptions {
-        id,
-        source_filter,
-        source_id,
-        messages: messages_flag,
-        include,
-        from_seq,
-        to_seq,
-        role,
-        format,
-    } = options;
-
+#[allow(clippy::too_many_arguments)]
+fn cmd_session_show(
+    id: Option<&str>,
+    source_filter: Option<&str>,
+    source_id: Option<&str>,
+    messages_flag: bool,
+    include: Option<&str>,
+    from_seq: Option<u32>,
+    to_seq: Option<u32>,
+    role: SessionRoleFilter,
+    format: SessionDetailFormat,
+) -> Result<()> {
     let store = Store::open()?;
     let sources = adapters::source_labels();
     let session = resolve_session_ref(&store, &sources, id, source_filter, source_id)?;
@@ -429,31 +395,23 @@ fn cmd_session_show(options: SessionShowOptions<'_>) -> Result<()> {
 
     match format {
         SessionDetailFormat::Text => {
-            print_session_text(&session, &messages, &usage_events, &events)
+            print!("{}", transcript::render_plain(&session, &messages));
+            if !usage_events.is_empty() {
+                println!("Usage events: {}", usage_events.len());
+            }
+            if !events.is_empty() {
+                println!("Session events: {}", events.len());
+            }
         }
         SessionDetailFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&session_detail_json(
-                    &session,
-                    &sources,
-                    &messages,
-                    &usage_events,
-                    &events,
-                ))?
-            );
+            let value =
+                recall::export::session_record_value(session, messages, usage_events, events)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
         }
         SessionDetailFormat::Jsonl => {
-            println!(
-                "{}",
-                serde_json::to_string(&session_detail_json(
-                    &session,
-                    &sources,
-                    &messages,
-                    &usage_events,
-                    &events,
-                ))?
-            );
+            let value =
+                recall::export::session_record_value(session, messages, usage_events, events)?;
+            println!("{}", serde_json::to_string(&value)?);
         }
     }
     Ok(())
@@ -500,7 +458,7 @@ fn cmd_session_export(
                     content.push_str("\n\n");
                 }
                 let messages = store.get_messages(&session.id)?;
-                content.push_str(&render_session_text(session, &messages));
+                content.push_str(&transcript::render_plain(session, &messages));
             }
             if let Some(path) = output {
                 ensure_parent_dir(&path)?;
@@ -578,7 +536,7 @@ fn cmd_session_command(
     source_id: Option<&str>,
     print_command: bool,
     format: SessionActionFormat,
-    action: PendingCommandAction,
+    action: SessionAction,
 ) -> Result<()> {
     let store = Store::open()?;
     let sources = adapters::source_labels();
@@ -586,21 +544,10 @@ fn cmd_session_command(
     if session.is_import {
         anyhow::bail!("imported session is not resumable on this machine");
     }
-    let command = match action {
-        PendingCommandAction::Resume => {
-            adapters::resume_command_for(&session.source, &session.source_id)
-        }
-        PendingCommandAction::OpenApp => {
-            adapters::app_command_for(&session.source, &session.source_id)
-        }
-    }
-    .ok_or_else(|| {
-        let action_label = match action {
-            PendingCommandAction::Resume => "resume",
-            PendingCommandAction::OpenApp => "open",
-        };
-        anyhow::anyhow!("{action_label} is not supported for {}", session.source)
-    })?;
+    let command = session_action::command_for(action, &session.source, &session.source_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("{} is not supported for {}", action.label(), session.source)
+        })?;
 
     if print_command {
         match format {
@@ -623,20 +570,7 @@ fn cmd_session_command(
         return Ok(());
     }
 
-    let mut process = Command::new(&command.program);
-    process
-        .args(&command.args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    if let Some(directory) = &session.directory {
-        process.current_dir(directory);
-    }
-    let status = process.status()?;
-    if !status.success() {
-        anyhow::bail!("command exited with status {status}");
-    }
-    Ok(())
+    session_action::run(&command, session.directory.as_deref())
 }
 
 fn resolve_session_ref(
@@ -704,28 +638,6 @@ fn resolve_single_source(source: &str, sources: &[(String, String)]) -> Result<S
         .find(|(id, label)| id == &lower || label.to_lowercase() == lower)
         .map(|(id, _)| id.clone())
         .ok_or_else(|| anyhow::anyhow!("unknown source: {source}"))
-}
-
-fn session_query_embedding(store: &Store, query: &str) -> Result<Option<Vec<f32>>> {
-    let progress = store.semantic_progress().unwrap_or_default();
-    if progress.done_sessions == 0 && progress.processing_sessions == 0 {
-        return Ok(None);
-    }
-    eprintln!("Loading embedding model...");
-    match EmbeddingProvider::new(true) {
-        Ok(provider) => {
-            let embedding = provider
-                .embed_query(&[query])?
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("failed to generate query embedding"))?;
-            Ok(Some(embedding))
-        }
-        Err(e) => {
-            eprintln!("Semantic unavailable: {e}");
-            Ok(None)
-        }
-    }
 }
 
 fn parse_session_includes(
@@ -854,21 +766,6 @@ fn session_list_row_json(row: &SessionListRow, sources: &[(String, String)]) -> 
     value
 }
 
-fn session_detail_json(
-    session: &Session,
-    sources: &[(String, String)],
-    messages: &[Message],
-    usage_events: &[types::SessionUsageEventRecord],
-    events: &[types::SessionEventRecord],
-) -> serde_json::Value {
-    serde_json::json!({
-        "session": session_json(session, sources),
-        "messages": messages.iter().map(message_json).collect::<Vec<_>>(),
-        "usage_events": usage_events.iter().map(usage_event_json).collect::<Vec<_>>(),
-        "events": events.iter().map(session_event_json).collect::<Vec<_>>()
-    })
-}
-
 fn session_json(session: &Session, sources: &[(String, String)]) -> serde_json::Value {
     serde_json::json!({
         "id": session.id,
@@ -896,96 +793,6 @@ fn session_ref_json(session: &Session) -> serde_json::Value {
         "source_id": session.source_id,
         "title": session.title
     })
-}
-
-fn message_json(message: &Message) -> serde_json::Value {
-    serde_json::json!({
-        "seq": message.seq,
-        "role": message.role.as_str(),
-        "timestamp": message.timestamp,
-        "content": message.content
-    })
-}
-
-fn usage_event_json(event: &types::SessionUsageEventRecord) -> serde_json::Value {
-    serde_json::json!({
-        "event_key": event.event_key,
-        "event_seq": event.event_seq,
-        "message_seq": event.message_seq,
-        "timestamp": event.timestamp,
-        "model": event.model,
-        "provider": event.provider,
-        "input_tokens": event.input_tokens,
-        "output_tokens": event.output_tokens,
-        "cache_read_tokens": event.cache_read_tokens,
-        "cache_write_tokens": event.cache_write_tokens,
-        "reasoning_tokens": event.reasoning_tokens,
-        "token_source": event.token_source,
-        "parser_version": event.parser_version,
-        "source_path": event.source_path,
-        "raw_usage_json": event.raw_usage_json
-    })
-}
-
-fn session_event_json(event: &types::SessionEventRecord) -> serde_json::Value {
-    serde_json::json!({
-        "event_seq": event.event_seq,
-        "timestamp": event.timestamp,
-        "kind": event.kind,
-        "actor": event.actor,
-        "name": event.name,
-        "status": event.status,
-        "target": event.target,
-        "message_seq": event.message_seq,
-        "summary": event.summary,
-        "source_path": event.source_path,
-        "source_event_id": event.source_event_id,
-        "attrs_json": event.attrs_json,
-        "parser_version": event.parser_version
-    })
-}
-
-fn print_session_text(
-    session: &Session,
-    messages: &[Message],
-    usage_events: &[types::SessionUsageEventRecord],
-    events: &[types::SessionEventRecord],
-) {
-    print!("{}", render_session_text(session, messages));
-    if !usage_events.is_empty() {
-        println!("Usage events: {}", usage_events.len());
-    }
-    if !events.is_empty() {
-        println!("Session events: {}", events.len());
-    }
-}
-
-fn render_session_text(session: &Session, messages: &[Message]) -> String {
-    let mut content = String::new();
-    content.push_str(&format!("Session: {}\n", session.title));
-    content.push_str(&format!("ID: {}\n", session.id));
-    content.push_str(&format!("Source: {}\n", session.source));
-    content.push_str(&format!("Source ID: {}\n", session.source_id));
-    if let Some(ref dir) = session.directory {
-        content.push_str(&format!("Directory: {dir}\n"));
-    }
-    content.push_str(&format!(
-        "Date: {}\n",
-        chrono::DateTime::from_timestamp_millis(session.started_at)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_default()
-    ));
-    content.push_str(&format!("Messages: {}\n", messages.len()));
-    content.push_str("\n---\n\n");
-
-    for msg in messages {
-        let role = match msg.role {
-            Role::User => "User",
-            Role::Assistant => "Assistant",
-        };
-        content.push_str(&format!("## {role} [{}]\n\n{}\n\n", msg.seq, msg.content));
-    }
-    content
 }
 
 fn source_label_for<'a>(source: &'a str, sources: &'a [(String, String)]) -> &'a str {

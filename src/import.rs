@@ -16,6 +16,24 @@ pub struct ImportSummary {
     pub skipped: usize,
 }
 
+pub fn run_cli(file: &str, dry_run: bool) -> Result<()> {
+    let store = Store::open()?;
+    let summary = if file == "-" {
+        let stdin = std::io::stdin();
+        import_jsonl(&store, dry_run, stdin.lock())?
+    } else {
+        let f = std::fs::File::open(file).map_err(|e| anyhow!("cannot open {file}: {e}"))?;
+        import_jsonl(&store, dry_run, std::io::BufReader::new(f))?
+    };
+
+    let suffix = if dry_run { " (dry-run, nothing written)" } else { "" };
+    println!(
+        "total {} | imported {} | skipped {}{suffix}",
+        summary.total, summary.imported, summary.skipped
+    );
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct ImportRecord {
     schema_version: u32,
