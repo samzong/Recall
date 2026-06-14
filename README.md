@@ -14,6 +14,28 @@ brew install samzong/tap/recall
 make install # from a source checkout
 ```
 
+## Shell completion
+
+Generate a static completion script and load it from your shell `fpath`:
+
+```bash
+recall completions zsh > ~/.zsh/completions/_recall
+```
+
+Add to `~/.zshrc` (works alongside `gmc` and other tools):
+
+```bash
+fpath=(~/.zsh/completions ~/.grok/completions/zsh $fpath)
+autoload -Uz compinit && compinit
+```
+
+Other shells:
+
+```bash
+recall completions bash > ~/.bash_completion.d/recall
+recall completions fish > ~/.config/fish/completions/recall.fish
+```
+
 ## Support
 
 One index across every AI coding CLI. Sync once, search everywhere, resume right where you left off.

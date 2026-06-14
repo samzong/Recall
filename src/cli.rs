@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 
 use crate::session;
 
@@ -95,6 +96,11 @@ enum Commands {
         #[command(subcommand)]
         command: session::SessionCommands,
     },
+    #[command(about = "Generate shell completion script")]
+    Completions {
+        #[arg(help = "Target shell")]
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -138,12 +144,13 @@ pub fn run() -> Result<()> {
             recall::export::run_cli(source.as_deref(), time.as_deref(), project.as_deref(), limit)?
         }
         Some(Commands::Import { file, dry_run }) => recall::import::run_cli(&file, dry_run)?,
-        Some(Commands::Share { command }) => match command {
-            ShareCommands::Init { project_name, publish_dir } => {
-                recall::share_init::run(project_name, publish_dir)?
-            }
-        },
+        Some(Commands::Share { command: ShareCommands::Init { project_name, publish_dir } }) => {
+            recall::share_init::run(project_name, publish_dir)?
+        }
         Some(Commands::Session { command }) => session::cmd_session(command)?,
+        Some(Commands::Completions { shell }) => {
+            generate(shell, &mut Cli::command(), "recall", &mut std::io::stdout());
+        }
         None => recall::tui::runner::run(None)?,
     }
 
@@ -152,7 +159,7 @@ pub fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ShareCommands};
+    use super::{Cli, Commands, ShareCommands, Shell, generate};
     use clap::{CommandFactory, Parser};
     use recall::adapters::{
         adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
@@ -211,6 +218,21 @@ mod tests {
         assert!(compact_help.contains("import Import session records from JSON Lines"));
         assert!(compact_help.contains("share Share session pages"));
         assert!(compact_help.contains("session Operate on indexed sessions"));
+        assert!(compact_help.contains("completions Generate shell completion script"));
+    }
+
+    #[test]
+    fn completions_generates_zsh_script() {
+        assert!(matches!(
+            Cli::try_parse_from(["recall", "completions", "zsh"]).unwrap().command,
+            Some(Commands::Completions { shell: Shell::Zsh })
+        ));
+
+        let mut output = Vec::new();
+        generate(Shell::Zsh, &mut Cli::command(), "recall", &mut output);
+        let script = String::from_utf8(output).unwrap();
+        assert!(script.contains("#compdef recall"));
+        assert!(script.contains("search"));
     }
 
     #[test]

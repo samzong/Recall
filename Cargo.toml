@@ -8,6 +8,7 @@ repository = "https://github.com/samzong/Recall"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sqlite-vec = "0.1"
 hf-hub = { version = "0.5", features = ["ureq"] }

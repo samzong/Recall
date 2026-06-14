@@ -52,6 +52,10 @@ doc: ## Generate API documentation
 
 install: ## Install binary to ~/.cargo/bin
 	$(CARGO) install --path . --locked
+	@if [ -d "$(HOME)/.zsh/completions" ]; then \
+		"$(HOME)/.cargo/bin/recall" completions zsh > "$(HOME)/.zsh/completions/_recall"; \
+		printf '$(GREEN)  ✓ Updated ~/.zsh/completions/_recall$(RESET)\n'; \
+	fi
 
 uninstall: ## Remove installed binary
 	$(CARGO) uninstall recall
