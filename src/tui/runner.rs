@@ -2,11 +2,11 @@ use anyhow::Result;
 
 use crate::adapters;
 use crate::config::AppConfig;
-use crate::db::search::{SearchEngine, TimeRange};
+use crate::db::search::TimeRange;
 use crate::db::store::Store;
-use crate::embedding::EmbeddingProvider;
 use crate::semantic;
 use crate::sync::run_dashboard_sync_job;
+use crate::tui::search_worker::SearchWorker;
 
 pub fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Result<()> {
     use std::io;
@@ -49,12 +49,11 @@ pub fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Res
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let engine = SearchEngine::new(&store.conn);
-    let mut provider: Option<EmbeddingProvider> = None;
     let mut config = AppConfig::load_or_default();
     config.normalize_sources(&sources);
 
     let mut app = App::new(&store, sources, config);
+    let search_worker = SearchWorker::spawn();
     if let Some((source_filter, time_filter)) = usage_start {
         app.source_filter_selection = source_filter.unwrap_or_default();
         if let Some(time_filter) = time_filter {
@@ -68,11 +67,14 @@ pub fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Res
 
     loop {
         app.poll_share_publish();
+        while let Some(response) = search_worker.try_recv() {
+            app.apply_search_response(&store, response);
+        }
         terminal.draw(|f| ui::render(f, &app))?;
 
         match poll_event(tick_rate)? {
             AppEvent::Key(key) => {
-                app.handle_key(key, &store, &engine, &mut provider);
+                app.handle_key(key, &store);
             }
             AppEvent::ScrollUp => app.handle_scroll_up(&store),
             AppEvent::ScrollDown => app.handle_scroll_down(&store),
@@ -95,7 +97,10 @@ pub fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Res
             }
         }
 
-        app.try_search(&store, &engine, &mut provider);
+        app.try_search(&store, &search_worker);
+        while let Some(response) = search_worker.try_recv() {
+            app.apply_search_response(&store, response);
+        }
 
         if app.should_quit {
             break;

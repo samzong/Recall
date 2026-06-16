@@ -1,18 +1,18 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::adapters::ResumeCommand;
 use crate::config::AppConfig;
-use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
+use crate::db::search::{SearchFilters, TimeRange};
 use crate::db::store::{ProjectDirectory, Store};
-use crate::embedding::EmbeddingProvider;
 use crate::session_action;
 use crate::skill_audit::{self, SkillAuditFilters, SkillAuditReport};
 use crate::transcript;
+use crate::tui::search_worker::{SearchPhase, SearchRequest, SearchResponse, SearchWorker};
 use crate::types::{
     BackgroundJobStatus, MatchSource, Message, Role, SearchResult, SemanticProgress,
     SessionUsageEventRecord,
@@ -22,6 +22,7 @@ use crate::usage::{self, TokenTotals, UsageFilters, UsageReport};
 pub use crate::session_action::SessionAction as PendingCommandAction;
 
 const USAGE_LOADING_MIN_MS: u128 = 75;
+const SEARCH_DEBOUNCE_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageTab {
@@ -72,10 +73,18 @@ mod tests {
             project_filter: None,
             time_filter: TimeRange::All,
             filter_focus: FilterFocus::Source,
+            filters_dirty: false,
+            draft_source_filter_selection: Vec::new(),
+            draft_project_filter: None,
+            draft_time_filter: TimeRange::All,
+            draft_sort_order: SortOrder::Newest,
             should_quit: false,
             last_keystroke: Instant::now(),
             search_pending: false,
-            embedding_init_pending: false,
+            search_request_id: 0,
+            active_search_id: 0,
+            search_in_flight: false,
+            search_feedback: None,
             embedding_unavailable: false,
             status_message: None,
             sort_order: SortOrder::Newest,
@@ -216,17 +225,10 @@ mod tests {
     fn ctrl_o_from_search_confirms_codex_app_open() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
-        let engine = SearchEngine::new(&store.conn);
-        let mut provider = None;
         let mut app = app_with_sources();
         app.results = vec![codex_search_result()];
 
-        app.handle_search_key(
-            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-            &store,
-            &engine,
-            &mut provider,
-        );
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), &store);
 
         assert!(matches!(app.mode, AppMode::ConfirmResume));
         let pending = app.pending_resume.as_ref().unwrap();
@@ -244,8 +246,6 @@ mod tests {
     fn imported_session_suppresses_resume_and_app_open() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
-        let engine = SearchEngine::new(&store.conn);
-        let mut provider = None;
         let mut app = app_with_sources();
         let mut result = codex_search_result();
         result.session.is_import = true;
@@ -256,8 +256,6 @@ mod tests {
             app.handle_search_key(
                 KeyEvent::new(KeyCode::Char(key_char), KeyModifiers::CONTROL),
                 &store,
-                &engine,
-                &mut provider,
             );
 
             assert!(
@@ -332,7 +330,8 @@ mod tests {
         app.toggle_source_picker_row();
         app.commit_source_picker_filter();
 
-        assert_eq!(app.source_filter_selection, vec!["codex".to_string()]);
+        assert_eq!(app.draft_source_filter_selection, vec!["codex".to_string()]);
+        assert!(app.source_filter_selection.is_empty());
     }
 
     #[test]
@@ -348,10 +347,13 @@ mod tests {
     fn clear_filters_restores_newest_sort() {
         let mut app = app_with_sources();
         app.sort_order = SortOrder::Relevance;
+        app.open_filters();
 
         app.clear_filters();
 
-        assert_eq!(app.sort_order, SortOrder::Newest);
+        assert_eq!(app.sort_order, SortOrder::Relevance);
+        assert_eq!(app.draft_sort_order, SortOrder::Newest);
+        assert!(app.filters_dirty);
     }
 
     #[test]
@@ -369,41 +371,183 @@ mod tests {
     }
 
     #[test]
-    fn applying_project_picker_closes_filters_window() {
+    fn stale_search_response_does_not_replace_current_results() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
-        let engine = SearchEngine::new(&store.conn);
-        let mut provider = None;
+        let mut app = app_with_sources();
+        app.query = "current".to_string();
+        app.results = vec![search_result_with_times("current-result", 100, None)];
+        app.active_search_id = 2;
+
+        app.apply_search_response(
+            &store,
+            SearchResponse {
+                id: 1,
+                query: "old".to_string(),
+                phase: SearchPhase::Text,
+                result: Ok(vec![search_result_with_times("old-result", 200, None)]),
+            },
+        );
+
+        assert_eq!(app.results[0].session.source_id, "current-result");
+    }
+
+    #[test]
+    fn text_search_response_keeps_semantic_refinement_pending() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.query = "parser".to_string();
+        app.active_search_id = 1;
+        app.semantic_progress.done_sessions = 1;
+
+        app.apply_search_response(
+            &store,
+            SearchResponse {
+                id: 1,
+                query: "parser".to_string(),
+                phase: SearchPhase::Text,
+                result: Ok(vec![search_result_with_times("fts-result", 100, None)]),
+            },
+        );
+
+        assert_eq!(app.results[0].session.source_id, "fts-result");
+        assert!(app.search_in_flight);
+        assert_eq!(app.search_feedback.as_deref(), Some("Refining semantic results..."));
+    }
+
+    #[test]
+    fn filter_time_range_left_right_defers_search_until_esc() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.mode = AppMode::Filters;
+        app.query = "parser".to_string();
+        app.filter_focus = FilterFocus::Time;
+
+        app.handle_filters_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &store);
+
+        assert_eq!(app.time_filter, TimeRange::All);
+        assert!(app.filters_dirty);
+        assert!(!app.search_pending);
+        assert!(matches!(app.mode, AppMode::Filters));
+
+        app.handle_filters_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);
+
+        assert_eq!(app.time_filter, TimeRange::Today);
+        assert!(matches!(app.mode, AppMode::Search));
+        assert!(app.search_pending);
+        assert_eq!(app.search_feedback.as_deref(), Some("Filters queued..."));
+    }
+
+    #[test]
+    fn filter_sort_left_right_defers_search_until_esc() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.mode = AppMode::Filters;
+        app.query = "parser".to_string();
+        app.filter_focus = FilterFocus::Sort;
+
+        app.handle_filters_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &store);
+
+        assert_eq!(app.sort_order, SortOrder::Newest);
+        assert!(app.filters_dirty);
+        assert!(!app.search_pending);
+
+        app.handle_filters_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);
+
+        assert_eq!(app.sort_order, SortOrder::Relevance);
+        assert!(matches!(app.mode, AppMode::Search));
+        assert!(app.search_pending);
+        assert_eq!(app.search_feedback.as_deref(), Some("Filters queued..."));
+    }
+
+    #[test]
+    fn filter_esc_closes_without_syncing_results_or_stats() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.mode = AppMode::Filters;
+        app.filter_focus = FilterFocus::Time;
+        app.results = vec![search_result_with_times("existing", 100, None)];
+        app.total_sessions = 42;
+        app.total_messages = 99;
+
+        app.handle_filters_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &store);
+        app.handle_filters_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);
+
+        assert!(matches!(app.mode, AppMode::Search));
+        assert_eq!(app.results[0].session.source_id, "existing");
+        assert_eq!(app.total_sessions, 42);
+        assert_eq!(app.total_messages, 99);
+        assert!(app.search_pending);
+        assert_eq!(app.search_feedback.as_deref(), Some("Filters queued..."));
+    }
+
+    #[test]
+    fn filter_commit_invalidates_in_flight_search_response() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.query = "parser".to_string();
+        app.mode = AppMode::Filters;
+        app.filter_focus = FilterFocus::Time;
+        app.results = vec![search_result_with_times("current-result", 100, None)];
+        app.search_request_id = 1;
+        app.active_search_id = 1;
+        app.search_in_flight = true;
+
+        app.handle_filters_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &store);
+        app.handle_filters_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);
+        app.apply_search_response(
+            &store,
+            SearchResponse {
+                id: 1,
+                query: "parser".to_string(),
+                phase: SearchPhase::Text,
+                result: Ok(vec![search_result_with_times("old-filter-result", 200, None)]),
+            },
+        );
+
+        assert_eq!(app.results[0].session.source_id, "current-result");
+        assert!(app.search_pending);
+    }
+
+    #[test]
+    fn applying_project_picker_returns_to_filter_overview_without_searching() {
         let mut app = app_with_sources();
         app.mode = AppMode::Filters;
         app.filters_editing_project = true;
         app.project_picker_selection = Some("/Users/x/git/samzong/Recall".to_string());
         app.project_picker_dirty = true;
 
-        app.apply_project_picker(&store, &engine, &mut provider);
+        app.apply_project_picker();
 
-        assert!(matches!(app.mode, AppMode::Search));
+        assert!(matches!(app.mode, AppMode::Filters));
         assert!(!app.filters_editing_project);
-        assert_eq!(app.project_filter, Some("/Users/x/git/samzong/Recall".to_string()));
+        assert_eq!(app.project_filter, None);
+        assert_eq!(app.draft_project_filter, Some("/Users/x/git/samzong/Recall".to_string()));
+        assert!(app.filters_dirty);
+        assert!(!app.search_pending);
     }
 
     #[test]
-    fn applying_source_picker_closes_filters_window() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let engine = SearchEngine::new(&store.conn);
-        let mut provider = None;
+    fn applying_source_picker_returns_to_filter_overview_without_searching() {
         let mut app = app_with_sources();
         app.mode = AppMode::Filters;
         app.filters_editing_source = true;
         app.source_picker_selection = vec!["codex".to_string()];
         app.source_picker_dirty = true;
 
-        app.apply_source_picker(&store, &engine, &mut provider);
+        app.apply_source_picker();
 
-        assert!(matches!(app.mode, AppMode::Search));
+        assert!(matches!(app.mode, AppMode::Filters));
         assert!(!app.filters_editing_source);
-        assert_eq!(app.source_filter_selection, vec!["codex".to_string()]);
+        assert!(app.source_filter_selection.is_empty());
+        assert_eq!(app.draft_source_filter_selection, vec!["codex".to_string()]);
+        assert!(app.filters_dirty);
+        assert!(!app.search_pending);
     }
 }
 
@@ -564,10 +708,18 @@ pub struct App {
     pub source_filter_selection: Vec<String>,
     pub time_filter: TimeRange,
     pub filter_focus: FilterFocus,
+    pub filters_dirty: bool,
+    pub draft_source_filter_selection: Vec<String>,
+    pub draft_project_filter: Option<String>,
+    pub draft_time_filter: TimeRange,
+    pub draft_sort_order: SortOrder,
     pub should_quit: bool,
     pub last_keystroke: Instant,
     pub search_pending: bool,
-    pub embedding_init_pending: bool,
+    pub search_request_id: u64,
+    pub active_search_id: u64,
+    pub search_in_flight: bool,
+    pub search_feedback: Option<String>,
     pub embedding_unavailable: bool,
     pub status_message: Option<String>,
     pub sort_order: SortOrder,
@@ -642,10 +794,18 @@ impl App {
             source_filter_selection: Vec::new(),
             time_filter: TimeRange::All,
             filter_focus: FilterFocus::Source,
+            filters_dirty: false,
+            draft_source_filter_selection: Vec::new(),
+            draft_project_filter: None,
+            draft_time_filter: TimeRange::All,
+            draft_sort_order: SortOrder::Newest,
             should_quit: false,
             last_keystroke: Instant::now(),
             search_pending: false,
-            embedding_init_pending: false,
+            search_request_id: 0,
+            active_search_id: 0,
+            search_in_flight: false,
+            search_feedback: None,
             embedding_unavailable: false,
             status_message: None,
             sort_order: SortOrder::Newest,
@@ -719,7 +879,15 @@ impl App {
     }
 
     pub fn source_filter_label(&self) -> String {
-        let explicit = self.normalized_source_selection(&self.source_filter_selection);
+        self.source_filter_label_for_selection(&self.source_filter_selection)
+    }
+
+    pub fn draft_source_filter_label(&self) -> String {
+        self.source_filter_label_for_selection(&self.draft_source_filter_selection)
+    }
+
+    fn source_filter_label_for_selection(&self, selection: &[String]) -> String {
+        let explicit = self.normalized_source_selection(selection);
         if explicit.is_empty() {
             return if self.enabled_sources().len() == self.all_sources.len() {
                 "ALL".to_string()
@@ -742,7 +910,15 @@ impl App {
     }
 
     pub fn time_filter_label(&self) -> &'static str {
-        match self.time_filter {
+        Self::time_range_label(self.time_filter)
+    }
+
+    pub fn draft_time_filter_label(&self) -> &'static str {
+        Self::time_range_label(self.draft_time_filter)
+    }
+
+    fn time_range_label(time_range: TimeRange) -> &'static str {
+        match time_range {
             TimeRange::Today => "Today",
             TimeRange::Week => "7d",
             TimeRange::Month => "30d",
@@ -760,7 +936,15 @@ impl App {
     }
 
     pub fn sort_label(&self) -> &'static str {
-        match self.sort_order {
+        Self::sort_order_label(self.sort_order)
+    }
+
+    pub fn draft_sort_label(&self) -> &'static str {
+        Self::sort_order_label(self.draft_sort_order)
+    }
+
+    fn sort_order_label(sort_order: SortOrder) -> &'static str {
+        match sort_order {
             SortOrder::Relevance => "Relevance",
             SortOrder::Newest => "Newest",
         }
@@ -768,6 +952,13 @@ impl App {
 
     pub fn project_filter_label(&self) -> String {
         self.project_filter
+            .as_deref()
+            .map(short_project_label)
+            .unwrap_or_else(|| "All projects".to_string())
+    }
+
+    pub fn draft_project_filter_label(&self) -> String {
+        self.draft_project_filter
             .as_deref()
             .map(short_project_label)
             .unwrap_or_else(|| "All projects".to_string())
@@ -797,16 +988,12 @@ impl App {
             .collect();
         self.selected_index = 0;
         self.panel_focus = PanelFocus::SessionList;
+        self.search_pending = false;
+        self.search_in_flight = false;
         self.load_preview(store);
     }
 
-    pub fn handle_key(
-        &mut self,
-        key: KeyEvent,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
+    pub fn handle_key(&mut self, key: KeyEvent, store: &Store) {
         self.status_message = None;
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -815,13 +1002,13 @@ impl App {
         }
 
         match self.mode {
-            AppMode::Search => self.handle_search_key(key, store, engine, provider),
+            AppMode::Search => self.handle_search_key(key, store),
             AppMode::Usage => self.handle_usage_key(key, store),
             AppMode::Viewing => self.handle_viewing_key(key),
             AppMode::ShareResult => self.handle_share_result_key(key),
             AppMode::ExportInput => self.handle_export_key(key),
-            AppMode::Settings => self.handle_settings_key(key, store, engine, provider),
-            AppMode::Filters => self.handle_filters_key(key, store, engine, provider),
+            AppMode::Settings => self.handle_settings_key(key, store),
+            AppMode::Filters => self.handle_filters_key(key, store),
             AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
         }
     }
@@ -949,13 +1136,7 @@ impl App {
         }
     }
 
-    fn handle_search_key(
-        &mut self,
-        key: KeyEvent,
-        store: &Store,
-        _engine: &SearchEngine,
-        _provider: &mut Option<EmbeddingProvider>,
-    ) {
+    fn handle_search_key(&mut self, key: KeyEvent, store: &Store) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
             self.open_filters();
             return;
@@ -989,7 +1170,7 @@ impl App {
                 } else if !self.query.is_empty() {
                     self.query.clear();
                     self.cursor_pos = 0;
-                    self.load_recent(store);
+                    self.queue_search();
                 } else {
                     self.should_quit = true;
                 }
@@ -997,8 +1178,7 @@ impl App {
             KeyCode::Char(c) if self.panel_focus == PanelFocus::SessionList => {
                 self.query.insert(self.cursor_pos, c);
                 self.cursor_pos += c.len_utf8();
-                self.last_keystroke = Instant::now();
-                self.search_pending = true;
+                self.queue_search();
             }
             KeyCode::Backspace
                 if self.panel_focus == PanelFocus::SessionList && self.cursor_pos > 0 =>
@@ -1010,8 +1190,7 @@ impl App {
                     .unwrap_or(0);
                 self.query.replace_range(prev..self.cursor_pos, "");
                 self.cursor_pos = prev;
-                self.last_keystroke = Instant::now();
-                self.search_pending = true;
+                self.queue_search();
             }
             KeyCode::Left => {
                 if self.panel_focus == PanelFocus::Preview {
@@ -1344,13 +1523,7 @@ impl App {
         }
     }
 
-    fn handle_settings_key(
-        &mut self,
-        key: KeyEvent,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
+    fn handle_settings_key(&mut self, key: KeyEvent, store: &Store) {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.mode = AppMode::Search;
@@ -1358,75 +1531,63 @@ impl App {
             KeyCode::Up => self.handle_scroll_up(store),
             KeyCode::Down => self.handle_scroll_down(store),
             KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
-                self.update_setting(store, engine, provider);
+                self.update_setting(store);
             }
             _ => {}
         }
     }
 
-    fn handle_filters_key(
-        &mut self,
-        key: KeyEvent,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
+    fn handle_filters_key(&mut self, key: KeyEvent, store: &Store) {
         if self.filters_editing_source {
-            self.handle_source_picker_key(key, store, engine, provider);
+            self.handle_source_picker_key(key, store);
             return;
         }
         if self.filters_editing_project {
-            self.handle_project_picker_key(key, store, engine, provider);
+            self.handle_project_picker_key(key, store);
             return;
         }
 
         match key.code {
             KeyCode::Esc => {
-                self.mode = AppMode::Search;
+                self.close_filters();
             }
             KeyCode::Up => self.handle_scroll_up(store),
             KeyCode::Down => self.handle_scroll_down(store),
+            KeyCode::Left => {
+                self.adjust_filter_value(false);
+            }
+            KeyCode::Right => {
+                self.adjust_filter_value(true);
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                self.activate_filter_row(store, engine, provider);
+                self.activate_filter_row(store);
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 self.clear_filters();
-                self.refresh_after_filter_change(store, engine, provider);
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                self.time_filter = TimeRange::Today;
-                self.refresh_after_filter_change(store, engine, provider);
+                self.set_time_filter(TimeRange::Today);
             }
             KeyCode::Char('w') | KeyCode::Char('W') => {
-                self.time_filter = TimeRange::Week;
-                self.refresh_after_filter_change(store, engine, provider);
+                self.set_time_filter(TimeRange::Week);
             }
             KeyCode::Char('m') | KeyCode::Char('M') => {
-                self.time_filter = TimeRange::Month;
-                self.refresh_after_filter_change(store, engine, provider);
+                self.set_time_filter(TimeRange::Month);
             }
             KeyCode::Char('l') | KeyCode::Char('L') => {
-                self.time_filter = TimeRange::All;
-                self.refresh_after_filter_change(store, engine, provider);
+                self.set_time_filter(TimeRange::All);
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.sort_order = SortOrder::Relevance;
-                self.refresh_after_filter_change(store, engine, provider);
+                self.set_sort_order(SortOrder::Relevance);
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.sort_order = SortOrder::Newest;
-                self.refresh_after_filter_change(store, engine, provider);
+                self.set_sort_order(SortOrder::Newest);
             }
             _ => {}
         }
     }
 
-    fn activate_filter_row(
-        &mut self,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
+    fn activate_filter_row(&mut self, store: &Store) {
         match self.filter_focus {
             FilterFocus::Source => {
                 self.open_source_picker();
@@ -1434,32 +1595,72 @@ impl App {
             FilterFocus::Project => {
                 self.open_project_picker(store);
             }
-            FilterFocus::Time => {
-                self.time_filter = match self.time_filter {
-                    TimeRange::All => TimeRange::Today,
-                    TimeRange::Today => TimeRange::Week,
-                    TimeRange::Week => TimeRange::Month,
-                    TimeRange::Month => TimeRange::All,
-                };
-                self.refresh_after_filter_change(store, engine, provider);
-            }
-            FilterFocus::Sort => {
-                self.sort_order = match self.sort_order {
-                    SortOrder::Relevance => SortOrder::Newest,
-                    SortOrder::Newest => SortOrder::Relevance,
-                };
-                self.refresh_after_filter_change(store, engine, provider);
-            }
+            FilterFocus::Time | FilterFocus::Sort => {}
         }
     }
 
-    fn handle_source_picker_key(
-        &mut self,
-        key: KeyEvent,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
+    fn close_filters(&mut self) {
+        self.mode = AppMode::Search;
+        if self.filters_dirty {
+            self.source_filter_selection = self.draft_source_filter_selection.clone();
+            self.project_filter = self.draft_project_filter.clone();
+            self.time_filter = self.draft_time_filter;
+            self.sort_order = self.draft_sort_order;
+            self.filters_dirty = false;
+            self.invalidate_active_search();
+            self.queue_search_with_feedback("Filters queued...");
+        }
+    }
+
+    fn mark_filters_dirty(&mut self) {
+        self.filters_dirty = true;
+    }
+
+    fn adjust_filter_value(&mut self, forward: bool) {
+        match self.filter_focus {
+            FilterFocus::Time => self.cycle_time_filter(forward),
+            FilterFocus::Sort => self.cycle_sort_order(),
+            FilterFocus::Source | FilterFocus::Project => {}
+        }
+    }
+
+    fn set_time_filter(&mut self, time_filter: TimeRange) {
+        if self.draft_time_filter != time_filter {
+            self.draft_time_filter = time_filter;
+            self.mark_filters_dirty();
+        }
+    }
+
+    fn cycle_time_filter(&mut self, forward: bool) {
+        let next = match (self.draft_time_filter, forward) {
+            (TimeRange::All, true) => TimeRange::Today,
+            (TimeRange::Today, true) => TimeRange::Week,
+            (TimeRange::Week, true) => TimeRange::Month,
+            (TimeRange::Month, true) => TimeRange::All,
+            (TimeRange::All, false) => TimeRange::Month,
+            (TimeRange::Month, false) => TimeRange::Week,
+            (TimeRange::Week, false) => TimeRange::Today,
+            (TimeRange::Today, false) => TimeRange::All,
+        };
+        self.set_time_filter(next);
+    }
+
+    fn set_sort_order(&mut self, sort_order: SortOrder) {
+        if self.draft_sort_order != sort_order {
+            self.draft_sort_order = sort_order;
+            self.mark_filters_dirty();
+        }
+    }
+
+    fn cycle_sort_order(&mut self) {
+        let next = match self.draft_sort_order {
+            SortOrder::Relevance => SortOrder::Newest,
+            SortOrder::Newest => SortOrder::Relevance,
+        };
+        self.set_sort_order(next);
+    }
+
+    fn handle_source_picker_key(&mut self, key: KeyEvent, store: &Store) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
             self.source_picker_query.clear();
             self.source_picker_cursor = 0;
@@ -1483,7 +1684,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                self.apply_source_picker(store, engine, provider);
+                self.apply_source_picker();
             }
             KeyCode::Char(' ') => {
                 self.toggle_source_picker_row();
@@ -1544,6 +1745,11 @@ impl App {
         self.mode = AppMode::Filters;
         self.filters_editing_source = false;
         self.filters_editing_project = false;
+        self.draft_source_filter_selection = self.source_filter_selection.clone();
+        self.draft_project_filter = self.project_filter.clone();
+        self.draft_time_filter = self.time_filter;
+        self.draft_sort_order = self.sort_order;
+        self.filters_dirty = false;
     }
 
     fn open_source_picker(&mut self) {
@@ -1555,7 +1761,7 @@ impl App {
         self.source_picker_selected = 0;
         self.source_picker_typing = false;
         self.source_picker_selection =
-            self.normalized_source_selection(&self.source_filter_selection);
+            self.normalized_source_selection(&self.draft_source_filter_selection);
         if let Some(selected_source) = self.source_picker_selection.first() {
             self.source_picker_selected = self
                 .source_picker_rows()
@@ -1583,13 +1789,7 @@ impl App {
         self.source_picker_dirty = false;
     }
 
-    fn handle_project_picker_key(
-        &mut self,
-        key: KeyEvent,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
+    fn handle_project_picker_key(&mut self, key: KeyEvent, store: &Store) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
             self.project_picker_query.clear();
             self.project_picker_cursor = 0;
@@ -1613,7 +1813,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                self.apply_project_picker(store, engine, provider);
+                self.apply_project_picker();
             }
             KeyCode::Char(' ') => {
                 self.toggle_project_picker_row();
@@ -1678,10 +1878,10 @@ impl App {
         self.project_picker_query.clear();
         self.project_picker_cursor = 0;
         self.project_picker_selected = 0;
-        self.project_picker_selection = self.project_filter.clone();
+        self.project_picker_selection = self.draft_project_filter.clone();
         self.project_picker_dirty = false;
         self.project_picker_typing = false;
-        if let Some(selected_project) = self.project_filter.as_ref() {
+        if let Some(selected_project) = self.draft_project_filter.as_ref() {
             self.project_picker_selected = self
                 .project_picker_rows()
                 .iter()
@@ -1707,29 +1907,27 @@ impl App {
         self.project_picker_typing = false;
     }
 
-    fn apply_project_picker(
-        &mut self,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
+    fn apply_project_picker(&mut self) {
+        let previous = self.draft_project_filter.clone();
         self.commit_project_picker_filter();
         self.close_project_picker();
-        self.mode = AppMode::Search;
-        self.refresh_after_filter_change(store, engine, provider);
+        self.mode = AppMode::Filters;
+        if self.draft_project_filter != previous {
+            self.mark_filters_dirty();
+        }
     }
 
     fn commit_project_picker_filter(&mut self) {
         if self.project_picker_dirty {
-            self.project_filter = self.project_picker_selection.clone();
+            self.draft_project_filter = self.project_picker_selection.clone();
         } else if let Some(row) = self.project_picker_rows().get(self.project_picker_selected) {
             match *row {
                 ProjectPickerRow::All => {
-                    self.project_filter = None;
+                    self.draft_project_filter = None;
                 }
                 ProjectPickerRow::Project(index) => {
                     if let Some(project) = self.project_directories.get(index) {
-                        self.project_filter = Some(project.directory.clone());
+                        self.draft_project_filter = Some(project.directory.clone());
                     }
                 }
             }
@@ -1760,12 +1958,8 @@ impl App {
         self.project_picker_dirty = true;
     }
 
-    fn apply_source_picker(
-        &mut self,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
+    fn apply_source_picker(&mut self) {
+        let previous = self.draft_source_filter_selection.clone();
         self.commit_source_picker_filter();
 
         self.source_picker_query.clear();
@@ -1775,8 +1969,10 @@ impl App {
         self.source_picker_selection.clear();
         self.source_picker_dirty = false;
         self.filters_editing_source = false;
-        self.mode = AppMode::Search;
-        self.refresh_after_filter_change(store, engine, provider);
+        self.mode = AppMode::Filters;
+        if self.draft_source_filter_selection != previous {
+            self.mark_filters_dirty();
+        }
     }
 
     fn commit_source_picker_filter(&mut self) {
@@ -1785,16 +1981,16 @@ impl App {
             && self.source_picker_selection.len() > 1;
 
         if self.source_picker_dirty || confirming_existing_multi_selection {
-            self.source_filter_selection =
+            self.draft_source_filter_selection =
                 self.normalized_source_selection(&self.source_picker_selection);
         } else if let Some(row) = self.source_picker_rows().get(self.source_picker_selected) {
             match *row {
                 SourcePickerRow::All => {
-                    self.source_filter_selection.clear();
+                    self.draft_source_filter_selection.clear();
                 }
                 SourcePickerRow::Source(index) => {
                     if let Some((source_id, _)) = self.all_sources.get(index) {
-                        self.source_filter_selection = vec![source_id.clone()];
+                        self.draft_source_filter_selection = vec![source_id.clone()];
                     }
                 }
             }
@@ -1829,25 +2025,17 @@ impl App {
     }
 
     fn clear_filters(&mut self) {
-        self.source_filter_selection.clear();
-        self.project_filter = None;
-        self.time_filter = TimeRange::All;
-        self.sort_order = SortOrder::Newest;
+        let was_filtered = !self.draft_source_filter_selection.is_empty()
+            || self.draft_project_filter.is_some()
+            || self.draft_time_filter != TimeRange::All
+            || self.draft_sort_order != SortOrder::Newest;
+        self.draft_source_filter_selection.clear();
+        self.draft_project_filter = None;
+        self.draft_time_filter = TimeRange::All;
+        self.draft_sort_order = SortOrder::Newest;
         self.filter_focus = FilterFocus::Source;
-    }
-
-    fn refresh_after_filter_change(
-        &mut self,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
-        self.update_scope_metrics(store);
-        self.refresh_usage(store);
-        if self.query.is_empty() {
-            self.load_recent(store);
-        } else {
-            self.do_search(store, engine, provider);
+        if was_filtered {
+            self.mark_filters_dirty();
         }
     }
 
@@ -1922,96 +2110,109 @@ impl App {
         self.skill_audit_error = Some(format!("Skill audit unavailable: {error}"));
     }
 
-    pub fn try_search(
-        &mut self,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
+    pub fn try_search(&mut self, store: &Store, worker: &SearchWorker) {
         self.refresh_semantic_progress(store);
-        if self.embedding_init_pending {
-            self.do_search(store, engine, provider);
-            return;
-        }
         if !self.search_pending {
             return;
         }
-        if self.last_keystroke.elapsed().as_millis() < 150 {
+        if self.last_keystroke.elapsed() < Duration::from_millis(SEARCH_DEBOUNCE_MS) {
             return;
         }
         self.search_pending = false;
-        self.do_search(store, engine, provider);
-    }
+        let query = self.query.trim().to_string();
 
-    fn do_search(
-        &mut self,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
-        let query = self.query.trim();
-        if query.is_empty() {
-            self.load_recent(store);
-            return;
-        }
-
-        if !self.semantic_ready() {
-            self.run_search(store, engine, None);
-            return;
-        }
-
-        if provider.is_none() && !self.embedding_init_pending && !self.embedding_unavailable {
-            self.status_message = Some("Loading embedding model...".to_string());
-            self.embedding_init_pending = true;
-            return;
-        }
-        if self.embedding_init_pending {
-            self.embedding_init_pending = false;
-            match EmbeddingProvider::new(false) {
-                Ok(p) => {
-                    *provider = Some(p);
-                    self.embedding_unavailable = false;
-                    self.status_message = None;
-                }
-                Err(_) => {
-                    self.embedding_unavailable = true;
-                    self.status_message =
-                        Some("Semantic unavailable — using text search only".to_string());
-                }
-            }
-        }
-        let embedding = provider
-            .as_ref()
-            .and_then(|p| p.embed_query(&[query]).ok())
-            .and_then(|mut e| if e.is_empty() { None } else { Some(e.swap_remove(0)) });
-
-        self.run_search(store, engine, embedding.as_deref());
-    }
-
-    fn run_search(&mut self, store: &Store, engine: &SearchEngine, embedding: Option<&[f32]>) {
-        let query = self.query.trim();
-
-        let filters = SearchFilters {
-            sources: self.source_filter_ids(),
-            time_range: self.time_filter,
-            directory: self.project_filter.clone(),
+        let request_id = self.next_search_request_id();
+        let request = SearchRequest {
+            id: request_id,
+            query,
+            filters: self.search_filters(),
+            semantic_ready: self.semantic_ready(),
         };
 
-        match engine.hybrid_search(query, embedding, &filters, 200, 3) {
+        if worker.search(request) {
+            self.active_search_id = request_id;
+            self.search_in_flight = true;
+            self.search_feedback = Some("Searching...".to_string());
+        } else {
+            self.search_in_flight = false;
+            self.search_feedback = None;
+            self.status_message = Some("Search worker unavailable".to_string());
+        }
+    }
+
+    pub fn apply_search_response(&mut self, store: &Store, response: SearchResponse) {
+        if response.id != self.active_search_id || response.query != self.query.trim() {
+            return;
+        }
+
+        match response.result {
             Ok(mut results) => {
                 self.apply_sort(&mut results);
                 self.results = results;
                 self.selected_index = 0;
-                self.status_message = None;
+                self.panel_focus = PanelFocus::SessionList;
+                self.load_preview(store);
+
+                if response.phase == SearchPhase::Text
+                    && !response.query.is_empty()
+                    && self.semantic_ready()
+                {
+                    self.search_in_flight = true;
+                    self.search_feedback = Some("Refining semantic results...".to_string());
+                } else {
+                    self.search_in_flight = false;
+                    self.search_feedback = None;
+                }
             }
-            Err(e) => {
-                self.status_message = Some(format!("Search error: {e}"));
-                self.results.clear();
+            Err(error) => {
+                if response.phase == SearchPhase::Text {
+                    self.results.clear();
+                    self.preview_messages.clear();
+                } else {
+                    self.embedding_unavailable = true;
+                }
+                self.search_in_flight = false;
+                self.search_feedback = None;
+                self.status_message = Some(error);
             }
         }
+    }
 
+    fn next_search_request_id(&mut self) -> u64 {
+        self.search_request_id = self.search_request_id.saturating_add(1);
+        self.search_request_id
+    }
+
+    fn invalidate_active_search(&mut self) {
+        self.active_search_id = self.next_search_request_id();
+        self.search_in_flight = false;
+    }
+
+    fn search_filters(&self) -> SearchFilters {
+        SearchFilters {
+            sources: self.source_filter_ids(),
+            time_range: self.time_filter,
+            directory: self.project_filter.clone(),
+        }
+    }
+
+    fn queue_search(&mut self) {
+        self.queue_search_with_feedback("Search queued...");
+    }
+
+    fn queue_search_now(&mut self) {
+        let now = Instant::now();
+        self.last_keystroke =
+            now.checked_sub(Duration::from_millis(SEARCH_DEBOUNCE_MS)).unwrap_or(now);
+        self.search_pending = true;
+        self.search_feedback = Some("Search queued...".to_string());
         self.panel_focus = PanelFocus::SessionList;
-        self.load_preview(store);
+    }
+
+    fn queue_search_with_feedback(&mut self, feedback: &str) {
+        self.last_keystroke = Instant::now();
+        self.search_pending = true;
+        self.search_feedback = Some(feedback.to_string());
     }
 
     fn semantic_ready(&self) -> bool {
@@ -2137,6 +2338,12 @@ impl App {
         self.source_filter_selection.clear();
         self.project_filter = None;
         self.time_filter = self.config.sync_window.to_time_range();
+        self.sort_order = SortOrder::Newest;
+        self.draft_source_filter_selection = self.source_filter_selection.clone();
+        self.draft_project_filter = self.project_filter.clone();
+        self.draft_time_filter = self.time_filter;
+        self.draft_sort_order = self.sort_order;
+        self.filters_dirty = false;
     }
 
     fn reset_usage_dashboard(&mut self) {
@@ -2257,12 +2464,7 @@ impl App {
         1 + self.all_sources.len()
     }
 
-    fn update_setting(
-        &mut self,
-        store: &Store,
-        engine: &SearchEngine,
-        provider: &mut Option<EmbeddingProvider>,
-    ) {
+    fn update_setting(&mut self, store: &Store) {
         if self.settings_selected == 0 {
             self.config.sync_window = self.config.sync_window.next();
         } else if let Some((source_id, _)) = self.all_sources.get(self.settings_selected - 1) {
@@ -2292,7 +2494,7 @@ impl App {
         if self.query.is_empty() {
             self.load_recent(store);
         } else {
-            self.do_search(store, engine, provider);
+            self.queue_search_now();
         }
     }
 

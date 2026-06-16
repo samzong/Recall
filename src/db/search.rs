@@ -11,6 +11,7 @@ pub struct SearchEngine<'a> {
     conn: &'a Connection,
 }
 
+#[derive(Debug, Clone)]
 pub struct SearchFilters {
     pub sources: Option<Vec<String>>,
     pub time_range: TimeRange,

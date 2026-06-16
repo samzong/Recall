@@ -956,16 +956,22 @@ fn render_search_box(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let display_query =
-        if app.query.is_empty() { "Type to search...".to_string() } else { app.query.clone() };
-
-    let style = if app.query.is_empty() {
-        Style::default().fg(Color::DarkGray)
+    let line = if app.query.is_empty() {
+        if let Some(feedback) = app.search_feedback.as_deref() {
+            Line::from(Span::styled(feedback.to_string(), Style::default().fg(Color::Yellow)))
+        } else {
+            Line::from(Span::styled("Type to search...", Style::default().fg(Color::DarkGray)))
+        }
+    } else if let Some(feedback) = app.search_feedback.as_deref() {
+        Line::from(vec![
+            Span::styled(app.query.clone(), Style::default().fg(Color::White)),
+            Span::styled(format!("  {feedback}"), Style::default().fg(Color::Yellow)),
+        ])
     } else {
-        Style::default().fg(Color::White)
+        Line::from(Span::styled(app.query.clone(), Style::default().fg(Color::White)))
     };
 
-    let input = Paragraph::new(display_query).style(style).block(block);
+    let input = Paragraph::new(line).block(block);
     f.render_widget(input, area);
 
     if app.panel_focus == PanelFocus::SessionList {
@@ -1034,38 +1040,40 @@ fn render_filter_overview(f: &mut Frame, app: &App) {
     let mut lines = vec![Line::from("")];
     lines.push(filter_overview_line(
         "Source",
-        &app.source_filter_label(),
+        &app.draft_source_filter_label(),
         "Enter",
         app.filter_focus == FilterFocus::Source,
     ));
     lines.push(filter_overview_line(
         "Project",
-        &app.project_filter_label(),
+        &app.draft_project_filter_label(),
         "Enter",
         app.filter_focus == FilterFocus::Project,
     ));
     lines.push(filter_overview_line(
         "Time Range",
-        app.time_filter_label(),
-        "d/w/m/l",
+        app.draft_time_filter_label(),
+        "←/→",
         app.filter_focus == FilterFocus::Time,
     ));
     lines.push(filter_overview_line(
         "Sort",
-        app.sort_label(),
-        "r/n",
+        app.draft_sort_label(),
+        "←/→",
         app.filter_focus == FilterFocus::Sort,
     ));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
-        Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Enter/Space", Style::default().fg(Color::Yellow)),
-        Span::styled(" edit/toggle  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("←/→", Style::default().fg(Color::Yellow)),
+        Span::styled(" adjust  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter", Style::default().fg(Color::Yellow)),
+        Span::styled(" edit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("c", Style::default().fg(Color::Yellow)),
         Span::styled(" clear  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
-        Span::styled(" close", Style::default().fg(Color::DarkGray)),
+        Span::styled(" apply", Style::default().fg(Color::DarkGray)),
     ]));
 
     let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
