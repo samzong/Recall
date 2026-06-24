@@ -1,6 +1,6 @@
 ---
 name: recall
-description: Use Recall as a project memory layer for local AI coding session history. Trigger when Codex needs to review a project through prior agent sessions, recover historical decisions, find repeated problems or failed approaches, extract user/project preferences, inspect Claude Code/Codex/OpenCode/Cursor/etc. session evidence, or export indexed sessions as JSONL for deeper analysis.
+description: Use Recall as a project memory layer for local AI coding session history. Trigger when the user mentions recall, wants a live share link (分享会话/分享对话/分享这个对话/给我链接/share session/session link), wants to refresh or update an existing share link (更新分享链接/刷新分享/重新分享/update share link), resume or open a session, search or export sessions, review project history, recover decisions, find failed approaches, or inspect Claude Code/Codex/OpenCode/Cursor/Grok session evidence.
 ---
 
 # Recall
@@ -14,6 +14,70 @@ Use the installed `recall` command when inspecting the user's session history. I
 If `recall` is unavailable, stop the Recall workflow, tell the user it is not installed, and offer `brew install samzong/tap/recall` instead of pretending history was inspected.
 
 Recall history is evidence, not truth. Verify technical claims, code behavior, commands, paths, and invariants against the current repository before acting.
+
+## Intent Routing
+
+Pick the workflow from user intent. Do not run the full project-review scoping flow for one-shot session actions.
+
+| Intent | Example prompts | Workflow |
+| --- | --- | --- |
+| Share a live link | "分享会话", "分享这个对话", "share this session", "给我链接" | Publish Or Refresh Share Link |
+| Refresh an existing link | "用 recall 更新分享链接", "刷新分享", "重新分享", "update the share link" | Publish Or Refresh Share Link |
+| Resume or open | "继续这个会话", "resume this chat" | Session Resume/Open |
+| Find one session | "找上次讨论 migration 的会话" | Search, then `session show` |
+| Review project history | "用 recall 审查这个项目", "历史风险" | Scoping Protocol + Analysis Modes |
+
+Treat "share" and "update/refresh share link" as the same action: sync the latest transcript, publish to Pages, return the live URL.
+
+## Publish Or Refresh Share Link
+
+When the user wants to share a session or update an existing share link, execute immediately. Do not ask scoping questions. Do not use `--dry-run` unless they explicitly ask to preview or validate only.
+
+### What the user expects
+
+- "分享会话" -> a **live, openable URL** for the current conversation.
+- "用 recall 更新分享链接" -> **re-publish** the current conversation so the page reflects the latest messages. The URL usually stays the same; the deployed HTML changes.
+
+### Steps
+
+1. Infer the active source from the runtime when possible:
+   - Grok -> `grok`
+   - Cursor -> `cursor`
+   - Codex -> `codex`
+   - Claude Code -> `claude-code`
+   - OpenCode -> `opencode`
+   If the source is unclear, omit `--source` and rely on project + recency.
+
+2. Sync and resolve the session id. Always include `--sync` so share/update uses the latest messages.
+   - Current conversation (default):
+     ```bash
+     recall session list --project /absolute/project/path --source <source> --limit 1 --sort updated --sync --format json
+     ```
+   - Named or older session: add `--query "<keywords>"` and/or `--time 7d`, still prefer `--sort updated`.
+   - Explicit id from the user: skip list and use that id directly.
+
+3. Publish for real. This is mandatory for share/update requests:
+   ```bash
+   recall session share --id <recall-session-id> --format json
+   ```
+   Never stop at `--dry-run` for these requests. Dry-run only computes a future URL locally and leaves the live page at 404 or stale.
+   Progress text goes to stderr; read the URL from stdout JSON at `share.url`.
+   Add `--copy-url` when they ask to copy it; add `--open` when they ask to open it.
+
+4. Reply in this shape:
+   ```text
+   <url>
+
+   <one-line context: title, source, and whether this was a fresh share or refreshed publish>
+   ```
+   Do not dump raw JSON unless debugging.
+
+### Failure handling
+
+- If sharing fails because Pages is not configured, tell the user to run `recall share init` once, then retry publish.
+- If publish succeeds but the URL still 404s, rerun step 3 without `--dry-run` and report that redeploy finished.
+
+Sharing publishes session content to the configured share target. Warn briefly if the session may contain secrets.
 
 ## Scoping Protocol
 
@@ -128,7 +192,8 @@ recall export --project /absolute/project/path --source codex --time 30d --limit
 recall session list --project /absolute/project/path --limit 20 --format json
 recall session show --id <session-id> --format json --include metadata,messages,usage,events
 recall session export --id <session-id> --format jsonl
-recall session share --id <session-id> --dry-run --format json
+recall session share --id <session-id> --format json
+recall session share --id <session-id> --dry-run --format json  # preview only; never use for share/update requests
 recall session resume --id <session-id> --print-command
 recall import recall-export.jsonl --dry-run
 recall import recall-export.jsonl
@@ -170,6 +235,8 @@ Do not use these as the primary workflow for analysis:
 
 - `recall` with no subcommand: launches the TUI.
 - `recall usage` without `--json`: launches a dashboard flow.
+- `recall session share --dry-run` when the user asked to share, update, or refresh a link.
+- Returning a URL without running `recall session share` (no `--dry-run`).
 - Resume or app-launch behavior from the TUI: it opens another interactive session and has side effects.
 - Hidden commands such as `__bench-*` or `__background-worker`: internal or development-only.
 - Raw source transcript paths: use the public export unless the user explicitly asks for source-level forensics.
