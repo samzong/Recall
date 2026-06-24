@@ -27,6 +27,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.2"
 fs2 = "0.4"
+pulldown-cmark = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10", features = ["metal"] }

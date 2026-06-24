@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html};
 use serde_json::Value;
 
 use crate::config::{AppConfig, ShareConfig};
@@ -14,7 +15,7 @@ const PROVIDER_CLOUDFLARE_PAGES: &str = "cloudflare-pages";
 const PAGES_PROJECT_NAME_FIELD: &str = "Project Name";
 const PAGES_PROJECT_DOMAINS_FIELD: &str = "Project Domains";
 const MAX_PAGES_ASSET_BYTES: usize = 25 * 1024 * 1024;
-const HEADERS: &str = "/*\n  X-Robots-Tag: noindex, nofollow\n  X-Frame-Options: DENY\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: no-referrer\n";
+const HEADERS: &str = "/*\n  X-Robots-Tag: noindex, nofollow\n  X-Frame-Options: DENY\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: no-referrer\n  Cache-Control: no-store\n";
 const ROBOTS: &str = "User-agent: *\nDisallow: /\n";
 
 #[derive(Debug, Clone)]
@@ -30,80 +31,178 @@ pub struct SharePreview {
 }
 
 const SESSION_PAGE_CSS: &str = r#"
-:root {
-  --page-bg: #F5F5F7;
-  --content-bg: #FFFFFF;
-  --text-primary: #1D1D1F;
-  --text-secondary: #86868B;
-  --user-block-bg: #FFF3D6;
-  --user-block-border: rgba(255, 149, 0, 0.22);
-  --user-block-accent: #FF9500;
-  --log-border: #E5E5EA;
-  --layout-width: 1040px;
-  --code-bg: #1E1E1E;
-  --code-text: #F5F5F7;
-  --border-radius: 12px;
-  --read-width: 700px;
-  --font-system: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
-  --font-mono: "SF Mono", Menlo, monospace;
+:root{
+  --page-bg:#FAF9F6;--surface:#FFFFFF;--user-surface:#FFFFFF;
+  --text-primary:#23211C;--text-secondary:#6C685F;--text-tertiary:#9A958A;
+  --accent:#3C4FA0;--accent-soft:rgba(60,79,160,.09);
+  --rule:rgba(35,33,28,.10);--rule-strong:rgba(35,33,28,.16);
+  --code-bg:#F4F2EC;--tool-bg:rgba(35,33,28,.028);
+  --read-width:716px;--layout-width:1100px;
+  --font-serif:"Newsreader",Georgia,"Times New Roman","Songti SC","STSong","Source Han Serif SC","Noto Serif CJK SC",SimSun,serif;
+  --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+  --font-mono:"JetBrains Mono","SF Mono",Menlo,"PingFang SC","Microsoft YaHei",monospace;
 }
 *,*::before,*::after{box-sizing:border-box}
-body{margin:0;overflow-x:hidden;background:var(--page-bg);color:var(--text-primary);font:15px/1.65 var(--font-system);-webkit-font-smoothing:antialiased}
-.site-header{position:sticky;top:0;z-index:10;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);background:rgba(255,255,255,.72);border-bottom:1px solid rgba(0,0,0,.05)}
-.site-header-inner{max-width:var(--layout-width);margin:0 auto;padding:22px 24px 18px}
-.site-header h1{margin:0 0 6px;font-size:22px;font-weight:600;line-height:1.3;letter-spacing:-.02em;color:var(--text-primary)}
-.meta{margin:0;color:var(--text-secondary);font-size:13px;line-height:1.5}
-.layout{display:flex;align-items:flex-start;justify-content:center;gap:36px;max-width:var(--layout-width);margin:0 auto;padding:28px 24px 64px}
-.page{flex:0 1 var(--read-width);min-width:0;padding:0;margin:0}
-.document{min-width:0;background:var(--content-bg);border-radius:var(--border-radius);padding:40px 36px 52px}
-.user-toc{flex:0 0 220px;position:sticky;top:88px;max-height:calc(100vh - 104px);overflow-y:auto;padding:4px 0 12px}
-.user-toc-title{margin:0 0 12px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-secondary)}
-.user-toc nav{display:flex;flex-direction:column;gap:2px}
-.user-toc a{display:block;padding:7px 10px;border-left:2px solid transparent;border-radius:0 8px 8px 0;color:var(--text-secondary);font-size:12px;line-height:1.45;text-decoration:none;transition:color .15s ease,background .15s ease,border-color .15s ease}
-.user-toc a:hover{color:var(--text-primary);background:rgba(0,0,0,.03);border-left-color:var(--user-block-accent)}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{margin:0;background:var(--page-bg);color:var(--text-primary);font:16px/1.6 var(--font-sans);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+
+.site-header{position:sticky;top:0;z-index:10;backdrop-filter:saturate(140%) blur(16px);-webkit-backdrop-filter:saturate(140%) blur(16px);background:rgba(250,249,246,.82);border-bottom:1px solid var(--rule)}
+.site-header-inner{max-width:var(--layout-width);margin:0 auto;padding:18px 32px 16px}
+.site-header h1{margin:0;max-width:var(--read-width);font:600 29px/1.22 var(--font-serif);letter-spacing:-.01em;color:var(--text-primary)}
+.meta{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:13px 0 2px;color:var(--text-secondary);font-size:13px}
+.meta-item{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.meta-sep{width:3px;height:3px;border-radius:50%;background:var(--text-tertiary);opacity:.7}
+.meta-tags{display:inline-flex;flex-wrap:wrap;gap:6px}
+.meta-tag{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border:1px solid var(--rule);border-radius:999px;background:var(--surface);font:500 11.5px/1.5 var(--font-mono);color:var(--text-secondary)}
+.meta-tag b{font-weight:500;color:var(--text-primary)}
+
+.layout{display:grid;grid-template-columns:minmax(0,var(--read-width)) 212px;grid-template-areas:"page toc";justify-content:center;gap:64px;max-width:var(--layout-width);margin:0 auto;padding:40px 32px 28px}
+.page{grid-area:page;min-width:0}
+.document{min-width:0}
+
+.user-toc{grid-area:toc;position:sticky;top:50vh;transform:translateY(-50%);align-self:start;max-height:80vh;display:flex;flex-direction:column;align-items:flex-end;gap:4px;padding:4px 0;z-index:5}
+.user-toc-title{margin:0 3px 4px 0;font:600 10px/1 var(--font-sans);letter-spacing:.12em;text-transform:uppercase;color:var(--text-tertiary);opacity:0;transform:translateX(4px);transition:opacity .16s ease,transform .16s ease}
+.user-toc:hover .user-toc-title{opacity:1;transform:none}
+.toc-nav-btn{display:flex;align-items:center;justify-content:center;width:26px;height:20px;margin-right:-3px;border:0;background:none;color:var(--text-tertiary);cursor:pointer;border-radius:6px;transition:color .15s,background .15s}
+.toc-nav-btn:hover{color:var(--accent);background:var(--accent-soft)}
+.toc-nav-btn svg{width:13px;height:13px}
+.toc-ticks{display:flex;flex-direction:column;gap:3px;width:100%;align-items:flex-end}
+.tick{display:flex;align-items:center;justify-content:flex-end;gap:9px;height:22px;padding:0 3px 0 8px;text-decoration:none;border-radius:7px;color:var(--text-secondary);transition:background .14s}
+.tick-label{display:flex;align-items:baseline;justify-content:flex-end;gap:9px;max-width:0;opacity:0;overflow:hidden;white-space:nowrap;transition:max-width .22s ease,opacity .16s ease}
+.user-toc:hover .tick-label{max-width:165px;opacity:1}
+.tick-n{flex:none;font:500 10.5px/1.5 var(--font-mono);color:var(--text-tertiary)}
+.tick-t{font-size:12px;line-height:1.35;color:inherit;overflow:hidden;text-overflow:ellipsis}
+.tick-line{flex:none;width:18px;height:2px;border-radius:2px;background:var(--rule-strong);transition:width .2s ease,background .2s ease}
+.tick.active .tick-line{width:30px;background:var(--accent)}
+.user-toc:hover .tick.active .tick-line{width:24px}
+.tick:hover{background:var(--accent-soft)}
+.tick:hover .tick-t,.tick:hover .tick-n{color:var(--text-primary)}
+.tick.active .tick-t{color:var(--text-primary);font-weight:500}
+.tick.active .tick-n{color:var(--accent)}
+
 .turn{margin:0}
-.turn.user{scroll-margin-top:96px}
-.role-label{display:block;margin:0 0 10px;font-size:12px;font-weight:500;letter-spacing:.02em;color:var(--text-secondary)}
-.turn.user .role-label{color:#B25000}
-.turn.assistant .role-label{color:#5856D6}
-.turn.user:not(:first-child){margin-top:48px;padding-top:36px;border-top:1px solid var(--log-border)}
-.turn.assistant{margin-top:24px}
-.turn.user+.turn.assistant{margin-top:20px}
-.user-block{min-width:0;max-width:100%;background:var(--user-block-bg);border-radius:var(--border-radius);padding:16px 20px;border:1px solid var(--user-block-border);box-shadow:inset 3px 0 0 var(--user-block-accent)}
-.assistant-body{min-width:0;max-width:100%;color:var(--text-primary);font-size:16px}
+.turn.user{scroll-margin-top:128px}
+.turn.user+.turn.assistant,.turn.assistant{margin-top:20px}
+.turn.user:not(:first-child){margin-top:44px}
+.role-label{display:inline-flex;align-items:center;gap:7px;margin:0 0 11px;font:600 11px/1 var(--font-sans);letter-spacing:.09em;text-transform:uppercase}
+.role-label::before{content:"";width:14px;height:1px;background:currentColor;opacity:.5}
+.turn.user .role-label{color:var(--text-tertiary)}
+.turn.assistant .role-label{color:var(--accent)}
+
+.user-block{min-width:0;background:var(--user-surface);border:1px solid var(--rule);border-left:3px solid var(--rule-strong);border-radius:4px 10px 10px 4px;padding:15px 18px;box-shadow:0 1px 2px rgba(35,33,28,.04)}
+.user-block .prose{font-family:var(--font-sans);font-size:15.5px;line-height:1.62;color:var(--text-primary)}
+
+.assistant-body{min-width:0;max-width:100%;color:var(--text-primary)}
+.assistant-body>.prose+.prose{margin-top:.7em}
+.assistant-body .prose{font:18px/1.72 var(--font-serif)}
+.assistant-body .tool-run{margin:1.25em 0}
 .prose{min-width:0;max-width:100%;overflow-wrap:anywhere;word-break:break-word}
-.assistant-body .tool-run{margin:1.4em 0}
-.tool-group{margin:0;color:var(--text-secondary);font-size:13px;line-height:1.5}
-.tool-group>summary{cursor:pointer;list-style:none;color:var(--text-secondary);padding:2px 0}
-.tool-group>summary::-webkit-details-marker{display:none}
-.tool-group>summary::before{content:"▸ ";display:inline-block;transition:transform .15s ease}
-.tool-group[open]>summary::before{transform:rotate(90deg)}
-.tool-group-items{margin:8px 0 0;padding:0 0 0 8px}
-.prose p{margin:0 0 1.2em}
+.prose p{margin:0 0 .8em;text-wrap:pretty}
 .prose p:last-child{margin-bottom:0}
-.prose h2,.prose h3{margin:1.4em 0 .6em;font-weight:600;line-height:1.35;letter-spacing:-.02em;color:var(--text-primary)}
-.prose h2{font-size:19px}
-.prose h3{font-size:17px}
-.prose ul{margin:0 0 1.2em;padding-left:1.4em}
-.prose li{margin:0 0 .45em}
+.prose h1,.prose h2,.prose h3,.prose h4{font-family:var(--font-serif);font-weight:600;line-height:1.3;letter-spacing:-.01em;color:var(--text-primary)}
+.prose h1{margin:1.5em 0 .5em;font-size:25px}
+.prose h2{margin:1.5em 0 .5em;font-size:23px}
+.prose h3{margin:1.3em 0 .4em;font-size:19px}
+.prose h4{margin:1.3em 0 .4em;font-size:16px}
+.prose ul,.prose ol{margin:0 0 .9em;padding-left:1.25em}
+.prose li{margin:0 0 .4em}
+.prose li>p{margin:.35em 0}
+.prose li::marker{color:var(--text-tertiary)}
 .prose strong{font-weight:600}
-.prose code{font:13px/1.5 var(--font-mono);background:var(--user-block-bg);border-radius:4px;padding:2px 6px;color:var(--text-primary)}
-pre.code-block,pre.preformatted{margin:1.2em 0;padding:16px;border-radius:8px;font:13px/1.55 var(--font-mono);overflow-x:auto;white-space:pre;word-break:normal;max-width:100%}
-pre.code-block{background:var(--code-bg);color:var(--code-text)}
-pre.preformatted{background:rgba(0,0,0,.04);color:var(--text-primary)}
-.tool-run{margin:1.2em 0;padding:10px 0 10px 14px;border-left:3px solid var(--log-border)}
+.prose em{font-style:italic}
+.prose del{color:var(--text-secondary)}
+.prose a{color:var(--accent);text-decoration:none;border-bottom:1px solid var(--accent-soft)}
+.prose a:hover{border-bottom-color:var(--accent)}
+.prose blockquote{margin:1em 0;padding:.2em 0 .2em 14px;border-left:3px solid var(--rule-strong);color:var(--text-secondary)}
+.prose blockquote p{margin:.45em 0}
+.prose hr{border:0;border-top:1px solid var(--rule);margin:1.4em 0}
+.prose table{width:100%;border-collapse:collapse;margin:1em 0;font-size:14px;line-height:1.45;display:block;overflow-x:auto}
+.prose th,.prose td{border:1px solid var(--rule);padding:7px 9px;text-align:left;vertical-align:top}
+.prose th{background:var(--code-bg);font-weight:600}
+.prose input[type="checkbox"]{width:14px;height:14px;margin:0 .45em 0 0;vertical-align:-2px}
+.prose code{font:.86em/1.5 var(--font-mono);background:var(--accent-soft);border-radius:5px;padding:1.5px 5px;color:#39406b}
+
+pre.code-block,pre.preformatted,.prose pre{margin:1.1em 0;padding:15px 17px;border:1px solid var(--rule);border-radius:10px;font:13px/1.62 var(--font-mono);overflow-x:auto;white-space:pre;word-break:normal;max-width:100%;color:var(--text-primary)}
+pre.code-block{background:var(--code-bg)}
+pre.code-block code,.prose pre code{background:transparent;border-radius:0;padding:0;color:inherit;font:inherit}
+pre.preformatted{background:var(--surface);color:var(--text-secondary)}
+
+.tool-run{margin:1.25em 0;padding:6px 4px 6px 16px;border-left:2px solid var(--rule)}
 .tool-run .tool-group{border-left:0;padding:0;margin:0}
-.tool-run .log,.tool-group-items .log{margin:0 0 6px;padding:0 0 0 10px;border-left:2px solid var(--log-border)}
-.tool-run .log:last-child,.tool-group-items .log:last-child{margin-bottom:0}
-.empty{margin:0;color:var(--text-secondary);font-size:15px;line-height:1.65}
-@media (max-width:960px){.layout{display:block;padding:28px 20px 64px}.user-toc{display:none}}
-.log{margin:1em 0;padding:0 0 0 14px;border-left:3px solid var(--log-border);color:var(--text-secondary);font-size:13px;line-height:1.5}
-.log summary{cursor:pointer;list-style:none;color:var(--text-secondary)}
+.tool-group{margin:0;color:var(--text-secondary);font-size:13px;line-height:1.5}
+.tool-group>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;padding:3px 0;font:500 12.5px/1.4 var(--font-sans);color:var(--text-secondary)}
+.tool-group>summary::-webkit-details-marker{display:none}
+.tool-group>summary .chev,.log summary .chev{flex:none;width:14px;height:14px;color:var(--text-tertiary);transition:transform .15s}
+.tool-group[open]>summary .chev,.log[open] summary .chev{transform:rotate(90deg)}
+.tool-group>summary .count{margin-left:2px;padding:1px 7px;border-radius:999px;background:var(--accent-soft);font:500 11px/1.5 var(--font-mono);color:var(--accent)}
+.tool-group-items{margin:7px 0 0;padding:0 0 0 6px;display:flex;flex-direction:column;gap:2px}
+
+.log{margin:.6em 0;color:var(--text-secondary);font-size:13px;line-height:1.5}
+.tool-run .log,.tool-group-items .log{margin:0}
+.log summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;padding:5px 9px;border-radius:7px;font:500 12.5px/1.4 var(--font-sans);color:var(--text-secondary);transition:background .12s}
+.log summary:hover{background:var(--tool-bg)}
 .log summary::-webkit-details-marker{display:none}
-.log summary::before{content:"▸ ";display:inline-block;transition:transform .15s ease}
-.log[open] summary::before{transform:rotate(90deg)}
-.log pre{margin:8px 0 0;padding:0;background:transparent;border:0;color:var(--text-secondary);font:13px/1.5 var(--font-mono);white-space:pre-wrap;word-break:break-word}
+.log summary .badge{flex:none;font:500 10px/1.5 var(--font-mono);letter-spacing:.04em;text-transform:uppercase;padding:1px 7px;border-radius:5px;background:var(--tool-bg);color:var(--text-tertiary)}
+.log summary .lname{font-family:var(--font-mono);font-size:12px;color:var(--text-primary)}
+.log[open] summary{color:var(--text-primary)}
+.log pre{margin:6px 0 4px;padding:11px 13px;background:var(--tool-bg);border:1px solid var(--rule);border-radius:8px;color:var(--text-secondary);font:12px/1.55 var(--font-mono);white-space:pre-wrap;word-break:break-word;overflow-x:auto}
+
+.empty{margin:0;color:var(--text-secondary);font:18px/1.65 var(--font-serif)}
+
+.site-footer{max-width:var(--layout-width);margin:0 auto;padding:22px 32px 60px}
+.site-footer-inner{max-width:var(--read-width);margin-left:auto;margin-right:auto;display:flex;align-items:center;justify-content:center;gap:10px;padding-top:22px;border-top:1px solid var(--rule);color:var(--text-tertiary);font-size:12.5px}
+.site-footer .brand-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.site-footer b{font-weight:600;color:var(--text-secondary)}
+
+@media (max-width:980px){
+  .site-header-inner{padding:16px 20px 14px}
+  .layout{display:block;padding:28px 20px 24px}
+  .user-toc{display:none}
+  .site-footer{padding:18px 20px 56px}
+  .assistant-body .prose{font-size:17px}
+}
 "#;
+
+const CHEVRON_SVG: &str = "<svg class=\"chev\" viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\"><path d=\"M6 4l4 4-4 4\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
+
+const TOC_NAV_SCRIPT: &str = r#"<script>
+(function(){
+  function setup(){
+    var sections = Array.prototype.slice.call(document.querySelectorAll('.turn.user'));
+    var ticks = Array.prototype.slice.call(document.querySelectorAll('.tick'));
+    if(!sections.length || !ticks.length) return;
+    var tickFor = {};
+    ticks.forEach(function(t){ var h=t.getAttribute('href'); if(h) tickFor[h.slice(1)]=t; });
+    var activeId = sections[0].id, offset = 150;
+    function compute(){
+      var cur = sections[0].id;
+      for(var i=0;i<sections.length;i++){
+        if(sections[i].getBoundingClientRect().top - offset <= 0) cur = sections[i].id; else break;
+      }
+      activeId = cur;
+      ticks.forEach(function(t){ t.classList.remove('active'); });
+      if(tickFor[cur]) tickFor[cur].classList.add('active');
+    }
+    var ticking = false;
+    window.addEventListener('scroll', function(){
+      if(ticking) return; ticking = true;
+      requestAnimationFrame(function(){ compute(); ticking = false; });
+    }, { passive:true });
+    compute();
+    function go(dir){
+      var idx = sections.map(function(s){return s.id;}).indexOf(activeId);
+      var n = Math.max(0, Math.min(sections.length-1, idx+dir));
+      var top = sections[n].getBoundingClientRect().top + window.scrollY - 120;
+      window.scrollTo({ top: top, behavior: 'smooth' });
+    }
+    var up = document.querySelector('.toc-up'), down = document.querySelector('.toc-down');
+    if(up) up.addEventListener('click', function(){ go(-1); });
+    if(down) down.addEventListener('click', function(){ go(1); });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', setup);
+  else setup();
+})();
+</script>"#;
 
 pub fn default_project_name() -> String {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -338,6 +437,10 @@ pub fn render_session_html(
     out.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
     out.push_str("<meta name=\"robots\" content=\"noindex,nofollow\">");
+    out.push_str("<link rel=\"icon\" href=\"data:,\">");
+    out.push_str("<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">");
+    out.push_str("<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>");
+    out.push_str("<link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=JetBrains+Mono:wght@400;500&display=swap\">");
     out.push_str("<title>");
     out.push_str(&escape_html(&display_title));
     out.push_str("</title><style>");
@@ -345,15 +448,15 @@ pub fn render_session_html(
     out.push_str("</style></head><body>");
     out.push_str("<header class=\"site-header\"><div class=\"site-header-inner\"><h1>");
     out.push_str(&escape_html(&display_title));
-    out.push_str("</h1><p class=\"meta\">");
+    out.push_str("</h1><div class=\"meta\"><span class=\"meta-item\">");
     out.push_str(&escape_html(&format_source_label(&session.source)));
-    out.push_str(" · ");
+    out.push_str("</span><span class=\"meta-sep\"></span><span class=\"meta-item\">");
     out.push_str(&escape_html(&format_started_at(session.started_at)));
-    out.push_str(" · ");
+    out.push_str("</span><span class=\"meta-sep\"></span><span class=\"meta-item\">");
     out.push_str(&messages.len().to_string());
-    out.push_str(" messages");
+    out.push_str(" messages</span>");
     append_header_display_meta(&mut out, display_meta);
-    out.push_str("</p></div></header>");
+    out.push_str("</div></div></header>");
     out.push_str("<div class=\"layout\"><div class=\"page\"><article class=\"document\">");
     if blocks.is_empty() {
         out.push_str("<p class=\"empty\">No messages in this session.</p>");
@@ -370,7 +473,12 @@ pub fn render_session_html(
     }
     out.push_str("</article></div>");
     render_user_toc(&mut out, &user_toc);
-    out.push_str("</div></body></html>");
+    out.push_str("</div>");
+    out.push_str("<footer class=\"site-footer\"><div class=\"site-footer-inner\">");
+    out.push_str("<span class=\"brand-dot\"></span><span>Published with <b>Recall</b></span>");
+    out.push_str("</div></footer>");
+    out.push_str(TOC_NAV_SCRIPT);
+    out.push_str("</body></html>");
     out
 }
 
@@ -402,8 +510,10 @@ fn prepare_render_blocks(messages: &[Message]) -> Vec<RenderBlock> {
 
     for message in messages {
         match message.role {
+            Role::User if !pending_tools.is_empty() => {
+                pending_tools.push(message.content.clone());
+            }
             Role::User => {
-                attach_tools(&mut blocks, &mut pending_tools);
                 blocks.push(RenderBlock::User(message.content.clone()));
             }
             Role::Assistant if is_tool_message(&message.content) => {
@@ -412,7 +522,7 @@ fn prepare_render_blocks(messages: &[Message]) -> Vec<RenderBlock> {
             Role::Assistant => {
                 attach_tools(&mut blocks, &mut pending_tools);
                 if let Some(RenderBlock::Assistant(segments)) = blocks.last_mut() {
-                    segments.push(AssistantSegment::Text(message.content.clone()));
+                    append_assistant_text_segment(segments, message.content.clone());
                 } else {
                     blocks.push(RenderBlock::Assistant(vec![AssistantSegment::Text(
                         message.content.clone(),
@@ -423,6 +533,24 @@ fn prepare_render_blocks(messages: &[Message]) -> Vec<RenderBlock> {
     }
     attach_tools(&mut blocks, &mut pending_tools);
     blocks
+}
+
+fn append_assistant_text_segment(segments: &mut Vec<AssistantSegment>, content: String) {
+    if let Some(AssistantSegment::Text(previous)) = segments.last_mut() {
+        let previous_core = assistant_text_core(previous);
+        let content_core = assistant_text_core(&content);
+        if !previous_core.is_empty() && previous_core == content_core {
+            if content.contains("<oai-mem-citation>") && !previous.contains("<oai-mem-citation>") {
+                *previous = content;
+            }
+            return;
+        }
+    }
+    segments.push(AssistantSegment::Text(content));
+}
+
+fn assistant_text_core(text: &str) -> &str {
+    text.split("<oai-mem-citation>").next().unwrap_or(text).trim()
 }
 
 fn collect_user_toc(blocks: &[RenderBlock]) -> Vec<(usize, String)> {
@@ -442,15 +570,27 @@ fn render_user_toc(out: &mut String, entries: &[(usize, String)]) {
     if entries.is_empty() {
         return;
     }
-    out.push_str("<aside class=\"user-toc\"><p class=\"user-toc-title\">User messages</p><nav>");
+    out.push_str(
+        "<aside class=\"user-toc\" aria-label=\"Questions in this conversation\"><p class=\"user-toc-title\">Questions</p>",
+    );
+    out.push_str(
+        "<button type=\"button\" class=\"toc-nav-btn toc-up\" aria-label=\"Previous question\"><svg viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\"><path d=\"M4 10l4-4 4 4\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg></button>",
+    );
+    out.push_str("<nav class=\"toc-ticks\">");
     for (index, label) in entries {
-        out.push_str("<a href=\"#user-");
+        out.push_str("<a class=\"tick\" href=\"#user-");
         out.push_str(&index.to_string());
-        out.push_str("\">");
-        out.push_str(&escape_html(&format!("{index}. {label}")));
-        out.push_str("</a>");
+        out.push_str("\"><span class=\"tick-label\"><span class=\"tick-n\">");
+        out.push_str(&format!("{index:02}"));
+        out.push_str("</span><span class=\"tick-t\">");
+        out.push_str(&escape_html(label));
+        out.push_str("</span></span><span class=\"tick-line\"></span></a>");
     }
-    out.push_str("</nav></aside>");
+    out.push_str("</nav>");
+    out.push_str(
+        "<button type=\"button\" class=\"toc-nav-btn toc-down\" aria-label=\"Next question\"><svg viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\"><path d=\"M4 6l4 4 4-4\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg></button>",
+    );
+    out.push_str("</aside>");
 }
 
 fn render_block_html(out: &mut String, block: RenderBlock, user_index: Option<usize>) {
@@ -496,8 +636,21 @@ fn render_content(out: &mut String, text: &str) {
         pending.clear();
     };
 
-    for line in text.lines() {
-        let sanitized = utils::sanitize_line(line);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let sanitized = utils::sanitize_line(lines[index]);
+        if is_oai_mem_citation_start(&sanitized) {
+            if !prose.trim().is_empty() {
+                render_markdown_text(out, &prose);
+                prose.clear();
+            }
+            let (citation, next_index) = collect_oai_mem_citation(&lines, index);
+            pending_logs.push(citation);
+            rendered = true;
+            index = next_index;
+            continue;
+        }
         if is_log_line(&sanitized) {
             if !prose.trim().is_empty() {
                 render_markdown_text(out, &prose);
@@ -512,6 +665,7 @@ fn render_content(out: &mut String, text: &str) {
             }
             prose.push_str(&sanitized);
         }
+        index += 1;
     }
     flush_logs(out, &mut pending_logs);
     if !prose.trim().is_empty() {
@@ -524,105 +678,180 @@ fn render_content(out: &mut String, text: &str) {
     out.push_str("</div>");
 }
 
+fn is_oai_mem_citation_start(line: &str) -> bool {
+    line.trim_start().starts_with("<oai-mem-citation>")
+}
+
+fn collect_oai_mem_citation(lines: &[&str], start: usize) -> (String, usize) {
+    let mut block = Vec::new();
+    let mut index = start;
+    while index < lines.len() {
+        let sanitized = utils::sanitize_line(lines[index]);
+        let is_end = sanitized.trim_end().ends_with("</oai-mem-citation>");
+        block.push(sanitized);
+        index += 1;
+        if is_end {
+            break;
+        }
+    }
+    (block.join("\n"), index)
+}
+
 fn render_markdown_text(out: &mut String, text: &str) {
-    for fragment in split_text_fragments(text.trim()) {
+    for fragment in split_markdown_fragments(text.trim()) {
         match fragment {
-            TextFragment::Prose(prose) => render_markdown_blocks(out, &prose),
-            TextFragment::Code(code) => render_code_block(out, &code),
+            MarkdownFragment::Markdown(markdown) => render_markdown_blocks(out, &markdown),
+            MarkdownFragment::Preformatted(lines) => render_preformatted_block(out, &lines),
         }
     }
 }
 
 fn render_markdown_blocks(out: &mut String, text: &str) {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index].trim_end();
-        if line.trim().is_empty() {
-            index += 1;
-            continue;
-        }
-        if let Some(stripped) = line.strip_prefix("### ") {
-            out.push_str("<h3>");
-            render_inline_markup(out, stripped.trim());
-            out.push_str("</h3>");
-            index += 1;
-            continue;
-        }
-        if let Some(stripped) = line.strip_prefix("## ") {
-            out.push_str("<h2>");
-            render_inline_markup(out, stripped.trim());
-            out.push_str("</h2>");
-            index += 1;
-            continue;
-        }
-        if is_list_marker_line(line) {
-            out.push_str("<ul>");
-            while index < lines.len() && is_list_marker_line(lines[index]) {
-                out.push_str("<li>");
-                render_inline_markup(out, list_marker_text(lines[index]));
-                out.push_str("</li>");
-                index += 1;
-            }
-            out.push_str("</ul>");
-            continue;
-        }
-        let mut paragraph = String::new();
-        while index < lines.len() {
-            let current = lines[index].trim_end();
-            if current.trim().is_empty()
-                || current.starts_with("### ")
-                || current.starts_with("## ")
-                || is_list_marker_line(current)
-            {
-                break;
-            }
-            if is_preformatted_line(current) {
-                if !paragraph.is_empty() {
-                    out.push_str("<p>");
-                    render_inline_markup(out, paragraph.trim());
-                    out.push_str("</p>");
-                    paragraph.clear();
+    let mut events = Vec::new();
+    let mut unsafe_link_depth = 0usize;
+    let mut dropped_image_depth = 0usize;
+    let mut code_block: Option<Option<String>> = None;
+    let mut code = String::new();
+    for event in Parser::new_ext(text, markdown_options()) {
+        if let Some(language) = code_block.as_ref() {
+            match event {
+                Event::End(TagEnd::CodeBlock) => {
+                    events.push(trusted_html_event(render_code_block_html(
+                        &code,
+                        language.as_deref(),
+                    )));
+                    code.clear();
+                    code_block = None;
                 }
-                let start = index;
-                while index < lines.len() && is_preformatted_line(lines[index]) {
-                    index += 1;
-                }
-                render_preformatted_block(out, &lines[start..index]);
-                continue;
+                Event::Text(value)
+                | Event::Code(value)
+                | Event::Html(value)
+                | Event::InlineHtml(value)
+                | Event::InlineMath(value)
+                | Event::DisplayMath(value) => code.push_str(&value),
+                Event::SoftBreak | Event::HardBreak => code.push('\n'),
+                _ => {}
             }
-            if !paragraph.is_empty() {
-                paragraph.push('\n');
-            }
-            paragraph.push_str(current);
-            index += 1;
+            continue;
         }
-        if !paragraph.is_empty() {
-            out.push_str("<p>");
-            render_inline_markup(out, paragraph.trim());
-            out.push_str("</p>");
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                code_block = Some(code_block_language(kind));
+            }
+            Event::Start(Tag::Link { dest_url, .. }) if !is_safe_markdown_link(&dest_url) => {
+                unsafe_link_depth += 1;
+            }
+            Event::End(TagEnd::Link) if unsafe_link_depth > 0 => {
+                unsafe_link_depth -= 1;
+            }
+            Event::Start(Tag::Image { .. }) => {
+                dropped_image_depth += 1;
+            }
+            Event::End(TagEnd::Image) if dropped_image_depth > 0 => {
+                dropped_image_depth -= 1;
+            }
+            Event::Html(raw) | Event::InlineHtml(raw) => {
+                events.push(Event::Text(raw.into_static()));
+            }
+            other => events.push(other.into_static()),
+        }
+    }
+    if let Some(language) = code_block.take() {
+        events.push(trusted_html_event(render_code_block_html(&code, language.as_deref())));
+    }
+    html::push_html(out, events.into_iter());
+}
+
+fn markdown_options() -> Options {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_GFM);
+    options
+}
+
+fn trusted_html_event(value: String) -> Event<'static> {
+    Event::Html(CowStr::Boxed(value.into_boxed_str()))
+}
+
+fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {
+    match kind {
+        CodeBlockKind::Indented => None,
+        CodeBlockKind::Fenced(info) => {
+            let language = info.split_whitespace().next().unwrap_or("").trim();
+            if is_fence_language_tag(language) { Some(language.to_string()) } else { None }
         }
     }
 }
 
-fn is_preformatted_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return false;
+fn render_code_block_html(text: &str, language: Option<&str>) -> String {
+    let code = dedent_code_block(text);
+    let mut out = String::new();
+    out.push_str("<pre class=\"code-block\"><code");
+    if let Some(language) = language {
+        out.push_str(" class=\"language-");
+        out.push_str(&escape_html(language));
+        out.push('"');
     }
-    if trimmed
-        .chars()
-        .any(|ch| matches!(ch, '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼' | '│' | '─'))
+    out.push('>');
+    out.push_str(&escape_html(&code));
+    out.push_str("</code></pre>");
+    out
+}
+
+fn is_safe_markdown_link(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
     {
         return true;
     }
-    if trimmed.starts_with('|') && trimmed.contains('|') {
+    let Some((scheme, _)) = trimmed.split_once(':') else {
         return true;
-    }
-    trimmed.len() >= 16 && trimmed.chars().all(|ch| matches!(ch, '-' | '=' | '|' | ':' | ' ' | '+'))
+    };
+    matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https" | "mailto")
 }
 
-fn render_preformatted_block(out: &mut String, lines: &[&str]) {
+fn split_markdown_fragments(text: &str) -> Vec<MarkdownFragment> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut fragments = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        if is_preformatted_line(lines[index]) {
+            let start = index;
+            while index < lines.len() && is_preformatted_line(lines[index]) {
+                index += 1;
+            }
+            fragments.push(MarkdownFragment::Preformatted(
+                lines[start..index].iter().map(|line| (*line).to_string()).collect(),
+            ));
+            continue;
+        }
+        let start = index;
+        while index < lines.len() && !is_preformatted_line(lines[index]) {
+            index += 1;
+        }
+        let markdown = lines[start..index].join("\n");
+        if !markdown.trim().is_empty() {
+            fragments.push(MarkdownFragment::Markdown(markdown));
+        }
+    }
+    if fragments.is_empty() && !text.is_empty() {
+        fragments.push(MarkdownFragment::Markdown(text.to_string()));
+    }
+    fragments
+}
+
+enum MarkdownFragment {
+    Markdown(String),
+    Preformatted(Vec<String>),
+}
+
+fn render_preformatted_block(out: &mut String, lines: &[String]) {
     out.push_str("<pre class=\"preformatted\">");
     for (index, line) in lines.iter().enumerate() {
         if index > 0 {
@@ -633,90 +862,35 @@ fn render_preformatted_block(out: &mut String, lines: &[&str]) {
     out.push_str("</pre>");
 }
 
-enum InlineToken {
-    Code(usize),
-    Bold(usize),
-}
-
-fn render_inline_markup(out: &mut String, text: &str) {
-    let mut rest = text;
-    while !rest.is_empty() {
-        let tick = rest.find('`');
-        let bold = rest.find("**");
-        let next = match (tick, bold) {
-            (Some(t), Some(b)) => {
-                if t < b {
-                    InlineToken::Code(t)
-                } else {
-                    InlineToken::Bold(b)
-                }
-            }
-            (Some(t), None) => InlineToken::Code(t),
-            (None, Some(b)) => InlineToken::Bold(b),
-            (None, None) => {
-                render_plain_text(out, rest);
-                break;
-            }
-        };
-        match next {
-            InlineToken::Code(pos) => {
-                render_plain_text(out, &rest[..pos]);
-                rest = &rest[pos + 1..];
-                if let Some(end) = rest.find('`') {
-                    let code = &rest[..end];
-                    if !code.is_empty() {
-                        out.push_str("<code>");
-                        out.push_str(&escape_html(code));
-                        out.push_str("</code>");
-                    }
-                    rest = &rest[end + 1..];
-                } else {
-                    out.push_str(&escape_html(&format!("`{rest}")));
-                    break;
-                }
-            }
-            InlineToken::Bold(pos) => {
-                render_plain_text(out, &rest[..pos]);
-                rest = &rest[pos + 2..];
-                if let Some(end) = rest.find("**") {
-                    out.push_str("<strong>");
-                    out.push_str(&escape_html(&rest[..end]));
-                    out.push_str("</strong>");
-                    rest = &rest[end + 2..];
-                } else {
-                    out.push_str("**");
-                    render_plain_text(out, rest);
-                    break;
-                }
-            }
-        }
+fn is_preformatted_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
     }
+    trimmed
+        .chars()
+        .any(|ch| matches!(ch, '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼' | '│' | '─'))
 }
 
-fn render_plain_text(out: &mut String, text: &str) {
-    for (index, line) in text.split('\n').enumerate() {
-        if index > 0 {
-            out.push_str("<br>");
-        }
-        out.push_str(&escape_html(line));
-    }
+fn dedent_code_block(text: &str) -> String {
+    let lines: Vec<&str> = text.trim_matches('\n').lines().collect();
+    let indent = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.chars().take_while(|ch| *ch == ' ' || *ch == '\t').count())
+        .min()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|line| line.chars().skip(indent).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn is_list_marker_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("* ") || trimmed.starts_with("- ")
-}
-
-fn list_marker_text(line: &str) -> &str {
-    let trimmed = line.trim_start();
-    trimmed.strip_prefix("* ").or_else(|| trimmed.strip_prefix("- ")).unwrap_or(trimmed)
-}
-
-fn render_code_block(out: &mut String, text: &str) {
-    let code = strip_code_fence_language(text);
-    out.push_str("<pre class=\"code-block\">");
-    out.push_str(&escape_html(code.trim_end()));
-    out.push_str("</pre>");
+fn is_fence_language_tag(line: &str) -> bool {
+    !line.is_empty()
+        && line.len() <= 32
+        && line.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '+')
 }
 
 fn render_tool_group(out: &mut String, logs: &[String]) {
@@ -728,8 +902,11 @@ fn render_tool_group(out: &mut String, logs: &[String]) {
         return;
     }
     out.push_str("<details class=\"tool-group\"><summary>");
+    out.push_str(CHEVRON_SVG);
     out.push_str(&escape_html(&format!("{} tool executions", logs.len())));
-    out.push_str("</summary><div class=\"tool-group-items\">");
+    out.push_str("<span class=\"count\">");
+    out.push_str(&logs.len().to_string());
+    out.push_str("</span></summary><div class=\"tool-group-items\">");
     for log in logs {
         render_log_segment(out, log);
     }
@@ -737,62 +914,39 @@ fn render_tool_group(out: &mut String, logs: &[String]) {
 }
 
 fn render_log_segment(out: &mut String, text: &str) {
+    let (badge, name) = log_badge_and_name(text);
     out.push_str("<details class=\"log\"><summary>");
-    out.push_str(&escape_html(&log_summary(text)));
-    out.push_str("</summary><pre>");
+    out.push_str(CHEVRON_SVG);
+    out.push_str("<span class=\"badge\">");
+    out.push_str(&escape_html(badge));
+    out.push_str("</span><span class=\"lname\">");
+    out.push_str(&escape_html(&name));
+    out.push_str("</span></summary><pre>");
     out.push_str(&escape_html(text));
     out.push_str("</pre></details>");
 }
 
-enum TextFragment {
-    Prose(String),
-    Code(String),
-}
-
-fn split_text_fragments(text: &str) -> Vec<TextFragment> {
-    let mut fragments = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("```") {
-        if start > 0 {
-            let prose = rest[..start].trim();
-            if !prose.is_empty() {
-                fragments.push(TextFragment::Prose(prose.to_string()));
-            }
-        }
-        rest = &rest[start + 3..];
-        if let Some(end) = rest.find("```") {
-            fragments.push(TextFragment::Code(rest[..end].to_string()));
-            rest = &rest[end + 3..];
-        } else {
-            fragments.push(TextFragment::Code(rest.to_string()));
-            return fragments;
-        }
+fn log_badge_and_name(text: &str) -> (&'static str, String) {
+    let summary = log_summary(text);
+    if let Some(rest) = summary.strip_prefix("Tool call: ") {
+        return ("tool", rest.to_string());
     }
-    let prose = rest.trim();
-    if !prose.is_empty() {
-        fragments.push(TextFragment::Prose(prose.to_string()));
+    if let Some(rest) = summary.strip_prefix("Tool result: ") {
+        return ("result", rest.to_string());
     }
-    if fragments.is_empty() && !text.is_empty() {
-        fragments.push(TextFragment::Prose(text.to_string()));
+    if let Some(rest) = summary.strip_prefix("Tool use: ") {
+        return ("tool", rest.to_string());
     }
-    fragments
-}
-
-fn strip_code_fence_language(text: &str) -> &str {
-    if text.starts_with('\n') {
-        return text.trim_start_matches('\n');
+    if let Some(name) = summary.strip_suffix(" result") {
+        return ("result", name.to_string());
     }
-    let Some(first_newline) = text.find('\n') else {
-        return if is_fence_language_tag(text.trim()) { "" } else { text };
-    };
-    let first_line = text[..first_newline].trim();
-    if is_fence_language_tag(first_line) { &text[first_newline + 1..] } else { text }
-}
-
-fn is_fence_language_tag(line: &str) -> bool {
-    !line.is_empty()
-        && line.len() <= 32
-        && line.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '+')
+    if summary == "Citation" {
+        return ("citation", summary);
+    }
+    if summary == "System log" {
+        return ("system", summary);
+    }
+    ("log", summary)
 }
 
 fn is_tool_message(content: &str) -> bool {
@@ -878,14 +1032,21 @@ fn bracket_tool_name(line: &str) -> Option<&str> {
 }
 
 fn append_header_display_meta(out: &mut String, display_meta: &SessionDisplayMeta) {
+    if display_meta.models.is_empty() && display_meta.thinking_depths.is_empty() {
+        return;
+    }
+    out.push_str("<span class=\"meta-tags\">");
     if !display_meta.models.is_empty() {
-        out.push_str(" · Model: ");
+        out.push_str("<span class=\"meta-tag\">model <b>");
         out.push_str(&escape_html(&display_meta.models.join(", ")));
+        out.push_str("</b></span>");
     }
     if !display_meta.thinking_depths.is_empty() {
-        out.push_str(" · Thinking: ");
+        out.push_str("<span class=\"meta-tag\">thinking <b>");
         out.push_str(&escape_html(&display_meta.thinking_depths.join(", ")));
+        out.push_str("</b></span>");
     }
+    out.push_str("</span>");
 }
 
 fn enrich_display_meta_from_usage(
@@ -1348,8 +1509,9 @@ mod tests {
         );
         assert!(html.contains("<p>I will inspect it.</p>"));
         assert!(html.contains("2 tool executions"));
-        assert!(html.contains("<summary>Tool call: run_terminal_command_v2</summary>"));
-        assert!(html.contains("<summary>Tool result: run_terminal_command_v2</summary>"));
+        assert!(html.contains("<span class=\"badge\">tool</span>"));
+        assert!(html.contains("<span class=\"badge\">result</span>"));
+        assert_eq!(html.matches("<span class=\"lname\">run_terminal_command_v2</span>").count(), 2);
         assert!(html.contains("<p>The answer is here.</p>"));
         assert!(html.contains("class=\"tool-group\""));
     }
@@ -1366,7 +1528,7 @@ mod tests {
                 seq: 0,
             }],
         );
-        assert!(html.contains("--read-width: 700px"));
+        assert!(html.contains("--read-width:716px"));
         assert!(html.contains("class=\"site-header\""));
         assert!(html.contains("class=\"user-block\""));
         assert!(html.contains("<pre class=\"code-block\">"));
@@ -1387,6 +1549,71 @@ mod tests {
         );
         assert!(html.contains("hello"));
         assert!(html.contains("world"));
+    }
+
+    #[test]
+    fn html_renderer_dedents_fenced_code_blocks() {
+        let html = render_html(
+            &session("s1"),
+            &[Message {
+                session_id: "local-id".to_string(),
+                role: Role::Assistant,
+                content: "Example:\n```yaml\n     skill:\n       root: skills/mosoo\n```"
+                    .to_string(),
+                timestamp: None,
+                seq: 0,
+            }],
+        );
+        assert!(
+            html.contains(
+                "<pre class=\"code-block\"><code class=\"language-yaml\">skill:\n  root: skills/mosoo</code></pre>"
+            )
+        );
+    }
+
+    #[test]
+    fn html_renderer_uses_real_markdown_for_agent_replies() {
+        let html = render_html(
+            &session("s1"),
+            &[Message {
+                session_id: "local-id".to_string(),
+                role: Role::Assistant,
+                content:
+                    "## Result\n\n1. First\n   - nested **bold**\n   - task\n\n> quoted note\n\n| Name | Value |\n| --- | --- |\n| one | `two` |\n\n~~old~~"
+                        .to_string(),
+                timestamp: None,
+                seq: 0,
+            }],
+        );
+        assert!(html.contains("<h2>Result</h2>"));
+        assert!(html.contains("<ol>"));
+        assert!(html.contains("<ul>"));
+        assert!(html.contains("<strong>bold</strong>"));
+        assert!(html.contains("<blockquote>"));
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<td><code>two</code></td>"));
+        assert!(html.contains("<del>old</del>"));
+    }
+
+    #[test]
+    fn html_renderer_escapes_raw_html_and_filters_unsafe_links() {
+        let html = render_html(
+            &session("s1"),
+            &[Message {
+                session_id: "local-id".to_string(),
+                role: Role::Assistant,
+                content:
+                    "Inline <span>html</span> and [bad](javascript:alert(1)) plus [good](https://example.com).\n\n![alt](https://example.com/image.png)"
+                        .to_string(),
+                timestamp: None,
+                seq: 0,
+            }],
+        );
+        assert!(html.contains("&lt;span&gt;html&lt;/span&gt;"));
+        assert!(!html.contains("javascript:"));
+        assert!(html.contains("<a href=\"https://example.com\">good</a>"));
+        assert!(!html.contains("<img"));
+        assert!(html.contains("alt"));
     }
 
     #[test]
@@ -1424,9 +1651,57 @@ mod tests {
                 seq: 0,
             }],
         );
-        assert!(html.contains("<summary>Citation</summary>"));
+        assert!(html.contains("<span class=\"badge\">citation</span>"));
+        assert!(html.contains("<span class=\"lname\">Citation</span>"));
         assert!(html.contains("<p>Here is the answer.</p>"));
         assert!(html.contains("<p>Done.</p>"));
+    }
+
+    #[test]
+    fn html_renderer_collapses_multiline_memory_citation() {
+        let html = render_html(
+            &session("s1"),
+            &[Message {
+                session_id: "local-id".to_string(),
+                role: Role::Assistant,
+                content:
+                    "Answer.\n<oai-mem-citation>\n<citation_entries>\nMEMORY.md:1-2|note=[used]\n</citation_entries>\n</oai-mem-citation>\nNext."
+                        .to_string(),
+                timestamp: None,
+                seq: 0,
+            }],
+        );
+        assert_eq!(html.matches("<span class=\"lname\">Citation</span>").count(), 1);
+        assert!(!html.contains("2 tool executions"));
+        assert!(html.contains("<p>Answer.</p>"));
+        assert!(html.contains("<p>Next.</p>"));
+    }
+
+    #[test]
+    fn html_renderer_replaces_duplicate_final_with_cited_version() {
+        let html = render_html(
+            &session("s1"),
+            &[
+                Message {
+                    session_id: "local-id".to_string(),
+                    role: Role::Assistant,
+                    content: "Final answer.".to_string(),
+                    timestamp: None,
+                    seq: 0,
+                },
+                Message {
+                    session_id: "local-id".to_string(),
+                    role: Role::Assistant,
+                    content:
+                        "Final answer.\n<oai-mem-citation>\n<citation_entries>\nMEMORY.md:1-2|note=[used]\n</citation_entries>\n</oai-mem-citation>"
+                            .to_string(),
+                    timestamp: None,
+                    seq: 1,
+                },
+            ],
+        );
+        assert_eq!(html.matches("Final answer.").count(), 1);
+        assert!(html.contains("<span class=\"lname\">Citation</span>"));
     }
 
     #[test]
@@ -1460,8 +1735,8 @@ mod tests {
         assert!(html.contains("<p>Answer incoming.</p>"));
         assert!(html.contains("class=\"tool-run\""));
         assert!(html.contains("2 tool executions"));
-        assert!(html.contains("<summary>Read</summary>"));
-        assert!(html.contains("<summary>Glob</summary>"));
+        assert!(html.contains("<span class=\"lname\">Read</span>"));
+        assert!(html.contains("<span class=\"lname\">Glob</span>"));
         assert_eq!(html.matches("class=\"turn assistant\"").count(), 1);
         assert!(html.contains("role-label\">Assistant"));
         assert!(html.contains("assistant-body\"><div class=\"prose\"><p>Answer incoming.</p>"));
@@ -1563,9 +1838,52 @@ mod tests {
         assert!(html.contains("href=\"#user-2\""));
         assert!(html.contains("id=\"user-1\""));
         assert!(html.contains("id=\"user-2\""));
-        assert!(html.contains("--user-block-bg: #FFF3D6"));
-        assert!(html.contains("1. First question"));
-        assert!(html.contains("2. Second question"));
+        assert!(html.contains("--accent:#3C4FA0"));
+        assert!(html.contains("<span class=\"tick-t\">First question</span>"));
+        assert!(html.contains("<span class=\"tick-t\">Second question</span>"));
+    }
+
+    #[test]
+    fn html_renderer_treats_user_tool_results_as_logs_not_turns() {
+        let html = render_html(
+            &session("s1"),
+            &[
+                Message {
+                    session_id: "local-id".to_string(),
+                    role: Role::User,
+                    content: "Read the config file.".to_string(),
+                    timestamp: None,
+                    seq: 0,
+                },
+                Message {
+                    session_id: "local-id".to_string(),
+                    role: Role::Assistant,
+                    content: "[Read] {\"path\":\"config.toml\"}".to_string(),
+                    timestamp: None,
+                    seq: 1,
+                },
+                Message {
+                    session_id: "local-id".to_string(),
+                    role: Role::User,
+                    content: "{\"method\":\"get_file\",\"content\":\"secret body\"}".to_string(),
+                    timestamp: None,
+                    seq: 2,
+                },
+                Message {
+                    session_id: "local-id".to_string(),
+                    role: Role::Assistant,
+                    content: "Here is what the config says.".to_string(),
+                    timestamp: None,
+                    seq: 3,
+                },
+            ],
+        );
+        assert_eq!(html.matches("class=\"turn user\"").count(), 1);
+        assert!(html.contains("<span class=\"tick-t\">Read the config file.</span>"));
+        assert!(!html.contains("<span class=\"tick-t\">{&quot;method&quot;"));
+        assert!(html.contains("2 tool executions"));
+        assert!(html.contains("secret body"));
+        assert!(html.contains("<p>Here is what the config says.</p>"));
     }
 
     #[test]
@@ -1617,8 +1935,12 @@ mod tests {
                 thinking_depths: vec!["high".to_string()],
             },
         );
-        assert!(html.contains("<p class=\"meta\">"));
-        assert!(html.contains("0 messages · Model: grok-composer-2.5-fast · Thinking: high</p>"));
+        assert!(html.contains("<div class=\"meta\">"));
+        assert!(html.contains("0 messages</span>"));
+        assert!(
+            html.contains("<span class=\"meta-tag\">model <b>grok-composer-2.5-fast</b></span>")
+        );
+        assert!(html.contains("<span class=\"meta-tag\">thinking <b>high</b></span>"));
     }
 
     #[test]
