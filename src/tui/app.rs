@@ -9,6 +9,7 @@ use crate::adapters::ResumeCommand;
 use crate::config::AppConfig;
 use crate::db::search::{SearchFilters, TimeRange};
 use crate::db::store::{ProjectDirectory, Store};
+use crate::handoff;
 use crate::session_action;
 use crate::skill_audit::{self, SkillAuditFilters, SkillAuditReport};
 use crate::transcript;
@@ -18,8 +19,6 @@ use crate::types::{
     SessionUsageEventRecord,
 };
 use crate::usage::{self, TokenTotals, UsageFilters, UsageReport};
-
-pub use crate::session_action::SessionAction as PendingCommandAction;
 
 const USAGE_LOADING_MIN_MS: u128 = 75;
 const SEARCH_DEBOUNCE_MS: u64 = 250;
@@ -38,7 +37,15 @@ pub enum AppMode {
     ExportInput,
     Settings,
     Filters,
+    HandoffTarget,
     ConfirmResume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingCommandAction {
+    Resume,
+    OpenApp,
+    Handoff,
 }
 
 #[cfg(test)]
@@ -97,6 +104,7 @@ mod tests {
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
             pending_resume: None,
+            handoff_target_selected: 0,
             share_popup: None,
             share_publish_rx: None,
             exec_on_exit: None,
@@ -268,6 +276,27 @@ mod tests {
                 "status message must explain why nothing happened"
             );
         }
+    }
+
+    #[test]
+    fn imported_session_can_handoff_from_detail_view() {
+        let mut app = app_with_sources();
+        let mut result = codex_search_result();
+        result.session.is_import = true;
+        app.results = vec![result];
+        app.viewing_messages = vec![message(Role::User, None, 0)];
+        app.mode = AppMode::Viewing;
+
+        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::HandoffTarget));
+
+        app.handle_handoff_target_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.mode, AppMode::ConfirmResume));
+        let pending = app.pending_resume.as_ref().unwrap();
+        assert_eq!(pending.action, PendingCommandAction::Handoff);
+        assert_eq!(pending.command.program, "codex");
+        assert!(pending.command.args[0].contains("This is a handoff, not a native resume."));
     }
 
     #[test]
@@ -732,6 +761,7 @@ pub struct App {
     pub semantic_last_refresh: Instant,
     pub settings_selected: usize,
     pub pending_resume: Option<PendingResume>,
+    pub handoff_target_selected: usize,
     pub share_popup: Option<SharePopup>,
     pub share_publish_rx: Option<mpsc::Receiver<Result<String, String>>>,
     pub exec_on_exit: Option<(ResumeCommand, Option<String>)>,
@@ -818,6 +848,7 @@ impl App {
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
             pending_resume: None,
+            handoff_target_selected: 0,
             share_popup: None,
             share_publish_rx: None,
             exec_on_exit: None,
@@ -1009,6 +1040,7 @@ impl App {
             AppMode::ExportInput => self.handle_export_key(key),
             AppMode::Settings => self.handle_settings_key(key, store),
             AppMode::Filters => self.handle_filters_key(key, store),
+            AppMode::HandoffTarget => self.handle_handoff_target_key(key),
             AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
         }
     }
@@ -1317,6 +1349,9 @@ impl App {
             KeyCode::Char('v') => {
                 self.preview_current_session();
             }
+            KeyCode::Char('h') => {
+                self.open_handoff_target_picker();
+            }
             KeyCode::Char('/') => {
                 self.viewing_search_input = Some(String::new());
                 self.viewing_search_input_cursor = 0;
@@ -1466,14 +1501,27 @@ impl App {
     }
 
     fn start_resume_confirmation(&mut self, origin: ResumeOrigin) {
-        self.start_command_confirmation(origin, PendingCommandAction::Resume);
+        self.start_source_command_confirmation(
+            origin,
+            session_action::SessionAction::Resume,
+            PendingCommandAction::Resume,
+        );
     }
 
     fn start_app_open_confirmation(&mut self, origin: ResumeOrigin) {
-        self.start_command_confirmation(origin, PendingCommandAction::OpenApp);
+        self.start_source_command_confirmation(
+            origin,
+            session_action::SessionAction::OpenApp,
+            PendingCommandAction::OpenApp,
+        );
     }
 
-    fn start_command_confirmation(&mut self, origin: ResumeOrigin, action: PendingCommandAction) {
+    fn start_source_command_confirmation(
+        &mut self,
+        origin: ResumeOrigin,
+        source_action: session_action::SessionAction,
+        action: PendingCommandAction,
+    ) {
         let Some(result) = self.results.get(self.selected_index) else {
             return;
         };
@@ -1484,10 +1532,10 @@ impl App {
             return;
         }
         let Some(command) =
-            session_action::command_for(action, &session.source, &session.source_id)
+            session_action::command_for(source_action, &session.source, &session.source_id)
         else {
             self.status_message =
-                Some(format!("{} not supported for {}", action.title(), session.source));
+                Some(format!("{} not supported for {}", source_action.title(), session.source));
             return;
         };
         self.pending_resume = Some(PendingResume {
@@ -1497,6 +1545,50 @@ impl App {
             session_title: session.title.clone(),
             cwd: session.directory.clone(),
             origin,
+        });
+        self.mode = AppMode::ConfirmResume;
+    }
+
+    fn open_handoff_target_picker(&mut self) {
+        self.handoff_target_selected = 0;
+        self.mode = AppMode::HandoffTarget;
+    }
+
+    fn handle_handoff_target_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = AppMode::Viewing;
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.handoff_target_selected > 0 => {
+                self.handoff_target_selected -= 1;
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if self.handoff_target_selected + 1 < handoff::TARGETS.len() =>
+            {
+                self.handoff_target_selected += 1;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let target = &handoff::TARGETS[self.handoff_target_selected];
+                self.start_handoff_confirmation(target);
+            }
+            _ => {}
+        }
+    }
+
+    fn start_handoff_confirmation(&mut self, target: &handoff::HandoffTarget) {
+        let Some(result) = self.results.get(self.selected_index) else {
+            return;
+        };
+        let session = &result.session;
+        let prompt = handoff::build_prompt(session, &self.viewing_messages);
+        let command = handoff::command_for_target(target, prompt);
+        self.pending_resume = Some(PendingResume {
+            command,
+            action: PendingCommandAction::Handoff,
+            source_label: target.label.to_string(),
+            session_title: session.title.clone(),
+            cwd: session.directory.clone(),
+            origin: ResumeOrigin::Viewing,
         });
         self.mode = AppMode::ConfirmResume;
     }

@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod embedding;
 pub mod export;
+pub mod handoff;
 pub mod import;
 pub mod info;
 pub mod query;

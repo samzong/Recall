@@ -10,6 +10,7 @@ use recall::config::AppConfig;
 use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
 use recall::db::store::{SessionListSort, Store};
 use recall::export::ExportOptions;
+use recall::handoff;
 use recall::query::{parse_time_range, query_embedding, resolve_source_filter};
 use recall::semantic;
 use recall::session_action::{self, SessionAction};
@@ -119,6 +120,19 @@ pub(crate) enum SessionCommands {
         print_command: bool,
         #[arg(long, value_enum, default_value_t = SessionActionFormat::Text)]
         format: SessionActionFormat,
+    },
+    #[command(about = "Handoff one selected session to a new target agent session")]
+    Handoff {
+        #[arg(long, help = "Recall session id")]
+        id: Option<String>,
+        #[arg(long, help = "Source id or label")]
+        source: Option<String>,
+        #[arg(long, help = "Source-native session id")]
+        source_id: Option<String>,
+        #[arg(long, help = "Target agent id")]
+        to: String,
+        #[arg(long, help = "Print the handoff prompt instead of executing the target")]
+        print_prompt: bool,
     },
 }
 
@@ -260,6 +274,15 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
                 print_command,
                 format,
                 SessionAction::OpenApp,
+            )
+        }
+        SessionCommands::Handoff { id, source, source_id, to, print_prompt } => {
+            cmd_session_handoff(
+                id.as_deref(),
+                source.as_deref(),
+                source_id.as_deref(),
+                &to,
+                print_prompt,
             )
         }
     }
@@ -574,6 +597,33 @@ fn cmd_session_command(
     session_action::run(&command, session.directory.as_deref())
 }
 
+fn cmd_session_handoff(
+    id: Option<&str>,
+    source_filter: Option<&str>,
+    source_id: Option<&str>,
+    target: &str,
+    print_prompt: bool,
+) -> Result<()> {
+    let store = Store::open()?;
+    let sources = adapters::source_labels();
+    let session = resolve_session_ref(&store, &sources, id, source_filter, source_id)?;
+    let target = handoff::target_for(target)?;
+    let messages = store.get_messages(&session.id)?;
+    let prompt = handoff::build_prompt(&session, &messages);
+
+    if print_prompt {
+        print!("{prompt}");
+        return Ok(());
+    }
+
+    let command = handoff::command_for_target(target, prompt);
+    session_action::run(&command, handoff_working_directory(session.directory.as_deref()))
+}
+
+fn handoff_working_directory(directory: Option<&str>) -> Option<&str> {
+    directory.filter(|dir| std::path::Path::new(*dir).is_dir())
+}
+
 fn resolve_session_ref(
     store: &Store,
     sources: &[(String, String)],
@@ -874,4 +924,26 @@ fn open_url(url: &str) -> Result<()> {
         anyhow::bail!("{program} exited with status {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handoff_working_directory_keeps_existing_directory() {
+        let directory = std::env::temp_dir().to_string_lossy().into_owned();
+
+        assert_eq!(handoff_working_directory(Some(directory.as_str())), Some(directory.as_str()));
+    }
+
+    #[test]
+    fn handoff_working_directory_drops_missing_directory() {
+        let directory = std::env::temp_dir()
+            .join(format!("recall-missing-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(handoff_working_directory(Some(directory.as_str())), None);
+    }
 }

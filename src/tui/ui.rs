@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::db::search::TimeRange;
+use crate::handoff;
 use crate::skill_audit::{SkillTier, SkillUsageEntry, format_last_used, format_signals};
 use crate::tui::app::{
     App, AppMode, FilterFocus, PanelFocus, PendingCommandAction, ProjectPickerRow, ResumeOrigin,
@@ -77,6 +78,10 @@ pub fn render(f: &mut Frame, app: &App) {
         AppMode::Filters => {
             render_search(f, app);
             render_filter_picker(f, app);
+        }
+        AppMode::HandoffTarget => {
+            render_viewing(f, app);
+            render_handoff_target_picker(f, app);
         }
         AppMode::ExportInput => {
             render_viewing(f, app);
@@ -1326,6 +1331,8 @@ fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" export  ", Style::default().fg(Color::DarkGray)),
         Span::styled("s", Style::default().fg(Color::Yellow)),
         Span::styled(" share  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("h", Style::default().fg(Color::Yellow)),
+        Span::styled(" handoff  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Ctrl+R", Style::default().fg(Color::Yellow)),
         Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Ctrl+O", Style::default().fg(Color::Yellow)),
@@ -1370,6 +1377,49 @@ fn render_viewing(f: &mut Frame, app: &App) {
     }
 
     f.render_widget(Paragraph::new(status_line), outer[1]);
+}
+
+fn render_handoff_target_picker(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let width = area.width.clamp(36, 56);
+    let height = (handoff::TARGETS.len() as u16 + 5).max(8);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .title(" Handoff target ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Black));
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+    for (index, target) in handoff::TARGETS.iter().enumerate() {
+        let selected = index == app.handoff_target_selected;
+        let marker = if selected { ">" } else { " " };
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker} "), style),
+            Span::styled(target.label, style),
+            Span::styled(format!(" ({})", target.id), style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" [Enter] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("select  ", Style::default().fg(Color::White)),
+        Span::styled("[Esc] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("cancel", Style::default().fg(Color::White)),
+    ]));
+
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(Clear, rect);
+    f.render_widget(widget, rect);
 }
 
 fn render_viewing_summary(f: &mut Frame, app: &App, area: Rect) {
@@ -1786,10 +1836,12 @@ fn render_confirm_resume(f: &mut Frame, app: &App) {
     let block_title = match pending.action {
         PendingCommandAction::Resume => " Resume session ",
         PendingCommandAction::OpenApp => " Open in app ",
+        PendingCommandAction::Handoff => " Handoff session ",
     };
     let confirm_label = match pending.action {
         PendingCommandAction::Resume => "confirm & exec     ",
         PendingCommandAction::OpenApp => "confirm & open     ",
+        PendingCommandAction::Handoff => "confirm & handoff  ",
     };
 
     let block = Block::default()
@@ -1816,7 +1868,13 @@ fn render_confirm_resume(f: &mut Frame, app: &App) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Source:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                match pending.action {
+                    PendingCommandAction::Handoff => " Target:  ",
+                    _ => " Source:  ",
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(
                 pending.source_label.clone(),
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -2055,6 +2113,59 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("https://recall-share.pages.dev/source1"));
+    }
+
+    #[test]
+    fn render_handoff_target_picker_shows_targets() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.mode = AppMode::HandoffTarget;
+        app.handoff_target_selected = 3;
+        app.results = vec![SearchResult {
+            session: Session {
+                id: "session1".to_string(),
+                source: "codex".to_string(),
+                source_id: "source1".to_string(),
+                title: "Test session".to_string(),
+                directory: None,
+                started_at: 0,
+                updated_at: None,
+                message_count: 1,
+                entrypoint: None,
+                custom_title: None,
+                summary: None,
+                duration_minutes: None,
+                source_file_path: None,
+                is_import: true,
+            },
+            match_source: MatchSource::Fts,
+            snippet: None,
+        }];
+        app.viewing_messages = vec![Message {
+            session_id: "session1".to_string(),
+            role: Role::User,
+            content: "hello".to_string(),
+            timestamp: None,
+            seq: 0,
+        }];
+        app.viewing_sanitized_lines =
+            vec![vec![SanitizedLine { text: "hello".to_string(), lower: "hello".to_string() }]];
+
+        let backend = TestBackend::new(90, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let rendered = (0..18)
+            .map(|y| buffer_row(terminal.backend().buffer(), y, 90))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Handoff target"));
+        assert!(rendered.contains("Codex (codex)"));
+        assert!(rendered.contains("OpenCode (opencode)"));
+        assert!(rendered.contains("[Enter]"));
+        assert!(rendered.contains("select"));
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
