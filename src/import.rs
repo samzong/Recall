@@ -54,6 +54,12 @@ struct ImportSession {
     title: String,
     #[serde(default)]
     directory: Option<String>,
+    #[serde(default)]
+    repo_remote: Option<String>,
+    #[serde(default)]
+    repo_slug: Option<String>,
+    #[serde(default)]
+    repo_name: Option<String>,
     started_at: i64,
     #[serde(default)]
     updated_at: Option<i64>,
@@ -144,7 +150,7 @@ pub fn import_jsonl<R: BufRead>(store: &Store, dry_run: bool, reader: R) -> Resu
         if record.record_type != RECORD_TYPE {
             bail!("line {line_no}: unsupported record_type '{}'", record.record_type);
         }
-        if !matches!(record.schema_version, 2 | 3) {
+        if !matches!(record.schema_version, 2..=4) {
             bail!("line {line_no}: unsupported schema_version {}", record.schema_version);
         }
 
@@ -179,6 +185,9 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
         source_id: s.source_id,
         title: s.title,
         directory: s.directory,
+        repo_remote: s.repo_remote,
+        repo_slug: s.repo_slug,
+        repo_name: s.repo_name,
         started_at: s.started_at,
         updated_at: s.updated_at,
         message_count: record.messages.len() as u32,
@@ -284,6 +293,9 @@ mod tests {
             source_id: source_id.to_string(),
             title: title.to_string(),
             directory: Some("/tmp/project".to_string()),
+            repo_remote: Some("github.com/samzong/Recall".to_string()),
+            repo_slug: Some("samzong/Recall".to_string()),
+            repo_name: Some("Recall".to_string()),
             started_at: 1_000,
             updated_at: Some(2_000),
             message_count: 2,
@@ -374,6 +386,7 @@ mod tests {
             sources: None,
             time_range: TimeRange::All,
             project: None,
+            repo: None,
             limit: None,
         };
         let mut out = Vec::new();

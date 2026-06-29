@@ -1,18 +1,19 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 
-use crate::db::search::TimeRange;
+use crate::db::search::{RepoFilter, TimeRange};
+use crate::repo_identity::{RepoIdentity, identity_from_slug, normalize_remote_url};
 use crate::types::{
     BackgroundJobStatus, Message, RawSessionEvent, RawUsageEvent, Role, SemanticProgress,
     SemanticSessionJob, Session, SessionEventRecord, SessionUsageEventRecord, UsageEventRecord,
 };
 use crate::utils::f32_slice_to_bytes;
 
-pub(crate) const SESSION_COLUMNS: &str = "id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import";
+pub(crate) const SESSION_COLUMNS: &str = "id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import";
 
 pub(crate) fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -21,15 +22,18 @@ pub(crate) fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sess
         source_id: row.get(2)?,
         title: row.get(3)?,
         directory: row.get(4)?,
-        started_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        message_count: row.get(7)?,
-        entrypoint: row.get(8)?,
-        custom_title: row.get(9)?,
-        summary: row.get(10)?,
-        duration_minutes: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
-        source_file_path: row.get(12)?,
-        is_import: row.get(13)?,
+        repo_remote: row.get(5)?,
+        repo_slug: row.get(6)?,
+        repo_name: row.get(7)?,
+        started_at: row.get(8)?,
+        updated_at: row.get(9)?,
+        message_count: row.get(10)?,
+        entrypoint: row.get(11)?,
+        custom_title: row.get(12)?,
+        summary: row.get(13)?,
+        duration_minutes: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+        source_file_path: row.get(15)?,
+        is_import: row.get(16)?,
     })
 }
 
@@ -49,6 +53,9 @@ pub struct SessionPath {
     pub source_id: String,
     pub directory: Option<String>,
     pub source_file_path: Option<String>,
+    pub repo_remote: Option<String>,
+    pub repo_slug: Option<String>,
+    pub repo_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,14 +228,17 @@ impl Store {
 
     pub fn insert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             rusqlite::params![
                 session.id,
                 session.source,
                 session.source_id,
                 session.title,
                 session.directory,
+                session.repo_remote,
+                session.repo_slug,
+                session.repo_name,
                 session.started_at,
                 session.updated_at,
                 session.message_count,
@@ -297,14 +307,17 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         {
             tx.execute(
-                "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     session.id,
                     session.source,
                     session.source_id,
                     session.title,
                     session.directory,
+                    session.repo_remote,
+                    session.repo_slug,
+                    session.repo_name,
                     session.started_at,
                     session.updated_at,
                     session.message_count,
@@ -840,7 +853,7 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
     ) -> Result<SemanticProgress> {
-        self.semantic_progress_for_search_scope(sources, time_range, None)
+        self.semantic_progress_for_search_scope(sources, time_range, None, None)
     }
 
     pub fn semantic_progress_for_search_scope(
@@ -848,6 +861,7 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
         directory: Option<&str>,
+        repo: Option<&RepoFilter>,
     ) -> Result<SemanticProgress> {
         let mut sql = String::from(
             "SELECT
@@ -862,7 +876,15 @@ impl Store {
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
-        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, directory);
+        apply_scope_filters(
+            &mut sql,
+            &mut params,
+            &mut param_idx,
+            sources,
+            time_range,
+            directory,
+            repo,
+        );
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
 
@@ -892,6 +914,7 @@ impl Store {
             sources,
             time_range,
             directory,
+            repo,
         );
         current_sql.push_str(" ORDER BY COALESCE(s.updated_at, s.started_at) DESC LIMIT 1");
         let current_param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -907,7 +930,7 @@ impl Store {
 
     pub fn session_paths_for_source(&self, source: &str) -> Result<Vec<SessionPath>> {
         let mut stmt = self.conn.prepare(
-            "SELECT source_id, directory, source_file_path
+            "SELECT source_id, directory, source_file_path, repo_remote, repo_slug, repo_name
              FROM sessions
              WHERE source = ?1",
         )?;
@@ -916,9 +939,33 @@ impl Store {
                 source_id: row.get(0)?,
                 directory: row.get(1)?,
                 source_file_path: row.get(2)?,
+                repo_remote: row.get(3)?,
+                repo_slug: row.get(4)?,
+                repo_name: row.get(5)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn update_session_repo_identity(
+        &self,
+        source: &str,
+        source_id: &str,
+        identity: &RepoIdentity,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions
+             SET repo_remote = ?1, repo_slug = ?2, repo_name = ?3
+             WHERE source = ?4 AND source_id = ?5",
+            rusqlite::params![
+                identity.remote.as_str(),
+                identity.slug.as_str(),
+                identity.name.as_str(),
+                source,
+                source_id,
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn delete_session_data(&self, source: &str, source_id: &str) -> Result<()> {
@@ -1211,7 +1258,7 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
     ) -> Result<(u64, u64)> {
-        self.stats_for_search_scope(sources, time_range, None)
+        self.stats_for_search_scope(sources, time_range, None, None)
     }
 
     pub fn stats_for_search_scope(
@@ -1219,6 +1266,7 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
         directory: Option<&str>,
+        repo: Option<&RepoFilter>,
     ) -> Result<(u64, u64)> {
         let mut session_sql = String::from("SELECT COUNT(*) FROM sessions s WHERE 1=1");
         let mut session_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -1230,6 +1278,7 @@ impl Store {
             sources,
             time_range,
             directory,
+            repo,
         );
         let session_param_refs: Vec<&dyn rusqlite::types::ToSql> =
             session_params.iter().map(|p| p.as_ref()).collect();
@@ -1251,6 +1300,7 @@ impl Store {
             sources,
             time_range,
             directory,
+            repo,
         );
         let message_param_refs: Vec<&dyn rusqlite::types::ToSql> =
             message_params.iter().map(|p| p.as_ref()).collect();
@@ -1260,7 +1310,7 @@ impl Store {
     }
 
     pub fn list_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
-        self.list_recent_sessions_for_search_scope(None, TimeRange::All, None, limit)
+        self.list_recent_sessions_for_search_scope(None, TimeRange::All, None, None, limit)
     }
 
     pub fn list_recent_sessions_for_search_scope(
@@ -1268,6 +1318,7 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
         directory: Option<&str>,
+        repo: Option<&RepoFilter>,
         limit: usize,
     ) -> Result<Vec<Session>> {
         let mut sql = format!(
@@ -1277,7 +1328,15 @@ impl Store {
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
-        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, directory);
+        apply_scope_filters(
+            &mut sql,
+            &mut params,
+            &mut param_idx,
+            sources,
+            time_range,
+            directory,
+            repo,
+        );
         sql.push_str(&format!(
             " ORDER BY COALESCE(updated_at, started_at) DESC, started_at DESC, source ASC, source_id ASC LIMIT ?{param_idx}"
         ));
@@ -1293,16 +1352,18 @@ impl Store {
         Ok(sessions)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn list_indexed_sessions(
         &self,
         sources: Option<&[String]>,
         time_range: TimeRange,
         directory: Option<&str>,
+        repo: Option<&RepoFilter>,
         limit: Option<usize>,
         offset: usize,
         sort: SessionListSort,
     ) -> Result<Vec<Session>> {
-        self.list_sessions_for_scope(sources, time_range, directory, limit, offset, sort)
+        self.list_sessions_for_scope(sources, time_range, directory, repo, limit, offset, sort)
     }
 
     pub fn list_export_sessions(
@@ -1310,23 +1371,27 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
         directory: Option<&str>,
+        repo: Option<&RepoFilter>,
         limit: Option<usize>,
     ) -> Result<Vec<Session>> {
         self.list_sessions_for_scope(
             sources,
             time_range,
             directory,
+            repo,
             limit,
             0,
             SessionListSort::Newest,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn list_sessions_for_scope(
         &self,
         sources: Option<&[String]>,
         time_range: TimeRange,
         directory: Option<&str>,
+        repo: Option<&RepoFilter>,
         limit: Option<usize>,
         offset: usize,
         sort: SessionListSort,
@@ -1338,7 +1403,15 @@ impl Store {
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
-        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, directory);
+        apply_scope_filters(
+            &mut sql,
+            &mut params,
+            &mut param_idx,
+            sources,
+            time_range,
+            directory,
+            repo,
+        );
         let order_by = match sort {
             SessionListSort::Newest => "s.started_at DESC, source ASC, source_id ASC",
             SessionListSort::Oldest => "s.started_at ASC, source ASC, source_id ASC",
@@ -1364,6 +1437,82 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), session_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn resolve_repo_filter(&self, value: &str) -> Result<RepoFilter> {
+        let value = value.trim();
+        if value.is_empty() {
+            bail!("repo filter cannot be empty");
+        }
+
+        if let Some(identity) = normalize_remote_url(value) {
+            return Ok(RepoFilter::Remote(identity.remote));
+        }
+        if let Some(identity) = identity_from_slug(value) {
+            return Ok(RepoFilter::Slug(identity.slug));
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT repo_slug
+             FROM sessions
+             WHERE repo_name = ?1 AND repo_slug IS NOT NULL AND repo_slug != ''
+             ORDER BY repo_slug ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![value], |row| row.get::<_, String>(0))?;
+        let candidates = rows.collect::<Result<Vec<_>, _>>()?;
+        if candidates.len() > 1 {
+            bail!("repo name '{value}' is ambiguous: {}", candidates.join(", "));
+        }
+        Ok(candidates
+            .first()
+            .cloned()
+            .map(RepoFilter::Slug)
+            .unwrap_or_else(|| RepoFilter::Name(value.to_string())))
+    }
+
+    pub fn resolve_project_repo_filters(
+        &self,
+        project_filter: Option<&str>,
+        repo_filter: Option<&str>,
+    ) -> Result<(Option<String>, Option<RepoFilter>)> {
+        let mut directory = None;
+        let mut repo = None;
+
+        if let Some(project) = non_empty(project_filter) {
+            if self.project_filter_is_directory(project)? {
+                directory = Some(project.to_string());
+            } else {
+                repo = Some(self.resolve_repo_filter(project)?);
+            }
+        }
+
+        if let Some(value) = non_empty(repo_filter) {
+            if repo.is_some() {
+                bail!("--project repo identity cannot be combined with --repo");
+            }
+            repo = Some(self.resolve_repo_filter(value)?);
+        }
+
+        Ok((directory, repo))
+    }
+
+    fn project_filter_is_directory(&self, value: &str) -> Result<bool> {
+        if project_filter_looks_like_path(value) || std::path::Path::new(value).is_dir() {
+            return Ok(true);
+        }
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1
+                 FROM sessions
+                 WHERE directory = ?1 OR directory LIKE ?2
+                 LIMIT 1",
+                rusqlite::params![value, directory_child_pattern(value)],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(found)
     }
 
     pub fn list_project_directories(&self) -> Result<Vec<ProjectDirectory>> {
@@ -1465,6 +1614,7 @@ fn apply_scope_filters(
     sources: Option<&[String]>,
     time_range: TimeRange,
     directory: Option<&str>,
+    repo: Option<&RepoFilter>,
 ) {
     if let Some(sources) = sources
         && !sources.is_empty()
@@ -1494,10 +1644,25 @@ fn apply_scope_filters(
         params.push(Box::new(directory_child_pattern(dir)));
         *param_idx += 2;
     }
+
+    if let Some(repo) = repo {
+        let (column, value) = repo.column_and_value();
+        sql.push_str(&format!(" AND s.{column} = ?{}", *param_idx));
+        params.push(Box::new(value.to_string()));
+        *param_idx += 1;
+    }
 }
 
 fn directory_child_pattern(dir: &str) -> String {
     if dir.ends_with('/') { format!("{dir}%") } else { format!("{dir}/%") }
+}
+
+fn project_filter_looks_like_path(value: &str) -> bool {
+    value.starts_with('/') || value.starts_with('.') || value.starts_with('~')
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -1512,6 +1677,9 @@ mod exclusion_tests {
             source_id: format!("src-{id}"),
             title: "t".to_string(),
             directory: dir.map(String::from),
+            repo_remote: None,
+            repo_slug: None,
+            repo_name: None,
             started_at: 0,
             updated_at: Some(1),
             message_count: 0,

@@ -166,6 +166,7 @@ fn recent_sessions(store: &Store, request: &SearchRequest) -> anyhow::Result<Vec
         request.filters.sources.as_deref(),
         request.filters.time_range,
         request.filters.directory.as_deref(),
+        request.filters.repo.as_ref(),
         SEARCH_LIMIT,
     )?;
     Ok(recent

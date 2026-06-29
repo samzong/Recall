@@ -3,7 +3,7 @@ use recall::adapters::gemini::parse_gemini_session;
 use recall::adapters::kiro::parse_kiro_conversation;
 use recall::config::AppConfig;
 use recall::db::schema;
-use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
+use recall::db::search::{RepoFilter, SearchEngine, SearchFilters, TimeRange};
 use recall::db::store::Store;
 use recall::export::{ExportOptions, write_jsonl};
 use recall::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource};
@@ -21,6 +21,9 @@ fn make_session(id: &str, source: &str, source_id: &str, title: &str) -> Session
         source_id: source_id.to_string(),
         title: title.to_string(),
         directory: Some("/tmp/test".to_string()),
+        repo_remote: None,
+        repo_slug: None,
+        repo_name: None,
         started_at: chrono::Utc::now().timestamp_millis(),
         updated_at: None,
         message_count: 1,
@@ -82,7 +85,7 @@ fn make_session_event(kind: &str, name: Option<&str>, target: Option<&str>) -> R
 }
 
 fn no_filters() -> SearchFilters {
-    SearchFilters { sources: None, time_range: TimeRange::All, directory: None }
+    SearchFilters { sources: None, time_range: TimeRange::All, directory: None, repo: None }
 }
 
 #[test]
@@ -255,6 +258,9 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     session.custom_title = Some("Export custom title".to_string());
     session.summary = Some("Export summary".to_string());
     session.duration_minutes = Some(12);
+    session.repo_remote = Some("github.com/samzong/Recall".to_string());
+    session.repo_slug = Some("samzong/Recall".to_string());
+    session.repo_name = Some("Recall".to_string());
     let messages = vec![
         make_message("s1", Role::User, "hello", 0),
         make_message("s1", Role::Assistant, "hi", 1),
@@ -277,6 +283,7 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
         sources: None,
         time_range: TimeRange::All,
         project: None,
+        repo: None,
         limit: Some(10),
     };
     let mut out = Vec::new();
@@ -286,11 +293,14 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     let lines: Vec<_> = text.lines().collect();
     assert_eq!(lines.len(), 1);
     let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(value["schema_version"], 3);
+    assert_eq!(value["schema_version"], 4);
     assert_eq!(value["record_type"], "session");
     assert_eq!(value["session"]["source"], "codex");
     assert_eq!(value["session"]["source_id"], "raw1");
     assert_eq!(value["session"]["directory"], "/tmp/test");
+    assert_eq!(value["session"]["repo_remote"], "github.com/samzong/Recall");
+    assert_eq!(value["session"]["repo_slug"], "samzong/Recall");
+    assert_eq!(value["session"]["repo_name"], "Recall");
     assert_eq!(value["session"]["custom_title"], "Export custom title");
     assert_eq!(value["session"]["summary"], "Export summary");
     assert_eq!(value["session"]["duration_minutes"], 12);
@@ -327,6 +337,7 @@ fn export_jsonl_can_select_sessions_by_id() {
         sources: None,
         time_range: TimeRange::All,
         project: None,
+        repo: None,
         limit: None,
     };
     let mut out = Vec::new();
@@ -372,6 +383,7 @@ fn export_jsonl_applies_source_time_project_and_limit_filters() {
         sources: Some(vec!["codex".to_string()]),
         time_range: TimeRange::Month,
         project: Some("/tmp/project".to_string()),
+        repo: None,
         limit: Some(1),
     };
     let mut out = Vec::new();
@@ -506,6 +518,7 @@ fn search_with_source_filter() {
         sources: Some(vec!["claude-code".to_string()]),
         time_range: TimeRange::All,
         directory: None,
+        repo: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
     assert_eq!(results.len(), 1);
@@ -540,6 +553,7 @@ fn search_with_directory_filter_respects_project_boundary() {
         sources: None,
         time_range: TimeRange::All,
         directory: Some("/tmp/project".to_string()),
+        repo: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
     let mut ids: Vec<String> = results.into_iter().map(|result| result.session.id).collect();
@@ -560,11 +574,115 @@ fn recent_sessions_with_directory_filter_respects_project_boundary() {
     store.insert_session(&sibling).unwrap();
 
     let sessions = store
-        .list_recent_sessions_for_search_scope(None, TimeRange::All, Some("/tmp/project"), 10)
+        .list_recent_sessions_for_search_scope(None, TimeRange::All, Some("/tmp/project"), None, 10)
         .unwrap();
 
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].id, "s1");
+}
+
+#[test]
+fn search_with_repo_filter_matches_sibling_worktrees() {
+    let store = setup();
+    let mut main = make_session("s1", "codex", "raw1", "Main worktree");
+    main.directory = Some("/tmp/Recall".to_string());
+    main.repo_remote = Some("github.com/samzong/Recall".to_string());
+    main.repo_slug = Some("samzong/Recall".to_string());
+    main.repo_name = Some("Recall".to_string());
+    let mut sibling = make_session("s2", "opencode", "raw2", "Sibling worktree");
+    sibling.directory = Some("/tmp/Recall--feature".to_string());
+    sibling.repo_remote = Some("github.com/samzong/Recall".to_string());
+    sibling.repo_slug = Some("samzong/Recall".to_string());
+    sibling.repo_name = Some("Recall".to_string());
+    let mut other = make_session("s3", "claude-code", "raw3", "Other repo");
+    other.directory = Some("/tmp/other".to_string());
+    other.repo_remote = Some("github.com/other/Recall".to_string());
+    other.repo_slug = Some("other/Recall".to_string());
+    other.repo_name = Some("Recall".to_string());
+
+    for session in [&main, &sibling, &other] {
+        store.insert_session(session).unwrap();
+        store.insert_messages(&[make_message(&session.id, Role::User, "fix parser", 0)]).unwrap();
+    }
+
+    let engine = SearchEngine::new(&store.conn);
+    let filters = SearchFilters {
+        sources: None,
+        time_range: TimeRange::All,
+        directory: None,
+        repo: Some(RepoFilter::Slug("samzong/Recall".to_string())),
+    };
+    let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
+    let mut ids: Vec<String> = results.into_iter().map(|result| result.session.id).collect();
+    ids.sort();
+
+    assert_eq!(ids, vec!["s1".to_string(), "s2".to_string()]);
+}
+
+#[test]
+fn export_jsonl_applies_repo_filter() {
+    let store = setup();
+    let mut main = make_session("s1", "codex", "raw1", "Main worktree");
+    main.repo_slug = Some("samzong/Recall".to_string());
+    main.repo_name = Some("Recall".to_string());
+    let mut other = make_session("s2", "codex", "raw2", "Other repo");
+    other.repo_slug = Some("other/Recall".to_string());
+    other.repo_name = Some("Recall".to_string());
+
+    for session in [&main, &other] {
+        store.insert_session(session).unwrap();
+        store.insert_messages(&[make_message(&session.id, Role::User, &session.title, 0)]).unwrap();
+    }
+
+    let options = ExportOptions {
+        session_ids: Vec::new(),
+        sources: None,
+        time_range: TimeRange::All,
+        project: None,
+        repo: Some(RepoFilter::Slug("samzong/Recall".to_string())),
+        limit: None,
+    };
+    let mut out = Vec::new();
+    write_jsonl(&store, &options, &mut out).unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 1);
+    let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(value["session"]["id"], "s1");
+    assert_eq!(value["session"]["repo_slug"], "samzong/Recall");
+}
+
+#[test]
+fn repo_name_filter_fails_when_ambiguous() {
+    let store = setup();
+    let mut first = make_session("s1", "codex", "raw1", "First");
+    first.repo_slug = Some("samzong/Recall".to_string());
+    first.repo_name = Some("Recall".to_string());
+    let mut second = make_session("s2", "opencode", "raw2", "Second");
+    second.repo_slug = Some("other/Recall".to_string());
+    second.repo_name = Some("Recall".to_string());
+    store.insert_session(&first).unwrap();
+    store.insert_session(&second).unwrap();
+
+    let err = store.resolve_repo_filter("Recall").unwrap_err().to_string();
+    assert!(err.contains("ambiguous"));
+    assert!(err.contains("samzong/Recall"));
+    assert!(err.contains("other/Recall"));
+}
+
+#[test]
+fn project_filter_prefers_indexed_relative_directory() {
+    let store = setup();
+    let mut session = make_session("s1", "codex", "raw1", "Relative directory");
+    session.directory = Some("samzong/Recall".to_string());
+    store.insert_session(&session).unwrap();
+
+    let (directory, repo) =
+        store.resolve_project_repo_filters(Some("samzong/Recall"), None).unwrap();
+
+    assert_eq!(directory.as_deref(), Some("samzong/Recall"));
+    assert_eq!(repo, None);
 }
 
 #[test]
@@ -607,6 +725,9 @@ fn sync_skips_unchanged_session() {
         source_id: "raw1".to_string(),
         title: "Original".to_string(),
         directory: None,
+        repo_remote: None,
+        repo_slug: None,
+        repo_name: None,
         started_at: 1000,
         updated_at: Some(2000),
         message_count: 2,
@@ -632,6 +753,9 @@ fn sync_detects_new_messages() {
         source_id: "raw1".to_string(),
         title: "Original".to_string(),
         directory: None,
+        repo_remote: None,
+        repo_slug: None,
+        repo_name: None,
         started_at: 1000,
         updated_at: Some(2000),
         message_count: 2,
@@ -669,6 +793,9 @@ fn sync_detects_updated_timestamp() {
         source_id: "raw1".to_string(),
         title: "Original".to_string(),
         directory: None,
+        repo_remote: None,
+        repo_slug: None,
+        repo_name: None,
         started_at: 1000,
         updated_at: Some(2000),
         message_count: 3,

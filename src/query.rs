@@ -12,19 +12,17 @@ pub fn run_search(
     source_filter: Option<&str>,
     time_filter: Option<&str>,
     project_filter: Option<&str>,
+    repo_filter: Option<&str>,
 ) -> Result<()> {
     let store = Store::open()?;
     let engine = SearchEngine::new(&store.conn);
     let sources = adapters::source_labels();
     let resolved_source = resolve_source_filter(source_filter, &sources)?;
     let time_range = parse_time_range(time_filter);
+    let (directory, repo) = store.resolve_project_repo_filters(project_filter, repo_filter)?;
     let embedding = query_embedding(&store, query, |message| println!("{message}"))?;
 
-    let filters = SearchFilters {
-        sources: resolved_source,
-        time_range,
-        directory: project_filter.map(String::from),
-    };
+    let filters = SearchFilters { sources: resolved_source, time_range, directory, repo };
 
     let results = engine.hybrid_search(query, embedding.as_deref(), &filters, 20, 3)?;
 

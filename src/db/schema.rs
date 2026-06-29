@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub fn register_sqlite_vec() {
@@ -36,6 +36,9 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
     }
     if version < 8 {
         migrate_v8(conn)?;
+    }
+    if version < 9 {
+        migrate_v9(conn)?;
     }
     Ok(())
 }
@@ -286,6 +289,23 @@ fn migrate_v8(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn migrate_v9(conn: &Connection) -> anyhow::Result<()> {
+    for stmt in [
+        "ALTER TABLE sessions ADD COLUMN repo_remote TEXT",
+        "ALTER TABLE sessions ADD COLUMN repo_slug TEXT",
+        "ALTER TABLE sessions ADD COLUMN repo_name TEXT",
+    ] {
+        add_column_if_missing(conn, stmt)?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_repo_remote ON sessions(repo_remote);
+         CREATE INDEX IF NOT EXISTS idx_sessions_repo_slug ON sessions(repo_slug);
+         CREATE INDEX IF NOT EXISTS idx_sessions_repo_name ON sessions(repo_name);
+         PRAGMA user_version = 9;",
+    )?;
+    Ok(())
+}
+
 fn add_column_if_missing(conn: &Connection, stmt: &str) -> anyhow::Result<()> {
     if let Err(err) = conn.execute(stmt, []) {
         let msg = err.to_string();
@@ -378,6 +398,38 @@ mod tests {
             .query_row("SELECT is_import FROM sessions WHERE id = 's1'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(is_import, 0, "existing local sessions must default to is_import = 0");
+    }
+
+    #[test]
+    fn migrate_v9_adds_repo_identity_to_existing_v8_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, source TEXT NOT NULL, source_id TEXT NOT NULL,
+                title TEXT NOT NULL, directory TEXT, started_at INTEGER NOT NULL,
+                updated_at INTEGER, message_count INTEGER NOT NULL DEFAULT 0,
+                entrypoint TEXT, custom_title TEXT, summary TEXT,
+                duration_minutes INTEGER, source_file_path TEXT,
+                is_import INTEGER NOT NULL DEFAULT 0, UNIQUE(source, source_id)
+            );
+            INSERT INTO sessions (id, source, source_id, title, started_at)
+            VALUES ('s1', 'codex', 'c1', 'existing', 0);
+            PRAGMA user_version = 8;",
+        )
+        .unwrap();
+
+        init(&conn).unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        for col in ["repo_remote", "repo_slug", "repo_name"] {
+            let sql = format!("SELECT {col} FROM sessions");
+            conn.prepare(&sql)
+                .unwrap_or_else(|e| panic!("column {col} missing after migrate_v9: {e}"));
+        }
+        let repo_remote: Option<String> = conn
+            .query_row("SELECT repo_remote FROM sessions WHERE id = 's1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(repo_remote, None);
     }
 
     #[test]

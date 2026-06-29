@@ -7,6 +7,7 @@ pub mod export;
 pub mod import;
 pub mod info;
 pub mod query;
+pub mod repo_identity;
 pub mod semantic;
 pub mod session_action;
 pub mod share;

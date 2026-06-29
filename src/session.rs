@@ -28,6 +28,8 @@ pub(crate) enum SessionCommands {
         time: Option<String>,
         #[arg(long, help = "Filter by project directory, including child paths")]
         project: Option<String>,
+        #[arg(long, help = "Filter by repository identity")]
+        repo: Option<String>,
         #[arg(long, default_value_t = 50, help = "Maximum sessions to return")]
         limit: usize,
         #[arg(long, default_value_t = 0, help = "Skip sessions for pagination")]
@@ -182,6 +184,7 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
             source,
             time,
             project,
+            repo,
             limit,
             offset,
             all,
@@ -193,6 +196,7 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
             source.as_deref(),
             time.as_deref(),
             project.as_deref(),
+            repo.as_deref(),
             limit,
             offset,
             all,
@@ -271,6 +275,7 @@ fn cmd_session_list(
     source_filter: Option<&str>,
     time_filter: Option<&str>,
     project_filter: Option<&str>,
+    repo_filter: Option<&str>,
     limit: usize,
     offset: usize,
     all: bool,
@@ -299,6 +304,9 @@ fn cmd_session_list(
     }
 
     let store = Store::open()?;
+    let (directory, repo) = store.resolve_project_repo_filters(project_filter, repo_filter)?;
+    let effective_repo_filter = repo_filter
+        .or_else(|| if repo.is_some() && directory.is_none() { project_filter } else { None });
     let effective_limit = if all { None } else { Some(limit) };
     let rows: Vec<SessionListRow> = if let Some(query) = query.filter(|q| !q.trim().is_empty()) {
         let engine = SearchEngine::new(&store.conn);
@@ -306,7 +314,8 @@ fn cmd_session_list(
         let filters = SearchFilters {
             sources: resolved_source.clone(),
             time_range,
-            directory: project_filter.map(String::from),
+            directory: directory.clone(),
+            repo: repo.clone(),
         };
         let search_limit = effective_limit.unwrap_or(10_000).saturating_add(offset).max(1);
         let results =
@@ -331,7 +340,8 @@ fn cmd_session_list(
             .list_indexed_sessions(
                 resolved_source.as_deref(),
                 time_range,
-                project_filter,
+                directory.as_deref(),
+                repo.as_ref(),
                 effective_limit,
                 offset,
                 sort,
@@ -350,6 +360,7 @@ fn cmd_session_list(
             source_filter,
             time_filter,
             project_filter,
+            effective_repo_filter,
             limit,
             offset,
             all,
@@ -439,6 +450,7 @@ fn cmd_session_export(
                 sources: None,
                 time_range: TimeRange::All,
                 project: None,
+                repo: None,
                 limit: None,
             };
             if let Some(path) = output {
@@ -716,6 +728,7 @@ fn print_session_list_json(
     source: Option<&str>,
     time: Option<&str>,
     project: Option<&str>,
+    repo: Option<&str>,
     limit: usize,
     offset: usize,
     all: bool,
@@ -728,6 +741,7 @@ fn print_session_list_json(
                 "query": query,
                 "source": source,
                 "project": project,
+                "repo": repo,
                 "time": time.unwrap_or("all"),
                 "limit": if all { serde_json::Value::Null } else { serde_json::json!(limit) },
                 "offset": offset,
@@ -775,6 +789,9 @@ fn session_json(session: &Session, sources: &[(String, String)]) -> serde_json::
         "source_id": session.source_id,
         "title": session.title,
         "project": session.directory,
+        "repo_remote": session.repo_remote,
+        "repo_slug": session.repo_slug,
+        "repo_name": session.repo_name,
         "started_at": session.started_at,
         "updated_at": session.updated_at,
         "message_count": session.message_count,

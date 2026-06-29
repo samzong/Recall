@@ -5,8 +5,9 @@ use tracing::info;
 
 use crate::adapters;
 use crate::config::AppConfig;
-use crate::db::store::{EventSessionStateMeta, Store, UsageSessionStateMeta};
+use crate::db::store::{EventSessionStateMeta, SessionPath, Store, UsageSessionStateMeta};
 use crate::query::resolve_source_filter;
+use crate::repo_identity::{RepoIdentity, RepoIdentityCache};
 use crate::semantic;
 use crate::types::{Message, Role, Session};
 use crate::utils;
@@ -87,6 +88,7 @@ pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
     config.normalize_sources(&labels);
     let since_ts = if options.usage_only { None } else { config.sync_window.to_since_cutoff() };
     let path_excluder = config.build_path_excluder()?;
+    let mut repo_cache = RepoIdentityCache::default();
 
     let mut new_sessions = 0u32;
     let mut updated_sessions = 0u32;
@@ -181,11 +183,23 @@ pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
         }
 
         let mut existing_meta = store.session_meta_map(source_id)?;
-        let mut existing_paths = store
-            .session_paths_for_source(source_id)?
-            .into_iter()
-            .map(|path| (path.source_id, (path.directory, path.source_file_path)))
-            .collect::<HashMap<_, _>>();
+        let mut existing_paths = HashMap::new();
+        for mut path in store.session_paths_for_source(source_id)? {
+            if path.directory.is_some()
+                && (path.repo_remote.is_none()
+                    || path.repo_slug.is_none()
+                    || path.repo_name.is_none())
+            {
+                let repo_identity = repo_cache.resolve(path.directory.as_deref());
+                if let Some(repo) = repo_identity.as_ref() {
+                    store.update_session_repo_identity(source_id, &path.source_id, repo)?;
+                    path.repo_remote = Some(repo.remote.clone());
+                    path.repo_slug = Some(repo.slug.clone());
+                    path.repo_name = Some(repo.name.clone());
+                }
+            }
+            existing_paths.insert(path.source_id.clone(), path);
+        }
         let mut imported_ids = store.imported_source_ids(source_id)?;
         let mut existing_usage_meta = store.usage_state_meta_map(source_id)?;
         let mut existing_event_meta = if options.usage_only && !options.backfill_events {
@@ -224,6 +238,20 @@ pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 continue;
             }
 
+            let repo_identity = repo_cache.resolve(raw.directory.as_deref());
+            let existing_repo_fields = existing_paths.get(&raw_source_id).filter(|old| {
+                repo_identity.is_none() && old.directory.as_deref() == raw.directory.as_deref()
+            });
+            let (repo_remote, repo_slug, repo_name) = match repo_identity.as_ref() {
+                Some(repo) => {
+                    (Some(repo.remote.clone()), Some(repo.slug.clone()), Some(repo.name.clone()))
+                }
+                None => existing_repo_fields
+                    .map(|old| {
+                        (old.repo_remote.clone(), old.repo_slug.clone(), old.repo_name.clone())
+                    })
+                    .unwrap_or((None, None, None)),
+            };
             let msg_count = raw.messages.len() as u32;
             let usage_backfill_needed = raw.usage_parser_version.is_some_and(|version| {
                 !usage_state_is_current(
@@ -246,15 +274,9 @@ pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                     if imported_ids.remove(&raw_source_id) {
                         store.clear_import_marker(source_id, &raw_source_id)?;
                     }
-                    let metadata_changed = existing_paths.get(&raw_source_id).is_some_and(
-                        |(old_directory, old_source_file_path)| {
-                            raw_session_metadata_changed(
-                                &raw,
-                                old_directory.as_deref(),
-                                old_source_file_path.as_deref(),
-                            )
-                        },
-                    );
+                    let metadata_changed = existing_paths.get(&raw_source_id).is_some_and(|old| {
+                        raw_session_metadata_changed(&raw, repo_identity.as_ref(), old)
+                    });
                     let content_changed = old_msg_count != msg_count
                         || metadata_changed
                         || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
@@ -356,6 +378,9 @@ pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 source_id: raw.source_id,
                 title,
                 directory: raw.directory,
+                repo_remote,
+                repo_slug,
+                repo_name,
                 started_at: raw.started_at,
                 updated_at: raw.updated_at,
                 message_count: msg_count,
@@ -399,7 +424,14 @@ pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 .insert(session.source_id.clone(), (session.updated_at, session.message_count));
             existing_paths.insert(
                 session.source_id.clone(),
-                (session.directory.clone(), session.source_file_path.clone()),
+                SessionPath {
+                    source_id: session.source_id.clone(),
+                    directory: session.directory.clone(),
+                    source_file_path: session.source_file_path.clone(),
+                    repo_remote: session.repo_remote.clone(),
+                    repo_slug: session.repo_slug.clone(),
+                    repo_name: session.repo_name.clone(),
+                },
             );
             if let Some(parser_version) = raw.usage_parser_version {
                 existing_usage_meta.insert(
@@ -530,11 +562,20 @@ fn decide_existing_session_action(
 
 fn raw_session_metadata_changed(
     raw: &adapters::RawSession,
-    old_directory: Option<&str>,
-    old_source_file_path: Option<&str>,
+    repo_identity: Option<&RepoIdentity>,
+    old: &SessionPath,
 ) -> bool {
-    raw.directory.as_deref().is_some_and(|directory| old_directory != Some(directory))
-        || raw.source_file_path.as_deref().is_some_and(|path| old_source_file_path != Some(path))
+    let repo_changed = repo_identity.is_some_and(|repo| {
+        old.repo_remote.as_deref() != Some(repo.remote.as_str())
+            || old.repo_slug.as_deref() != Some(repo.slug.as_str())
+            || old.repo_name.as_deref() != Some(repo.name.as_str())
+    });
+    raw.directory.as_deref().is_some_and(|directory| old.directory.as_deref() != Some(directory))
+        || raw
+            .source_file_path
+            .as_deref()
+            .is_some_and(|path| old.source_file_path.as_deref() != Some(path))
+        || repo_changed
 }
 
 fn generate_title(messages: &[adapters::RawMessage]) -> String {
@@ -585,7 +626,10 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::adapters::RawSession;
-    use crate::db::{schema, store::Store};
+    use crate::db::{
+        schema,
+        store::{SessionPath, Store},
+    };
     use crate::types::Session;
 
     use super::{
@@ -606,6 +650,9 @@ mod tests {
             source_id: source_id.to_string(),
             title: "t".to_string(),
             directory: None,
+            repo_remote: None,
+            repo_slug: None,
+            repo_name: None,
             started_at: 0,
             updated_at: Some(1),
             message_count: 0,
@@ -672,12 +719,28 @@ mod tests {
             None,
             vec![],
         );
-        assert!(raw_session_metadata_changed(&raw, None, None));
-        assert!(!raw_session_metadata_changed(&raw, Some("/Users/x/git/samzong/Recall"), None));
+        let missing = SessionPath {
+            source_id: "raw1".to_string(),
+            directory: None,
+            source_file_path: None,
+            repo_remote: None,
+            repo_slug: None,
+            repo_name: None,
+        };
+        let same = SessionPath {
+            source_id: "raw1".to_string(),
+            directory: Some("/Users/x/git/samzong/Recall".to_string()),
+            source_file_path: None,
+            repo_remote: Some("github.com/samzong/Recall".to_string()),
+            repo_slug: None,
+            repo_name: None,
+        };
+        assert!(raw_session_metadata_changed(&raw, None, &missing));
+        assert!(!raw_session_metadata_changed(&raw, None, &same));
 
         let mut raw_with_path = RawSession::search_only("raw1", None, 0, Some(1), None, vec![]);
         raw_with_path.source_file_path = Some("/tmp/session.jsonl".to_string());
-        assert!(raw_session_metadata_changed(&raw_with_path, None, None));
+        assert!(raw_session_metadata_changed(&raw_with_path, None, &missing));
     }
 
     #[test]

@@ -54,6 +54,8 @@ enum Commands {
         time: Option<String>,
         #[arg(long, help = "Filter by project directory, including child paths")]
         project: Option<String>,
+        #[arg(long, help = "Filter by repository identity")]
+        repo: Option<String>,
     },
     #[command(about = "Show token usage reports")]
     Usage {
@@ -72,6 +74,8 @@ enum Commands {
         time: Option<String>,
         #[arg(long, help = "Filter by project directory, including child paths")]
         project: Option<String>,
+        #[arg(long, help = "Filter by repository identity")]
+        repo: Option<String>,
         #[arg(
             long,
             default_value_t = 0,
@@ -131,18 +135,23 @@ pub fn run() -> Result<()> {
             recall::bench::run_eval(dataset.as_deref(), verbose)?
         }
         Some(Commands::BenchDumpSessions) => recall::bench::dump_sessions()?,
-        Some(Commands::Search { query, source, time, project }) => recall::query::run_search(
+        Some(Commands::Search { query, source, time, project, repo }) => recall::query::run_search(
             &query,
             source.as_deref(),
             time.as_deref(),
             project.as_deref(),
+            repo.as_deref(),
         )?,
         Some(Commands::Usage { json, source, time }) => {
             recall::usage::run_cli(json, source.as_deref(), time.as_deref())?
         }
-        Some(Commands::Export { source, time, project, limit }) => {
-            recall::export::run_cli(source.as_deref(), time.as_deref(), project.as_deref(), limit)?
-        }
+        Some(Commands::Export { source, time, project, repo, limit }) => recall::export::run_cli(
+            source.as_deref(),
+            time.as_deref(),
+            project.as_deref(),
+            repo.as_deref(),
+            limit,
+        )?,
         Some(Commands::Import { file, dry_run }) => recall::import::run_cli(&file, dry_run)?,
         Some(Commands::Share { command: ShareCommands::Init { project_name, publish_dir } }) => {
             recall::share_init::run(project_name, publish_dir)?

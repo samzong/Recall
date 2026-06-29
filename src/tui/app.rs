@@ -141,6 +141,9 @@ mod tests {
                 source_id: "019e6d8d-588b-7fd2-a326-c525469ed120".to_string(),
                 title: "Codex thread".to_string(),
                 directory: Some("/tmp/project".to_string()),
+                repo_remote: None,
+                repo_slug: None,
+                repo_name: None,
                 started_at: 0,
                 updated_at: None,
                 message_count: 1,
@@ -979,6 +982,7 @@ impl App {
                 source_ids.as_deref(),
                 self.time_filter,
                 self.project_filter.as_deref(),
+                None,
                 200,
             )
             .unwrap_or_default();
@@ -2193,6 +2197,7 @@ impl App {
             sources: self.source_filter_ids(),
             time_range: self.time_filter,
             directory: self.project_filter.clone(),
+            repo: None,
         }
     }
 
@@ -2234,6 +2239,7 @@ impl App {
             self.source_filter_ids().as_deref(),
             self.time_filter,
             self.project_filter.as_deref(),
+            None,
         ) {
             self.total_sessions = sessions;
             self.total_messages = messages;
@@ -2242,6 +2248,7 @@ impl App {
             self.source_filter_ids().as_deref(),
             self.time_filter,
             self.project_filter.as_deref(),
+            None,
         ) {
             self.semantic_progress = progress;
         }

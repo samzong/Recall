@@ -172,7 +172,8 @@ pub fn run_search(query: &str) -> Result<()> {
     let embed_ms = t_embed.elapsed().as_millis();
 
     let engine = SearchEngine::new(&store.conn);
-    let filters = SearchFilters { sources: None, time_range: TimeRange::All, directory: None };
+    let filters =
+        SearchFilters { sources: None, time_range: TimeRange::All, directory: None, repo: None };
 
     let t_search = Instant::now();
     let results = engine.hybrid_search(query, Some(&query_embedding), &filters, 20, 3)?;
@@ -309,7 +310,8 @@ pub fn evaluate<F>(
 where
     F: Fn(&str) -> Option<Vec<f32>>,
 {
-    let filters = SearchFilters { sources: None, time_range: TimeRange::All, directory: None };
+    let filters =
+        SearchFilters { sources: None, time_range: TimeRange::All, directory: None, repo: None };
     let mut report = EvalReport { total: entries.len(), ..Default::default() };
 
     for entry in entries {

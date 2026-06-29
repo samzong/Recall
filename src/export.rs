@@ -4,12 +4,12 @@ use anyhow::{Result, anyhow};
 use serde::Serialize;
 
 use crate::adapters;
-use crate::db::search::TimeRange;
+use crate::db::search::{RepoFilter, TimeRange};
 use crate::db::store::Store;
 use crate::query::{parse_time_range, resolve_source_filter};
 use crate::types::{Message, Role, Session, SessionEventRecord, SessionUsageEventRecord};
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const RECORD_TYPE: &str = "session";
 
 pub struct ExportOptions {
@@ -17,6 +17,7 @@ pub struct ExportOptions {
     pub sources: Option<Vec<String>>,
     pub time_range: TimeRange,
     pub project: Option<String>,
+    pub repo: Option<RepoFilter>,
     pub limit: Option<usize>,
 }
 
@@ -24,15 +25,18 @@ pub fn run_cli(
     source_filter: Option<&str>,
     time_filter: Option<&str>,
     project_filter: Option<&str>,
+    repo_filter: Option<&str>,
     limit: usize,
 ) -> Result<()> {
     let store = Store::open()?;
     let sources = adapters::source_labels();
+    let (directory, repo) = store.resolve_project_repo_filters(project_filter, repo_filter)?;
     let options = ExportOptions {
         session_ids: Vec::new(),
         sources: resolve_source_filter(source_filter, &sources)?,
         time_range: parse_time_range(time_filter),
-        project: project_filter.map(String::from),
+        project: directory,
+        repo,
         limit: if limit == 0 { None } else { Some(limit) },
     };
     let stdout = std::io::stdout();
@@ -57,6 +61,9 @@ struct ExportSession {
     source_id: String,
     title: String,
     directory: Option<String>,
+    repo_remote: Option<String>,
+    repo_slug: Option<String>,
+    repo_name: Option<String>,
     started_at: i64,
     updated_at: Option<i64>,
     message_count: u32,
@@ -117,6 +124,7 @@ pub fn write_jsonl<W: Write>(store: &Store, options: &ExportOptions, mut writer:
             options.sources.as_deref(),
             options.time_range,
             options.project.as_deref(),
+            options.repo.as_ref(),
             options.limit,
         )?
     } else {
@@ -183,6 +191,9 @@ impl From<Session> for ExportSession {
             source_id: session.source_id,
             title: session.title,
             directory: session.directory,
+            repo_remote: session.repo_remote,
+            repo_slug: session.repo_slug,
+            repo_name: session.repo_name,
             started_at: session.started_at,
             updated_at: session.updated_at,
             message_count: session.message_count,

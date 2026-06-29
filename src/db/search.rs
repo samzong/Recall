@@ -16,6 +16,24 @@ pub struct SearchFilters {
     pub sources: Option<Vec<String>>,
     pub time_range: TimeRange,
     pub directory: Option<String>,
+    pub repo: Option<RepoFilter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoFilter {
+    Remote(String),
+    Slug(String),
+    Name(String),
+}
+
+impl RepoFilter {
+    pub(crate) fn column_and_value(&self) -> (&'static str, &str) {
+        match self {
+            RepoFilter::Remote(remote) => ("repo_remote", remote),
+            RepoFilter::Slug(slug) => ("repo_slug", slug),
+            RepoFilter::Name(name) => ("repo_name", name),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +247,12 @@ fn apply_filters(
         params.push(Box::new(dir.clone()));
         params.push(Box::new(directory_child_pattern(dir)));
         *param_idx += 2;
+    }
+    if let Some(ref repo) = filters.repo {
+        let (column, value) = repo.column_and_value();
+        sql.push_str(&format!(" AND s.{column} = ?{}", *param_idx));
+        params.push(Box::new(value.to_string()));
+        *param_idx += 1;
     }
 }
 
