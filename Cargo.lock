@@ -1954,6 +1954,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kitup"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490a1b89ac8fa33dbd4f81b39a51c8f09c47b33f0bdae18674326793f272142c"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2762,6 +2773,7 @@ dependencies = [
  "fs2",
  "globset",
  "hf-hub",
+ "kitup",
  "pulldown-cmark",
  "ratatui",
  "rusqlite",

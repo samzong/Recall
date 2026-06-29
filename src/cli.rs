@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -95,6 +96,11 @@ enum Commands {
         #[command(subcommand)]
         command: ShareCommands,
     },
+    #[command(about = "Manage bundled Agent Skill")]
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
     #[command(about = "Operate on indexed sessions")]
     Session {
         #[command(subcommand)]
@@ -115,6 +121,24 @@ enum ShareCommands {
         project_name: Option<String>,
         #[arg(long, help = "Local directory used for generated share pages")]
         publish_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCommands {
+    #[command(about = "Install Recall bundled Agent Skill")]
+    Install {
+        #[arg(long, help = "Install scope: user or project")]
+        scope: Option<String>,
+        #[arg(
+            long = "agent",
+            help = "Target agent id. Repeat for multiple agents. Use '*' for all."
+        )]
+        agents: Vec<String>,
+        #[arg(long, help = "Show install plan without writing")]
+        dry_run: bool,
+        #[arg(short, long, help = "Skip prompts and accept policy-selected targets")]
+        yes: bool,
     },
 }
 
@@ -156,6 +180,9 @@ pub fn run() -> Result<()> {
         Some(Commands::Share { command: ShareCommands::Init { project_name, publish_dir } }) => {
             recall::share_init::run(project_name, publish_dir)?
         }
+        Some(Commands::Skill {
+            command: SkillCommands::Install { scope, agents, dry_run, yes },
+        }) => run_skill_install(scope, agents, dry_run, yes)?,
         Some(Commands::Session { command }) => session::cmd_session(command)?,
         Some(Commands::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "recall", &mut std::io::stdout());
@@ -166,9 +193,59 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+fn run_skill_install(
+    scope: Option<String>,
+    agents: Vec<String>,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    let flags = kitup::parse_install_flags(kitup::InstallFlagValues {
+        scope,
+        scope_set: false,
+        agents,
+        yes,
+        dry_run,
+    });
+    kitup::install_flag_error(&flags.errors)?;
+
+    let report = kitup::run_bundled_skill_install(&kitup::InstallWorkflowOptions {
+        install: kitup::InstallOptions {
+            base: kitup::BaseOptions::default(),
+            app_id: "recall".to_string(),
+            skill_bundle: recall_skill_bundle(),
+            scope: flags.scope,
+            agents: flags.agents,
+        },
+        yes: flags.yes,
+        dry_run: flags.dry_run,
+        stdin_tty: std::io::stdin().is_terminal(),
+        current_agent: None,
+        default_scope: Some(kitup::Scope::User),
+        scope_set: flags.scope_set,
+        prompt_scope: true,
+    })?;
+    kitup::install_workflow_error(&report)?;
+    Ok(())
+}
+
+fn recall_skill_bundle() -> kitup::SkillBundle {
+    kitup::files_bundle(vec![
+        kitup::SkillFile {
+            path: "SKILL.md".to_string(),
+            contents: include_bytes!("../skills/recall/SKILL.md").to_vec(),
+            mode: None,
+        },
+        kitup::SkillFile {
+            path: "agents/openai.yaml".to_string(),
+            contents: include_bytes!("../skills/recall/agents/openai.yaml").to_vec(),
+            mode: None,
+        },
+    ])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ShareCommands, Shell, generate};
+    use super::{Cli, Commands, ShareCommands, Shell, SkillCommands, generate};
     use clap::{CommandFactory, Parser};
     use recall::adapters::{
         adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
@@ -226,6 +303,7 @@ mod tests {
         assert!(compact_help.contains("export Export session records as JSON Lines"));
         assert!(compact_help.contains("import Import session records from JSON Lines"));
         assert!(compact_help.contains("share Share session pages"));
+        assert!(compact_help.contains("skill Manage bundled Agent Skill"));
         assert!(compact_help.contains("session Operate on indexed sessions"));
         assert!(compact_help.contains("completions Generate shell completion script"));
     }
@@ -254,6 +332,33 @@ mod tests {
             assert!(!help.contains("<TIME>        "), "{subcommand} time help missing");
             assert!(!help.contains("<QUERY>  "), "{subcommand} query help missing");
             assert!(!help.contains("<FILE>  \n"), "{subcommand} file help missing");
+        }
+    }
+
+    #[test]
+    fn skill_install_accepts_kitup_flags() {
+        let cli = Cli::try_parse_from([
+            "recall",
+            "skill",
+            "install",
+            "--scope",
+            "project",
+            "--agent",
+            "codex,claude-code",
+            "--dry-run",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Skill {
+                command: SkillCommands::Install { scope, agents, dry_run, yes },
+            }) => {
+                assert_eq!(scope.as_deref(), Some("project"));
+                assert_eq!(agents, ["codex,claude-code"]);
+                assert!(dry_run);
+                assert!(yes);
+            }
+            _ => panic!("expected skill install command"),
         }
     }
 
