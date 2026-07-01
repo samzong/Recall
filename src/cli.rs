@@ -246,6 +246,7 @@ fn recall_skill_bundle() -> kitup::SkillBundle {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands, ShareCommands, Shell, SkillCommands, generate};
+    use crate::session;
     use clap::{CommandFactory, Parser};
     use recall::adapters::{
         adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
@@ -287,6 +288,29 @@ mod tests {
                 assert_eq!(publish_dir.unwrap().to_string_lossy(), "/tmp/recall-share");
             }
             _ => panic!("expected share init command"),
+        }
+    }
+
+    #[test]
+    fn session_share_accepts_tldr_file() {
+        let cli = Cli::try_parse_from([
+            "recall",
+            "session",
+            "share",
+            "--id",
+            "session-1",
+            "--tldr-file",
+            "/tmp/recall-tldr.md",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Session {
+                command: session::SessionCommands::Share { id, tldr_file, .. },
+            }) => {
+                assert_eq!(id.as_deref(), Some("session-1"));
+                assert_eq!(tldr_file.unwrap().to_string_lossy(), "/tmp/recall-tldr.md");
+            }
+            _ => panic!("expected session share command"),
         }
     }
 

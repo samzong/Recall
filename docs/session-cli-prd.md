@@ -210,6 +210,7 @@ recall session share --source codex --source-id <source-id> --format json
 recall session share --id <id> --dry-run
 recall session share --id <id> --open
 recall session share --id <id> --copy-url
+recall session share --id <id> --tldr-file /tmp/recall-tldr.md --format json
 ```
 
 Options:
@@ -220,12 +221,16 @@ Options:
   not deploy.
 - `--open`: open the resulting URL in the default browser.
 - `--copy-url`: copy the resulting URL to the system clipboard.
+- `--tldr-file <path>`: render this markdown file as the TL;DR block at the
+  top of the shared page. When omitted, Recall derives a simple TL;DR from the
+  first user message, final assistant conclusion, and low-weight trace context.
 - `--format <text|json>`: default `text`.
 
 Behavior:
 
 - Requires existing `recall share init` configuration.
 - Uses the same Cloudflare Pages renderer and deployment path as the TUI.
+- Renders a TL;DR block above the transcript before deploying.
 - Returns a deterministic URL for the selected source session.
 - Uses the actual `project_domain` stored or resolved from Cloudflare Pages
   project metadata; it must not guess `project_name.pages.dev` when the domain

@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Subcommand, ValueEnum};
 use recall::adapters;
 use recall::config::AppConfig;
@@ -94,6 +94,8 @@ pub(crate) enum SessionCommands {
         open: bool,
         #[arg(long, help = "Copy the resulting URL to clipboard")]
         copy_url: bool,
+        #[arg(long, help = "Markdown file to render as the share page TL;DR")]
+        tldr_file: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = SessionActionFormat::Text)]
         format: SessionActionFormat,
     },
@@ -249,17 +251,25 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
                 output,
             )
         }
-        SessionCommands::Share { id, source, source_id, dry_run, open, copy_url, format } => {
-            cmd_session_share(
-                id.as_deref(),
-                source.as_deref(),
-                source_id.as_deref(),
-                dry_run,
-                open,
-                copy_url,
-                format,
-            )
-        }
+        SessionCommands::Share {
+            id,
+            source,
+            source_id,
+            dry_run,
+            open,
+            copy_url,
+            tldr_file,
+            format,
+        } => cmd_session_share(
+            id.as_deref(),
+            source.as_deref(),
+            source_id.as_deref(),
+            dry_run,
+            open,
+            copy_url,
+            tldr_file.as_deref(),
+            format,
+        ),
         SessionCommands::Resume { id, source, source_id, print_command, format } => {
             cmd_session_command(
                 id.as_deref(),
@@ -513,6 +523,7 @@ fn cmd_session_share(
     dry_run: bool,
     open: bool,
     copy_url: bool,
+    tldr_file: Option<&Path>,
     format: SessionActionFormat,
 ) -> Result<()> {
     let store = Store::open()?;
@@ -521,12 +532,32 @@ fn cmd_session_share(
     let messages = store.get_messages(&session.id)?;
     let usage_events = store.list_usage_events_for_session(&session.id)?;
     let config = AppConfig::load_or_default();
-    let preview = recall::share::preview_session(&config, &session, &messages, &usage_events)?;
+    let tldr_markdown = match tldr_file {
+        Some(path) => Some(
+            fs::read_to_string(path)
+                .with_context(|| format!("failed to read TL;DR file {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let render_options = recall::share::ShareRenderOptions { tldr_markdown };
+    let preview = recall::share::preview_session_with_options(
+        &config,
+        &session,
+        &messages,
+        &usage_events,
+        &render_options,
+    )?;
     let url = if dry_run {
         preview.url.clone()
     } else {
         eprintln!("Sharing session {}...", session.id);
-        recall::share::publish_session(&config, &session, &messages, &usage_events)?
+        recall::share::publish_session_with_options(
+            &config,
+            &session,
+            &messages,
+            &usage_events,
+            &render_options,
+        )?
     };
 
     if copy_url {

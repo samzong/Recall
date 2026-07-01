@@ -10,9 +10,13 @@ Let a user publish one Recall session to a browser-viewable URL. The current sup
 2. Recall checks that `wrangler` exists, is logged in, and can access Cloudflare Pages.
 3. Recall suggests a generated Pages project name such as `recall-share-7f3a2c` and asks for a local publish directory.
 4. In the TUI session view, the user presses `s`.
-5. Recall writes one static HTML file to `<publish_dir>/<session_uuid>.html`.
-6. Recall deploys the publish directory with Wrangler.
-7. The TUI shows `https://<project_domain>/<session_uuid>` for the user to copy, where `project_domain` comes from Cloudflare's project metadata.
+5. Recall builds a short TL;DR for the page. Agent workflows may pass a
+   stronger markdown summary with `recall session share --tldr-file`; otherwise
+   Recall derives a simple summary from the first user message, final assistant
+   conclusion, and low-weight trace context.
+6. Recall writes one static HTML file to `<publish_dir>/<session_uuid>.html`.
+7. Recall deploys the publish directory with Wrangler.
+8. The TUI shows `https://<project_domain>/<session_uuid>` for the user to copy, where `project_domain` comes from Cloudflare's project metadata.
 
 ## Scope
 
@@ -25,6 +29,7 @@ Let a user publish one Recall session to a browser-viewable URL. The current sup
 ## Page
 
 - Show readable user and assistant messages.
+- Show a TL;DR block above the transcript.
 - Collapse tool calls and tool results by default.
 - Do not show local filesystem paths.
 

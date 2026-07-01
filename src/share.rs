@@ -30,6 +30,11 @@ pub struct SharePreview {
     pub html_bytes: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ShareRenderOptions {
+    pub tldr_markdown: Option<String>,
+}
+
 const SESSION_PAGE_CSS: &str = r#"
 :root{
   --page-bg:#FAF9F6;--surface:#FFFFFF;--user-surface:#FFFFFF;
@@ -59,6 +64,14 @@ body{margin:0;background:var(--page-bg);color:var(--text-primary);font:16px/1.6 
 .layout{display:grid;grid-template-columns:minmax(0,var(--read-width)) 212px;grid-template-areas:"page toc";justify-content:center;gap:64px;max-width:var(--layout-width);margin:0 auto;padding:40px 32px 28px}
 .page{grid-area:page;min-width:0}
 .document{min-width:0}
+
+.tldr{margin:0 0 34px;padding:17px 19px 18px;border:1px solid var(--rule-strong);border-left:3px solid var(--accent);border-radius:8px;background:var(--surface);box-shadow:0 1px 2px rgba(35,33,28,.04)}
+.tldr-title{margin:0 0 10px;font:600 12px/1 var(--font-sans);letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+.tldr .prose{font:15.5px/1.62 var(--font-sans);color:var(--text-primary)}
+.tldr .prose p{margin-bottom:.6em}
+.tldr .prose strong{color:var(--text-primary)}
+.tldr .prose ul,.tldr .prose ol{margin-bottom:.6em}
+.tldr .prose li{margin-bottom:.25em}
 
 .user-toc{grid-area:toc;position:sticky;top:50vh;transform:translateY(-50%);align-self:start;max-height:80vh;display:flex;flex-direction:column;align-items:flex-end;gap:4px;padding:4px 0;z-index:5}
 .user-toc-title{margin:0 3px 4px 0;font:600 10px/1 var(--font-sans);letter-spacing:.12em;text-transform:uppercase;color:var(--text-tertiary);opacity:0;transform:translateX(4px);transition:opacity .16s ease,transform .16s ease}
@@ -293,7 +306,8 @@ pub fn write_preview_file(
     let share_id = share_id_for_session(session);
     let file_path = preview_dir.join(format!("{share_id}.html"));
     let display_meta = collect_session_display_meta(session, usage_events);
-    let html = render_session_html(session, messages, &display_meta);
+    let tldr = generate_session_tldr_markdown(messages);
+    let html = render_session_html_with_tldr(session, messages, &display_meta, tldr.as_deref());
     fs::write(&file_path, html)
         .with_context(|| format!("failed to write {}", file_path.display()))?;
     Ok(file_path)
@@ -332,7 +346,23 @@ pub fn preview_session(
     messages: &[Message],
     usage_events: &[SessionUsageEventRecord],
 ) -> Result<SharePreview> {
-    let (preview, _) = build_publish_preview(config, session, messages, usage_events)?;
+    preview_session_with_options(
+        config,
+        session,
+        messages,
+        usage_events,
+        &ShareRenderOptions::default(),
+    )
+}
+
+pub fn preview_session_with_options(
+    config: &AppConfig,
+    session: &Session,
+    messages: &[Message],
+    usage_events: &[SessionUsageEventRecord],
+    options: &ShareRenderOptions,
+) -> Result<SharePreview> {
+    let (preview, _) = build_publish_preview(config, session, messages, usage_events, options)?;
     Ok(preview)
 }
 
@@ -342,7 +372,23 @@ pub fn publish_session(
     messages: &[Message],
     usage_events: &[SessionUsageEventRecord],
 ) -> Result<String> {
-    let (preview, html) = build_publish_preview(config, session, messages, usage_events)?;
+    publish_session_with_options(
+        config,
+        session,
+        messages,
+        usage_events,
+        &ShareRenderOptions::default(),
+    )
+}
+
+pub fn publish_session_with_options(
+    config: &AppConfig,
+    session: &Session,
+    messages: &[Message],
+    usage_events: &[SessionUsageEventRecord],
+    options: &ShareRenderOptions,
+) -> Result<String> {
+    let (preview, html) = build_publish_preview(config, session, messages, usage_events, options)?;
 
     init_publish_dir(&preview.publish_dir)?;
 
@@ -358,6 +404,7 @@ fn build_publish_preview(
     session: &Session,
     messages: &[Message],
     usage_events: &[SessionUsageEventRecord],
+    options: &ShareRenderOptions,
 ) -> Result<(SharePreview, String)> {
     let share = config
         .share
@@ -373,7 +420,13 @@ fn build_publish_preview(
 
     let share_id = share_id_for_session(session);
     let display_meta = collect_session_display_meta(session, usage_events);
-    let html = render_session_html(session, messages, &display_meta);
+    let tldr = options
+        .tldr_markdown
+        .as_deref()
+        .filter(|tldr| !tldr.trim().is_empty())
+        .map(|tldr| tldr.trim().to_string())
+        .or_else(|| generate_session_tldr_markdown(messages));
+    let html = render_session_html_with_tldr(session, messages, &display_meta, tldr.as_deref());
     if html.len() > MAX_PAGES_ASSET_BYTES {
         bail!("session page is larger than Cloudflare Pages' 25 MiB asset limit");
     }
@@ -429,6 +482,15 @@ pub fn render_session_html(
     messages: &[Message],
     display_meta: &SessionDisplayMeta,
 ) -> String {
+    render_session_html_with_tldr(session, messages, display_meta, None)
+}
+
+fn render_session_html_with_tldr(
+    session: &Session,
+    messages: &[Message],
+    display_meta: &SessionDisplayMeta,
+    tldr_markdown: Option<&str>,
+) -> String {
     let title = session.custom_title.as_deref().unwrap_or(&session.title);
     let display_title = display_title(title);
     let blocks = prepare_render_blocks(messages);
@@ -458,6 +520,9 @@ pub fn render_session_html(
     append_header_display_meta(&mut out, display_meta);
     out.push_str("</div></div></header>");
     out.push_str("<div class=\"layout\"><div class=\"page\"><article class=\"document\">");
+    if let Some(tldr) = tldr_markdown.filter(|tldr| !tldr.trim().is_empty()) {
+        render_tldr_html(&mut out, tldr);
+    }
     if blocks.is_empty() {
         out.push_str("<p class=\"empty\">No messages in this session.</p>");
     } else {
@@ -479,6 +544,133 @@ pub fn render_session_html(
     out.push_str("</div></footer>");
     out.push_str(TOC_NAV_SCRIPT);
     out.push_str("</body></html>");
+    out
+}
+
+fn render_tldr_html(out: &mut String, markdown: &str) {
+    out.push_str("<section class=\"tldr\" aria-labelledby=\"tldr-title\">");
+    out.push_str("<h2 id=\"tldr-title\" class=\"tldr-title\">TL;DR</h2>");
+    render_content(out, markdown);
+    out.push_str("</section>");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareTldr {
+    pub query: Option<String>,
+    pub conclusion: Option<String>,
+    pub trace: Vec<String>,
+}
+
+impl ShareTldr {
+    pub fn to_markdown(&self) -> Option<String> {
+        let mut sections = Vec::new();
+        if let Some(query) = self.query.as_deref().filter(|value| !value.trim().is_empty()) {
+            sections.push(format!("**Query:** {}", trim_to_chars(query, 620)));
+        }
+        if let Some(conclusion) =
+            self.conclusion.as_deref().filter(|value| !value.trim().is_empty())
+        {
+            sections.push(format!("**Conclusion:** {}", trim_to_chars(conclusion, 700)));
+        }
+        if !self.trace.is_empty() {
+            let mut trace = String::from("**Trace:**");
+            for item in &self.trace {
+                trace.push_str("\n- ");
+                trace.push_str(&trim_to_chars(item, 180));
+            }
+            sections.push(trace);
+        }
+        if sections.is_empty() { None } else { Some(sections.join("\n\n")) }
+    }
+}
+
+pub fn generate_session_tldr_markdown(messages: &[Message]) -> Option<String> {
+    generate_session_tldr(messages).and_then(|tldr| tldr.to_markdown())
+}
+
+pub fn generate_session_tldr(messages: &[Message]) -> Option<ShareTldr> {
+    let blocks = prepare_render_blocks(messages);
+    let mut user_turns = Vec::new();
+    let mut assistant_texts = Vec::new();
+
+    for block in &blocks {
+        match block {
+            RenderBlock::User(content) => {
+                if let Some(text) = clean_tldr_text(content) {
+                    user_turns.push(text);
+                }
+            }
+            RenderBlock::Assistant(segments) => {
+                for segment in segments {
+                    if let AssistantSegment::Text(content) = segment
+                        && let Some(text) = clean_tldr_text(content)
+                    {
+                        assistant_texts.push(text);
+                    }
+                }
+            }
+        }
+    }
+
+    let query = user_turns.first().cloned();
+    let conclusion = assistant_texts.last().cloned();
+    let trace = user_turns.iter().skip(1).take(3).cloned().collect::<Vec<_>>();
+
+    let tldr = ShareTldr { query, conclusion, trace };
+    if tldr.query.is_none() && tldr.conclusion.is_none() && tldr.trace.is_empty() {
+        None
+    } else {
+        Some(tldr)
+    }
+}
+
+fn clean_tldr_text(text: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut in_code_fence = false;
+    for line in text.lines() {
+        let sanitized = utils::sanitize_line(line);
+        let trimmed = sanitized.trim();
+        if trimmed.starts_with("```") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence
+            || trimmed.is_empty()
+            || is_log_line(trimmed)
+            || is_oai_mem_citation_start(trimmed)
+            || trimmed.contains("</oai-mem-citation>")
+        {
+            continue;
+        }
+        lines.push(trim_summary_marker(trimmed).to_string());
+    }
+    let collapsed = collapse_whitespace(&lines.join(" "));
+    if collapsed.is_empty() { None } else { Some(collapsed) }
+}
+
+fn trim_summary_marker(line: &str) -> &str {
+    let line = line.trim_start_matches('#').trim_start();
+    let line = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+        .unwrap_or(line);
+    let Some((head, tail)) = line.split_once(". ") else {
+        return line;
+    };
+    if !head.is_empty() && head.chars().all(|ch| ch.is_ascii_digit()) { tail } else { line }
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn trim_to_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max_chars.saturating_sub(3)).collect::<String>();
+    out.push_str("...");
     out
 }
 
@@ -1496,6 +1688,91 @@ mod tests {
     fn html_renderer_omits_local_directory() {
         let html = render_html(&session("s1"), &[]);
         assert!(!html.contains("/tmp/project"));
+    }
+
+    #[test]
+    fn tldr_generator_weights_query_conclusion_and_trace() {
+        let messages = vec![
+            Message {
+                session_id: "local-id".to_string(),
+                role: Role::User,
+                content: "Build the thing.".to_string(),
+                timestamp: None,
+                seq: 0,
+            },
+            Message {
+                session_id: "local-id".to_string(),
+                role: Role::Assistant,
+                content: "[Read] {\"path\":\"src/share.rs\"}".to_string(),
+                timestamp: None,
+                seq: 1,
+            },
+            Message {
+                session_id: "local-id".to_string(),
+                role: Role::User,
+                content: "{\"method\":\"get_file\",\"content\":\"tool result\"}".to_string(),
+                timestamp: None,
+                seq: 2,
+            },
+            Message {
+                session_id: "local-id".to_string(),
+                role: Role::Assistant,
+                content: "Intermediate trace note.".to_string(),
+                timestamp: None,
+                seq: 3,
+            },
+            Message {
+                session_id: "local-id".to_string(),
+                role: Role::User,
+                content: "Please share this session.".to_string(),
+                timestamp: None,
+                seq: 4,
+            },
+            Message {
+                session_id: "local-id".to_string(),
+                role: Role::Assistant,
+                content: "Final answer with result.".to_string(),
+                timestamp: None,
+                seq: 5,
+            },
+        ];
+
+        let tldr = generate_session_tldr(&messages).unwrap();
+        assert_eq!(tldr.query.as_deref(), Some("Build the thing."));
+        assert_eq!(tldr.conclusion.as_deref(), Some("Final answer with result."));
+        assert_eq!(tldr.trace, vec!["Please share this session."]);
+
+        let markdown = tldr.to_markdown().unwrap();
+        let query = markdown.find("**Query:**").unwrap();
+        let conclusion = markdown.find("**Conclusion:**").unwrap();
+        let trace = markdown.find("**Trace:**").unwrap();
+        assert!(query < conclusion);
+        assert!(conclusion < trace);
+        assert!(!markdown.contains("tool result"));
+    }
+
+    #[test]
+    fn html_renderer_places_tldr_before_transcript_and_escapes_it() {
+        let html = render_session_html_with_tldr(
+            &session("s1"),
+            &[Message {
+                session_id: "local-id".to_string(),
+                role: Role::User,
+                content: "First question".to_string(),
+                timestamp: None,
+                seq: 0,
+            }],
+            &SessionDisplayMeta::default(),
+            Some("**Query:** <script>alert('x')</script>"),
+        );
+
+        let tldr = html.find("class=\"tldr\"").unwrap();
+        let first_turn = html.find("class=\"turn user\"").unwrap();
+        assert!(tldr < first_turn);
+        assert!(html.contains("TL;DR"));
+        assert!(html.contains("&lt;script&gt;alert("));
+        assert!(html.contains("&lt;/script&gt;"));
+        assert!(!html.contains("<script>alert"));
     }
 
     #[test]
