@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
 use recall::adapters;
 use recall::config::AppConfig;
@@ -516,6 +516,7 @@ fn cmd_session_export(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_session_share(
     id: Option<&str>,
     source_filter: Option<&str>,
@@ -532,13 +533,7 @@ fn cmd_session_share(
     let messages = store.get_messages(&session.id)?;
     let usage_events = store.list_usage_events_for_session(&session.id)?;
     let config = AppConfig::load_or_default();
-    let tldr_markdown = match tldr_file {
-        Some(path) => Some(
-            fs::read_to_string(path)
-                .with_context(|| format!("failed to read TL;DR file {}", path.display()))?,
-        ),
-        None => None,
-    };
+    let tldr_markdown = tldr_file.and_then(read_tldr_file);
     let render_options = recall::share::ShareRenderOptions { tldr_markdown };
     let preview = recall::share::preview_session_with_options(
         &config,
@@ -959,6 +954,19 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
+fn read_tldr_file(path: &Path) -> Option<String> {
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            let trimmed = content.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        }
+        Err(err) => {
+            eprintln!("Warning: skipping TL;DR file {}: {err}", path.display());
+            None
+        }
+    }
+}
+
 fn open_url(url: &str) -> Result<()> {
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("open", vec![url])
@@ -993,5 +1001,25 @@ mod tests {
             .into_owned();
 
         assert_eq!(handoff_working_directory(Some(directory.as_str())), None);
+    }
+
+    #[test]
+    fn read_tldr_file_skips_missing_file() {
+        let path = std::env::temp_dir().join(format!("recall-missing-{}.md", uuid::Uuid::new_v4()));
+
+        assert_eq!(read_tldr_file(&path), None);
+    }
+
+    #[test]
+    fn read_tldr_file_trims_blank_and_content() {
+        let path = std::env::temp_dir().join(format!("recall-tldr-{}.md", uuid::Uuid::new_v4()));
+        fs::write(&path, "  **Summary**  \n").unwrap();
+
+        assert_eq!(read_tldr_file(&path).as_deref(), Some("**Summary**"));
+
+        fs::write(&path, " \n\t").unwrap();
+        assert_eq!(read_tldr_file(&path), None);
+
+        let _ = fs::remove_file(path);
     }
 }

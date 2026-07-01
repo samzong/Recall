@@ -100,17 +100,16 @@ When the user wants to share a session or update an existing share link, execute
    Progress text goes to stderr; read the URL from stdout JSON at `share.url`.
    Add `--copy-url` when they ask to copy it; add `--open` when they ask to open it.
 
-   Before publishing, create a short TL;DR markdown file and pass it with
-   `--tldr-file`. Weight the first user message highest because it captures
-   the user's intent, weight the final assistant conclusion next, and use
-   trace/process messages only as low-weight context:
+   Before publishing, write a short TL;DR markdown file from the current agent
+   context and pass it with `--tldr-file`. Weight the user's request highest,
+   weight the final outcome next, and use trace/process details only as
+   low-weight context:
    ```bash
-   recall session show --id <recall-session-id> --format json --include metadata,messages > /tmp/recall-session.json
-   # Agent writes /tmp/recall-tldr.md from the structured JSON.
+   # Agent writes /tmp/recall-tldr.md from the current conversation context.
    recall session share --id <recall-session-id> --tldr-file /tmp/recall-tldr.md --format json
    ```
-   If no TL;DR file is supplied, Recall renders a simple local TL;DR from the
-   same Query / Conclusion / Trace weighting before it deploys the page.
+   If the TL;DR file is missing, unreadable, or blank, Recall skips the TL;DR
+   block and still publishes the session.
 
 4. Reply in this shape:
    ```text
