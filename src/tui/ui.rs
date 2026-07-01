@@ -1719,7 +1719,7 @@ fn render_export_input(f: &mut Frame, app: &App) {
 fn render_settings(f: &mut Frame, app: &App) {
     let area = f.area();
     let width = area.width.min(70);
-    let height = (app.all_sources.len() as u16 + 6).min(area.height.saturating_sub(2).max(6));
+    let height = (app.all_sources.len() as u16 + 7).min(area.height.saturating_sub(2).max(7));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -1741,12 +1741,15 @@ fn render_settings(f: &mut Frame, app: &App) {
             if app.settings_selected == 0 { selected_style } else { normal_style },
         ),
     ]));
+    let prefix = if app.config.default_current_repo_scope { "[x]" } else { "[ ]" };
+    let style = if app.settings_selected == 1 { selected_style } else { normal_style };
+    lines.push(Line::from(Span::styled(format!(" {prefix} Default Current Repo"), style)));
     lines.push(Line::from(""));
 
     for (index, (source_id, label)) in app.all_sources.iter().enumerate() {
         let enabled = app.config.is_source_enabled(source_id);
         let prefix = if enabled { "[x]" } else { "[ ]" };
-        let style = if app.settings_selected == index + 1 { selected_style } else { normal_style };
+        let style = if app.settings_selected == index + 2 { selected_style } else { normal_style };
         lines.push(Line::from(Span::styled(format!(" {prefix} {label} ({source_id})"), style)));
     }
 
