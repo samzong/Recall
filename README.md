@@ -1,8 +1,10 @@
+**English** | [Chinese](./README.zh-CN.md)
+
 # Recall
 
 > Local-first search across every AI coding session on your machine.
 
-[![Recall TUI](docs/recall.png)](https://asciinema.org/a/909453)
+[![Recall](docs/recall.png)](https://asciinema.org/a/909453)
 
 Jump between Claude Code, Codex, and whatever comes next; Recall pulls those scattered local sessions into one searchable index, tracks usage when token metadata is available, and drops you back into the original CLI.
 
@@ -10,30 +12,25 @@ Jump between Claude Code, Codex, and whatever comes next; Recall pulls those sca
 
 ```bash
 brew install samzong/tap/recall
-# or
-make install # from a source checkout
 ```
 
-## Shell completion
-
-Generate a static completion script and load it from your shell `fpath`:
+## Usage
 
 ```bash
-recall completions zsh > ~/.zsh/completions/_recall
+recall sync          # incremental sync (safe to run anytime)
+recall               # launch TUI
+recall usage         # usage dashboard
+recall export > recall-export.jsonl # export all session
+recall import recall-export.jsonl --dry-run  # preview an import
+recall session list  # list sessions for agents/scripts
+recall session share --id <session-id> --format json  # publish one selected session
+recall info  # index stats and worker status
 ```
 
-Add to `~/.zshrc` (works alongside `gmc` and other tools):
+With Skill use **Recall** is the best way.
 
 ```bash
-fpath=(~/.zsh/completions ~/.grok/completions/zsh $fpath)
-autoload -Uz compinit && compinit
-```
-
-Other shells:
-
-```bash
-recall completions bash > ~/.bash_completion.d/recall
-recall completions fish > ~/.config/fish/completions/recall.fish
+recall skill install # auto detect agents and install skills
 ```
 
 ## Support
@@ -46,73 +43,23 @@ One index across every AI coding CLI. Sync once, search everywhere, resume right
 | OpenCode        |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Codex           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Pi              |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
-| Antigravity CLI |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
+| Antigravity |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
 | Gemini          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Kiro            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
-| Copilot CLI     |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
+| Copilot     |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
 | Cursor          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |   ✅   |
 | Cline           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
 | Grok            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |        |
 
-## Usage
+## Acknowledgements
 
-```bash
-recall sync          # incremental sync (safe to run anytime)
-recall sync --force  # reprocess every session (after changing embedding model)
-recall               # launch TUI
-recall search Q      # one-shot CLI search
-recall search Q --project /path/to/repo
-recall usage         # usage dashboard
-recall usage --json  # usage report for scripts
-recall export --source codex --project /path/to/repo --limit 20 > recall-export.jsonl
-recall import recall-export.jsonl --dry-run  # preview an import
-recall session list --source codex --limit 20  # list sessions for agents/scripts
-recall session show --id <session-id> --include metadata,messages --format json
-recall session export --id <session-id> --format jsonl
-recall session share --id <session-id> --format json  # publish one selected session
-recall session resume --id <session-id> --print-command
-recall info          # index stats and worker status
-```
-
-## Export
-
-`recall export` writes JSON Lines to stdout, with one JSON object per indexed
-session. Redirect stdout to save an export file:
-
-```bash
-recall export --source codex --project /path/to/repo > recall-export.jsonl
-```
-
-Each session includes `schema_version`, `record_type`, `session`, `messages`,
-`usage_events`, and `events`. It covers the portable session data Recall can
-import again; derived index state such as FTS rows, embeddings, and background
-job state is rebuilt locally. Optional fields are emitted as `null`. By default
-all sessions are exported; use `--limit N` to truncate. `--time` filters on
-`started_at`, so prefer a full export when moving data between machines.
-
-## Import
-
-`recall import <file>` (or `-` for stdin) loads sessions from an export file
-into the local index. How the file travels between machines is up to you.
-
-```bash
-# machine A
-recall export > recall-a.jsonl
-# machine B
-recall import recall-a.jsonl
-```
-
-- Idempotent: a session whose `(source, source_id)` already exists locally is
-  skipped, so re-running an import is safe and local data always wins.
-- Imported sessions are searchable and appear in usage reports, but cannot be
-  resumed on this machine (the source tool's own files were not copied); the
-  TUI explains this if you try.
-- `--dry-run` parses and reports counts without writing anything.
+- Thanks to [tokscale](https://github.com/junhoyeo/tokscale) for the usage dashboard reference and token accounting behavior.
+- Thanks to [Ratatui](https://github.com/ratatui/ratatui) and [Crossterm](https://github.com/crossterm-rs/crossterm) for the terminal UI foundation.
+- Thanks to [sqlite-vec](https://github.com/asg017/sqlite-vec) and SQLite FTS5 for keeping local text and vector search embedded.
+- Thanks to [Candle](https://github.com/huggingface/candle), Hugging Face, and [intfloat/multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small) for local semantic embeddings.
+- Thanks to [kitup](https://github.com/samzong/kitup) for the bundled agent skill installer.
+- Thanks to [LINUX DO](https://linux.do/) for the open-source sharing community.
 
 ## License
 
-[MIT](LICENSE)
-
-## Acknowledgements
-
-Thanks to [tokscale](https://github.com/junhoyeo/tokscale) for the usage dashboard reference and token accounting behavior.
+This project is licensed under the [MIT](LICENSE) License.
