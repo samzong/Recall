@@ -1118,11 +1118,20 @@ fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .results
+    let visible_rows = block.inner(area).height as usize;
+    let selected_index = app.selected_index.min(app.results.len().saturating_sub(1));
+    let start = if visible_rows == 0 {
+        0
+    } else {
+        selected_index.saturating_add(1).saturating_sub(visible_rows)
+    };
+    let end = (start + visible_rows).min(app.results.len());
+
+    let items: Vec<ListItem> = app.results[start..end]
         .iter()
         .enumerate()
-        .map(|(i, result)| {
+        .map(|(offset, result)| {
+            let i = start + offset;
             let s = &result.session;
             let age = crate::utils::format_age(s.started_at);
             let source_label = app.source_label_for(&s.source);
@@ -2178,6 +2187,53 @@ mod tests {
         assert!(rendered.contains("OpenCode (opencode)"));
         assert!(rendered.contains("[Enter]"));
         assert!(rendered.contains("select"));
+    }
+
+    #[test]
+    fn render_result_list_scrolls_selected_row_into_view() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.results = (1..=6)
+            .map(|n| SearchResult {
+                session: Session {
+                    id: format!("session{n}"),
+                    source: "codex".to_string(),
+                    source_id: format!("source{n}"),
+                    title: format!("Session {n}"),
+                    directory: None,
+                    repo_remote: None,
+                    repo_slug: None,
+                    repo_name: None,
+                    started_at: 0,
+                    updated_at: None,
+                    message_count: 1,
+                    entrypoint: None,
+                    custom_title: None,
+                    summary: None,
+                    duration_minutes: None,
+                    source_file_path: None,
+                    is_import: false,
+                },
+                match_source: MatchSource::Fts,
+                snippet: None,
+            })
+            .collect();
+        app.selected_index = 3;
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let rendered = (0..10)
+            .map(|y| buffer_row(terminal.backend().buffer(), y, 80))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!rendered.contains("Session 1"));
+        assert!(rendered.contains("Session 2"));
+        assert!(rendered.contains("Session 3"));
+        assert!(rendered.contains("Session 4"));
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
