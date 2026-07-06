@@ -1346,10 +1346,8 @@ fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Ctrl+O", Style::default().fg(Color::Yellow)),
         Span::styled(" app  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc", Style::default().fg(Color::Yellow)),
-        Span::styled(" back  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q", Style::default().fg(Color::Yellow)),
-        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        Span::styled("Esc/q", Style::default().fg(Color::Yellow)),
+        Span::styled(" back", Style::default().fg(Color::DarkGray)),
     ];
 
     let status_line = if let Some(ref input) = app.viewing_search_input {
@@ -1970,9 +1968,11 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" settings  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
                     Span::styled(" clear  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("q", Style::default().fg(Color::Yellow)),
-                    Span::styled(" quit", Style::default().fg(Color::DarkGray)),
                 ];
+                if app.query.is_empty() {
+                    spans.push(Span::styled("q", Style::default().fg(Color::Yellow)));
+                    spans.push(Span::styled(" quit", Style::default().fg(Color::DarkGray)));
+                }
                 if let Some(span) = semantic_span.clone() {
                     spans.push(span);
                 }
