@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -5,12 +6,14 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tracing::debug;
 
-use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
 use crate::db::store::Store;
-use crate::types::Role;
+use crate::types::{RawUsageEvent, Role, TokenSource};
+
+const USAGE_PARSER_VERSION: u32 = 1;
 
 pub struct GrokAdapter;
 
@@ -21,6 +24,10 @@ impl SourceAdapter for GrokAdapter {
 
     fn label(&self) -> &str {
         "GRK"
+    }
+
+    fn usage_parser_version(&self) -> Option<u32> {
+        Some(USAGE_PARSER_VERSION)
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
@@ -73,6 +80,14 @@ struct GrokSummary {
     directory: Option<String>,
     started_at: i64,
     updated_at: Option<i64>,
+    current_model_id: Option<String>,
+}
+
+struct PromptTokenState {
+    prompt_id: String,
+    peak_total_tokens: i64,
+    timestamp: Option<i64>,
+    model: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,9 +117,17 @@ fn scan_for_sync_impl(
     since_ts: Option<i64>,
 ) -> anyhow::Result<SyncScanResult> {
     let (entries, _) = collect_grok_entries(sessions_dir);
-    file_scan::run_file_scan(store, "grok", since_ts, entries, |entry, mtime_ms| {
-        parse_grok_session_for_entry(&entry, mtime_ms)
-    })
+    file_scan::run_file_scan_with_options(
+        store,
+        "grok",
+        since_ts,
+        FileScanOptions {
+            usage_parser_version: Some(USAGE_PARSER_VERSION),
+            event_parser_version: None,
+        },
+        entries,
+        |entry, mtime_ms| parse_grok_session_for_entry(&entry, mtime_ms),
+    )
 }
 
 fn prune_impl(sessions_dir: &Path, store: &Store) -> anyhow::Result<()> {
@@ -243,7 +266,7 @@ fn parse_grok_session_for_entry(
         }
     };
 
-    let messages = match parse_grok_updates(&entry.stat_target) {
+    let (messages, mut usage_events) = match parse_grok_updates(&entry.stat_target) {
         Ok(parsed) => parsed,
         Err(err) => {
             debug!("failed to parse Grok updates {}: {err}", entry.stat_target.display());
@@ -253,6 +276,15 @@ fn parse_grok_session_for_entry(
 
     if messages.is_empty() {
         return Ok(None);
+    }
+
+    let fallback_model = summary.current_model_id.clone().unwrap_or_else(|| "grok".to_string());
+    let source_path = entry.stat_target.to_str().map(str::to_string);
+    for event in &mut usage_events {
+        if event.model.is_empty() {
+            event.model = fallback_model.clone();
+        }
+        event.source_path = source_path.clone();
     }
 
     let started_at =
@@ -265,7 +297,8 @@ fn parse_grok_session_for_entry(
         summary.updated_at.or(Some(mtime_ms)),
         None,
         messages,
-    );
+    )
+    .with_usage(usage_events, USAGE_PARSER_VERSION);
 
     session.updated_at = Some(mtime_ms);
     Ok(Some(session))
@@ -292,19 +325,33 @@ fn load_grok_summary(session_dir: &Path, fallback_id: &str) -> anyhow::Result<Gr
         .filter(|cwd| !cwd.is_empty())
         .map(str::to_string);
 
+    let current_model_id = doc
+        .get("current_model_id")
+        .and_then(|model| model.as_str())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+
     let started_at = parse_rfc3339_ms(doc.get("created_at")).unwrap_or(0);
     let updated_at = parse_rfc3339_ms(doc.get("updated_at"));
-    Ok(GrokSummary { session_id, directory, started_at, updated_at })
+    Ok(GrokSummary { session_id, directory, started_at, updated_at, current_model_id })
 }
 
-fn parse_grok_updates(updates_path: &Path) -> anyhow::Result<Vec<RawMessage>> {
+fn parse_grok_updates(
+    updates_path: &Path,
+) -> anyhow::Result<(Vec<RawMessage>, Vec<RawUsageEvent>)> {
     let file = fs::File::open(updates_path)?;
     parse_grok_updates_reader(BufReader::new(file))
 }
 
-fn parse_grok_updates_reader<R: BufRead>(reader: R) -> anyhow::Result<Vec<RawMessage>> {
+fn parse_grok_updates_reader<R: BufRead>(
+    reader: R,
+) -> anyhow::Result<(Vec<RawMessage>, Vec<RawUsageEvent>)> {
     let mut messages = Vec::new();
     let mut pending_agent: Option<PendingAgentMessage> = None;
+    let mut prompts: Vec<PromptTokenState> = Vec::new();
+    let mut prompt_index: HashMap<String, usize> = HashMap::new();
+    let mut last_model: Option<String> = None;
     for line in reader.lines() {
         let line = line?;
         let line = line.trim();
@@ -327,6 +374,7 @@ fn parse_grok_updates_reader<R: BufRead>(reader: R) -> anyhow::Result<Vec<RawMes
         let session_update =
             update.get("sessionUpdate").and_then(|value| value.as_str()).unwrap_or("");
         let timestamp_ms = doc.get("timestamp").and_then(json_i64).map(|ts| ts * 1000);
+        track_prompt_tokens(params, timestamp_ms, &mut prompts, &mut prompt_index, &mut last_model);
 
         match session_update {
             "user_message_chunk" => {
@@ -377,7 +425,83 @@ fn parse_grok_updates_reader<R: BufRead>(reader: R) -> anyhow::Result<Vec<RawMes
         }
     }
 
-    Ok(messages)
+    Ok((messages, prompt_usage_events(prompts)))
+}
+
+fn track_prompt_tokens(
+    params: &Value,
+    timestamp_ms: Option<i64>,
+    prompts: &mut Vec<PromptTokenState>,
+    prompt_index: &mut HashMap<String, usize>,
+    last_model: &mut Option<String>,
+) {
+    let Some(meta) = params.get("_meta") else {
+        return;
+    };
+    if let Some(model) = meta.get("modelId").and_then(|value| value.as_str())
+        && !model.is_empty()
+    {
+        *last_model = Some(model.to_string());
+    }
+    let Some(prompt_id) =
+        meta.get("promptId").and_then(|value| value.as_str()).filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let Some(total_tokens) = meta.get("totalTokens").and_then(json_i64) else {
+        return;
+    };
+    let index = match prompt_index.get(prompt_id) {
+        Some(index) => *index,
+        None => {
+            prompts.push(PromptTokenState {
+                prompt_id: prompt_id.to_string(),
+                peak_total_tokens: 0,
+                timestamp: None,
+                model: None,
+            });
+            prompt_index.insert(prompt_id.to_string(), prompts.len() - 1);
+            prompts.len() - 1
+        }
+    };
+    let prompt = &mut prompts[index];
+    prompt.peak_total_tokens = prompt.peak_total_tokens.max(total_tokens);
+    if timestamp_ms.is_some() {
+        prompt.timestamp = timestamp_ms;
+    }
+    if prompt.model.is_none() {
+        prompt.model = last_model.clone();
+    }
+}
+
+fn prompt_usage_events(prompts: Vec<PromptTokenState>) -> Vec<RawUsageEvent> {
+    let mut events = Vec::new();
+    let mut previous_peak = 0i64;
+    for prompt in prompts {
+        let delta = prompt.peak_total_tokens - previous_peak;
+        previous_peak = prompt.peak_total_tokens;
+        if delta <= 0 {
+            continue;
+        }
+        events.push(RawUsageEvent {
+            event_key: format!("prompt:{}", prompt.prompt_id),
+            event_seq: events.len() as u32,
+            message_seq: None,
+            timestamp: prompt.timestamp.unwrap_or_default(),
+            model: prompt.model.unwrap_or_default(),
+            provider: "xai".to_string(),
+            input_tokens: delta,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            token_source: TokenSource::Derived,
+            parser_version: USAGE_PARSER_VERSION,
+            source_path: None,
+            raw_usage_json: Some(format!("{{\"totalTokens\":{}}}", prompt.peak_total_tokens)),
+        });
+    }
+    events
 }
 
 fn agent_chunk_key(params: &Value) -> AgentChunkKey {
@@ -584,18 +708,40 @@ mod tests {
     #[test]
     fn parse_grok_updates_extracts_messages() {
         let jsonl = r#"{"timestamp":10,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hello"}},"_meta":{"totalTokens":100,"turnStartMs":1000}}}
-{"timestamp":11,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}},"_meta":{"totalTokens":250,"promptId":"prompt-1","turnStartMs":1000}}}
+{"timestamp":11,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}},"_meta":{"totalTokens":250,"promptId":"prompt-1","modelId":"grok-composer-2.5-fast","turnStartMs":1000}}}
 {"timestamp":12,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" there"}},"_meta":{"totalTokens":255,"promptId":"prompt-1","turnStartMs":1000}}}
 {"timestamp":20,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"next"}},"_meta":{"totalTokens":260,"turnStartMs":2000}}}
-{"timestamp":21,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}},"_meta":{"totalTokens":400,"turnStartMs":2000}}}
+{"timestamp":21,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}},"_meta":{"totalTokens":400,"promptId":"prompt-2","turnStartMs":2000}}}
 "#;
 
-        let messages = parse_grok_updates_reader(Cursor::new(jsonl)).unwrap();
+        let (messages, usage_events) = parse_grok_updates_reader(Cursor::new(jsonl)).unwrap();
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, Role::User);
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].content, "hi there");
+        assert_eq!(usage_events.len(), 2);
+        assert_eq!(usage_events[0].event_key, "prompt:prompt-1");
+        assert_eq!(usage_events[0].input_tokens, 255);
+        assert_eq!(usage_events[0].model, "grok-composer-2.5-fast");
+        assert_eq!(usage_events[0].timestamp, 12_000);
+        assert_eq!(usage_events[1].event_key, "prompt:prompt-2");
+        assert_eq!(usage_events[1].input_tokens, 145);
+    }
+
+    #[test]
+    fn parse_grok_updates_resyncs_after_compaction_shrink() {
+        let jsonl = r#"{"timestamp":10,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"a"}},"_meta":{"totalTokens":1000,"promptId":"prompt-a"}}}
+{"timestamp":20,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"b"}},"_meta":{"totalTokens":800,"promptId":"prompt-b"}}}
+{"timestamp":30,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"c"}},"_meta":{"totalTokens":900,"promptId":"prompt-c"}}}
+"#;
+
+        let (_, usage_events) = parse_grok_updates_reader(Cursor::new(jsonl)).unwrap();
+
+        assert_eq!(usage_events.len(), 2);
+        assert_eq!(usage_events[0].event_key, "prompt:prompt-a");
+        assert_eq!(usage_events[1].event_key, "prompt:prompt-c");
+        assert_eq!(usage_events[1].input_tokens, 100);
     }
 
     #[test]
@@ -607,7 +753,7 @@ mod tests {
 {"timestamp":21,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second"}},"_meta":{"promptId":"prompt-2","turnStartMs":2000}}}
 "#;
 
-        let messages = parse_grok_updates_reader(Cursor::new(jsonl)).unwrap();
+        let (messages, _) = parse_grok_updates_reader(Cursor::new(jsonl)).unwrap();
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].role, Role::Assistant);
@@ -722,8 +868,50 @@ mod tests {
         store.insert_session(&make_existing_session(session_id, mtime, 1)).unwrap();
 
         let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        assert_eq!(result.sessions.len(), 1, "missing usage state must trigger a backfill parse");
+
+        store
+            .persist_usage_events_for_existing_session(
+                "grok",
+                session_id,
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+
+        let result = scan_for_sync_impl(&root, &store, None).unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_grok_session_attaches_usage_with_model_fallback() {
+        let root = temp_grok_root("usage");
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let updates_path = write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            session_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z","current_model_id":"grok-composer-2.5-fast"}"#,
+            r#"{"timestamp":10,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hey"}},"_meta":{"turnStartMs":1000}}}
+{"timestamp":11,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"sure"}},"_meta":{"totalTokens":500,"promptId":"prompt-1","turnStartMs":1000}}}"#,
+        );
+        let mtime = file_scan::stat_mtime_ms(&updates_path).unwrap();
+        let entry = FileScanEntry {
+            session_id: session_id.to_string(),
+            stat_target: updates_path.clone(),
+            directory: None,
+        };
+
+        let session = parse_grok_session_for_entry(&entry, mtime).unwrap().unwrap();
+
+        assert_eq!(session.usage_parser_version, Some(USAGE_PARSER_VERSION));
+        assert_eq!(session.usage_events.len(), 1);
+        assert_eq!(session.usage_events[0].model, "grok-composer-2.5-fast");
+        assert_eq!(session.usage_events[0].source_path.as_deref(), updates_path.to_str());
 
         let _ = fs::remove_dir_all(&root);
     }
