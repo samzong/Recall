@@ -72,12 +72,15 @@ pub fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Res
         }
         terminal.draw(|f| ui::render(f, &app))?;
 
+        let size = terminal.size()?;
+        app.set_terminal_size(size.width, size.height);
         match poll_event(tick_rate)? {
-            AppEvent::Key(key) => {
-                app.handle_key(key, &store);
+            AppEvent::Key(key) => app.handle_key(key, &store),
+            AppEvent::MouseDown { column, row } => app.handle_mouse_down(column, row, &store),
+            AppEvent::ScrollUp { column, row } => app.handle_mouse_scroll_up(column, row, &store),
+            AppEvent::ScrollDown { column, row } => {
+                app.handle_mouse_scroll_down(column, row, &store);
             }
-            AppEvent::ScrollUp => app.handle_scroll_up(&store),
-            AppEvent::ScrollDown => app.handle_scroll_down(&store),
             AppEvent::Tick => {}
         }
 

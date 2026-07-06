@@ -1,12 +1,15 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 
 pub enum AppEvent {
     Key(KeyEvent),
-    ScrollUp,
-    ScrollDown,
+    MouseDown { column: u16, row: u16 },
+    ScrollUp { column: u16, row: u16 },
+    ScrollDown { column: u16, row: u16 },
     Tick,
 }
 
@@ -14,9 +17,13 @@ pub fn poll_event(tick_rate: Duration) -> Result<AppEvent> {
     if event::poll(tick_rate)? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => return Ok(AppEvent::Key(key)),
-            Event::Mouse(MouseEvent { kind, .. }) => match kind {
-                MouseEventKind::ScrollUp => return Ok(AppEvent::ScrollUp),
-                MouseEventKind::ScrollDown => return Ok(AppEvent::ScrollDown),
+            Event::Mouse(MouseEvent { kind, column, row, .. }) => match kind {
+                MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left) => {
+                    return Ok(AppEvent::MouseDown { column, row });
+                }
+                MouseEventKind::ScrollUp => return Ok(AppEvent::ScrollUp { column, row }),
+                MouseEventKind::ScrollDown => return Ok(AppEvent::ScrollDown { column, row }),
                 _ => {}
             },
             _ => {}

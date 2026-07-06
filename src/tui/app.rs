@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Position, Rect};
 
 use crate::adapters::ResumeCommand;
 use crate::config::AppConfig;
@@ -15,7 +16,12 @@ use crate::repo_identity::RepoIdentityCache;
 use crate::session_action;
 use crate::skill_audit::{self, SkillAuditFilters, SkillAuditReport};
 use crate::transcript;
+use crate::tui::layout::{
+    MessagePane, SearchLayout, ViewingLayout, search_layout, vertical_scrollbar_position,
+    viewing_layout,
+};
 use crate::tui::search_worker::{SearchPhase, SearchRequest, SearchResponse, SearchWorker};
+use crate::tui::text_layout::wrap_visual_rows;
 use crate::types::{
     BackgroundJobStatus, MatchSource, Message, Role, SearchResult, SemanticProgress,
     SessionUsageEventRecord,
@@ -60,16 +66,20 @@ mod tests {
 
     fn app_with_sources() -> App {
         App {
+            terminal_area: Rect::new(0, 0, 80, 24),
             mode: AppMode::Search,
             panel_focus: PanelFocus::SessionList,
             query: String::new(),
             cursor_pos: 0,
             results: Vec::new(),
             selected_index: 0,
+            result_scroll_offset: 0,
             preview_messages: Vec::new(),
             preview_selected_msg: 0,
+            preview_scroll_offset: 0,
             viewing_messages: Vec::new(),
             viewing_selected_msg: 0,
+            viewing_scroll_offset: 0,
             viewing_session_summary: None,
             all_sources: vec![
                 source("claude", "Claude"),
@@ -211,6 +221,99 @@ mod tests {
             source_path: None,
             raw_usage_json: None,
         }
+    }
+
+    fn numbered_results(count: usize) -> Vec<SearchResult> {
+        (0..count)
+            .map(|n| {
+                let mut result = codex_search_result();
+                result.session.id = format!("session{n}");
+                result.session.title = format!("Session {n}");
+                result
+            })
+            .collect()
+    }
+
+    #[test]
+    fn list_up_keeps_viewport_while_selection_remains_visible() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 12);
+        app.results = numbered_results(6);
+        app.selected_index = 5;
+        app.result_scroll_offset = 1;
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key(up, &store);
+        assert_eq!(app.selected_index, 4);
+        assert_eq!(app.result_list_start(5), 1);
+
+        for _ in 0..3 {
+            app.handle_key(up, &store);
+        }
+        assert_eq!(app.selected_index, 1);
+        assert_eq!(app.result_list_start(5), 1);
+
+        app.handle_key(up, &store);
+        assert_eq!(app.selected_index, 0);
+        assert_eq!(app.result_list_start(5), 0);
+    }
+
+    #[test]
+    fn mouse_click_selects_visible_session_row() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(22, 12);
+        app.results = numbered_results(6);
+
+        app.handle_mouse_down(2, 6, &store);
+
+        assert!(app.panel_focus == PanelFocus::SessionList);
+        assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn mouse_click_selects_preview_message() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 12);
+        app.results = numbered_results(1);
+        app.preview_messages =
+            vec![message(Role::User, None, 0), message(Role::Assistant, None, 1)];
+
+        app.handle_mouse_down(40, 8, &store);
+
+        assert!(app.panel_focus == PanelFocus::Preview);
+        assert_eq!(app.preview_selected_msg, 1);
+    }
+
+    #[test]
+    fn viewing_selection_anchors_scroll_offset() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 10);
+        app.mode = AppMode::Viewing;
+        app.viewing_messages = (0..5).map(|n| message(Role::User, None, n)).collect();
+        app.viewing_sanitized_lines = build_viewing_caches(&app.viewing_messages);
+
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+
+        app.handle_key(down, &store);
+        assert_eq!((app.viewing_selected_msg, app.viewing_scroll_offset), (1, 0));
+
+        app.handle_key(down, &store);
+        assert_eq!((app.viewing_selected_msg, app.viewing_scroll_offset), (2, 2));
+
+        app.handle_key(down, &store);
+        assert_eq!((app.viewing_selected_msg, app.viewing_scroll_offset), (3, 5));
+
+        app.handle_key(up, &store);
+        assert_eq!((app.viewing_selected_msg, app.viewing_scroll_offset), (2, 5));
     }
 
     #[test]
@@ -711,6 +814,12 @@ pub enum PanelFocus {
     Preview,
 }
 
+#[derive(Clone, Copy)]
+enum SearchMouseTarget {
+    SessionList(Option<usize>),
+    Preview,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum FilterFocus {
     Source,
@@ -758,16 +867,20 @@ pub enum SortOrder {
 }
 
 pub struct App {
+    terminal_area: Rect,
     pub mode: AppMode,
     pub panel_focus: PanelFocus,
     pub query: String,
     pub cursor_pos: usize,
     pub results: Vec<SearchResult>,
     pub selected_index: usize,
+    pub result_scroll_offset: usize,
     pub preview_messages: Vec<Message>,
     pub preview_selected_msg: usize,
+    pub preview_scroll_offset: usize,
     pub viewing_messages: Vec<Message>,
     pub viewing_selected_msg: usize,
+    pub viewing_scroll_offset: usize,
     pub viewing_session_summary: Option<ViewingSessionSummary>,
     pub all_sources: Vec<(String, String)>,
     pub config: AppConfig,
@@ -848,16 +961,20 @@ impl App {
         let repo_filter = default_repo_filter(&config);
 
         let mut app = Self {
+            terminal_area: Rect::new(0, 0, 80, 24),
             mode: AppMode::Search,
             panel_focus: PanelFocus::SessionList,
             query: String::new(),
             cursor_pos: 0,
             results: Vec::new(),
             selected_index: 0,
+            result_scroll_offset: 0,
             preview_messages: Vec::new(),
             preview_selected_msg: 0,
+            preview_scroll_offset: 0,
             viewing_messages: Vec::new(),
             viewing_selected_msg: 0,
+            viewing_scroll_offset: 0,
             viewing_session_summary: None,
             all_sources,
             config,
@@ -1063,6 +1180,7 @@ impl App {
             .map(|session| SearchResult { session, match_source: MatchSource::Fts, snippet: None })
             .collect();
         self.selected_index = 0;
+        self.result_scroll_offset = 0;
         self.panel_focus = PanelFocus::SessionList;
         self.search_pending = false;
         self.search_in_flight = false;
@@ -1080,7 +1198,13 @@ impl App {
         match self.mode {
             AppMode::Search => self.handle_search_key(key, store),
             AppMode::Usage => self.handle_usage_key(key, store),
-            AppMode::Viewing => self.handle_viewing_key(key),
+            AppMode::Viewing => {
+                let before = self.viewing_selected_msg;
+                self.handle_viewing_key(key);
+                if matches!(self.mode, AppMode::Viewing) && self.viewing_selected_msg != before {
+                    self.anchor_viewing_scroll();
+                }
+            }
             AppMode::ShareResult => self.handle_share_result_key(key),
             AppMode::ExportInput => self.handle_export_key(key),
             AppMode::Settings => self.handle_settings_key(key, store),
@@ -1088,6 +1212,10 @@ impl App {
             AppMode::HandoffTarget => self.handle_handoff_target_key(key),
             AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
         }
+    }
+
+    pub fn set_terminal_size(&mut self, width: u16, height: u16) {
+        self.terminal_area = Rect::new(0, 0, width, height);
     }
 
     pub fn poll_share_publish(&mut self) {
@@ -1121,20 +1249,12 @@ impl App {
     pub fn handle_scroll_up(&mut self, store: &Store) {
         match self.mode {
             AppMode::Search => match self.panel_focus {
-                PanelFocus::SessionList => {
-                    if !self.results.is_empty() && self.selected_index > 0 {
-                        self.selected_index -= 1;
-                        self.load_preview(store);
-                    }
-                }
-                PanelFocus::Preview => {
-                    if self.preview_selected_msg > 0 {
-                        self.preview_selected_msg -= 1;
-                    }
-                }
+                PanelFocus::SessionList => self.scroll_result_list_up(store),
+                PanelFocus::Preview => self.move_preview_selection(true),
             },
             AppMode::Viewing if self.viewing_selected_msg > 0 => {
                 self.viewing_selected_msg -= 1;
+                self.anchor_viewing_scroll();
             }
             AppMode::Settings if self.settings_selected > 0 => {
                 self.settings_selected -= 1;
@@ -1167,20 +1287,12 @@ impl App {
     pub fn handle_scroll_down(&mut self, store: &Store) {
         match self.mode {
             AppMode::Search => match self.panel_focus {
-                PanelFocus::SessionList => {
-                    if self.selected_index + 1 < self.results.len() {
-                        self.selected_index += 1;
-                        self.load_preview(store);
-                    }
-                }
-                PanelFocus::Preview => {
-                    if self.preview_selected_msg + 1 < self.preview_messages.len() {
-                        self.preview_selected_msg += 1;
-                    }
-                }
+                PanelFocus::SessionList => self.scroll_result_list_down(store),
+                PanelFocus::Preview => self.move_preview_selection(false),
             },
             AppMode::Viewing if self.viewing_selected_msg + 1 < self.viewing_messages.len() => {
                 self.viewing_selected_msg += 1;
+                self.anchor_viewing_scroll();
             }
             AppMode::Settings if self.settings_selected + 1 < self.settings_row_count() => {
                 self.settings_selected += 1;
@@ -1211,6 +1323,324 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn scroll_result_list_up(&mut self, store: &Store) {
+        if self.results.is_empty() || self.selected_index == 0 {
+            return;
+        }
+
+        let visible_rows = search_layout(self.terminal_area).list_inner().height as usize;
+        let start = self.result_list_start(visible_rows);
+        self.selected_index -= 1;
+        if visible_rows > 0 && self.selected_index < start {
+            self.result_scroll_offset = self.selected_index;
+        } else {
+            self.result_scroll_offset = start;
+        }
+        self.load_preview(store);
+    }
+
+    fn scroll_result_list_down(&mut self, store: &Store) {
+        if self.selected_index + 1 >= self.results.len() {
+            return;
+        }
+
+        let visible_rows = search_layout(self.terminal_area).list_inner().height as usize;
+        let start = self.result_list_start(visible_rows);
+        self.selected_index += 1;
+        if visible_rows > 0 && self.selected_index >= start + visible_rows {
+            self.result_scroll_offset = self.selected_index + 1 - visible_rows;
+        } else {
+            self.result_scroll_offset = start;
+        }
+        self.load_preview(store);
+    }
+
+    pub fn result_list_start(&self, visible_rows: usize) -> usize {
+        if visible_rows == 0 || self.results.is_empty() {
+            return 0;
+        }
+
+        let selected_index = self.selected_index.min(self.results.len().saturating_sub(1));
+        let max_start = self.results.len().saturating_sub(visible_rows);
+        let start = self.result_scroll_offset.min(max_start);
+        if selected_index < start {
+            selected_index
+        } else if selected_index >= start + visible_rows {
+            selected_index + 1 - visible_rows
+        } else {
+            start
+        }
+    }
+
+    fn move_preview_selection(&mut self, up: bool) {
+        let can_move = if up {
+            self.preview_selected_msg > 0
+        } else {
+            self.preview_selected_msg + 1 < self.preview_messages.len()
+        };
+        if !can_move {
+            return;
+        }
+
+        let inner = search_layout(self.terminal_area).preview_inner();
+        let pane = self.preview_pane(inner.width as usize);
+        let viewport = inner.height as usize;
+        self.preview_scroll_offset =
+            pane.scroll_start(self.preview_scroll_offset, self.preview_selected_msg, viewport);
+        if up {
+            self.preview_selected_msg -= 1;
+        } else {
+            self.preview_selected_msg += 1;
+        }
+        self.preview_scroll_offset =
+            pane.scroll_start(self.preview_scroll_offset, self.preview_selected_msg, viewport);
+    }
+
+    fn anchor_viewing_scroll(&mut self) {
+        let messages = viewing_layout(self.terminal_area).messages;
+        let pane = self.viewing_pane(messages.width as usize);
+        self.viewing_scroll_offset = pane.scroll_start(
+            self.viewing_scroll_offset,
+            self.viewing_selected_msg,
+            messages.height as usize,
+        );
+    }
+
+    pub fn preview_pane(&self, inner_width: usize) -> MessagePane {
+        let mut rows = Vec::with_capacity(self.preview_messages.len());
+        let mut focus = Vec::with_capacity(self.preview_messages.len());
+        for msg in &self.preview_messages {
+            let text: String = msg.content.chars().take(300).collect();
+            let body: usize = text
+                .lines()
+                .take(6)
+                .map(|line| {
+                    let line = crate::utils::sanitize_line(line);
+                    wrap_visual_rows(&format!("  {line}"), inner_width).len()
+                })
+                .sum();
+            rows.push(body + 2);
+            focus.push(1 + usize::from(text.lines().next().is_some()));
+        }
+        MessagePane::new(rows, focus)
+    }
+
+    pub fn viewing_pane(&self, inner_width: usize) -> MessagePane {
+        let mut rows = Vec::with_capacity(self.viewing_messages.len());
+        let mut focus = Vec::with_capacity(self.viewing_messages.len());
+        for index in 0..self.viewing_messages.len() {
+            let lines = self.viewing_sanitized_lines.get(index);
+            let body: usize = lines
+                .map(|lines| {
+                    lines.iter().map(|line| wrap_visual_rows(&line.text, inner_width).len()).sum()
+                })
+                .unwrap_or(0);
+            rows.push(body + 2);
+            focus.push(1 + usize::from(lines.is_some_and(|lines| !lines.is_empty())));
+        }
+        MessagePane::new(rows, focus)
+    }
+
+    fn preview_message_at_row(&self, row: u16, layout: &SearchLayout) -> Option<(usize, usize)> {
+        let inner = layout.preview_inner();
+        if row < inner.y || row >= inner.bottom() {
+            return None;
+        }
+
+        let pane = self.preview_pane(inner.width as usize);
+        let start = pane.scroll_start(
+            self.preview_scroll_offset,
+            self.preview_selected_msg,
+            inner.height as usize,
+        );
+        pane.index_at(start + usize::from(row - inner.y)).map(|index| (index, start))
+    }
+
+    fn viewing_message_at_row(&self, row: u16, layout: &ViewingLayout) -> Option<(usize, usize)> {
+        let messages = layout.messages;
+        if row < messages.y || row >= messages.bottom() {
+            return None;
+        }
+
+        let pane = self.viewing_pane(messages.width as usize);
+        let start = pane.scroll_start(
+            self.viewing_scroll_offset,
+            self.viewing_selected_msg,
+            messages.height as usize,
+        );
+        pane.index_at(start + usize::from(row - messages.y)).map(|index| (index, start))
+    }
+
+    pub fn handle_mouse_down(&mut self, column: u16, row: u16, store: &Store) {
+        if matches!(self.mode, AppMode::Viewing) {
+            let layout = viewing_layout(self.terminal_area);
+            if self.handle_viewing_scrollbar_down(column, row, &layout) {
+                return;
+            }
+            if let Some((index, start)) = self.viewing_message_at_row(row, &layout) {
+                self.viewing_selected_msg = index;
+                self.viewing_scroll_offset = start;
+            }
+            return;
+        }
+
+        if !matches!(self.mode, AppMode::Search) {
+            return;
+        }
+
+        let layout = search_layout(self.terminal_area);
+        if self.handle_search_scrollbar_down(column, row, &layout, store) {
+            return;
+        }
+
+        match self.search_mouse_target(column, row, &layout) {
+            Some(SearchMouseTarget::SessionList(index)) => {
+                self.panel_focus = PanelFocus::SessionList;
+                if let Some(index) = index {
+                    self.result_scroll_offset =
+                        self.result_list_start(layout.list_inner().height as usize);
+                    self.selected_index = index;
+                    self.load_preview(store);
+                }
+            }
+            Some(SearchMouseTarget::Preview) if !self.preview_messages.is_empty() => {
+                self.panel_focus = PanelFocus::Preview;
+                if let Some((index, start)) = self.preview_message_at_row(row, &layout) {
+                    self.preview_selected_msg = index;
+                    self.preview_scroll_offset = start;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_search_scrollbar_down(
+        &mut self,
+        column: u16,
+        row: u16,
+        layout: &SearchLayout,
+        store: &Store,
+    ) -> bool {
+        let list_viewport = layout.list_inner().height as usize;
+        if let Some(position) =
+            vertical_scrollbar_position(column, row, layout.list, self.results.len(), list_viewport)
+        {
+            self.panel_focus = PanelFocus::SessionList;
+            self.result_scroll_offset = position;
+            self.selected_index = position.min(self.results.len().saturating_sub(1));
+            self.load_preview(store);
+            return true;
+        }
+
+        if self.preview_messages.is_empty() {
+            return false;
+        }
+
+        let inner = layout.preview_inner();
+        let pane = self.preview_pane(inner.width as usize);
+        if let Some(position) = vertical_scrollbar_position(
+            column,
+            row,
+            layout.preview,
+            pane.total_rows(),
+            inner.height as usize,
+        ) {
+            self.panel_focus = PanelFocus::Preview;
+            self.preview_scroll_offset = position;
+            if let Some(index) = pane.index_at(position) {
+                self.preview_selected_msg = index;
+            }
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_viewing_scrollbar_down(
+        &mut self,
+        column: u16,
+        row: u16,
+        layout: &ViewingLayout,
+    ) -> bool {
+        let messages = layout.messages;
+        let pane = self.viewing_pane(messages.width as usize);
+        if let Some(position) = vertical_scrollbar_position(
+            column,
+            row,
+            layout.scrollbar_area(),
+            pane.total_rows(),
+            messages.height as usize,
+        ) {
+            self.viewing_scroll_offset = position;
+            if let Some(index) = pane.index_at(position) {
+                self.viewing_selected_msg = index;
+            }
+            return true;
+        }
+
+        false
+    }
+
+    pub fn handle_mouse_scroll_up(&mut self, column: u16, row: u16, store: &Store) {
+        self.handle_mouse_scroll(column, row, true, store);
+    }
+
+    pub fn handle_mouse_scroll_down(&mut self, column: u16, row: u16, store: &Store) {
+        self.handle_mouse_scroll(column, row, false, store);
+    }
+
+    fn handle_mouse_scroll(&mut self, column: u16, row: u16, up: bool, store: &Store) {
+        if matches!(self.mode, AppMode::Search) {
+            let layout = search_layout(self.terminal_area);
+            match self.search_mouse_target(column, row, &layout) {
+                Some(SearchMouseTarget::SessionList(_)) => {
+                    self.panel_focus = PanelFocus::SessionList;
+                    if up {
+                        self.scroll_result_list_up(store);
+                    } else {
+                        self.scroll_result_list_down(store);
+                    }
+                    return;
+                }
+                Some(SearchMouseTarget::Preview) if !self.preview_messages.is_empty() => {
+                    self.panel_focus = PanelFocus::Preview;
+                    self.move_preview_selection(up);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if up { self.handle_scroll_up(store) } else { self.handle_scroll_down(store) }
+    }
+
+    fn search_mouse_target(
+        &self,
+        column: u16,
+        row: u16,
+        layout: &SearchLayout,
+    ) -> Option<SearchMouseTarget> {
+        let pos = Position { x: column, y: row };
+        if layout.list.contains(pos) {
+            let inner = layout.list_inner();
+            if !inner.contains(pos) {
+                return Some(SearchMouseTarget::SessionList(None));
+            }
+
+            let start = self.result_list_start(inner.height as usize);
+            let index = start + usize::from(row - inner.y);
+            return Some(SearchMouseTarget::SessionList(
+                (index < self.results.len()).then_some(index),
+            ));
+        }
+
+        if layout.preview.contains(pos) {
+            return Some(SearchMouseTarget::Preview);
+        }
+
+        None
     }
 
     fn handle_search_key(&mut self, key: KeyEvent, store: &Store) {
@@ -1290,6 +1720,7 @@ impl App {
                 } else if !self.preview_messages.is_empty() {
                     self.panel_focus = PanelFocus::Preview;
                     self.preview_selected_msg = 0;
+                    self.preview_scroll_offset = 0;
                 }
             }
             KeyCode::Up => {
@@ -1361,6 +1792,7 @@ impl App {
                 self.mode = AppMode::Search;
                 self.viewing_messages.clear();
                 self.viewing_selected_msg = 0;
+                self.viewing_scroll_offset = 0;
                 self.viewing_session_summary = None;
                 self.viewing_search_query.clear();
                 self.viewing_search_status = None;
@@ -2296,6 +2728,7 @@ impl App {
                 self.apply_sort(&mut results);
                 self.results = results;
                 self.selected_index = 0;
+                self.result_scroll_offset = 0;
                 self.panel_focus = PanelFocus::SessionList;
                 self.load_preview(store);
 
@@ -2550,6 +2983,7 @@ impl App {
                     })
                     .collect();
                 self.selected_index = 0;
+                self.result_scroll_offset = 0;
                 self.panel_focus = PanelFocus::SessionList;
                 self.mode = AppMode::Search;
                 self.query = format!("skill:{skill_id}");
@@ -2653,6 +3087,7 @@ impl App {
 
     fn load_preview(&mut self, store: &Store) {
         self.preview_selected_msg = 0;
+        self.preview_scroll_offset = 0;
         if let Some(result) = self.results.get(self.selected_index) {
             match store.get_messages(&result.session.id) {
                 Ok(msgs) => {
@@ -2681,6 +3116,7 @@ impl App {
             self.viewing_sanitized_lines = build_viewing_caches(&msgs);
             self.viewing_messages = msgs;
             self.viewing_selected_msg = 0;
+            self.viewing_scroll_offset = 0;
             self.viewing_search_query.clear();
             self.viewing_search_input = None;
             self.viewing_search_input_cursor = 0;

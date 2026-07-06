@@ -2,10 +2,14 @@ use std::collections::BTreeMap;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::scrollbar;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 use unicode_width::UnicodeWidthStr;
 
 use crate::db::search::TimeRange;
@@ -15,6 +19,8 @@ use crate::tui::app::{
     App, AppMode, FilterFocus, PanelFocus, PendingCommandAction, ProjectPickerRow, ResumeOrigin,
     SanitizedLine, SourcePickerRow, UsageTab,
 };
+use crate::tui::layout::{search_layout, viewing_layout};
+use crate::tui::text_layout::{wrap_spans_to_lines, wrap_visual_rows};
 use crate::types::{MatchSource, Role};
 use crate::usage::{TokenTotals, UsageReport};
 
@@ -56,14 +62,48 @@ fn highlight_spans(text: &str, hay: &str, needle_lower: &str, base: Style) -> Ve
     spans
 }
 
-fn scroll_offset(selected_line_start: usize, inner_height: usize) -> u16 {
-    if inner_height == 0 {
-        0
-    } else if selected_line_start + 4 > inner_height {
-        (selected_line_start + 4).saturating_sub(inner_height) as u16
-    } else {
-        0
+fn row_visible(row: usize, viewport_start: usize, viewport_end: usize) -> bool {
+    row >= viewport_start && row < viewport_end
+}
+
+fn line_with_background(mut line: Line<'static>, bg: Color) -> Line<'static> {
+    if bg == Color::Reset {
+        return line;
     }
+
+    for span in &mut line.spans {
+        if span.style.bg.is_none() {
+            span.style.bg = Some(bg);
+        }
+    }
+    line
+}
+
+fn render_vertical_scrollbar(
+    f: &mut Frame,
+    area: Rect,
+    content_len: usize,
+    viewport_len: usize,
+    position: usize,
+) {
+    if viewport_len == 0 || content_len <= viewport_len {
+        return;
+    }
+
+    let mut state =
+        ScrollbarState::new(content_len).viewport_content_length(viewport_len).position(position);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .symbols(scrollbar::VERTICAL)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .thumb_symbol("▌")
+            .track_symbol(Some("▌"))
+            .thumb_style(Style::default().fg(Color::Cyan))
+            .track_style(Style::default().fg(Color::DarkGray)),
+        area.inner(Margin { vertical: 1, horizontal: 0 }),
+        &mut state,
+    );
 }
 
 pub fn render(f: &mut Frame, app: &App) {
@@ -930,29 +970,13 @@ fn format_compact(value: i64) -> String {
 }
 
 fn render_search(f: &mut Frame, app: &App) {
-    let area = f.area();
+    let layout = search_layout(f.area());
 
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Min(5),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    render_search_box(f, app, outer[0]);
-    render_filters(f, app, outer[1]);
-
-    let main_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(outer[2]);
-
-    render_result_list(f, app, main_area[0]);
-    render_preview(f, app, main_area[1]);
-    render_status_bar(f, app, outer[3]);
+    render_search_box(f, app, layout.search_box);
+    render_filters(f, app, layout.filters);
+    render_result_list(f, app, layout.list);
+    render_preview(f, app, layout.preview);
+    render_status_bar(f, app, layout.status);
 }
 
 fn render_search_box(f: &mut Frame, app: &App, area: Rect) {
@@ -1106,8 +1130,13 @@ fn filter_overview_line(
 fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.panel_focus == PanelFocus::SessionList;
     let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let title = if app.results.is_empty() {
+        " Sessions (0) ".to_string()
+    } else {
+        format!(" Sessions [{}/{}] ", app.selected_index + 1, app.results.len())
+    };
     let block = Block::default()
-        .title(format!(" Sessions ({}) ", app.results.len()))
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
 
@@ -1119,12 +1148,7 @@ fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let visible_rows = block.inner(area).height as usize;
-    let selected_index = app.selected_index.min(app.results.len().saturating_sub(1));
-    let start = if visible_rows == 0 {
-        0
-    } else {
-        selected_index.saturating_add(1).saturating_sub(visible_rows)
-    };
+    let start = app.result_list_start(visible_rows);
     let end = (start + visible_rows).min(app.results.len());
 
     let items: Vec<ListItem> = app.results[start..end]
@@ -1142,29 +1166,46 @@ fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
             };
             let title: String = s.title.chars().take(40).collect();
             let selected = i == app.selected_index;
+            let active_selected = focused && selected;
+            let passive_selected = selected && !focused;
+            let selected_text_style = if active_selected {
+                Style::default().fg(Color::Black)
+            } else if passive_selected {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
 
             let line = Line::from(vec![
                 Span::styled(
                     source_label.to_string(),
-                    Style::default().fg(if selected { Color::Black } else { Color::Green }),
+                    if selected { selected_text_style } else { Style::default().fg(Color::Green) },
                 ),
                 Span::raw(" "),
                 Span::styled(
                     match_label.to_string(),
-                    Style::default().fg(if selected { Color::Black } else { Color::DarkGray }),
+                    if selected {
+                        selected_text_style
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
                 ),
                 Span::raw(" "),
                 Span::styled(
                     title,
-                    Style::default().fg(if selected { Color::Black } else { Color::White }),
+                    if selected { selected_text_style } else { Style::default().fg(Color::White) },
                 ),
                 Span::styled(
                     format!("  {age}"),
-                    Style::default().fg(if selected { Color::Black } else { Color::DarkGray }),
+                    if selected {
+                        selected_text_style
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
                 ),
             ]);
 
-            ListItem::new(line).style(if selected {
+            ListItem::new(line).style(if active_selected {
                 Style::default().bg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -1174,6 +1215,7 @@ fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
 
     let list = List::new(items).block(block);
     f.render_widget(list, area);
+    render_vertical_scrollbar(f, area, app.results.len(), visible_rows, start);
 }
 
 fn render_preview(f: &mut Frame, app: &App, area: Rect) {
@@ -1207,9 +1249,17 @@ fn render_preview(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let inner = block.inner(area);
+    let inner_width = inner.width as usize;
+    let pane = app.preview_pane(inner_width);
+    let viewport_start = pane.scroll_start(
+        app.preview_scroll_offset,
+        app.preview_selected_msg,
+        inner.height as usize,
+    );
+    let viewport_end = viewport_start + inner.height as usize;
+    let mut visual_row = 0usize;
     let mut lines: Vec<Line> = Vec::new();
-    let mut selected_line_start: usize = 0;
-
     for (i, msg) in app.preview_messages.iter().enumerate() {
         let selected = focused && i == app.preview_selected_msg;
         let (prefix, color) = match msg.role {
@@ -1217,46 +1267,50 @@ fn render_preview(f: &mut Frame, app: &App, area: Rect) {
             Role::Assistant => ("Asst: ", Color::Green),
         };
 
-        if selected {
-            selected_line_start = lines.len();
-        }
-
-        let bg = if selected { Color::DarkGray } else { Color::Reset };
-
         let time_str = crate::utils::format_message_time(msg.timestamp);
+        let header_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
+            Color::DarkGray
+        } else {
+            Color::Reset
+        };
         let mut header = vec![Span::styled(
             prefix,
-            Style::default().fg(color).bg(bg).add_modifier(Modifier::BOLD),
+            Style::default().fg(color).bg(header_bg).add_modifier(Modifier::BOLD),
         )];
         if !time_str.is_empty() {
-            header.push(Span::styled(time_str, Style::default().fg(Color::DarkGray).bg(bg)));
+            header.push(Span::styled(time_str, Style::default().fg(Color::DarkGray).bg(header_bg)));
         }
         lines.push(Line::from(header));
+        visual_row += 1;
 
         let text: String = msg.content.chars().take(300).collect();
         for line in text.lines().take(6) {
             let line = crate::utils::sanitize_line(line);
-            lines.push(Line::from(Span::styled(
-                format!("  {line}"),
-                Style::default().fg(Color::White).bg(bg),
-            )));
+            let line = format!("  {line}");
+            for row in wrap_visual_rows(&line, inner_width) {
+                let body_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
+                    Color::DarkGray
+                } else {
+                    Color::Reset
+                };
+                lines.push(Line::from(Span::styled(
+                    row,
+                    Style::default().fg(Color::White).bg(body_bg),
+                )));
+                visual_row += 1;
+            }
         }
         lines.push(Line::from(""));
+        visual_row += 1;
     }
 
-    let scroll = scroll_offset(selected_line_start, block.inner(area).height as usize);
-
-    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll, 0));
+    let p = Paragraph::new(lines).block(block).scroll((viewport_start as u16, 0));
     f.render_widget(p, area);
+    render_vertical_scrollbar(f, area, pane.total_rows(), inner.height as usize, viewport_start);
 }
 
 fn render_viewing(f: &mut Frame, app: &App) {
-    let area = f.area();
-
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
-        .split(area);
+    let layout = viewing_layout(f.area());
 
     let session_info = app
         .results
@@ -1274,15 +1328,18 @@ fn render_viewing(f: &mut Frame, app: &App) {
         .title(session_info)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
-    let content_area = block.inner(outer[0]);
-    f.render_widget(block, outer[0]);
-    let content = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(content_area);
+    f.render_widget(block, layout.content);
 
+    let inner_width = layout.messages.width as usize;
+    let pane = app.viewing_pane(inner_width);
+    let viewport_start = pane.scroll_start(
+        app.viewing_scroll_offset,
+        app.viewing_selected_msg,
+        layout.messages.height as usize,
+    );
+    let viewport_end = viewport_start + layout.messages.height as usize;
+    let mut visual_row = 0usize;
     let mut lines: Vec<Line> = Vec::new();
-    let mut selected_line_start: usize = 0;
     let needle_lower = app.viewing_search_query.to_lowercase();
 
     for (i, msg) in app.viewing_messages.iter().enumerate() {
@@ -1292,40 +1349,54 @@ fn render_viewing(f: &mut Frame, app: &App) {
             Role::Assistant => ("Assistant", Color::Green),
         };
 
-        if selected {
-            selected_line_start = lines.len();
-        }
-
-        let bg = if selected { Color::DarkGray } else { Color::Reset };
-
         let time_str = crate::utils::format_message_time(msg.timestamp);
+        let header_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
+            Color::DarkGray
+        } else {
+            Color::Reset
+        };
         let mut header = vec![Span::styled(
             format!("── {prefix} ──"),
-            Style::default().fg(color).bg(bg).add_modifier(Modifier::BOLD),
+            Style::default().fg(color).bg(header_bg).add_modifier(Modifier::BOLD),
         )];
         if !time_str.is_empty() {
             header.push(Span::styled(
                 format!("  {time_str}"),
-                Style::default().fg(Color::DarkGray).bg(bg),
+                Style::default().fg(Color::DarkGray).bg(header_bg),
             ));
         }
         lines.push(Line::from(header));
+        visual_row += 1;
 
-        let body_style = Style::default().fg(Color::White).bg(bg);
         let empty: Vec<SanitizedLine> = Vec::new();
         let cached_lines = app.viewing_sanitized_lines.get(i).unwrap_or(&empty);
         for sl in cached_lines {
+            let body_style = Style::default().fg(Color::White);
             let spans = highlight_spans(&sl.text, &sl.lower, &needle_lower, body_style);
-            lines.push(Line::from(spans));
+            for line in wrap_spans_to_lines(spans, inner_width) {
+                let body_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
+                    Color::DarkGray
+                } else {
+                    Color::Reset
+                };
+                lines.push(line_with_background(line, body_bg));
+                visual_row += 1;
+            }
         }
         lines.push(Line::from(""));
+        visual_row += 1;
     }
 
-    let scroll = scroll_offset(selected_line_start, content[1].height as usize);
-
-    render_viewing_summary(f, app, content[0]);
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0));
-    f.render_widget(p, content[1]);
+    render_viewing_summary(f, app, layout.summary);
+    let p = Paragraph::new(lines).scroll((viewport_start as u16, 0));
+    f.render_widget(p, layout.messages);
+    render_vertical_scrollbar(
+        f,
+        layout.scrollbar_area(),
+        pane.total_rows(),
+        layout.messages.height as usize,
+        viewport_start,
+    );
 
     let help_spans = vec![
         Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
@@ -1381,11 +1452,11 @@ fn render_viewing(f: &mut Frame, app: &App) {
 
     if let Some(ref input) = app.viewing_search_input {
         let cursor_byte = app.viewing_search_input_cursor.min(input.len());
-        let cursor_x = outer[1].x + 2 + UnicodeWidthStr::width(&input[..cursor_byte]) as u16;
-        f.set_cursor_position((cursor_x, outer[1].y));
+        let cursor_x = layout.help.x + 2 + UnicodeWidthStr::width(&input[..cursor_byte]) as u16;
+        f.set_cursor_position((cursor_x, layout.help.y));
     }
 
-    f.render_widget(Paragraph::new(status_line), outer[1]);
+    f.render_widget(Paragraph::new(status_line), layout.help);
 }
 
 fn render_handoff_target_picker(f: &mut Frame, app: &App) {
@@ -2012,6 +2083,76 @@ mod tests {
     use crate::tui::app::{SharePopup, ViewingSessionSummary};
     use crate::types::{Message, SearchResult, Session};
 
+    fn numbered_session_result(n: usize) -> SearchResult {
+        SearchResult {
+            session: Session {
+                id: format!("session{n}"),
+                source: "codex".to_string(),
+                source_id: format!("source{n}"),
+                title: format!("Session {n}"),
+                directory: None,
+                repo_remote: None,
+                repo_slug: None,
+                repo_name: None,
+                started_at: 0,
+                updated_at: None,
+                message_count: 1,
+                entrypoint: None,
+                custom_title: None,
+                summary: None,
+                duration_minutes: None,
+                source_file_path: None,
+                is_import: false,
+            },
+            match_source: MatchSource::Fts,
+            snippet: None,
+        }
+    }
+
+    fn render_to_text(app: &App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        (0..height)
+            .map(|y| buffer_row(terminal.backend().buffer(), y, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn render_result_list_scrolls_selected_row_into_view() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.results = (1..=6).map(numbered_session_result).collect();
+        app.selected_index = 3;
+
+        let rendered = render_to_text(&app, 80, 10);
+
+        assert!(rendered.contains("Sessions [4/6]"));
+        assert!(!rendered.contains("Session 1"));
+        assert!(rendered.contains("Session 2"));
+        assert!(rendered.contains("Session 4"));
+    }
+
+    #[test]
+    fn render_result_list_keeps_viewport_when_selection_is_visible() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.results = (1..=6).map(numbered_session_result).collect();
+        app.selected_index = 1;
+        app.result_scroll_offset = 1;
+
+        let rendered = render_to_text(&app, 80, 10);
+
+        assert!(!rendered.contains("Session 1"));
+        assert!(rendered.contains("Session 2"));
+        assert!(rendered.contains("Session 4"));
+    }
+
     #[test]
     fn render_viewing_shows_one_line_session_summary_below_title() {
         crate::db::schema::register_sqlite_vec();
@@ -2187,53 +2328,6 @@ mod tests {
         assert!(rendered.contains("OpenCode (opencode)"));
         assert!(rendered.contains("[Enter]"));
         assert!(rendered.contains("select"));
-    }
-
-    #[test]
-    fn render_result_list_scrolls_selected_row_into_view() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
-        app.results = (1..=6)
-            .map(|n| SearchResult {
-                session: Session {
-                    id: format!("session{n}"),
-                    source: "codex".to_string(),
-                    source_id: format!("source{n}"),
-                    title: format!("Session {n}"),
-                    directory: None,
-                    repo_remote: None,
-                    repo_slug: None,
-                    repo_name: None,
-                    started_at: 0,
-                    updated_at: None,
-                    message_count: 1,
-                    entrypoint: None,
-                    custom_title: None,
-                    summary: None,
-                    duration_minutes: None,
-                    source_file_path: None,
-                    is_import: false,
-                },
-                match_source: MatchSource::Fts,
-                snippet: None,
-            })
-            .collect();
-        app.selected_index = 3;
-
-        let backend = TestBackend::new(80, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let rendered = (0..10)
-            .map(|y| buffer_row(terminal.backend().buffer(), y, 80))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(!rendered.contains("Session 1"));
-        assert!(rendered.contains("Session 2"));
-        assert!(rendered.contains("Session 3"));
-        assert!(rendered.contains("Session 4"));
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
