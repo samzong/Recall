@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub fn register_sqlite_vec() {
@@ -39,6 +39,9 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
     }
     if version < 9 {
         migrate_v9(conn)?;
+    }
+    if version < 10 {
+        migrate_v10(conn)?;
     }
     Ok(())
 }
@@ -306,6 +309,25 @@ fn migrate_v9(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn migrate_v10(conn: &Connection) -> anyhow::Result<()> {
+    let table_exists = |name: &str| -> anyhow::Result<bool> {
+        let exists: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    };
+    if table_exists("usage_events")? {
+        conn.execute("DELETE FROM usage_events WHERE source = 'grok'", [])?;
+    }
+    if table_exists("usage_session_state")? {
+        conn.execute("DELETE FROM usage_session_state WHERE source = 'grok'", [])?;
+    }
+    conn.execute_batch("PRAGMA user_version = 10;")?;
+    Ok(())
+}
+
 fn add_column_if_missing(conn: &Connection, stmt: &str) -> anyhow::Result<()> {
     if let Err(err) = conn.execute(stmt, []) {
         let msg = err.to_string();
@@ -430,6 +452,58 @@ mod tests {
             .query_row("SELECT repo_remote FROM sessions WHERE id = 's1'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(repo_remote, None);
+    }
+
+    #[test]
+    fn migrate_v10_purges_grok_usage_rows_from_existing_v9_db() {
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES
+                ('grok-session', 'grok', 'grok-source', 'grok', 0),
+                ('codex-session', 'codex', 'codex-source', 'codex', 0);
+             INSERT INTO usage_events (
+                session_id, source, source_id, event_key, event_seq, timestamp,
+                model, provider, token_source, parser_version, created_at
+             )
+             VALUES
+                ('grok-session', 'grok', 'grok-source', 'signals:context', 0, 1, 'grok-build', 'xai', 'observed', 3, 1),
+                ('codex-session', 'codex', 'codex-source', 'usage', 0, 1, 'gpt', 'openai', 'observed', 1, 1);
+             INSERT INTO usage_session_state (
+                session_id, source, source_id, parser_version, source_updated_at, event_count, synced_at
+             )
+             VALUES
+                ('grok-session', 'grok', 'grok-source', 3, 1, 1, 1),
+                ('codex-session', 'codex', 'codex-source', 1, 1, 1, 1);",
+        )
+        .unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), 9);
+        init(&conn).unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM usage_events WHERE source = 'grok'),
+                    (SELECT COUNT(*) FROM usage_events WHERE source = 'codex'),
+                    (SELECT COUNT(*) FROM usage_session_state WHERE source = 'grok'),
+                    (SELECT COUNT(*) FROM usage_session_state WHERE source = 'codex')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 1, 0, 1));
     }
 
     #[test]
