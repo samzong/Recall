@@ -35,8 +35,9 @@ impl SourceAdapter for GrokAdapter {
             return Ok(vec![]);
         };
 
+        let (entries, _) = collect_grok_entries(&sessions_dir);
         let mut sessions = Vec::new();
-        for entry in collect_grok_entries(&sessions_dir) {
+        for entry in entries {
             let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
                 continue;
             };
@@ -57,6 +58,13 @@ impl SourceAdapter for GrokAdapter {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
         };
         Ok(Some(scan_for_sync_impl(&sessions_dir, store, since_ts)?))
+    }
+
+    fn prune(&self, store: &Store) -> anyhow::Result<()> {
+        let Some(sessions_dir) = resolve_grok_sessions_dir()? else {
+            return Ok(());
+        };
+        prune_impl(&sessions_dir, store)
     }
 }
 
@@ -93,20 +101,35 @@ fn scan_for_sync_impl(
     store: &Store,
     since_ts: Option<i64>,
 ) -> anyhow::Result<SyncScanResult> {
-    let entries = collect_grok_entries(sessions_dir);
+    let (entries, _) = collect_grok_entries(sessions_dir);
     file_scan::run_file_scan(store, "grok", since_ts, entries, |entry, mtime_ms| {
         parse_grok_session_for_entry(&entry, mtime_ms)
     })
 }
 
-fn collect_grok_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
+fn prune_impl(sessions_dir: &Path, store: &Store) -> anyhow::Result<()> {
+    let (_, subagent_ids) = collect_grok_entries(sessions_dir);
+    if subagent_ids.is_empty() {
+        return Ok(());
+    }
+    let existing = store.session_meta_map("grok")?;
+    for source_id in &subagent_ids {
+        if existing.contains_key(source_id) {
+            store.delete_session_data("grok", source_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_grok_entries(sessions_dir: &Path) -> (Vec<FileScanEntry>, Vec<String>) {
     let mut entries = Vec::new();
+    let mut subagent_ids = Vec::new();
 
     let workspace_dirs = match fs::read_dir(sessions_dir) {
         Ok(dirs) => dirs,
         Err(err) => {
             debug!("cannot read Grok sessions dir: {err}");
-            return entries;
+            return (entries, subagent_ids);
         }
     };
 
@@ -143,25 +166,38 @@ fn collect_grok_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
                 continue;
             }
 
-            let directory = load_summary_directory(&session_path).or(fallback_directory.clone());
+            let (summary_directory, session_kind) = load_summary_probe(&session_path);
+            if matches!(session_kind.as_deref(), Some("subagent" | "subagent_resume")) {
+                subagent_ids.push(session_id);
+                continue;
+            }
+
+            let directory = summary_directory.or(fallback_directory.clone());
 
             entries.push(FileScanEntry { session_id, stat_target: updates_path, directory });
         }
     }
 
-    entries
+    (entries, subagent_ids)
 }
 
-fn load_summary_directory(session_dir: &Path) -> Option<String> {
+fn load_summary_probe(session_dir: &Path) -> (Option<String>, Option<String>) {
     let summary_path = session_dir.join("summary.json");
-    let content = fs::read_to_string(summary_path).ok()?;
-    let doc: Value = serde_json::from_str(&content).ok()?;
-    doc.get("info")
+    let Ok(content) = fs::read_to_string(summary_path) else {
+        return (None, None);
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&content) else {
+        return (None, None);
+    };
+    let directory = doc
+        .get("info")
         .and_then(|info| info.get("cwd"))
         .and_then(|cwd| cwd.as_str())
         .map(str::trim)
         .filter(|cwd| !cwd.is_empty())
-        .map(str::to_string)
+        .map(str::to_string);
+    let session_kind = doc.get("session_kind").and_then(|kind| kind.as_str()).map(str::to_string);
+    (directory, session_kind)
 }
 
 fn is_grok_session_id(id: &str) -> bool {
@@ -592,10 +628,80 @@ mod tests {
             r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hey"}}}}"#,
         );
 
-        let entries = collect_grok_entries(&root);
+        let (entries, subagent_ids) = collect_grok_entries(&root);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id, session_id);
         assert_eq!(entries[0].directory.as_deref(), Some("/tmp/from-summary"));
+        assert!(subagent_ids.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_grok_entries_skips_subagent_sessions() {
+        let root = temp_grok_root("subagent");
+        let normal_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let subagent_id = "119e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let resume_id = "229e9003-1ed9-70e3-803b-1e7f96a072eb";
+        write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            normal_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z"}"#,
+            r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hey"}}}}"#,
+        );
+        write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            subagent_id,
+            r#"{"info":{"id":"119e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z","session_kind":"subagent"}"#,
+            r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"119e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"machinery"}}}}"#,
+        );
+        write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            resume_id,
+            r#"{"info":{"id":"229e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z","session_kind":"subagent_resume"}"#,
+            r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"229e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"machinery"}}}}"#,
+        );
+
+        let (entries, mut subagent_ids) = collect_grok_entries(&root);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, normal_id);
+        subagent_ids.sort();
+        assert_eq!(subagent_ids, vec![subagent_id.to_string(), resume_id.to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_deletes_existing_subagent_session() {
+        let root = temp_grok_root("subagent-delete");
+        let normal_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let subagent_id = "119e9003-1ed9-70e3-803b-1e7f96a072eb";
+        write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            normal_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z"}"#,
+            r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hey"}}}}"#,
+        );
+        write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            subagent_id,
+            r#"{"info":{"id":"119e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z","session_kind":"subagent"}"#,
+            r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"119e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"machinery"}}}}"#,
+        );
+        let store = setup_store();
+        store.insert_session(&make_existing_session(subagent_id, 1, 1)).unwrap();
+
+        prune_impl(&root, &store).unwrap();
+        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+
+        assert!(!store.session_meta_map("grok").unwrap().contains_key(subagent_id));
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].source_id, normal_id);
 
         let _ = fs::remove_dir_all(&root);
     }

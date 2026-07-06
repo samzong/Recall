@@ -137,6 +137,11 @@ pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
         if options.verbose {
             println!("Scanning {label}...");
         }
+        if let Err(e) = adapter.prune(&store)
+            && options.emit
+        {
+            eprintln!("Error pruning {label}: {e}");
+        }
         let include_events = !options.usage_only || options.backfill_events;
         let optimized = if options.force {
             None

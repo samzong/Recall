@@ -33,6 +33,9 @@ pub trait SourceAdapter {
     ) -> anyhow::Result<Option<SyncScanResult>> {
         Ok(None)
     }
+    fn prune(&self, _store: &Store) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand>;
     fn app_command(&self, _source_id: &str) -> Option<ResumeCommand> {
         None
