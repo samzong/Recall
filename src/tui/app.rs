@@ -317,6 +317,70 @@ mod tests {
     }
 
     #[test]
+    fn enter_viewing_seeds_search_query_and_jumps_to_first_match() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        let result = codex_search_result();
+        store.insert_session(&result.session).unwrap();
+        let mut first = message(Role::User, None, 0);
+        first.content = "intro".to_string();
+        let mut second = message(Role::Assistant, None, 1);
+        second.content = "Deploy finished".to_string();
+        store.insert_messages(&[first, second]).unwrap();
+        app.results = vec![result];
+        app.query = "deploy missing".to_string();
+
+        app.enter_viewing(&store);
+
+        assert!(matches!(app.mode, AppMode::Viewing));
+        assert_eq!(app.viewing_search_query, "deploy missing");
+        assert_eq!(app.viewing_match_indices(), &[1]);
+        assert_eq!(app.viewing_selected_msg, 1);
+    }
+
+    #[test]
+    fn enter_viewing_strips_punctuation_from_seeded_query_like_fts() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        let result = codex_search_result();
+        store.insert_session(&result.session).unwrap();
+        let mut first = message(Role::User, None, 0);
+        first.content = "intro".to_string();
+        let mut second = message(Role::Assistant, None, 1);
+        second.content = "run deploy(now) with config.yaml".to_string();
+        store.insert_messages(&[first, second]).unwrap();
+        app.results = vec![result];
+        app.query = "deploy() config.yaml".to_string();
+
+        app.enter_viewing(&store);
+
+        assert_eq!(app.viewing_search_query, "deploy config yaml");
+        assert_eq!(app.viewing_match_indices(), &[1]);
+        assert_eq!(app.viewing_selected_msg, 1);
+    }
+
+    #[test]
+    fn enter_viewing_with_blank_query_starts_at_first_message() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        let result = codex_search_result();
+        store.insert_session(&result.session).unwrap();
+        store.insert_messages(&[message(Role::User, None, 0)]).unwrap();
+        app.results = vec![result];
+        app.query = "   ".to_string();
+
+        app.enter_viewing(&store);
+
+        assert!(matches!(app.mode, AppMode::Viewing));
+        assert!(app.viewing_search_query.is_empty());
+        assert!(app.viewing_match_indices().is_empty());
+        assert_eq!(app.viewing_selected_msg, 0);
+    }
+
+    #[test]
     fn viewing_session_summary_counts_messages_duration_and_tokens() {
         let messages = vec![
             message(Role::User, Some(0), 0),
@@ -1932,14 +1996,18 @@ impl App {
         }
     }
 
+    pub fn viewing_search_terms(&self) -> Vec<String> {
+        self.viewing_search_query.split_whitespace().map(str::to_lowercase).collect()
+    }
+
     fn recompute_viewing_matches(&mut self) {
         self.viewing_match_cache.clear();
-        if self.viewing_search_query.is_empty() {
+        let terms = self.viewing_search_terms();
+        if terms.is_empty() {
             return;
         }
-        let needle = self.viewing_search_query.to_lowercase();
         for (i, msg_lines) in self.viewing_sanitized_lines.iter().enumerate() {
-            if msg_lines.iter().any(|l| l.lower.contains(&needle)) {
+            if msg_lines.iter().any(|l| terms.iter().any(|t| l.lower.contains(t.as_str()))) {
                 self.viewing_match_cache.push(i);
             }
         }
@@ -3117,11 +3185,19 @@ impl App {
             self.viewing_messages = msgs;
             self.viewing_selected_msg = 0;
             self.viewing_scroll_offset = 0;
-            self.viewing_search_query.clear();
+            self.viewing_search_query = self
+                .query
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
             self.viewing_search_input = None;
             self.viewing_search_input_cursor = 0;
             self.viewing_search_status = None;
-            self.viewing_match_cache.clear();
+            self.recompute_viewing_matches();
+            if let Some(&first) = self.viewing_match_cache.first() {
+                self.viewing_selected_msg = first;
+            }
             self.mode = AppMode::Viewing;
         }
     }

@@ -24,8 +24,8 @@ use crate::tui::text_layout::{wrap_spans_to_lines, wrap_visual_rows};
 use crate::types::{MatchSource, Role};
 use crate::usage::{TokenTotals, UsageReport};
 
-fn highlight_spans(text: &str, hay: &str, needle_lower: &str, base: Style) -> Vec<Span<'static>> {
-    if needle_lower.is_empty() {
+fn highlight_spans(text: &str, hay: &str, needles: &[String], base: Style) -> Vec<Span<'static>> {
+    if needles.is_empty() {
         return vec![Span::styled(text.to_string(), base)];
     }
     if hay.len() != text.len() {
@@ -36,10 +36,14 @@ fn highlight_spans(text: &str, hay: &str, needle_lower: &str, base: Style) -> Ve
     let match_style =
         Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
     while cursor < text.len() {
-        match hay[cursor..].find(needle_lower) {
-            Some(rel) => {
-                let start = cursor + rel;
-                let end = start + needle_lower.len();
+        let hit = needles
+            .iter()
+            .filter(|n| !n.is_empty())
+            .filter_map(|n| hay[cursor..].find(n.as_str()).map(|rel| (cursor + rel, n.len())))
+            .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        match hit {
+            Some((start, len)) => {
+                let end = start + len;
                 if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
                     spans.push(Span::styled(text[cursor..].to_string(), base));
                     break;
@@ -1340,7 +1344,7 @@ fn render_viewing(f: &mut Frame, app: &App) {
     let viewport_end = viewport_start + layout.messages.height as usize;
     let mut visual_row = 0usize;
     let mut lines: Vec<Line> = Vec::new();
-    let needle_lower = app.viewing_search_query.to_lowercase();
+    let needles = app.viewing_search_terms();
 
     for (i, msg) in app.viewing_messages.iter().enumerate() {
         let selected = i == app.viewing_selected_msg;
@@ -1372,7 +1376,7 @@ fn render_viewing(f: &mut Frame, app: &App) {
         let cached_lines = app.viewing_sanitized_lines.get(i).unwrap_or(&empty);
         for sl in cached_lines {
             let body_style = Style::default().fg(Color::White);
-            let spans = highlight_spans(&sl.text, &sl.lower, &needle_lower, body_style);
+            let spans = highlight_spans(&sl.text, &sl.lower, &needles, body_style);
             for line in wrap_spans_to_lines(spans, inner_width) {
                 let body_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
                     Color::DarkGray
@@ -2117,6 +2121,36 @@ mod tests {
             .map(|y| buffer_row(terminal.backend().buffer(), y, width))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn highlight_spans_marks_each_query_term() {
+        let spans = highlight_spans(
+            "Alpha beta Gamma",
+            "alpha beta gamma",
+            &["alpha".to_string(), "gamma".to_string()],
+            Style::default(),
+        );
+
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["Alpha", " beta ", "Gamma"]);
+        assert_eq!(spans[0].style.bg, Some(Color::Yellow));
+        assert_eq!(spans[1].style.bg, None);
+        assert_eq!(spans[2].style.bg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn highlight_spans_prefers_longest_term_at_same_position() {
+        let spans = highlight_spans(
+            "foobar baz",
+            "foobar baz",
+            &["foo".to_string(), "foobar".to_string()],
+            Style::default(),
+        );
+
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["foobar", " baz"]);
+        assert_eq!(spans[0].style.bg, Some(Color::Yellow));
     }
 
     #[test]
