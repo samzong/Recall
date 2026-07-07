@@ -84,6 +84,32 @@ fn make_session_event(kind: &str, name: Option<&str>, target: Option<&str>) -> R
     }
 }
 
+fn count_rows(store: &Store, sql: &str) -> i64 {
+    store.conn.query_row(sql, [], |row| row.get(0)).unwrap()
+}
+
+fn count_fts_matches(store: &Store, query: &str) -> i64 {
+    store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
+            [query],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn first_message_id(store: &Store, session_id: &str) -> i64 {
+    store
+        .conn
+        .query_row(
+            "SELECT id FROM messages WHERE session_id = ?1 ORDER BY id LIMIT 1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn no_filters() -> SearchFilters {
     SearchFilters { sources: None, time_range: TimeRange::All, directory: None, repo: None }
 }
@@ -778,10 +804,188 @@ fn sync_detects_new_messages() {
     let changed = old_msg_count != new_msg_count
         || (new_updated_at.is_some() && new_updated_at != old_updated_at);
     assert!(changed, "sync must detect message count change");
+}
 
-    store.delete_session_data("test", "raw1").unwrap();
-    let after = store.session_meta("test", "raw1").unwrap();
-    assert!(after.is_none(), "old session must be deleted before re-insert");
+#[test]
+fn replace_session_rolls_back_delete_when_reinsert_fails() {
+    let store = setup();
+    let mut old_session = Session {
+        id: "s1".to_string(),
+        source: "test".to_string(),
+        source_id: "raw1".to_string(),
+        title: "Original".to_string(),
+        directory: None,
+        repo_remote: None,
+        repo_slug: None,
+        repo_name: None,
+        started_at: 1000,
+        updated_at: Some(2000),
+        message_count: 1,
+        entrypoint: None,
+        custom_title: None,
+        summary: None,
+        duration_minutes: None,
+        source_file_path: None,
+        is_import: false,
+    };
+    old_session.is_import = true;
+    let old_usage = [make_usage_event("old-usage", 1_800_000_000_000, "old-model")];
+    let old_events = [make_session_event("old_event", Some("old_tool"), Some("old-target"))];
+    store
+        .persist_session_with_usage_and_events(
+            &old_session,
+            &[make_message("s1", Role::User, "oldrollbacktoken", 0)],
+            &old_usage,
+            Some(1),
+            &old_events,
+            Some(1),
+        )
+        .unwrap();
+    let old_message_id = first_message_id(&store, "s1");
+    store.upsert_embeddings(&[(old_message_id, &vec![0.1f32; 384])]).unwrap();
+
+    let replacement = Session {
+        id: "s2".to_string(),
+        source: "test".to_string(),
+        source_id: "raw1".to_string(),
+        title: "Replacement".to_string(),
+        directory: None,
+        repo_remote: None,
+        repo_slug: None,
+        repo_name: None,
+        started_at: 1000,
+        updated_at: Some(3000),
+        message_count: 1,
+        entrypoint: None,
+        custom_title: None,
+        summary: None,
+        duration_minutes: None,
+        source_file_path: None,
+        is_import: false,
+    };
+    // Foreign keys are enabled in setup(); this fails after the replacement deletes old rows.
+    let invalid_messages = [make_message("missing-session", Role::User, "new message", 0)];
+
+    let result = store.replace_session_with_usage_and_events(
+        "test",
+        "raw1",
+        &replacement,
+        &invalid_messages,
+        &[],
+        None,
+        &[],
+        None,
+    );
+    assert!(result.is_err(), "replacement must fail before commit");
+
+    assert_eq!(store.session_meta("test", "raw1").unwrap(), Some((Some(2000), 1)));
+    let messages = store.get_messages("s1").unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, "oldrollbacktoken");
+    assert!(store.imported_source_ids("test").unwrap().contains("raw1"));
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM message_vec"), 1);
+    assert_eq!(count_fts_matches(&store, "oldrollbacktoken"), 1);
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM usage_events"), 1);
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM usage_session_state"), 1);
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM session_events"), 1);
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM event_session_state"), 1);
+    assert_eq!(
+        count_rows(&store, "SELECT COUNT(*) FROM session_embedding_state WHERE session_id = 's1'"),
+        1
+    );
+}
+
+#[test]
+fn replace_session_clears_import_marker_on_success() {
+    let store = setup();
+    let mut old_session = Session {
+        id: "s1".to_string(),
+        source: "test".to_string(),
+        source_id: "raw1".to_string(),
+        title: "Original".to_string(),
+        directory: None,
+        repo_remote: None,
+        repo_slug: None,
+        repo_name: None,
+        started_at: 1000,
+        updated_at: Some(2000),
+        message_count: 1,
+        entrypoint: None,
+        custom_title: None,
+        summary: None,
+        duration_minutes: None,
+        source_file_path: None,
+        is_import: false,
+    };
+    old_session.is_import = true;
+    let old_usage = [make_usage_event("old-usage", 1_800_000_000_000, "old-model")];
+    let old_events = [make_session_event("old_event", Some("old_tool"), Some("old-target"))];
+    store
+        .persist_session_with_usage_and_events(
+            &old_session,
+            &[make_message("s1", Role::User, "oldsuccesstoken", 0)],
+            &old_usage,
+            Some(1),
+            &old_events,
+            Some(1),
+        )
+        .unwrap();
+    let old_message_id = first_message_id(&store, "s1");
+    store.upsert_embeddings(&[(old_message_id, &vec![0.1f32; 384])]).unwrap();
+
+    let replacement = Session {
+        id: "s2".to_string(),
+        source: "test".to_string(),
+        source_id: "raw1".to_string(),
+        title: "Replacement".to_string(),
+        directory: None,
+        repo_remote: None,
+        repo_slug: None,
+        repo_name: None,
+        started_at: 1000,
+        updated_at: Some(3000),
+        message_count: 1,
+        entrypoint: None,
+        custom_title: None,
+        summary: None,
+        duration_minutes: None,
+        source_file_path: None,
+        is_import: false,
+    };
+    let messages = [make_message("s2", Role::User, "newsuccesstoken", 0)];
+
+    store
+        .replace_session_with_usage_and_events(
+            "test",
+            "raw1",
+            &replacement,
+            &messages,
+            &[],
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(store.session_meta("test", "raw1").unwrap(), Some((Some(3000), 1)));
+    assert!(store.get_messages("s1").unwrap().is_empty());
+    assert_eq!(store.get_messages("s2").unwrap()[0].content, "newsuccesstoken");
+    assert!(store.imported_source_ids("test").unwrap().is_empty());
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM message_vec"), 0);
+    assert_eq!(count_fts_matches(&store, "oldsuccesstoken"), 0);
+    assert_eq!(count_fts_matches(&store, "newsuccesstoken"), 1);
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM usage_events"), 0);
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM usage_session_state"), 0);
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM session_events"), 0);
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM event_session_state"), 0);
+    assert_eq!(
+        count_rows(&store, "SELECT COUNT(*) FROM session_embedding_state WHERE session_id = 's1'"),
+        0
+    );
+    assert_eq!(
+        count_rows(&store, "SELECT COUNT(*) FROM session_embedding_state WHERE session_id = 's2'"),
+        1
+    );
 }
 
 #[test]

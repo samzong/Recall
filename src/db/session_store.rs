@@ -90,7 +90,7 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn insert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
+            "INSERT INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             rusqlite::params![
                 session.id,
@@ -165,200 +165,50 @@ impl Store {
         event_parser_version: Option<u32>,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        {
-            tx.execute(
-                "INSERT OR REPLACE INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-                rusqlite::params![
-                    session.id,
-                    session.source,
-                    session.source_id,
-                    session.title,
-                    session.directory,
-                    session.repo_remote,
-                    session.repo_slug,
-                    session.repo_name,
-                    session.started_at,
-                    session.updated_at,
-                    session.message_count,
-                    session.entrypoint,
-                    session.custom_title,
-                    session.summary,
-                    session.duration_minutes,
-                    session.source_file_path,
-                    session.is_import,
-                ],
-            )?;
+        persist_session_with_usage_and_events_tx(
+            &tx,
+            session,
+            messages,
+            usage_events,
+            usage_parser_version,
+            session_events,
+            event_parser_version,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
 
-            {
-                let mut stmt = tx.prepare(
-                    "INSERT INTO messages (session_id, role, content, timestamp, seq)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                )?;
-                for msg in messages {
-                    stmt.execute(rusqlite::params![
-                        msg.session_id,
-                        msg.role.as_str(),
-                        msg.content,
-                        msg.timestamp,
-                        msg.seq,
-                    ])?;
-                }
-            }
-
-            {
-                tx.execute(
-                    "DELETE FROM usage_events WHERE session_id = ?1",
-                    rusqlite::params![session.id],
-                )?;
-                let created_at = Utc::now().timestamp_millis();
-                let mut stmt = tx.prepare(
-                    "INSERT INTO usage_events (
-                        session_id, source, source_id, event_key, event_seq, message_seq,
-                        timestamp, model, provider, input_tokens, output_tokens,
-                        cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                        token_source, parser_version, source_path, raw_usage_json, created_at
-                     )
-                     VALUES (
-                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                        ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
-                     )
-                     ON CONFLICT(session_id, event_key) DO UPDATE SET
-                        event_seq = excluded.event_seq,
-                        message_seq = excluded.message_seq,
-                        timestamp = excluded.timestamp,
-                        model = excluded.model,
-                        provider = excluded.provider,
-                        input_tokens = excluded.input_tokens,
-                        output_tokens = excluded.output_tokens,
-                        cache_read_tokens = excluded.cache_read_tokens,
-                        cache_write_tokens = excluded.cache_write_tokens,
-                        reasoning_tokens = excluded.reasoning_tokens,
-                        token_source = excluded.token_source,
-                        parser_version = excluded.parser_version,
-                        source_path = excluded.source_path,
-                        raw_usage_json = excluded.raw_usage_json",
-                )?;
-                for event in usage_events {
-                    stmt.execute(rusqlite::params![
-                        session.id,
-                        session.source,
-                        session.source_id,
-                        event.event_key,
-                        event.event_seq,
-                        event.message_seq,
-                        event.timestamp,
-                        event.model,
-                        event.provider,
-                        event.input_tokens,
-                        event.output_tokens,
-                        event.cache_read_tokens,
-                        event.cache_write_tokens,
-                        event.reasoning_tokens,
-                        event.token_source.as_str(),
-                        event.parser_version,
-                        event.source_path,
-                        event.raw_usage_json,
-                        created_at,
-                    ])?;
-                }
-            }
-
-            if let Some(parser_version) = usage_parser_version {
-                let synced_at = Utc::now().timestamp_millis();
-                tx.execute(
-                    "INSERT INTO usage_session_state (
-                        session_id, source, source_id, parser_version,
-                        source_updated_at, event_count, synced_at
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT(source, source_id) DO UPDATE SET
-                        session_id = excluded.session_id,
-                        parser_version = excluded.parser_version,
-                        source_updated_at = excluded.source_updated_at,
-                        event_count = excluded.event_count,
-                        synced_at = excluded.synced_at",
-                    rusqlite::params![
-                        session.id,
-                        session.source,
-                        session.source_id,
-                        parser_version,
-                        session.updated_at,
-                        usage_events.len() as u32,
-                        synced_at,
-                    ],
-                )?;
-            }
-
-            replace_session_events(
-                &tx,
-                &session.id,
-                &session.source,
-                &session.source_id,
-                session_events,
-                event_parser_version,
-                session.updated_at,
-            )?;
-
-            let units_total: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM messages
-                 WHERE session_id = ?1 AND role = 'user' AND LENGTH(content) > 2",
-                rusqlite::params![session.id],
-                |row| row.get(0),
-            )?;
-
-            let now = Utc::now().timestamp_millis();
-            if units_total == 0 {
-                tx.execute(
-                    "INSERT INTO session_embedding_state (session_id, status, units_total, units_done, finished_at, last_error)
-                     VALUES (?1, 'done', 0, 0, ?2, NULL)
-                     ON CONFLICT(session_id) DO UPDATE SET
-                        status = 'done',
-                        units_total = 0,
-                        units_done = 0,
-                        started_at = NULL,
-                        finished_at = excluded.finished_at,
-                        last_error = NULL",
-                    rusqlite::params![session.id, now],
-                )?;
-            } else {
-                tx.execute(
-                    "INSERT INTO session_embedding_state (session_id, status, units_total, units_done, started_at, finished_at, last_error)
-                     VALUES (?1, 'pending', ?2, 0, NULL, NULL, NULL)
-                     ON CONFLICT(session_id) DO UPDATE SET
-                        status = 'pending',
-                        units_total = excluded.units_total,
-                        units_done = 0,
-                        started_at = NULL,
-                        finished_at = NULL,
-                        last_error = NULL",
-                    rusqlite::params![session.id, units_total],
-                )?;
-            }
-        }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn replace_session_with_usage_and_events(
+        &self,
+        old_source: &str,
+        old_source_id: &str,
+        session: &Session,
+        messages: &[Message],
+        usage_events: &[RawUsageEvent],
+        usage_parser_version: Option<u32>,
+        session_events: &[RawSessionEvent],
+        event_parser_version: Option<u32>,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        delete_session_data_tx(&tx, old_source, old_source_id)?;
+        persist_session_with_usage_and_events_tx(
+            &tx,
+            session,
+            messages,
+            usage_events,
+            usage_parser_version,
+            session_events,
+            event_parser_version,
+        )?;
         tx.commit()?;
         Ok(())
     }
 
     pub(crate) fn delete_session_data(&self, source: &str, source_id: &str) -> Result<()> {
-        let session_ids: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM sessions WHERE source = ?1 AND source_id = ?2")?;
-            stmt.query_map(rusqlite::params![source, source_id], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-        for sid in &session_ids {
-            self.conn.execute(
-                "DELETE FROM message_vec WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
-                rusqlite::params![sid],
-            )?;
-        }
-        self.conn.execute(
-            "DELETE FROM sessions WHERE source = ?1 AND source_id = ?2",
-            rusqlite::params![source, source_id],
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        delete_session_data_tx(&tx, source, source_id)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -622,4 +472,211 @@ impl Store {
         let rows = stmt.query_map(param_refs.as_slice(), session_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+}
+
+fn delete_session_data_tx(
+    tx: &rusqlite::Transaction<'_>,
+    source: &str,
+    source_id: &str,
+) -> Result<()> {
+    let session_ids: Vec<String> = {
+        let mut stmt =
+            tx.prepare("SELECT id FROM sessions WHERE source = ?1 AND source_id = ?2")?;
+        stmt.query_map(rusqlite::params![source, source_id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for sid in &session_ids {
+        tx.execute(
+            "DELETE FROM message_vec WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
+            rusqlite::params![sid],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM sessions WHERE source = ?1 AND source_id = ?2",
+        rusqlite::params![source, source_id],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_session_with_usage_and_events_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session: &Session,
+    messages: &[Message],
+    usage_events: &[RawUsageEvent],
+    usage_parser_version: Option<u32>,
+    session_events: &[RawSessionEvent],
+    event_parser_version: Option<u32>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        rusqlite::params![
+            session.id,
+            session.source,
+            session.source_id,
+            session.title,
+            session.directory,
+            session.repo_remote,
+            session.repo_slug,
+            session.repo_name,
+            session.started_at,
+            session.updated_at,
+            session.message_count,
+            session.entrypoint,
+            session.custom_title,
+            session.summary,
+            session.duration_minutes,
+            session.source_file_path,
+            session.is_import,
+        ],
+    )?;
+
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO messages (session_id, role, content, timestamp, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for msg in messages {
+            stmt.execute(rusqlite::params![
+                msg.session_id,
+                msg.role.as_str(),
+                msg.content,
+                msg.timestamp,
+                msg.seq,
+            ])?;
+        }
+    }
+
+    {
+        tx.execute(
+            "DELETE FROM usage_events WHERE session_id = ?1",
+            rusqlite::params![session.id],
+        )?;
+        let created_at = Utc::now().timestamp_millis();
+        let mut stmt = tx.prepare(
+            "INSERT INTO usage_events (
+                session_id, source, source_id, event_key, event_seq, message_seq,
+                timestamp, model, provider, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                token_source, parser_version, source_path, raw_usage_json, created_at
+             )
+             VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+             )
+             ON CONFLICT(session_id, event_key) DO UPDATE SET
+                event_seq = excluded.event_seq,
+                message_seq = excluded.message_seq,
+                timestamp = excluded.timestamp,
+                model = excluded.model,
+                provider = excluded.provider,
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                cache_read_tokens = excluded.cache_read_tokens,
+                cache_write_tokens = excluded.cache_write_tokens,
+                reasoning_tokens = excluded.reasoning_tokens,
+                token_source = excluded.token_source,
+                parser_version = excluded.parser_version,
+                source_path = excluded.source_path,
+                raw_usage_json = excluded.raw_usage_json",
+        )?;
+        for event in usage_events {
+            stmt.execute(rusqlite::params![
+                session.id,
+                session.source,
+                session.source_id,
+                event.event_key,
+                event.event_seq,
+                event.message_seq,
+                event.timestamp,
+                event.model,
+                event.provider,
+                event.input_tokens,
+                event.output_tokens,
+                event.cache_read_tokens,
+                event.cache_write_tokens,
+                event.reasoning_tokens,
+                event.token_source.as_str(),
+                event.parser_version,
+                event.source_path,
+                event.raw_usage_json,
+                created_at,
+            ])?;
+        }
+    }
+
+    if let Some(parser_version) = usage_parser_version {
+        let synced_at = Utc::now().timestamp_millis();
+        tx.execute(
+            "INSERT INTO usage_session_state (
+                session_id, source, source_id, parser_version,
+                source_updated_at, event_count, synced_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(source, source_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                parser_version = excluded.parser_version,
+                source_updated_at = excluded.source_updated_at,
+                event_count = excluded.event_count,
+                synced_at = excluded.synced_at",
+            rusqlite::params![
+                session.id,
+                session.source,
+                session.source_id,
+                parser_version,
+                session.updated_at,
+                usage_events.len() as u32,
+                synced_at,
+            ],
+        )?;
+    }
+
+    replace_session_events(
+        tx,
+        &session.id,
+        &session.source,
+        &session.source_id,
+        session_events,
+        event_parser_version,
+        session.updated_at,
+    )?;
+
+    let units_total: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM messages
+         WHERE session_id = ?1 AND role = 'user' AND LENGTH(content) > 2",
+        rusqlite::params![session.id],
+        |row| row.get(0),
+    )?;
+
+    let now = Utc::now().timestamp_millis();
+    if units_total == 0 {
+        tx.execute(
+            "INSERT INTO session_embedding_state (session_id, status, units_total, units_done, finished_at, last_error)
+             VALUES (?1, 'done', 0, 0, ?2, NULL)
+             ON CONFLICT(session_id) DO UPDATE SET
+                status = 'done',
+                units_total = 0,
+                units_done = 0,
+                started_at = NULL,
+                finished_at = excluded.finished_at,
+                last_error = NULL",
+            rusqlite::params![session.id, now],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO session_embedding_state (session_id, status, units_total, units_done, started_at, finished_at, last_error)
+             VALUES (?1, 'pending', ?2, 0, NULL, NULL, NULL)
+             ON CONFLICT(session_id) DO UPDATE SET
+                status = 'pending',
+                units_total = excluded.units_total,
+                units_done = 0,
+                started_at = NULL,
+                finished_at = NULL,
+                last_error = NULL",
+            rusqlite::params![session.id, units_total],
+        )?;
+    }
+
+    Ok(())
 }

@@ -373,7 +373,9 @@ mod tests {
         let session = full_session(source, source_id, title);
         let messages = full_messages(&session.id);
         store
-            .persist_session_with_usage_and_events(
+            .replace_session_with_usage_and_events(
+                source,
+                source_id,
                 &session,
                 &messages,
                 &[full_usage_event()],

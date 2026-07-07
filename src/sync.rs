@@ -276,9 +276,7 @@ pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
 
             match existing_meta.get(&raw_source_id) {
                 Some(&(old_updated_at, old_msg_count)) => {
-                    if imported_ids.remove(&raw_source_id) {
-                        store.clear_import_marker(source_id, &raw_source_id)?;
-                    }
+                    let was_imported = imported_ids.remove(&raw_source_id);
                     let metadata_changed = existing_paths.get(&raw_source_id).is_some_and(|old| {
                         raw_session_metadata_changed(&raw, repo_identity.as_ref(), old)
                     });
@@ -294,6 +292,9 @@ pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                         event_backfill_needed,
                     ) {
                         ExistingSessionAction::Skip => {
+                            if was_imported {
+                                store.clear_import_marker(source_id, &raw_source_id)?;
+                            }
                             skipped += 1;
                             continue;
                         }
@@ -350,6 +351,9 @@ pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                                     None,
                                 )?;
                             }
+                            if was_imported {
+                                store.clear_import_marker(source_id, &raw_source_id)?;
+                            }
                             if reprocessed {
                                 reprocessed_sessions += 1;
                             }
@@ -357,7 +361,7 @@ pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                         }
                         ExistingSessionAction::RefreshSession => {}
                     }
-                    store.delete_session_data(source_id, &raw_source_id)?;
+                    existing_usage_meta.remove(&raw_source_id);
                     existing_event_meta.remove(&raw_source_id);
                     if content_changed {
                         updated_sessions += 1;
@@ -417,7 +421,9 @@ pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 (Vec::new(), None)
             };
 
-            store.persist_session_with_usage_and_events(
+            store.replace_session_with_usage_and_events(
+                source_id,
+                &raw_source_id,
                 &session,
                 &messages,
                 &raw.usage_events,
