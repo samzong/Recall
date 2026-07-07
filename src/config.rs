@@ -8,7 +8,7 @@ use crate::db::search::TimeRange;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum SyncWindow {
+pub(crate) enum SyncWindow {
     Today,
     Week,
     Month,
@@ -17,7 +17,7 @@ pub enum SyncWindow {
 }
 
 impl SyncWindow {
-    pub fn next(self) -> Self {
+    pub(crate) fn next(self) -> Self {
         match self {
             Self::Today => Self::Week,
             Self::Week => Self::Month,
@@ -26,7 +26,7 @@ impl SyncWindow {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Today => "today",
             Self::Week => "7d",
@@ -35,7 +35,7 @@ impl SyncWindow {
         }
     }
 
-    pub fn to_since_cutoff(self) -> Option<i64> {
+    pub(crate) fn to_since_cutoff(self) -> Option<i64> {
         match self {
             Self::Today => crate::utils::parse_since("1d"),
             Self::Week => crate::utils::parse_since("7d"),
@@ -44,7 +44,7 @@ impl SyncWindow {
         }
     }
 
-    pub fn to_time_range(self) -> TimeRange {
+    pub(crate) fn to_time_range(self) -> TimeRange {
         match self {
             Self::Today => TimeRange::Today,
             Self::Week => TimeRange::Week,
@@ -55,15 +55,15 @@ impl SyncWindow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AppConfig {
+pub(crate) struct AppConfig {
     #[serde(default)]
-    pub disabled_sources: Vec<String>,
+    pub(crate) disabled_sources: Vec<String>,
     #[serde(default, rename = "enabled_sources", skip_serializing_if = "Vec::is_empty")]
     legacy_enabled_sources: Vec<String>,
     #[serde(default)]
-    pub sync_window: SyncWindow,
+    pub(crate) sync_window: SyncWindow,
     #[serde(default)]
-    pub default_current_repo_scope: bool,
+    pub(crate) default_current_repo_scope: bool,
     /// Glob patterns matched against each session's `directory` (cwd) field.
     /// Sessions whose cwd matches ANY glob are dropped at sync time — they
     /// never enter the FTS or vector index. Edit via the config file.
@@ -73,22 +73,22 @@ pub struct AppConfig {
     /// children, not `dir`). Examples: `**/observer-sessions`,
     /// `**/.claude-mem/**`, `**/scratch-*`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub excluded_paths: Vec<String>,
+    pub(crate) excluded_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub share: Option<ShareConfig>,
+    pub(crate) share: Option<ShareConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ShareConfig {
-    pub provider: String,
-    pub project_name: String,
+pub(crate) struct ShareConfig {
+    pub(crate) provider: String,
+    pub(crate) project_name: String,
     #[serde(default)]
-    pub project_domain: String,
-    pub publish_dir: String,
+    pub(crate) project_domain: String,
+    pub(crate) publish_dir: String,
 }
 
 impl AppConfig {
-    pub fn load() -> Result<Self> {
+    pub(crate) fn load() -> Result<Self> {
         let path = config_path()?;
         if !path.exists() {
             return Ok(Self::default());
@@ -99,11 +99,11 @@ impl AppConfig {
         Ok(config)
     }
 
-    pub fn load_or_default() -> Self {
+    pub(crate) fn load_or_default() -> Self {
         Self::load().unwrap_or_default()
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub(crate) fn save(&self) -> Result<()> {
         let path = config_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -112,7 +112,7 @@ impl AppConfig {
         Ok(())
     }
 
-    pub fn normalize_sources(&mut self, known_sources: &[(String, String)]) {
+    pub(crate) fn normalize_sources(&mut self, known_sources: &[(String, String)]) {
         self.legacy_enabled_sources.clear();
 
         self.disabled_sources.retain(|id| known_sources.iter().any(|(known, _)| known == id));
@@ -125,7 +125,7 @@ impl AppConfig {
         }
     }
 
-    pub fn is_source_enabled(&self, source_id: &str) -> bool {
+    pub(crate) fn is_source_enabled(&self, source_id: &str) -> bool {
         !self.disabled_sources.iter().any(|id| id == source_id)
     }
 
@@ -133,7 +133,7 @@ impl AppConfig {
     /// Returns `None` when no rules are configured. Errors propagate so an
     /// invalid pattern fails loud — the user gets a startup error, not a
     /// silent half-applied filter.
-    pub fn build_path_excluder(&self) -> Result<Option<GlobSet>> {
+    pub(crate) fn build_path_excluder(&self) -> Result<Option<GlobSet>> {
         if self.excluded_paths.is_empty() {
             return Ok(None);
         }
@@ -147,7 +147,7 @@ impl AppConfig {
     }
 }
 
-pub fn config_path() -> Result<PathBuf> {
+pub(crate) fn config_path() -> Result<PathBuf> {
     let dir =
         dirs::config_dir().ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
     Ok(dir.join("recall").join("config.json"))

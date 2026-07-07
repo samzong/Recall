@@ -9,59 +9,59 @@ use serde_json::Value;
 use crate::db::search::TimeRange;
 use crate::db::store::{SkillAuditEventRow, Store};
 
-pub const CORE_INVOCATION_THRESHOLD: usize = 10;
+pub(crate) const CORE_INVOCATION_THRESHOLD: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum SkillTier {
+pub(crate) enum SkillTier {
     Core,
     Occasional,
     Dormant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub enum SkillSignal {
+pub(crate) enum SkillSignal {
     ReadSkillFile,
     SkillTool,
 }
 
 #[derive(Debug, Clone)]
-pub struct SkillAuditFilters {
-    pub sources: Option<Vec<String>>,
-    pub time_range: TimeRange,
+pub(crate) struct SkillAuditFilters {
+    pub(crate) sources: Option<Vec<String>>,
+    pub(crate) time_range: TimeRange,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SkillAuditSummary {
-    pub installed: usize,
-    pub core: usize,
-    pub occasional: usize,
-    pub dormant: usize,
+pub(crate) struct SkillAuditSummary {
+    pub(crate) installed: usize,
+    pub(crate) core: usize,
+    pub(crate) occasional: usize,
+    pub(crate) dormant: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SkillUsageEntry {
-    pub id: String,
-    pub tier: SkillTier,
-    pub invocations: usize,
-    pub last_used: Option<i64>,
-    pub signals: Vec<SkillSignal>,
-    pub install_path: Option<String>,
-    pub session_ids: Vec<String>,
+pub(crate) struct SkillUsageEntry {
+    pub(crate) id: String,
+    pub(crate) tier: SkillTier,
+    pub(crate) invocations: usize,
+    pub(crate) last_used: Option<i64>,
+    pub(crate) signals: Vec<SkillSignal>,
+    pub(crate) install_path: Option<String>,
+    pub(crate) session_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SkillAuditReport {
-    pub summary: SkillAuditSummary,
-    pub core: Vec<SkillUsageEntry>,
-    pub occasional: Vec<SkillUsageEntry>,
-    pub dormant: Vec<SkillUsageEntry>,
-    pub coverage_note: Option<String>,
+pub(crate) struct SkillAuditReport {
+    pub(crate) summary: SkillAuditSummary,
+    pub(crate) core: Vec<SkillUsageEntry>,
+    pub(crate) occasional: Vec<SkillUsageEntry>,
+    pub(crate) dormant: Vec<SkillUsageEntry>,
+    pub(crate) coverage_note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-pub struct InstalledSkill {
-    pub id: String,
-    pub install_path: String,
+pub(crate) struct InstalledSkill {
+    pub(crate) id: String,
+    pub(crate) install_path: String,
 }
 
 #[derive(Default)]
@@ -72,7 +72,7 @@ struct SkillAccumulator {
     signals: BTreeSet<SkillSignal>,
 }
 
-pub fn build_skill_audit_report(
+pub(crate) fn build_skill_audit_report(
     store: &Store,
     filters: &SkillAuditFilters,
 ) -> Result<SkillAuditReport> {
@@ -160,7 +160,7 @@ fn sort_entries(entries: &mut [SkillUsageEntry]) {
     });
 }
 
-pub fn scan_installed_skills() -> Vec<InstalledSkill> {
+pub(crate) fn scan_installed_skills() -> Vec<InstalledSkill> {
     let Some(home) = home_dir() else {
         return Vec::new();
     };
@@ -297,7 +297,7 @@ fn resolve_skill_id(raw: &str, installed_ids: &HashSet<String>) -> String {
         .to_string()
 }
 
-pub fn format_last_used(timestamp_ms: Option<i64>) -> String {
+pub(crate) fn format_last_used(timestamp_ms: Option<i64>) -> String {
     let Some(timestamp_ms) = timestamp_ms else {
         return "never".to_string();
     };
@@ -315,7 +315,7 @@ pub fn format_last_used(timestamp_ms: Option<i64>) -> String {
     }
 }
 
-pub fn format_signals(signals: &[SkillSignal]) -> &'static str {
+pub(crate) fn format_signals(signals: &[SkillSignal]) -> &'static str {
     let has_tool = signals.contains(&SkillSignal::SkillTool);
     let has_read = signals.contains(&SkillSignal::ReadSkillFile);
     match (has_tool, has_read) {

@@ -7,20 +7,20 @@ use crate::db::store::{SESSION_COLUMNS, session_from_row};
 use crate::types::{MatchSource, SearchResult, Session};
 use crate::utils::f32_slice_to_bytes;
 
-pub struct SearchEngine<'a> {
+pub(crate) struct SearchEngine<'a> {
     conn: &'a Connection,
 }
 
 #[derive(Debug, Clone)]
-pub struct SearchFilters {
-    pub sources: Option<Vec<String>>,
-    pub time_range: TimeRange,
-    pub directory: Option<String>,
-    pub repo: Option<RepoFilter>,
+pub(crate) struct SearchFilters {
+    pub(crate) sources: Option<Vec<String>>,
+    pub(crate) time_range: TimeRange,
+    pub(crate) directory: Option<String>,
+    pub(crate) repo: Option<RepoFilter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RepoFilter {
+pub(crate) enum RepoFilter {
     Remote(String),
     Slug(String),
     Name(String),
@@ -37,7 +37,7 @@ impl RepoFilter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimeRange {
+pub(crate) enum TimeRange {
     Today,
     Week,
     Month,
@@ -45,7 +45,7 @@ pub enum TimeRange {
 }
 
 impl TimeRange {
-    pub fn millis_ago(&self) -> Option<i64> {
+    pub(crate) fn millis_ago(&self) -> Option<i64> {
         self.cutoff_millis_at(Local::now())
     }
 
@@ -69,11 +69,11 @@ struct Hit {
 }
 
 impl<'a> SearchEngine<'a> {
-    pub fn new(conn: &'a Connection) -> Self {
+    pub(crate) fn new(conn: &'a Connection) -> Self {
         Self { conn }
     }
 
-    pub fn hybrid_search(
+    pub(crate) fn hybrid_search(
         &self,
         query: &str,
         embedding: Option<&[f32]>,

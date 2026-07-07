@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
 use crate::types::{RawUsageEvent, Role, TokenSource};
 
-pub struct GeminiAdapter;
+pub(crate) struct GeminiAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 1;
 
@@ -76,7 +76,11 @@ fn parse_gemini_session_file(path: &Path) -> anyhow::Result<Option<RawSession>> 
     parse_gemini_session_value(doc, fallback_id, Some(path.display().to_string()))
 }
 
-pub fn parse_gemini_session(json: &str, fallback_id: &str) -> anyhow::Result<Option<RawSession>> {
+#[cfg(test)]
+pub(crate) fn parse_gemini_session(
+    json: &str,
+    fallback_id: &str,
+) -> anyhow::Result<Option<RawSession>> {
     let doc: Value = serde_json::from_str(json)?;
     parse_gemini_session_value(doc, fallback_id, None)
 }

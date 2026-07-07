@@ -1,11 +1,11 @@
 #[derive(Debug, Clone, PartialEq)]
-pub enum Role {
+pub(crate) enum Role {
     User,
     Assistant,
 }
 
 impl Role {
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             Role::User => "user",
             Role::Assistant => "assistant",
@@ -15,14 +15,14 @@ impl Role {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum TokenSource {
+pub(crate) enum TokenSource {
     Observed,
     Derived,
     Estimated,
 }
 
 impl TokenSource {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             TokenSource::Observed => "observed",
             TokenSource::Derived => "derived",
@@ -57,157 +57,160 @@ impl std::str::FromStr for Role {
 }
 
 #[derive(Debug, Clone)]
-pub struct Session {
-    pub id: String,
-    pub source: String,
-    pub source_id: String,
-    pub title: String,
-    pub directory: Option<String>,
-    pub repo_remote: Option<String>,
-    pub repo_slug: Option<String>,
-    pub repo_name: Option<String>,
-    pub started_at: i64,
-    pub updated_at: Option<i64>,
-    pub message_count: u32,
-    pub entrypoint: Option<String>,
-    pub custom_title: Option<String>,
-    pub summary: Option<String>,
-    pub duration_minutes: Option<u32>,
-    pub source_file_path: Option<String>,
-    pub is_import: bool,
+pub(crate) struct Session {
+    pub(crate) id: String,
+    pub(crate) source: String,
+    pub(crate) source_id: String,
+    pub(crate) title: String,
+    pub(crate) directory: Option<String>,
+    pub(crate) repo_remote: Option<String>,
+    pub(crate) repo_slug: Option<String>,
+    pub(crate) repo_name: Option<String>,
+    pub(crate) started_at: i64,
+    pub(crate) updated_at: Option<i64>,
+    pub(crate) message_count: u32,
+    pub(crate) entrypoint: Option<String>,
+    pub(crate) custom_title: Option<String>,
+    pub(crate) summary: Option<String>,
+    pub(crate) duration_minutes: Option<u32>,
+    pub(crate) source_file_path: Option<String>,
+    pub(crate) is_import: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct Message {
-    pub session_id: String,
-    pub role: Role,
-    pub content: String,
-    pub timestamp: Option<i64>,
-    pub seq: u32,
+pub(crate) struct Message {
+    pub(crate) session_id: String,
+    pub(crate) role: Role,
+    pub(crate) content: String,
+    pub(crate) timestamp: Option<i64>,
+    pub(crate) seq: u32,
 }
 
 #[derive(Debug, Clone)]
-pub struct RawUsageEvent {
-    pub event_key: String,
-    pub event_seq: u32,
-    pub message_seq: Option<u32>,
-    pub timestamp: i64,
-    pub model: String,
-    pub provider: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub reasoning_tokens: i64,
-    pub token_source: TokenSource,
-    pub parser_version: u32,
-    pub source_path: Option<String>,
-    pub raw_usage_json: Option<String>,
+pub(crate) struct RawUsageEvent {
+    pub(crate) event_key: String,
+    pub(crate) event_seq: u32,
+    pub(crate) message_seq: Option<u32>,
+    pub(crate) timestamp: i64,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) cache_write_tokens: i64,
+    pub(crate) reasoning_tokens: i64,
+    pub(crate) token_source: TokenSource,
+    pub(crate) parser_version: u32,
+    pub(crate) source_path: Option<String>,
+    pub(crate) raw_usage_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-pub struct RawSessionEvent {
-    pub event_seq: u32,
-    pub timestamp: Option<i64>,
-    pub kind: String,
-    pub actor: String,
-    pub name: Option<String>,
-    pub status: Option<String>,
-    pub target: Option<String>,
-    pub message_seq: Option<u32>,
-    pub summary: Option<String>,
-    pub source_path: Option<String>,
-    pub source_event_id: Option<String>,
-    pub attrs_json: Option<String>,
-    pub parser_version: u32,
+pub(crate) struct RawSessionEvent {
+    pub(crate) event_seq: u32,
+    pub(crate) timestamp: Option<i64>,
+    pub(crate) kind: String,
+    pub(crate) actor: String,
+    pub(crate) name: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) target: Option<String>,
+    pub(crate) message_seq: Option<u32>,
+    pub(crate) summary: Option<String>,
+    pub(crate) source_path: Option<String>,
+    pub(crate) source_event_id: Option<String>,
+    pub(crate) attrs_json: Option<String>,
+    pub(crate) parser_version: u32,
 }
 
 #[derive(Debug, Clone)]
-pub struct UsageEventRecord {
-    pub session_id: String,
-    pub source: String,
-    pub source_id: String,
-    pub event_key: String,
-    pub timestamp: i64,
-    pub model: String,
-    pub provider: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub reasoning_tokens: i64,
-    pub token_source: String,
+pub(crate) struct UsageEventRecord {
+    pub(crate) session_id: String,
+    pub(crate) source: String,
+    #[allow(dead_code)] // persisted for future per-source usage breakdown
+    pub(crate) source_id: String,
+    pub(crate) event_key: String,
+    pub(crate) timestamp: i64,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) cache_write_tokens: i64,
+    pub(crate) reasoning_tokens: i64,
+    pub(crate) token_source: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionEventRecord {
-    pub event_seq: u32,
-    pub timestamp: Option<i64>,
-    pub kind: String,
-    pub actor: String,
-    pub name: Option<String>,
-    pub status: Option<String>,
-    pub target: Option<String>,
-    pub message_seq: Option<u32>,
-    pub summary: Option<String>,
-    pub source_path: Option<String>,
-    pub source_event_id: Option<String>,
-    pub attrs_json: Option<String>,
-    pub parser_version: u32,
+pub(crate) struct SessionEventRecord {
+    pub(crate) event_seq: u32,
+    pub(crate) timestamp: Option<i64>,
+    pub(crate) kind: String,
+    pub(crate) actor: String,
+    pub(crate) name: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) target: Option<String>,
+    pub(crate) message_seq: Option<u32>,
+    pub(crate) summary: Option<String>,
+    pub(crate) source_path: Option<String>,
+    pub(crate) source_event_id: Option<String>,
+    pub(crate) attrs_json: Option<String>,
+    pub(crate) parser_version: u32,
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionUsageEventRecord {
-    pub event_key: String,
-    pub event_seq: u32,
-    pub message_seq: Option<u32>,
-    pub timestamp: i64,
-    pub model: String,
-    pub provider: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub reasoning_tokens: i64,
-    pub token_source: String,
-    pub parser_version: u32,
-    pub source_path: Option<String>,
-    pub raw_usage_json: Option<String>,
+pub(crate) struct SessionUsageEventRecord {
+    pub(crate) event_key: String,
+    pub(crate) event_seq: u32,
+    pub(crate) message_seq: Option<u32>,
+    pub(crate) timestamp: i64,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) cache_write_tokens: i64,
+    pub(crate) reasoning_tokens: i64,
+    pub(crate) token_source: String,
+    pub(crate) parser_version: u32,
+    pub(crate) source_path: Option<String>,
+    pub(crate) raw_usage_json: Option<String>,
 }
 
 #[derive(Debug)]
-pub enum MatchSource {
+pub(crate) enum MatchSource {
     Fts,
     Vector,
     Hybrid,
 }
 
 #[derive(Debug)]
-pub struct SearchResult {
-    pub session: Session,
-    pub match_source: MatchSource,
-    pub snippet: Option<String>,
+pub(crate) struct SearchResult {
+    pub(crate) session: Session,
+    pub(crate) match_source: MatchSource,
+    pub(crate) snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct SemanticProgress {
-    pub total_sessions: u64,
-    pub done_sessions: u64,
-    pub processing_sessions: u64,
-    pub failed_sessions: u64,
-    pub pending_sessions: u64,
-    pub current_session_title: Option<String>,
+pub(crate) struct SemanticProgress {
+    pub(crate) total_sessions: u64,
+    pub(crate) done_sessions: u64,
+    pub(crate) processing_sessions: u64,
+    pub(crate) failed_sessions: u64,
+    pub(crate) pending_sessions: u64,
+    #[allow(dead_code)] // populated for future status-bar detail
+    pub(crate) current_session_title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-pub struct SemanticSessionJob {
-    pub session_id: String,
-    pub title: String,
-    pub units_total: u64,
+pub(crate) struct SemanticSessionJob {
+    pub(crate) session_id: String,
+    pub(crate) title: String,
+    pub(crate) units_total: u64,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct BackgroundJobStatus {
-    pub phase: Option<String>,
-    pub detail: Option<String>,
+pub(crate) struct BackgroundJobStatus {
+    pub(crate) phase: Option<String>,
+    #[allow(dead_code)] // loaded from background_jobs.detail
+    pub(crate) detail: Option<String>,
 }

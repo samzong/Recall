@@ -1,8 +1,5 @@
 use anyhow::Result;
 
-mod cli;
-mod session;
-
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -11,7 +8,6 @@ fn main() -> Result<()> {
         )
         .init();
 
-    recall::db::schema::register_sqlite_vec();
-
-    cli::run()
+    recall::init();
+    recall::run()
 }

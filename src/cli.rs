@@ -142,24 +142,24 @@ enum SkillCommands {
     },
 }
 
-pub fn run() -> Result<()> {
+pub(crate) fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Info) => recall::info::run()?,
+        Some(Commands::Info) => crate::info::run()?,
         Some(Commands::Sync { force, verbose, source }) => {
-            recall::sync::run_cli(force, verbose, source.as_deref())?
+            crate::sync::run_cli(force, verbose, source.as_deref())?
         }
         Some(Commands::BackgroundWorker { sync_first }) => {
-            recall::sync::run_background_worker(sync_first)?
+            crate::sync::run_background_worker(sync_first)?
         }
-        Some(Commands::BenchSemantic) => recall::bench::run_semantic()?,
-        Some(Commands::BenchSearch { query }) => recall::bench::run_search(&query)?,
+        Some(Commands::BenchSemantic) => crate::bench::run_semantic()?,
+        Some(Commands::BenchSearch { query }) => crate::bench::run_search(&query)?,
         Some(Commands::BenchEval { dataset, verbose }) => {
-            recall::bench::run_eval(dataset.as_deref(), verbose)?
+            crate::bench::run_eval(dataset.as_deref(), verbose)?
         }
-        Some(Commands::BenchDumpSessions) => recall::bench::dump_sessions()?,
-        Some(Commands::Search { query, source, time, project, repo }) => recall::query::run_search(
+        Some(Commands::BenchDumpSessions) => crate::bench::dump_sessions()?,
+        Some(Commands::Search { query, source, time, project, repo }) => crate::query::run_search(
             &query,
             source.as_deref(),
             time.as_deref(),
@@ -167,18 +167,18 @@ pub fn run() -> Result<()> {
             repo.as_deref(),
         )?,
         Some(Commands::Usage { json, source, time }) => {
-            recall::usage::run_cli(json, source.as_deref(), time.as_deref())?
+            crate::usage::run_cli(json, source.as_deref(), time.as_deref())?
         }
-        Some(Commands::Export { source, time, project, repo, limit }) => recall::export::run_cli(
+        Some(Commands::Export { source, time, project, repo, limit }) => crate::export::run_cli(
             source.as_deref(),
             time.as_deref(),
             project.as_deref(),
             repo.as_deref(),
             limit,
         )?,
-        Some(Commands::Import { file, dry_run }) => recall::import::run_cli(&file, dry_run)?,
+        Some(Commands::Import { file, dry_run }) => crate::import::run_cli(&file, dry_run)?,
         Some(Commands::Share { command: ShareCommands::Init { project_name, publish_dir } }) => {
-            recall::share_init::run(project_name, publish_dir)?
+            crate::share_init::run(project_name, publish_dir)?
         }
         Some(Commands::Skill {
             command: SkillCommands::Install { scope, agents, dry_run, yes },
@@ -187,7 +187,7 @@ pub fn run() -> Result<()> {
         Some(Commands::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "recall", &mut std::io::stdout());
         }
-        None => recall::tui::runner::run(None)?,
+        None => crate::tui::runner::run(None)?,
     }
 
     Ok(())
@@ -246,11 +246,11 @@ fn recall_skill_bundle() -> kitup::SkillBundle {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands, ShareCommands, Shell, SkillCommands, generate};
-    use crate::session;
-    use clap::{CommandFactory, Parser};
-    use recall::adapters::{
+    use crate::adapters::{
         adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
     };
+    use crate::session;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn export_accepts_default_jsonl_without_format_flag() {

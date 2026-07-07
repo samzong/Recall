@@ -13,7 +13,7 @@ struct SourceSummary {
     error: Option<String>,
 }
 
-pub fn run() -> Result<()> {
+pub(crate) fn run() -> Result<()> {
     let all = adapters::all_adapters();
     let labels = adapters::source_labels();
     let mut config = AppConfig::load_or_default();

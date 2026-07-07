@@ -8,14 +8,14 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 const MODEL_ID: &str = "intfloat/multilingual-e5-small";
 
-pub struct EmbeddingProvider {
+pub(crate) struct EmbeddingProvider {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
 }
 
 impl EmbeddingProvider {
-    pub fn new(show_progress: bool) -> Result<Self> {
+    pub(crate) fn new(show_progress: bool) -> Result<Self> {
         let device = select_device()?;
         let (config_path, tokenizer_path, weights_path) = download_model(show_progress)?;
 
@@ -36,19 +36,19 @@ impl EmbeddingProvider {
         Ok(Self { model, tokenizer, device })
     }
 
-    pub fn embed_query(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    pub(crate) fn embed_query(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let prefixed: Vec<String> = texts.iter().map(|t| format!("query: {t}")).collect();
         let refs: Vec<&str> = prefixed.iter().map(|s| s.as_str()).collect();
         self.embed_batch(&refs)
     }
 
-    pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    pub(crate) fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let prefixed: Vec<String> = texts.iter().map(|t| format!("passage: {t}")).collect();
         let refs: Vec<&str> = prefixed.iter().map(|s| s.as_str()).collect();
         self.embed_batch(&refs)
     }
 
-    pub fn embed_documents_with_batch(
+    pub(crate) fn embed_documents_with_batch(
         &self,
         texts: &[String],
         batch_size: usize,
@@ -98,7 +98,7 @@ impl EmbeddingProvider {
         Ok(normalized.to_vec2::<f32>()?)
     }
 
-    pub fn device_name(&self) -> &str {
+    pub(crate) fn device_name(&self) -> &str {
         match &self.device {
             Device::Cpu => "CPU",
             Device::Cuda(_) => "CUDA",

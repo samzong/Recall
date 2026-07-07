@@ -12,16 +12,16 @@ use crate::types::{Message, Role, Session, SessionEventRecord, SessionUsageEvent
 const SCHEMA_VERSION: u32 = 4;
 const RECORD_TYPE: &str = "session";
 
-pub struct ExportOptions {
-    pub session_ids: Vec<String>,
-    pub sources: Option<Vec<String>>,
-    pub time_range: TimeRange,
-    pub project: Option<String>,
-    pub repo: Option<RepoFilter>,
-    pub limit: Option<usize>,
+pub(crate) struct ExportOptions {
+    pub(crate) session_ids: Vec<String>,
+    pub(crate) sources: Option<Vec<String>>,
+    pub(crate) time_range: TimeRange,
+    pub(crate) project: Option<String>,
+    pub(crate) repo: Option<RepoFilter>,
+    pub(crate) limit: Option<usize>,
 }
 
-pub fn run_cli(
+pub(crate) fn run_cli(
     source_filter: Option<&str>,
     time_filter: Option<&str>,
     project_filter: Option<&str>,
@@ -118,7 +118,11 @@ struct ExportEvent {
     parser_version: u32,
 }
 
-pub fn write_jsonl<W: Write>(store: &Store, options: &ExportOptions, mut writer: W) -> Result<()> {
+pub(crate) fn write_jsonl<W: Write>(
+    store: &Store,
+    options: &ExportOptions,
+    mut writer: W,
+) -> Result<()> {
     let sessions = if options.session_ids.is_empty() {
         store.list_export_sessions(
             options.sources.as_deref(),
@@ -141,7 +145,7 @@ pub fn write_jsonl<W: Write>(store: &Store, options: &ExportOptions, mut writer:
     write_jsonl_for_sessions(store, sessions, &mut writer)
 }
 
-pub fn session_record_value(
+pub(crate) fn session_record_value(
     session: Session,
     messages: Vec<Message>,
     usage_events: Vec<SessionUsageEventRecord>,

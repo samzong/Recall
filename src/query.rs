@@ -7,7 +7,7 @@ use crate::embedding::EmbeddingProvider;
 use crate::types;
 use crate::utils;
 
-pub fn run_search(
+pub(crate) fn run_search(
     query: &str,
     source_filter: Option<&str>,
     time_filter: Option<&str>,
@@ -57,7 +57,7 @@ pub fn run_search(
     Ok(())
 }
 
-pub fn resolve_source_filter(
+pub(crate) fn resolve_source_filter(
     source_filter: Option<&str>,
     sources: &[(String, String)],
 ) -> Result<Option<Vec<String>>> {
@@ -73,7 +73,7 @@ pub fn resolve_source_filter(
     Ok(Some(vec![resolved]))
 }
 
-pub fn parse_time_range(time_filter: Option<&str>) -> TimeRange {
+pub(crate) fn parse_time_range(time_filter: Option<&str>) -> TimeRange {
     match time_filter.map(|t| t.to_lowercase()) {
         Some(ref t) if t == "today" => TimeRange::Today,
         Some(ref t) if t == "7d" || t == "week" => TimeRange::Week,
@@ -82,7 +82,11 @@ pub fn parse_time_range(time_filter: Option<&str>) -> TimeRange {
     }
 }
 
-pub fn query_embedding<F>(store: &Store, query: &str, mut emit: F) -> Result<Option<Vec<f32>>>
+pub(crate) fn query_embedding<F>(
+    store: &Store,
+    query: &str,
+    mut emit: F,
+) -> Result<Option<Vec<f32>>>
 where
     F: FnMut(&str),
 {

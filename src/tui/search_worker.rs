@@ -10,32 +10,32 @@ const SEARCH_LIMIT: usize = 200;
 const FETCH_MULTIPLIER: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchPhase {
+pub(crate) enum SearchPhase {
     Text,
     Hybrid,
 }
 
-pub struct SearchRequest {
-    pub id: u64,
-    pub query: String,
-    pub filters: SearchFilters,
-    pub semantic_ready: bool,
+pub(crate) struct SearchRequest {
+    pub(crate) id: u64,
+    pub(crate) query: String,
+    pub(crate) filters: SearchFilters,
+    pub(crate) semantic_ready: bool,
 }
 
-pub struct SearchResponse {
-    pub id: u64,
-    pub query: String,
-    pub phase: SearchPhase,
-    pub result: Result<Vec<SearchResult>, String>,
+pub(crate) struct SearchResponse {
+    pub(crate) id: u64,
+    pub(crate) query: String,
+    pub(crate) phase: SearchPhase,
+    pub(crate) result: Result<Vec<SearchResult>, String>,
 }
 
-pub struct SearchWorker {
+pub(crate) struct SearchWorker {
     request_tx: Sender<SearchRequest>,
     response_rx: Receiver<SearchResponse>,
 }
 
 impl SearchWorker {
-    pub fn spawn() -> Self {
+    pub(crate) fn spawn() -> Self {
         let (request_tx, request_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
 
@@ -44,11 +44,11 @@ impl SearchWorker {
         Self { request_tx, response_rx }
     }
 
-    pub fn search(&self, request: SearchRequest) -> bool {
+    pub(crate) fn search(&self, request: SearchRequest) -> bool {
         self.request_tx.send(request).is_ok()
     }
 
-    pub fn try_recv(&self) -> Option<SearchResponse> {
+    pub(crate) fn try_recv(&self) -> Option<SearchResponse> {
         self.response_rx.try_recv().ok()
     }
 }

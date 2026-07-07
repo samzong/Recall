@@ -1,13 +1,13 @@
-use recall::adapters::copilot::parse_copilot_events;
-use recall::adapters::gemini::parse_gemini_session;
-use recall::adapters::kiro::parse_kiro_conversation;
-use recall::config::AppConfig;
-use recall::db::schema;
-use recall::db::search::{RepoFilter, SearchEngine, SearchFilters, TimeRange};
-use recall::db::store::Store;
-use recall::export::{ExportOptions, write_jsonl};
-use recall::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource};
-use recall::usage::{UsageFilters, build_usage_report};
+use crate::adapters::copilot::parse_copilot_events;
+use crate::adapters::gemini::parse_gemini_session;
+use crate::adapters::kiro::parse_kiro_conversation;
+use crate::config::AppConfig;
+use crate::db::schema;
+use crate::db::search::{RepoFilter, SearchEngine, SearchFilters, TimeRange};
+use crate::db::store::Store;
+use crate::export::{ExportOptions, write_jsonl};
+use crate::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource};
+use crate::usage::{UsageFilters, build_usage_report};
 
 fn setup() -> Store {
     schema::register_sqlite_vec();
@@ -694,7 +694,7 @@ fn role_fromstr() {
 
 #[test]
 fn format_age_values() {
-    use recall::utils::format_age;
+    use crate::utils::format_age;
 
     let now = chrono::Utc::now().timestamp_millis();
     assert_eq!(format_age(now), "<1h");
@@ -705,7 +705,7 @@ fn format_age_values() {
 
 #[test]
 fn f32_slice_to_bytes_roundtrip() {
-    use recall::utils::f32_slice_to_bytes;
+    use crate::utils::f32_slice_to_bytes;
 
     let original = vec![1.0f32, 2.5, -3.0, 0.0];
     let bytes = f32_slice_to_bytes(&original);

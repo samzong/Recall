@@ -5,7 +5,7 @@ use tracing::debug;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
 use crate::types::Role;
 
-pub struct KiroAdapter;
+pub(crate) struct KiroAdapter;
 
 impl SourceAdapter for KiroAdapter {
     fn id(&self) -> &str {
@@ -91,7 +91,7 @@ fn kiro_db_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(data_dir.join("kiro-cli/data.sqlite3"))
 }
 
-pub fn parse_kiro_conversation(
+pub(crate) fn parse_kiro_conversation(
     conversation_id: &str,
     cwd: &str,
     value_json: &str,

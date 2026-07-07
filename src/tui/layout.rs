@@ -1,24 +1,24 @@
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 
-pub struct SearchLayout {
-    pub search_box: Rect,
-    pub filters: Rect,
-    pub list: Rect,
-    pub preview: Rect,
-    pub status: Rect,
+pub(crate) struct SearchLayout {
+    pub(crate) search_box: Rect,
+    pub(crate) filters: Rect,
+    pub(crate) list: Rect,
+    pub(crate) preview: Rect,
+    pub(crate) status: Rect,
 }
 
 impl SearchLayout {
-    pub fn list_inner(&self) -> Rect {
+    pub(crate) fn list_inner(&self) -> Rect {
         self.list.inner(Margin { horizontal: 1, vertical: 1 })
     }
 
-    pub fn preview_inner(&self) -> Rect {
+    pub(crate) fn preview_inner(&self) -> Rect {
         self.preview.inner(Margin { horizontal: 1, vertical: 1 })
     }
 }
 
-pub fn search_layout(area: Rect) -> SearchLayout {
+pub(crate) fn search_layout(area: Rect) -> SearchLayout {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -43,15 +43,15 @@ pub fn search_layout(area: Rect) -> SearchLayout {
     }
 }
 
-pub struct ViewingLayout {
-    pub content: Rect,
-    pub summary: Rect,
-    pub messages: Rect,
-    pub help: Rect,
+pub(crate) struct ViewingLayout {
+    pub(crate) content: Rect,
+    pub(crate) summary: Rect,
+    pub(crate) messages: Rect,
+    pub(crate) help: Rect,
 }
 
 impl ViewingLayout {
-    pub fn scrollbar_area(&self) -> Rect {
+    pub(crate) fn scrollbar_area(&self) -> Rect {
         Rect::new(
             self.content.x,
             self.messages.y.saturating_sub(1),
@@ -61,7 +61,7 @@ impl ViewingLayout {
     }
 }
 
-pub fn viewing_layout(area: Rect) -> ViewingLayout {
+pub(crate) fn viewing_layout(area: Rect) -> ViewingLayout {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(1)])
@@ -76,26 +76,26 @@ pub fn viewing_layout(area: Rect) -> ViewingLayout {
     ViewingLayout { content: outer[0], summary: content[0], messages: content[1], help: outer[1] }
 }
 
-pub struct MessagePane {
+pub(crate) struct MessagePane {
     rows: Vec<usize>,
     focus: Vec<usize>,
 }
 
 impl MessagePane {
-    pub fn new(rows: Vec<usize>, focus: Vec<usize>) -> Self {
+    pub(crate) fn new(rows: Vec<usize>, focus: Vec<usize>) -> Self {
         debug_assert_eq!(rows.len(), focus.len());
         Self { rows, focus }
     }
 
-    pub fn total_rows(&self) -> usize {
+    pub(crate) fn total_rows(&self) -> usize {
         self.rows.iter().sum()
     }
 
-    pub fn start_of(&self, index: usize) -> usize {
+    pub(crate) fn start_of(&self, index: usize) -> usize {
         self.rows.iter().take(index).sum()
     }
 
-    pub fn index_at(&self, row: usize) -> Option<usize> {
+    pub(crate) fn index_at(&self, row: usize) -> Option<usize> {
         let mut end = 0usize;
         for (index, count) in self.rows.iter().enumerate() {
             end += count;
@@ -106,7 +106,12 @@ impl MessagePane {
         None
     }
 
-    pub fn scroll_start(&self, offset: usize, selected: usize, viewport_rows: usize) -> usize {
+    pub(crate) fn scroll_start(
+        &self,
+        offset: usize,
+        selected: usize,
+        viewport_rows: usize,
+    ) -> usize {
         if viewport_rows == 0 || self.rows.is_empty() {
             return 0;
         }
@@ -127,7 +132,7 @@ impl MessagePane {
     }
 }
 
-pub fn vertical_scrollbar_position(
+pub(crate) fn vertical_scrollbar_position(
     column: u16,
     row: u16,
     area: Rect,

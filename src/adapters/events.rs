@@ -2,16 +2,16 @@ use serde_json::Value;
 
 use crate::types::RawSessionEvent;
 
-pub struct EventContext {
-    pub event_seq: u32,
-    pub timestamp: Option<i64>,
-    pub source_path: Option<String>,
-    pub source_event_id: Option<String>,
-    pub message_seq: Option<u32>,
-    pub parser_version: u32,
+pub(crate) struct EventContext {
+    pub(crate) event_seq: u32,
+    pub(crate) timestamp: Option<i64>,
+    pub(crate) source_path: Option<String>,
+    pub(crate) source_event_id: Option<String>,
+    pub(crate) message_seq: Option<u32>,
+    pub(crate) parser_version: u32,
 }
 
-pub fn tool_call_event(
+pub(crate) fn tool_call_event(
     context: EventContext,
     name: String,
     args: Option<&Value>,
@@ -40,7 +40,7 @@ pub fn tool_call_event(
     }
 }
 
-pub fn tool_call_event_from_text(
+pub(crate) fn tool_call_event_from_text(
     context: EventContext,
     name: String,
     args: Option<&str>,
@@ -69,7 +69,7 @@ pub fn tool_call_event_from_text(
     }
 }
 
-pub fn tool_result_event(
+pub(crate) fn tool_result_event(
     context: EventContext,
     name: Option<String>,
     summary: Option<String>,
@@ -91,7 +91,7 @@ pub fn tool_result_event(
     }
 }
 
-pub fn target_from_value(value: &Value) -> Option<String> {
+pub(crate) fn target_from_value(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => non_empty(text),
         Value::Array(values) => command_target_from_array(values),

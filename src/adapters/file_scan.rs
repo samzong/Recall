@@ -4,22 +4,25 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 
+use crate::adapters::sync_state::{
+    event_state_is_current_for_mtime, usage_state_is_current_for_mtime,
+};
 use crate::adapters::{RawSession, SyncScanResult, SyncScanStats};
 use crate::db::store::Store;
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct FileScanOptions {
-    pub usage_parser_version: Option<u32>,
-    pub event_parser_version: Option<u32>,
+pub(crate) struct FileScanOptions {
+    pub(crate) usage_parser_version: Option<u32>,
+    pub(crate) event_parser_version: Option<u32>,
 }
 
-pub struct FileScanEntry {
-    pub session_id: String,
-    pub stat_target: PathBuf,
-    pub directory: Option<String>,
+pub(crate) struct FileScanEntry {
+    pub(crate) session_id: String,
+    pub(crate) stat_target: PathBuf,
+    pub(crate) directory: Option<String>,
 }
 
-pub fn run_file_scan<I, F>(
+pub(crate) fn run_file_scan<I, F>(
     store: &Store,
     source_id: &str,
     since_ts: Option<i64>,
@@ -40,7 +43,7 @@ where
     )
 }
 
-pub fn run_file_scan_with_options<I, F>(
+pub(crate) fn run_file_scan_with_options<I, F>(
     store: &Store,
     source_id: &str,
     since_ts: Option<i64>,
@@ -95,12 +98,12 @@ where
 
         if let Some((old_updated_at, _)) = existing.get(&entry.session_id)
             && *old_updated_at == Some(mtime_ms)
-            && usage_state_is_current(
+            && usage_state_is_current_for_mtime(
                 options.usage_parser_version,
                 usage_state.get(&entry.session_id).copied(),
                 mtime_ms,
             )
-            && event_state_is_current(
+            && event_state_is_current_for_mtime(
                 options.event_parser_version,
                 event_state.get(&entry.session_id).copied(),
                 mtime_ms,
@@ -118,35 +121,7 @@ where
     Ok(SyncScanResult { sessions, stats })
 }
 
-fn usage_state_is_current(
-    required_parser_version: Option<u32>,
-    state: Option<crate::db::store::UsageSessionStateMeta>,
-    mtime_ms: i64,
-) -> bool {
-    let Some(required_parser_version) = required_parser_version else {
-        return true;
-    };
-    let Some(state) = state else {
-        return false;
-    };
-    state.parser_version >= required_parser_version && state.source_updated_at == Some(mtime_ms)
-}
-
-fn event_state_is_current(
-    required_parser_version: Option<u32>,
-    state: Option<crate::db::store::EventSessionStateMeta>,
-    mtime_ms: i64,
-) -> bool {
-    let Some(required_parser_version) = required_parser_version else {
-        return true;
-    };
-    let Some(state) = state else {
-        return false;
-    };
-    state.parser_version >= required_parser_version && state.source_updated_at == Some(mtime_ms)
-}
-
-pub fn stat_mtime_ms(path: &Path) -> Option<i64> {
+pub(crate) fn stat_mtime_ms(path: &Path) -> Option<i64> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
     let duration = mtime.duration_since(UNIX_EPOCH).ok()?;

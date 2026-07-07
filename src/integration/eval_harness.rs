@@ -1,8 +1,8 @@
-use recall::bench::{EvalEntry, ExpectedSession, evaluate};
-use recall::db::schema;
-use recall::db::search::SearchEngine;
-use recall::db::store::Store;
-use recall::types::{Message, Role, Session};
+use crate::bench::{EvalEntry, ExpectedSession, evaluate};
+use crate::db::schema;
+use crate::db::search::SearchEngine;
+use crate::db::store::Store;
+use crate::types::{Message, Role, Session};
 
 fn setup() -> Store {
     schema::register_sqlite_vec();

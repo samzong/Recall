@@ -14,7 +14,7 @@ use crate::adapters::{
 use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
 
-pub struct CodexAdapter;
+pub(crate) struct CodexAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 4;
 const EVENT_PARSER_VERSION: u32 = 1;

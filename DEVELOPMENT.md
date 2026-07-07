@@ -175,6 +175,15 @@ CI runs `make check` — the same single command you run locally. There is no se
 make check = cargo fmt --check → cargo clippy → cargo test
 ```
 
+Regression and eval harness tests live in `src/integration/` inside the library crate. Run them with:
+
+```bash
+cargo test integration::regression
+cargo test integration::eval_harness
+```
+
+The former standalone targets `cargo test --test regression` and `cargo test --test eval_harness` are no longer used.
+
 Always run `make check` before pushing. If it passes locally, CI will pass.
 
 ## Releases

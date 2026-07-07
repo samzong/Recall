@@ -1,21 +1,22 @@
-pub mod antigravity;
-pub mod claude_code;
-pub mod cline;
-pub mod codex;
-pub mod copilot;
-pub mod cursor;
-pub mod events;
-pub mod file_scan;
-pub mod gemini;
-pub mod grok;
-pub mod kiro;
-pub mod opencode;
-pub mod pi;
+pub(crate) mod antigravity;
+pub(crate) mod claude_code;
+pub(crate) mod cline;
+pub(crate) mod codex;
+pub(crate) mod copilot;
+pub(crate) mod cursor;
+pub(crate) mod events;
+pub(crate) mod file_scan;
+pub(crate) mod gemini;
+pub(crate) mod grok;
+pub(crate) mod kiro;
+pub(crate) mod opencode;
+pub(crate) mod pi;
+pub(crate) mod sync_state;
 
 use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
-pub trait SourceAdapter {
+pub(crate) trait SourceAdapter {
     fn id(&self) -> &str;
     fn label(&self) -> &str;
     fn scan(&self) -> anyhow::Result<Vec<RawSession>>;
@@ -42,25 +43,25 @@ pub trait SourceAdapter {
     }
 }
 
-pub struct RawSession {
-    pub source_id: String,
-    pub directory: Option<String>,
-    pub started_at: i64,
-    pub updated_at: Option<i64>,
-    pub entrypoint: Option<String>,
-    pub messages: Vec<RawMessage>,
-    pub usage_events: Vec<RawUsageEvent>,
-    pub usage_parser_version: Option<u32>,
-    pub events: Vec<RawSessionEvent>,
-    pub event_parser_version: Option<u32>,
-    pub source_file_path: Option<String>,
-    pub custom_title: Option<String>,
-    pub summary: Option<String>,
-    pub duration_minutes: Option<u32>,
+pub(crate) struct RawSession {
+    pub(crate) source_id: String,
+    pub(crate) directory: Option<String>,
+    pub(crate) started_at: i64,
+    pub(crate) updated_at: Option<i64>,
+    pub(crate) entrypoint: Option<String>,
+    pub(crate) messages: Vec<RawMessage>,
+    pub(crate) usage_events: Vec<RawUsageEvent>,
+    pub(crate) usage_parser_version: Option<u32>,
+    pub(crate) events: Vec<RawSessionEvent>,
+    pub(crate) event_parser_version: Option<u32>,
+    pub(crate) source_file_path: Option<String>,
+    pub(crate) custom_title: Option<String>,
+    pub(crate) summary: Option<String>,
+    pub(crate) duration_minutes: Option<u32>,
 }
 
 impl RawSession {
-    pub fn search_only(
+    pub(crate) fn search_only(
         source_id: impl Into<String>,
         directory: Option<String>,
         started_at: i64,
@@ -86,51 +87,55 @@ impl RawSession {
         }
     }
 
-    pub fn with_usage(mut self, usage_events: Vec<RawUsageEvent>, parser_version: u32) -> Self {
+    pub(crate) fn with_usage(
+        mut self,
+        usage_events: Vec<RawUsageEvent>,
+        parser_version: u32,
+    ) -> Self {
         self.usage_events = usage_events;
         self.usage_parser_version = Some(parser_version);
         self
     }
 
-    pub fn with_events(mut self, events: Vec<RawSessionEvent>, parser_version: u32) -> Self {
+    pub(crate) fn with_events(mut self, events: Vec<RawSessionEvent>, parser_version: u32) -> Self {
         self.events = events;
         self.event_parser_version = Some(parser_version);
         self
     }
 }
 
-pub struct RawMessage {
-    pub role: Role,
-    pub content: String,
-    pub timestamp: Option<i64>,
+pub(crate) struct RawMessage {
+    pub(crate) role: Role,
+    pub(crate) content: String,
+    pub(crate) timestamp: Option<i64>,
 }
 
 #[derive(Default)]
-pub struct SyncScanStats {
-    pub skipped_sessions: u32,
-    pub filtered_sessions: u32,
+pub(crate) struct SyncScanStats {
+    pub(crate) skipped_sessions: u32,
+    pub(crate) filtered_sessions: u32,
 }
 
-pub struct SyncScanResult {
-    pub sessions: Vec<RawSession>,
-    pub stats: SyncScanStats,
+pub(crate) struct SyncScanResult {
+    pub(crate) sessions: Vec<RawSession>,
+    pub(crate) stats: SyncScanStats,
 }
 
-pub struct SourceScanSummary {
-    pub sessions: usize,
-    pub messages: usize,
-    pub oldest_started_at: Option<i64>,
-    pub newest_started_at: Option<i64>,
+pub(crate) struct SourceScanSummary {
+    pub(crate) sessions: usize,
+    pub(crate) messages: usize,
+    pub(crate) oldest_started_at: Option<i64>,
+    pub(crate) newest_started_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
-pub struct ResumeCommand {
-    pub program: String,
-    pub args: Vec<String>,
+pub(crate) struct ResumeCommand {
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
 }
 
 impl ResumeCommand {
-    pub fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         let mut out = self.program.clone();
         for arg in &self.args {
             out.push(' ');
@@ -140,7 +145,7 @@ impl ResumeCommand {
     }
 }
 
-pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
+pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
     vec![
         Box::new(claude_code::ClaudeCodeAdapter),
         Box::new(opencode::OpenCodeAdapter),
@@ -156,23 +161,23 @@ pub fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
     ]
 }
 
-pub fn resume_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {
+pub(crate) fn resume_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {
     all_adapters().iter().find(|a| a.id() == source).and_then(|a| a.resume_command(source_id))
 }
 
-pub fn app_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {
+pub(crate) fn app_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {
     all_adapters().iter().find(|a| a.id() == source).and_then(|a| a.app_command(source_id))
 }
 
-pub fn source_labels() -> Vec<(String, String)> {
+pub(crate) fn source_labels() -> Vec<(String, String)> {
     all_adapters().iter().map(|a| (a.id().to_string(), a.label().to_string())).collect()
 }
 
-pub fn source_supports_event_backfill(source_id: &str) -> bool {
+pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
     matches!(source_id, "codex" | "claude-code" | "cursor" | "copilot-cli" | "opencode")
 }
 
-pub fn adapter_supports_usage_dashboard(
+pub(crate) fn adapter_supports_usage_dashboard(
     adapter: &dyn SourceAdapter,
     backfill_events: bool,
 ) -> bool {
@@ -182,7 +187,7 @@ pub fn adapter_supports_usage_dashboard(
     backfill_events && source_supports_event_backfill(adapter.id())
 }
 
-pub fn dashboard_source_labels() -> Vec<(String, String)> {
+pub(crate) fn dashboard_source_labels() -> Vec<(String, String)> {
     all_adapters()
         .iter()
         .filter(|adapter| adapter_supports_usage_dashboard(adapter.as_ref(), true))

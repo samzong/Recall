@@ -13,16 +13,16 @@ use crate::types::{Message, Role, Session};
 use crate::utils;
 
 #[derive(Debug, Clone)]
-pub struct SyncRunOptions {
-    pub force: bool,
-    pub verbose: bool,
-    pub emit: bool,
-    pub usage_only: bool,
-    pub backfill_events: bool,
-    pub sources: Option<Vec<String>>,
+pub(crate) struct SyncRunOptions {
+    pub(crate) force: bool,
+    pub(crate) verbose: bool,
+    pub(crate) emit: bool,
+    pub(crate) usage_only: bool,
+    pub(crate) backfill_events: bool,
+    pub(crate) sources: Option<Vec<String>>,
 }
 
-pub fn run_cli(force: bool, verbose: bool, source_filter: Option<&str>) -> Result<()> {
+pub(crate) fn run_cli(force: bool, verbose: bool, source_filter: Option<&str>) -> Result<()> {
     let labels = adapters::source_labels();
     let sources = resolve_source_filter(source_filter, &labels)?;
     run_sync_job_inner(SyncRunOptions {
@@ -37,11 +37,11 @@ pub fn run_cli(force: bool, verbose: bool, source_filter: Option<&str>) -> Resul
     Ok(())
 }
 
-pub fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
+pub(crate) fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
     run_cli(force, verbose, None)
 }
 
-pub fn run_usage_sync_job() -> Result<()> {
+pub(crate) fn run_usage_sync_job() -> Result<()> {
     run_sync_job_inner(SyncRunOptions {
         force: false,
         verbose: false,
@@ -52,7 +52,7 @@ pub fn run_usage_sync_job() -> Result<()> {
     })
 }
 
-pub fn run_dashboard_sync_job() -> Result<()> {
+pub(crate) fn run_dashboard_sync_job() -> Result<()> {
     run_sync_job_inner(SyncRunOptions {
         force: false,
         verbose: false,
@@ -63,7 +63,7 @@ pub fn run_dashboard_sync_job() -> Result<()> {
     })
 }
 
-pub fn run_background_worker(sync_first: bool) -> Result<()> {
+pub(crate) fn run_background_worker(sync_first: bool) -> Result<()> {
     semantic::run_background_worker(sync_first, || run_sync_job(false, false))
 }
 
@@ -80,7 +80,7 @@ enum ExistingSessionAction {
     RefreshSession,
 }
 
-pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
+pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
     let store = Store::open()?;
     let all = adapters::all_adapters();
     let labels = adapters::source_labels();
@@ -259,7 +259,7 @@ pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
             };
             let msg_count = raw.messages.len() as u32;
             let usage_backfill_needed = raw.usage_parser_version.is_some_and(|version| {
-                !usage_state_is_current(
+                !crate::adapters::sync_state::usage_state_is_current(
                     version,
                     existing_usage_meta.get(&raw_source_id).copied(),
                     raw.updated_at,
@@ -267,7 +267,7 @@ pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
             });
             let event_backfill_needed = (options.backfill_events || !options.usage_only)
                 && raw.event_parser_version.is_some_and(|version| {
-                    !event_state_is_current(
+                    !crate::adapters::sync_state::event_state_is_current(
                         version,
                         existing_event_meta.get(&raw_source_id).copied(),
                         raw.updated_at,
@@ -506,28 +506,6 @@ pub fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn usage_state_is_current(
-    required_parser_version: u32,
-    state: Option<UsageSessionStateMeta>,
-    source_updated_at: Option<i64>,
-) -> bool {
-    state.is_some_and(|state| {
-        state.parser_version >= required_parser_version
-            && state.source_updated_at == source_updated_at
-    })
-}
-
-fn event_state_is_current(
-    required_parser_version: u32,
-    state: Option<EventSessionStateMeta>,
-    source_updated_at: Option<i64>,
-) -> bool {
-    state.is_some_and(|state| {
-        state.parser_version >= required_parser_version
-            && state.source_updated_at == source_updated_at
-    })
 }
 
 fn decide_existing_session_action(

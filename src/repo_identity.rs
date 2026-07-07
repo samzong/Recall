@@ -2,20 +2,20 @@ use std::collections::HashMap;
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoIdentity {
-    pub remote: String,
-    pub slug: String,
-    pub name: String,
+pub(crate) struct RepoIdentity {
+    pub(crate) remote: String,
+    pub(crate) slug: String,
+    pub(crate) name: String,
 }
 
 #[derive(Default)]
-pub struct RepoIdentityCache {
+pub(crate) struct RepoIdentityCache {
     by_directory: HashMap<String, Option<RepoIdentity>>,
     by_toplevel: HashMap<String, Option<RepoIdentity>>,
 }
 
 impl RepoIdentityCache {
-    pub fn resolve(&mut self, directory: Option<&str>) -> Option<RepoIdentity> {
+    pub(crate) fn resolve(&mut self, directory: Option<&str>) -> Option<RepoIdentity> {
         let directory = directory?.trim();
         if directory.is_empty() {
             return None;
@@ -44,7 +44,7 @@ impl RepoIdentityCache {
     }
 }
 
-pub fn normalize_remote_url(url: &str) -> Option<RepoIdentity> {
+pub(crate) fn normalize_remote_url(url: &str) -> Option<RepoIdentity> {
     let trimmed = url.trim().trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
     let path = trimmed
@@ -56,7 +56,7 @@ pub fn normalize_remote_url(url: &str) -> Option<RepoIdentity> {
     identity_from_slug(path)
 }
 
-pub fn identity_from_slug(slug: &str) -> Option<RepoIdentity> {
+pub(crate) fn identity_from_slug(slug: &str) -> Option<RepoIdentity> {
     let slug = slug.trim().trim_matches('/');
     let slug = slug.strip_suffix(".git").unwrap_or(slug);
     let mut parts = slug.split('/');

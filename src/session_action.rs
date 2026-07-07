@@ -5,20 +5,20 @@ use anyhow::Result;
 use crate::adapters::{self, ResumeCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionAction {
+pub(crate) enum SessionAction {
     Resume,
     OpenApp,
 }
 
 impl SessionAction {
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Resume => "resume",
             Self::OpenApp => "open",
         }
     }
 
-    pub fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         match self {
             Self::Resume => "Resume",
             Self::OpenApp => "Open in app",
@@ -26,14 +26,18 @@ impl SessionAction {
     }
 }
 
-pub fn command_for(action: SessionAction, source: &str, source_id: &str) -> Option<ResumeCommand> {
+pub(crate) fn command_for(
+    action: SessionAction,
+    source: &str,
+    source_id: &str,
+) -> Option<ResumeCommand> {
     match action {
         SessionAction::Resume => adapters::resume_command_for(source, source_id),
         SessionAction::OpenApp => adapters::app_command_for(source, source_id),
     }
 }
 
-pub fn run(command: &ResumeCommand, directory: Option<&str>) -> Result<()> {
+pub(crate) fn run(command: &ResumeCommand, directory: Option<&str>) -> Result<()> {
     let mut process = Command::new(&command.program);
     process
         .args(&command.args)

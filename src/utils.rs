@@ -1,4 +1,21 @@
-pub fn format_age(started_at: i64) -> String {
+use std::process::Command;
+
+pub(crate) fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
+    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else if cfg!(target_os = "windows") {
+        ("cmd", vec!["/C", "start", "", url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    let status = Command::new(program).args(args).status()?;
+    if !status.success() {
+        anyhow::bail!("{program} exited with status {status}");
+    }
+    Ok(())
+}
+
+pub(crate) fn format_age(started_at: i64) -> String {
     let now = chrono::Utc::now().timestamp_millis();
     let diff_hours = (now - started_at) / (1000 * 3600);
     if diff_hours < 1 {
@@ -16,7 +33,7 @@ pub fn format_age(started_at: i64) -> String {
     }
 }
 
-pub fn parse_since(s: &str) -> Option<i64> {
+pub(crate) fn parse_since(s: &str) -> Option<i64> {
     let s = s.trim().to_lowercase();
     let (num_str, multiplier) = if let Some(n) = s.strip_suffix('d') {
         (n, 24 * 3600 * 1000i64)
@@ -32,7 +49,7 @@ pub fn parse_since(s: &str) -> Option<i64> {
     Some(now - n * multiplier)
 }
 
-pub fn sanitize_line(line: &str) -> String {
+pub(crate) fn sanitize_line(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     for c in line.chars() {
         if c == '\t' {
@@ -46,7 +63,7 @@ pub fn sanitize_line(line: &str) -> String {
     out
 }
 
-pub fn format_message_time(ts: Option<i64>) -> String {
+pub(crate) fn format_message_time(ts: Option<i64>) -> String {
     let Some(ts) = ts else {
         return String::new();
     };
@@ -55,7 +72,7 @@ pub fn format_message_time(ts: Option<i64>) -> String {
         .unwrap_or_default()
 }
 
-pub fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(data.len() * 4);
     for &f in data {
         bytes.extend_from_slice(&f.to_le_bytes());
@@ -66,7 +83,7 @@ pub fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
 const TITLE_MAX_CHARS: usize = 80;
 const TITLE_TRUNCATE_TAIL: usize = 77;
 
-pub fn title_from_user_messages(user_contents: &[&str]) -> String {
+pub(crate) fn title_from_user_messages(user_contents: &[&str]) -> String {
     let chosen = user_contents
         .iter()
         .copied()

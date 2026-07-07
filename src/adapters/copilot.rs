@@ -14,7 +14,7 @@ use crate::adapters::{
 use crate::db::store::Store;
 use crate::types::{RawSessionEvent, Role};
 
-pub struct CopilotAdapter;
+pub(crate) struct CopilotAdapter;
 
 const EVENT_PARSER_VERSION: u32 = 1;
 
@@ -183,7 +183,8 @@ fn parse_copilot_session_for_entry(
     Ok(Some(raw))
 }
 
-pub fn parse_copilot_events(
+#[cfg(test)]
+pub(crate) fn parse_copilot_events(
     content: &str,
     fallback_id: &str,
 ) -> anyhow::Result<Option<RawSession>> {

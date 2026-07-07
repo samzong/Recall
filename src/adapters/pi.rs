@@ -14,7 +14,7 @@ use crate::adapters::{
 use crate::db::store::Store;
 use crate::types::{RawUsageEvent, Role, TokenSource};
 
-pub struct PiAdapter;
+pub(crate) struct PiAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 1;
 

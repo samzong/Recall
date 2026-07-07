@@ -15,7 +15,7 @@ use crate::adapters::{
 use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
 
-pub struct ClaudeCodeAdapter;
+pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 5;
 const EVENT_PARSER_VERSION: u32 = 2;

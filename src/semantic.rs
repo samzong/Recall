@@ -11,7 +11,7 @@ use crate::embedding::EmbeddingProvider;
 const SESSION_EMBED_BATCH: usize = 8;
 const BACKGROUND_JOB: &str = "pipeline";
 
-pub fn ensure_background_worker(sync_first: bool) -> Result<()> {
+pub(crate) fn ensure_background_worker(sync_first: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("__background-worker");
@@ -23,7 +23,7 @@ pub fn ensure_background_worker(sync_first: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run_background_worker<F>(sync_first: bool, mut sync_fn: F) -> Result<()>
+pub(crate) fn run_background_worker<F>(sync_first: bool, mut sync_fn: F) -> Result<()>
 where
     F: FnMut() -> Result<()>,
 {

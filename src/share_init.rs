@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use crate::config::AppConfig;
 
-pub fn run(project_name: Option<String>, publish_dir: Option<PathBuf>) -> Result<()> {
+pub(crate) fn run(project_name: Option<String>, publish_dir: Option<PathBuf>) -> Result<()> {
     let mut config = AppConfig::load_or_default();
     let existing = config.share.clone();
     if let Some(ref share) = existing {

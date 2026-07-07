@@ -16,7 +16,7 @@ use crate::types::Role;
 
 const TRANSCRIPT_RELATIVE_PATH: &[&str] = &[".system_generated", "logs", "transcript.jsonl"];
 
-pub struct AntigravityAdapter;
+pub(crate) struct AntigravityAdapter;
 
 impl SourceAdapter for AntigravityAdapter {
     fn id(&self) -> &str {

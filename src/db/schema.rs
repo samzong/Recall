@@ -3,7 +3,7 @@ use rusqlite::Connection;
 const SCHEMA_VERSION: i64 = 10;
 
 #[allow(clippy::missing_transmute_annotations)]
-pub fn register_sqlite_vec() {
+pub(crate) fn register_sqlite_vec() {
     unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
             sqlite_vec::sqlite3_vec_init as *const (),
@@ -11,7 +11,7 @@ pub fn register_sqlite_vec() {
     }
 }
 
-pub fn init(conn: &Connection) -> anyhow::Result<()> {
+pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 {
         migrate_v1(conn)?;
@@ -40,7 +40,7 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 9 {
         migrate_v9(conn)?;
     }
-    if version < 10 {
+    if version < SCHEMA_VERSION {
         migrate_v10(conn)?;
     }
     Ok(())
@@ -324,7 +324,7 @@ fn migrate_v10(conn: &Connection) -> anyhow::Result<()> {
     if table_exists("usage_session_state")? {
         conn.execute("DELETE FROM usage_session_state WHERE source = 'grok'", [])?;
     }
-    conn.execute_batch("PRAGMA user_version = 10;")?;
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     Ok(())
 }
 
@@ -338,11 +338,13 @@ fn add_column_if_missing(conn: &Connection, stmt: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn schema_version(conn: &Connection) -> anyhow::Result<i64> {
+#[cfg(test)]
+pub(crate) fn schema_version(conn: &Connection) -> anyhow::Result<i64> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(Into::into)
 }
 
-pub const fn current_schema_version() -> i64 {
+#[cfg(test)]
+pub(crate) const fn current_schema_version() -> i64 {
     SCHEMA_VERSION
 }
 

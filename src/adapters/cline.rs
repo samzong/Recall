@@ -11,7 +11,7 @@ use crate::adapters::{
 use crate::db::store::Store;
 use crate::types::Role;
 
-pub struct ClineAdapter;
+pub(crate) struct ClineAdapter;
 
 impl SourceAdapter for ClineAdapter {
     fn id(&self) -> &str {

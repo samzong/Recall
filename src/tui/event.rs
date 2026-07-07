@@ -5,7 +5,7 @@ use crossterm::event::{
     self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 
-pub enum AppEvent {
+pub(crate) enum AppEvent {
     Key(KeyEvent),
     MouseDown { column: u16, row: u16 },
     ScrollUp { column: u16, row: u16 },
@@ -13,7 +13,7 @@ pub enum AppEvent {
     Tick,
 }
 
-pub fn poll_event(tick_rate: Duration) -> Result<AppEvent> {
+pub(crate) fn poll_event(tick_rate: Duration) -> Result<AppEvent> {
     if event::poll(tick_rate)? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => return Ok(AppEvent::Key(key)),

@@ -3,19 +3,19 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::adapters;
+use crate::config::AppConfig;
+use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
+use crate::db::store::{SessionListSort, Store};
+use crate::export::ExportOptions;
+use crate::handoff;
+use crate::query::{parse_time_range, query_embedding, resolve_source_filter};
+use crate::semantic;
+use crate::session_action::{self, SessionAction};
+use crate::types::{MatchSource, Message, Role, Session};
+use crate::{sync::SyncRunOptions, sync::run_sync_job_inner, transcript};
 use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
-use recall::adapters;
-use recall::config::AppConfig;
-use recall::db::search::{SearchEngine, SearchFilters, TimeRange};
-use recall::db::store::{SessionListSort, Store};
-use recall::export::ExportOptions;
-use recall::handoff;
-use recall::query::{parse_time_range, query_embedding, resolve_source_filter};
-use recall::semantic;
-use recall::session_action::{self, SessionAction};
-use recall::types::{MatchSource, Message, Role, Session};
-use recall::{sync::SyncRunOptions, sync::run_sync_job_inner, transcript};
 
 #[derive(Subcommand)]
 pub(crate) enum SessionCommands {
@@ -449,12 +449,12 @@ fn cmd_session_show(
         }
         SessionDetailFormat::Json => {
             let value =
-                recall::export::session_record_value(session, messages, usage_events, events)?;
+                crate::export::session_record_value(session, messages, usage_events, events)?;
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         SessionDetailFormat::Jsonl => {
             let value =
-                recall::export::session_record_value(session, messages, usage_events, events)?;
+                crate::export::session_record_value(session, messages, usage_events, events)?;
             println!("{}", serde_json::to_string(&value)?);
         }
     }
@@ -489,11 +489,11 @@ fn cmd_session_export(
             if let Some(path) = output {
                 ensure_parent_dir(&path)?;
                 let file = fs::File::create(&path)?;
-                recall::export::write_jsonl(&store, &options, file)?;
+                crate::export::write_jsonl(&store, &options, file)?;
             } else {
                 let stdout = std::io::stdout();
                 let handle = stdout.lock();
-                recall::export::write_jsonl(&store, &options, handle)?;
+                crate::export::write_jsonl(&store, &options, handle)?;
             }
         }
         SessionExportFormat::Text => {
@@ -534,8 +534,8 @@ fn cmd_session_share(
     let usage_events = store.list_usage_events_for_session(&session.id)?;
     let config = AppConfig::load_or_default();
     let tldr_markdown = tldr_file.and_then(read_tldr_file);
-    let render_options = recall::share::ShareRenderOptions { tldr_markdown };
-    let preview = recall::share::preview_session_with_options(
+    let render_options = crate::share::ShareRenderOptions { tldr_markdown };
+    let preview = crate::share::preview_session_with_options(
         &config,
         &session,
         &messages,
@@ -546,7 +546,7 @@ fn cmd_session_share(
         preview.url.clone()
     } else {
         eprintln!("Sharing session {}...", session.id);
-        recall::share::publish_session_with_options(
+        crate::share::publish_session_with_options(
             &config,
             &session,
             &messages,
@@ -559,7 +559,7 @@ fn cmd_session_share(
         copy_to_clipboard(&url)?;
     }
     if open {
-        open_url(&url)?;
+        crate::utils::open_url_in_default_browser(&url)?;
     }
 
     match format {
@@ -965,21 +965,6 @@ fn read_tldr_file(path: &Path) -> Option<String> {
             None
         }
     }
-}
-
-fn open_url(url: &str) -> Result<()> {
-    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
-        ("open", vec![url])
-    } else if cfg!(target_os = "windows") {
-        ("cmd", vec!["/C", "start", "", url])
-    } else {
-        ("xdg-open", vec![url])
-    };
-    let status = Command::new(program).args(args).status()?;
-    if !status.success() {
-        anyhow::bail!("{program} exited with status {status}");
-    }
-    Ok(())
 }
 
 #[cfg(test)]

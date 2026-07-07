@@ -5,7 +5,7 @@ use crate::transcript;
 use crate::types::{Message, Session};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HandoffTarget {
+pub(crate) struct HandoffTarget {
     pub(crate) id: &'static str,
     pub(crate) label: &'static str,
 }
@@ -17,14 +17,14 @@ pub(crate) const TARGETS: [HandoffTarget; 4] = [
     HandoffTarget { id: "opencode", label: "OpenCode" },
 ];
 
-pub fn build_prompt(session: &Session, messages: &[Message]) -> String {
+pub(crate) fn build_prompt(session: &Session, messages: &[Message]) -> String {
     format!(
         "Use this Recall indexed session transcript as context for a new session. This is a handoff, not a native resume.\n\n{}",
         transcript::render_plain(session, messages)
     )
 }
 
-pub fn command_for_target(target: &HandoffTarget, prompt: String) -> ResumeCommand {
+pub(crate) fn command_for_target(target: &HandoffTarget, prompt: String) -> ResumeCommand {
     match target.id {
         "codex" => ResumeCommand { program: "codex".to_string(), args: vec![prompt] },
         "grok" => ResumeCommand { program: "grok".to_string(), args: vec![prompt] },
@@ -37,7 +37,7 @@ pub fn command_for_target(target: &HandoffTarget, prompt: String) -> ResumeComma
     }
 }
 
-pub fn target_for(target_id: &str) -> Result<&'static HandoffTarget> {
+pub(crate) fn target_for(target_id: &str) -> Result<&'static HandoffTarget> {
     let id = target_id.to_ascii_lowercase();
     TARGETS.iter().find(|target| target.id == id).ok_or_else(|| {
         let supported = TARGETS.iter().map(|target| target.id).collect::<Vec<_>>().join(", ");

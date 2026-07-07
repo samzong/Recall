@@ -1,14 +1,14 @@
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
-pub fn wrap_visual_rows(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_visual_rows(text: &str, width: usize) -> Vec<String> {
     wrap_spans_to_lines(vec![Span::raw(text.to_string())], width)
         .into_iter()
         .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
         .collect()
 }
 
-pub fn wrap_spans_to_lines(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn wrap_spans_to_lines(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut lines = Vec::new();
     let mut current = Vec::new();

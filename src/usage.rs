@@ -13,12 +13,16 @@ use crate::sync::run_usage_sync_job;
 use crate::types::UsageEventRecord;
 
 #[derive(Debug, Clone)]
-pub struct UsageFilters {
-    pub sources: Option<Vec<String>>,
-    pub time_range: TimeRange,
+pub(crate) struct UsageFilters {
+    pub(crate) sources: Option<Vec<String>>,
+    pub(crate) time_range: TimeRange,
 }
 
-pub fn run_cli(json: bool, source_filter: Option<&str>, time_filter: Option<&str>) -> Result<()> {
+pub(crate) fn run_cli(
+    json: bool,
+    source_filter: Option<&str>,
+    time_filter: Option<&str>,
+) -> Result<()> {
     let sources = usage_source_labels();
 
     if !json {
@@ -48,59 +52,59 @@ fn usage_source_labels() -> Vec<(String, String)> {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct TokenTotals {
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub reasoning_tokens: i64,
-    pub total_tokens: i64,
+pub(crate) struct TokenTotals {
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) cache_write_tokens: i64,
+    pub(crate) reasoning_tokens: i64,
+    pub(crate) total_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct UsageSummary {
-    pub events: usize,
-    pub sessions: usize,
-    pub sources: usize,
-    pub models: usize,
-    pub token_source_events: BTreeMap<String, usize>,
-    pub tokens: TokenTotals,
+pub(crate) struct UsageSummary {
+    pub(crate) events: usize,
+    pub(crate) sessions: usize,
+    pub(crate) sources: usize,
+    pub(crate) models: usize,
+    pub(crate) token_source_events: BTreeMap<String, usize>,
+    pub(crate) tokens: TokenTotals,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SourceUsage {
-    pub source: String,
-    pub sessions: usize,
-    pub events: usize,
-    pub tokens: TokenTotals,
+pub(crate) struct SourceUsage {
+    pub(crate) source: String,
+    pub(crate) sessions: usize,
+    pub(crate) events: usize,
+    pub(crate) tokens: TokenTotals,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ModelUsage {
-    pub source: String,
-    pub provider: String,
-    pub model: String,
-    pub sessions: usize,
-    pub events: usize,
-    pub tokens: TokenTotals,
+pub(crate) struct ModelUsage {
+    pub(crate) source: String,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) sessions: usize,
+    pub(crate) events: usize,
+    pub(crate) tokens: TokenTotals,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct PeriodUsage {
-    pub period: String,
-    pub sessions: usize,
-    pub events: usize,
-    pub tokens: TokenTotals,
+pub(crate) struct PeriodUsage {
+    pub(crate) period: String,
+    pub(crate) sessions: usize,
+    pub(crate) events: usize,
+    pub(crate) tokens: TokenTotals,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct UsageReport {
-    pub summary: UsageSummary,
-    pub by_source: Vec<SourceUsage>,
-    pub by_model: Vec<ModelUsage>,
-    pub daily: Vec<PeriodUsage>,
-    pub weekly: Vec<PeriodUsage>,
-    pub monthly: Vec<PeriodUsage>,
+pub(crate) struct UsageReport {
+    pub(crate) summary: UsageSummary,
+    pub(crate) by_source: Vec<SourceUsage>,
+    pub(crate) by_model: Vec<ModelUsage>,
+    pub(crate) daily: Vec<PeriodUsage>,
+    pub(crate) weekly: Vec<PeriodUsage>,
+    pub(crate) monthly: Vec<PeriodUsage>,
 }
 
 #[derive(Default)]
@@ -127,12 +131,12 @@ impl Accumulator {
     }
 }
 
-pub fn build_usage_report(store: &Store, filters: &UsageFilters) -> Result<UsageReport> {
+pub(crate) fn build_usage_report(store: &Store, filters: &UsageFilters) -> Result<UsageReport> {
     let events = store.list_usage_events(filters.sources.as_deref(), filters.time_range)?;
     Ok(aggregate_usage_events(&events))
 }
 
-pub fn aggregate_usage_events(events: &[UsageEventRecord]) -> UsageReport {
+pub(crate) fn aggregate_usage_events(events: &[UsageEventRecord]) -> UsageReport {
     let events = dedupe_report_events(events);
     let mut total = Accumulator::default();
     let mut by_source: BTreeMap<String, Accumulator> = BTreeMap::new();

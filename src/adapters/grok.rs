@@ -15,7 +15,7 @@ use crate::types::{RawUsageEvent, Role, TokenSource};
 
 const USAGE_PARSER_VERSION: u32 = 1;
 
-pub struct GrokAdapter;
+pub(crate) struct GrokAdapter;
 
 impl SourceAdapter for GrokAdapter {
     fn id(&self) -> &str {

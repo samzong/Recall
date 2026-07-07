@@ -9,7 +9,7 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SourceScanSummary, SyncScanResult,
     SyncScanStats,
 };
-use crate::db::store::{EventSessionStateMeta, Store, UsageSessionStateMeta};
+use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
@@ -34,7 +34,7 @@ const PARSED_PART_FILTER_SQL: &str = "
     )
 ";
 
-pub struct OpenCodeAdapter;
+pub(crate) struct OpenCodeAdapter;
 
 struct SessionRow {
     id: String,
@@ -648,12 +648,14 @@ fn scan_for_sync_conn(
             let current_message_count = current_counts.get(&session.id).copied().unwrap_or(0);
             if session.time_updated == old_updated_at
                 && current_message_count == old_message_count
-                && usage_state_is_current(
+                && crate::adapters::sync_state::usage_state_is_current(
+                    USAGE_PARSER_VERSION,
                     usage_state.get(&session.id).copied(),
                     session.time_updated,
                 )
                 && (!include_events
-                    || event_state_is_current(
+                    || crate::adapters::sync_state::event_state_is_current(
+                        EVENT_PARSER_VERSION,
                         event_state.get(&session.id).copied(),
                         session.time_updated,
                     ))
@@ -667,24 +669,6 @@ fn scan_for_sync_conn(
 
     let sessions = scan_session_messages(conn, candidates, include_events)?;
     Ok(SyncScanResult { sessions, stats })
-}
-
-fn usage_state_is_current(
-    state: Option<UsageSessionStateMeta>,
-    source_updated_at: Option<i64>,
-) -> bool {
-    state.is_some_and(|state| {
-        state.parser_version >= USAGE_PARSER_VERSION && state.source_updated_at == source_updated_at
-    })
-}
-
-fn event_state_is_current(
-    state: Option<EventSessionStateMeta>,
-    source_updated_at: Option<i64>,
-) -> bool {
-    state.is_some_and(|state| {
-        state.parser_version >= EVENT_PARSER_VERSION && state.source_updated_at == source_updated_at
-    })
 }
 
 #[cfg(test)]

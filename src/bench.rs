@@ -14,7 +14,7 @@ use crate::utils::f32_slice_to_bytes;
 
 const EVAL_TOP_K_MAX: usize = 20;
 
-pub fn run_semantic() -> Result<()> {
+pub(crate) fn run_semantic() -> Result<()> {
     println!("=== Recall Semantic Pipeline Benchmark ===\n");
 
     let store = Store::open()?;
@@ -151,7 +151,7 @@ pub fn run_semantic() -> Result<()> {
     Ok(())
 }
 
-pub fn run_search(query: &str) -> Result<()> {
+pub(crate) fn run_search(query: &str) -> Result<()> {
     println!("=== Recall Search Cold-Path Benchmark ===\n");
     println!("  query: {query}\n");
 
@@ -234,65 +234,66 @@ fn time_upsert_plain(store: &Store, items: &[(i64, &[f32])]) -> Result<u128> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ExpectedSession {
-    pub source: String,
-    pub source_id: String,
+pub(crate) struct ExpectedSession {
+    pub(crate) source: String,
+    pub(crate) source_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct EvalEntry {
-    pub query: String,
-    pub expected: Vec<ExpectedSession>,
+pub(crate) struct EvalEntry {
+    pub(crate) query: String,
+    pub(crate) expected: Vec<ExpectedSession>,
     #[serde(default)]
-    pub notes: Option<String>,
+    #[allow(dead_code)] // optional metadata in eval dataset JSON
+    pub(crate) notes: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-pub struct EvalFailure {
-    pub query: String,
-    pub rank: Option<usize>,
-    pub expected: Vec<ExpectedSession>,
+pub(crate) struct EvalFailure {
+    pub(crate) query: String,
+    pub(crate) rank: Option<usize>,
+    pub(crate) expected: Vec<ExpectedSession>,
 }
 
 #[derive(Debug, Clone)]
-pub struct ResultSummary {
-    pub rank: usize,
-    pub source: String,
-    pub source_id: String,
-    pub title: String,
-    pub match_label: &'static str,
-    pub is_expected: bool,
+pub(crate) struct ResultSummary {
+    pub(crate) rank: usize,
+    pub(crate) source: String,
+    pub(crate) source_id: String,
+    pub(crate) title: String,
+    pub(crate) match_label: &'static str,
+    pub(crate) is_expected: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct QueryDetail {
-    pub query: String,
-    pub total_expected: usize,
-    pub hits_in_top_k: usize,
-    pub best_rank: Option<usize>,
-    pub top_results: Vec<ResultSummary>,
+pub(crate) struct QueryDetail {
+    pub(crate) query: String,
+    pub(crate) total_expected: usize,
+    pub(crate) hits_in_top_k: usize,
+    pub(crate) best_rank: Option<usize>,
+    pub(crate) top_results: Vec<ResultSummary>,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct EvalReport {
-    pub total: usize,
-    pub hit_at_5: usize,
-    pub hit_at_10: usize,
-    pub mrr_sum: f64,
-    pub failures: Vec<EvalFailure>,
-    pub details: Vec<QueryDetail>,
+pub(crate) struct EvalReport {
+    pub(crate) total: usize,
+    pub(crate) hit_at_5: usize,
+    pub(crate) hit_at_10: usize,
+    pub(crate) mrr_sum: f64,
+    pub(crate) failures: Vec<EvalFailure>,
+    pub(crate) details: Vec<QueryDetail>,
 }
 
 impl EvalReport {
-    pub fn mrr(&self) -> f64 {
+    pub(crate) fn mrr(&self) -> f64 {
         if self.total == 0 { 0.0 } else { self.mrr_sum / self.total as f64 }
     }
 
-    pub fn hit_at_5_pct(&self) -> f64 {
+    pub(crate) fn hit_at_5_pct(&self) -> f64 {
         pct(self.hit_at_5, self.total)
     }
 
-    pub fn hit_at_10_pct(&self) -> f64 {
+    pub(crate) fn hit_at_10_pct(&self) -> f64 {
         pct(self.hit_at_10, self.total)
     }
 }
@@ -301,7 +302,7 @@ fn pct(num: usize, denom: usize) -> f64 {
     if denom == 0 { 0.0 } else { (num as f64) * 100.0 / denom as f64 }
 }
 
-pub fn evaluate<F>(
+pub(crate) fn evaluate<F>(
     engine: &SearchEngine,
     entries: &[EvalEntry],
     embedder: F,
@@ -402,7 +403,7 @@ fn build_result_summaries(
         .collect()
 }
 
-pub fn run_eval(dataset_override: Option<&str>, verbose: bool) -> Result<()> {
+pub(crate) fn run_eval(dataset_override: Option<&str>, verbose: bool) -> Result<()> {
     let dataset_path = resolve_dataset_path(dataset_override)?;
     let entries = load_dataset(&dataset_path)?;
 
@@ -539,7 +540,7 @@ fn load_dataset(path: &Path) -> Result<Vec<EvalEntry>> {
     Ok(entries)
 }
 
-pub fn dump_sessions() -> Result<()> {
+pub(crate) fn dump_sessions() -> Result<()> {
     let store = Store::open()?;
     let mut stmt = store.conn.prepare(
         "SELECT source, source_id, started_at, title FROM sessions ORDER BY started_at DESC",

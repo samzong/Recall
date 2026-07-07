@@ -1,6 +1,6 @@
 use crate::types::{Message, Role, Session};
 
-pub fn render_plain(session: &Session, messages: &[Message]) -> String {
+pub(crate) fn render_plain(session: &Session, messages: &[Message]) -> String {
     let mut content = String::new();
     content.push_str(&format!("Session: {}\n", session.title));
     content.push_str(&format!("ID: {}\n", session.id));

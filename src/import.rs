@@ -10,13 +10,13 @@ use crate::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session, Token
 const RECORD_TYPE: &str = "session";
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct ImportSummary {
-    pub total: usize,
-    pub imported: usize,
-    pub skipped: usize,
+pub(crate) struct ImportSummary {
+    pub(crate) total: usize,
+    pub(crate) imported: usize,
+    pub(crate) skipped: usize,
 }
 
-pub fn run_cli(file: &str, dry_run: bool) -> Result<()> {
+pub(crate) fn run_cli(file: &str, dry_run: bool) -> Result<()> {
     let store = Store::open()?;
     let summary = if file == "-" {
         let stdin = std::io::stdin();
@@ -134,7 +134,11 @@ struct ImportEvent {
     parser_version: u32,
 }
 
-pub fn import_jsonl<R: BufRead>(store: &Store, dry_run: bool, reader: R) -> Result<ImportSummary> {
+pub(crate) fn import_jsonl<R: BufRead>(
+    store: &Store,
+    dry_run: bool,
+    reader: R,
+) -> Result<ImportSummary> {
     let mut summary = ImportSummary::default();
     let mut seen: HashSet<(String, String)> = HashSet::new();
 
