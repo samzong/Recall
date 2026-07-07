@@ -292,6 +292,43 @@ mod tests {
     }
 
     #[test]
+    fn render_result_list_selected_row_background_fills_interior() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        let mut selected = numbered_session_result(1);
+        selected.session.title = "--- /tmp/pyrefly_base.txt漢".to_string();
+        app.results = vec![selected, numbered_session_result(2)];
+        app.selected_index = 0;
+
+        let width = 80;
+        let height = 10;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let frame = terminal.draw(|f| render(f, &app)).unwrap();
+
+        let layout =
+            crate::tui::layout::search_layout(ratatui::layout::Rect::new(0, 0, width, height));
+        let inner = layout.list_inner();
+        let buffer = frame.buffer;
+        let selected_y = inner.y;
+        let unselected_y = inner.y + 1;
+
+        for x in inner.x..inner.x + inner.width {
+            assert_eq!(
+                buffer[(x, selected_y)].style().bg,
+                Some(Color::Cyan),
+                "selected row x={x} should have cyan background"
+            );
+        }
+        assert!(
+            (inner.x..inner.x + inner.width)
+                .all(|x| buffer[(x, unselected_y)].style().bg != Some(Color::Cyan))
+        );
+    }
+
+    #[test]
     fn render_viewing_shows_one_line_session_summary_below_title() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();

@@ -257,8 +257,16 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
+    let list_inner = block.inner(area);
     let list = List::new(items).block(block);
     f.render_widget(list, area);
+    if focused && app.selected_index >= start && app.selected_index < end {
+        let row_y = list_inner.y + (app.selected_index - start) as u16;
+        f.buffer_mut().set_style(
+            Rect::new(list_inner.x, row_y, list_inner.width, 1),
+            Style::default().bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        );
+    }
     render_vertical_scrollbar(f, area, app.results.len(), visible_rows, start);
 }
 
