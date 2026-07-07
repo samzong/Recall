@@ -26,7 +26,9 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
 
     let usage_mode = usage_start.is_some();
     let store = Store::open()?;
-    semantic::ensure_background_worker(true)?;
+    if !cfg!(debug_assertions) {
+        semantic::ensure_background_worker(true)?;
+    }
     let sources = if usage_start.is_some() {
         adapters::dashboard_source_labels()
     } else {
@@ -54,6 +56,10 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
     config.normalize_sources(&sources);
 
     let mut app = App::new(&store, sources, config);
+    if cfg!(debug_assertions) {
+        app.status_message =
+            Some("Debug builds do not start semantic indexing; run cargo run -- sync first".into());
+    }
     let search_worker = SearchWorker::spawn();
     if let Some((source_filter, time_filter)) = usage_start {
         app.source_filter_selection = source_filter.unwrap_or_default();
