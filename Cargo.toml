@@ -7,6 +7,11 @@ description = "Unified search, usage tracking, and JSONL export for AI coding se
 repository = "https://github.com/samzong/Recall"
 publish = false
 
+[workspace]
+members = [".", "extensions/recall-probe"]
+default-members = ["."]
+resolver = "2"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"

@@ -1,0 +1,8 @@
+[package]
+name = "recall-probe"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Official Recall extension host probe"
+repository = "https://github.com/samzong/Recall"
+publish = false

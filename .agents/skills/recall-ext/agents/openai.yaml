@@ -1,0 +1,4 @@
+interface:
+  display_name: "Recall Ext"
+  short_description: "Develop and release Recall extensions"
+  default_prompt: "Use $recall-ext to develop, release, and self-check a Recall extension."

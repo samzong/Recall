@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -97,12 +97,12 @@ pub(crate) fn run_list() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_external(args: Vec<OsString>) -> Result<()> {
+pub(crate) fn run_external(args: Vec<OsString>) -> Result<ExitStatus> {
     let path_env = std::env::var_os("PATH").unwrap_or_default();
     run_external_with_path(args, &path_env)
 }
 
-fn run_external_with_path(args: Vec<OsString>, path_env: &OsStr) -> Result<()> {
+fn run_external_with_path(args: Vec<OsString>, path_env: &OsStr) -> Result<ExitStatus> {
     let mut args = args.into_iter();
     let name = args.next().ok_or_else(|| anyhow!("missing extension name"))?;
     let Some(name) = name.to_str() else {
@@ -114,14 +114,10 @@ fn run_external_with_path(args: Vec<OsString>, path_env: &OsStr) -> Result<()> {
     let path = find_in_path(name, path_env).ok_or_else(|| {
         anyhow!("unknown recall command '{name}' and recall-{name} was not found on PATH")
     })?;
-    let status = Command::new(&path)
+    Command::new(&path)
         .args(args)
         .status()
-        .with_context(|| format!("failed to run {}", path.display()))?;
-    if !status.success() {
-        bail!("extension recall-{name} exited with status {status}");
-    }
-    Ok(())
+        .with_context(|| format!("failed to run {}", path.display()))
 }
 
 fn discover_in_path(path_env: &OsStr) -> Vec<ExtensionEntry> {
@@ -228,7 +224,7 @@ printf "%s" "$1" > "$2"
 "#,
         );
 
-        run_external_with_path(
+        let status = run_external_with_path(
             vec![
                 OsString::from("demo"),
                 OsString::from("hello"),
@@ -238,7 +234,30 @@ printf "%s" "$1" > "$2"
         )
         .unwrap();
 
+        assert!(status.success());
         assert_eq!(fs::read_to_string(output).unwrap(), "hello");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn external_dispatch_returns_child_exit_status() {
+        let dir = temp_dir("exit-status");
+        let binary = dir.join("recall-demo");
+        write_executable(
+            &binary,
+            r#"#!/bin/sh
+exit "$1"
+"#,
+        );
+
+        let status = run_external_with_path(
+            vec![OsString::from("demo"), OsString::from("7")],
+            dir.as_os_str(),
+        )
+        .unwrap();
+
+        assert_eq!(status.code(), Some(7));
         fs::remove_dir_all(dir).unwrap();
     }
 

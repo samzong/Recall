@@ -1,0 +1,399 @@
+name: Extension Release
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - extensions/**
+      - .github/workflows/extension-release.yml
+  push:
+    branches: [main]
+    tags: ["recall-*-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Extension release tag to build, for example recall-probe-v0.1.0
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: git fetch --force --tags
+      - name: Check changed official extensions
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import tomllib
+
+          def run(args, **kwargs):
+              return subprocess.run(args, text=True, check=True, **kwargs)
+
+          def output(args):
+              return subprocess.check_output(args, text=True)
+
+          def package_meta(path):
+              data = tomllib.loads(pathlib.Path(path).read_text())
+              package = data["package"]
+              return package["name"], str(package["version"])
+
+          def semver(value):
+              parts = value.split("-", 1)[0].split(".")
+              if len(parts) != 3 or not all(part.isdigit() for part in parts):
+                  raise ValueError(f"official extension versions must use x.y.z: {value}")
+              return tuple(int(part) for part in parts)
+
+          base = os.environ["BASE_SHA"]
+          changed = output(["git", "diff", "--name-only", base, "HEAD"]).splitlines()
+          dirs = sorted({
+              "/".join(file.split("/")[:2])
+              for file in changed
+              if file.startswith("extensions/recall-") and len(file.split("/")) >= 2
+          })
+          if not dirs:
+              print("No official extension changes.")
+              raise SystemExit(0)
+
+          failed = False
+          for directory in dirs:
+              cargo_toml = pathlib.Path(directory) / "Cargo.toml"
+              if not cargo_toml.exists():
+                  continue
+              package, version = package_meta(cargo_toml)
+              try:
+                  base_text = output(["git", "show", f"{base}:{directory}/Cargo.toml"])
+                  base_data = tomllib.loads(base_text)
+                  base_version = str(base_data["package"]["version"])
+              except subprocess.CalledProcessError:
+                  base_version = None
+
+              version_changed = base_version != version
+              print(f"{package} {version} version_changed={str(version_changed).lower()}")
+              if version_changed:
+                  if base_version is not None and semver(version) <= semver(base_version):
+                      print(f"::error::{package} version must increase: {base_version} -> {version}")
+                      failed = True
+                  tag = f"{package}-v{version}"
+                  tag_exists = subprocess.run(
+                      ["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                      check=False,
+                  ).returncode == 0
+                  if tag_exists:
+                      print(f"::error::release tag already exists: {tag}")
+                      failed = True
+
+              run(["cargo", "build", "-p", package])
+              manifest_output = output([
+                  "cargo",
+                  "run",
+                  "-p",
+                  package,
+                  "--",
+                  "--recall-extension-manifest",
+              ])
+              manifest = json.loads(manifest_output)
+              expected_name = package.removeprefix("recall-")
+              checks = {
+                  "name": manifest.get("name") == expected_name,
+                  "version": manifest.get("version") == version,
+                  "protocol": isinstance(manifest.get("protocol"), int),
+                  "min_recall": isinstance(manifest.get("min_recall"), str),
+                  "commands": isinstance(manifest.get("commands"), list),
+              }
+              for field, ok in checks.items():
+                  if not ok:
+                      print(f"::error::{package} manifest has invalid {field}")
+                      failed = True
+
+          if failed:
+              raise SystemExit(1)
+          PY
+
+  tag:
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.tag == '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - run: git fetch --force --tags
+      - name: Find unreleased official extension versions
+        run: |
+          python3 <<'PY'
+          import pathlib
+          import subprocess
+          import tomllib
+
+          rows = []
+          for cargo_toml in sorted(pathlib.Path("extensions").glob("recall-*/Cargo.toml")):
+              data = tomllib.loads(cargo_toml.read_text())
+              package = data["package"]["name"]
+              version = str(data["package"]["version"])
+              tag = f"{package}-v{version}"
+              exists = subprocess.run(
+                  ["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+                  check=False,
+              ).returncode == 0
+              if not exists:
+                  rows.append(f"{package} {version} {tag}")
+
+          pathlib.Path("extension-tags.txt").write_text("\n".join(rows) + ("\n" if rows else ""))
+          if rows:
+              print("\n".join(rows))
+          else:
+              print("No unreleased official extension versions.")
+          PY
+      - name: Push extension release tags
+        if: hashFiles('extension-tags.txt') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -s extension-tags.txt ]; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          while read -r _ _ tag; do
+            git tag -a "$tag" -m "$tag"
+          done < extension-tags.txt
+          mapfile -t tags < <(awk '{print $3}' extension-tags.txt)
+          git push origin "${tags[@]}"
+          while read -r _ _ tag; do
+            gh workflow run extension-release.yml --ref main -f tag="$tag"
+          done < extension-tags.txt
+
+  build:
+    if: startsWith(github.ref, 'refs/tags/recall-') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: extension-${{ matrix.target }}
+      - name: Parse tag
+        shell: bash
+        run: |
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          fi
+          version="${tag##*-v}"
+          package="${tag:0:${#tag}-${#version}-2}"
+          {
+            echo "PACKAGE=$package"
+            echo "VERSION=$version"
+            echo "RELEASE_TAG=$tag"
+          } >> "$GITHUB_ENV"
+      - name: Validate tag
+        shell: bash
+        run: |
+          test -f "extensions/$PACKAGE/Cargo.toml"
+          python3 <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          package = os.environ["PACKAGE"]
+          version = os.environ["VERSION"]
+          data = tomllib.loads(pathlib.Path(f"extensions/{package}/Cargo.toml").read_text())
+          actual = str(data["package"]["version"])
+          if actual != version:
+              raise SystemExit(f"{package} version mismatch: tag={version} Cargo.toml={actual}")
+          PY
+      - name: Build
+        run: cargo build -p "$PACKAGE" --release --target ${{ matrix.target }}
+        shell: bash
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          archive="${PACKAGE}-v${VERSION}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$archive" "$PACKAGE"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "${env:PACKAGE}-v${env:VERSION}-${{ matrix.target }}.zip"
+          $binary = "target/${{ matrix.target }}/release/${env:PACKAGE}.exe"
+          Compress-Archive -Path $binary -DestinationPath $archive
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ env.PACKAGE }}-${{ matrix.target }}
+          path: |
+            ${{ env.PACKAGE }}-v${{ env.VERSION }}-*.tar.gz
+            ${{ env.PACKAGE }}-v${{ env.VERSION }}-*.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/recall-') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          fi
+          assets=( ./*.tar.gz ./*.zip )
+          sha256sum "${assets[@]}" | sort > checksums.txt
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber "${assets[@]}" checksums.txt
+          else
+            gh release create "$tag" \
+              --title "$tag" \
+              --generate-notes \
+              "${assets[@]}" checksums.txt
+          fi
+
+  catalog:
+    if: startsWith(github.ref, 'refs/tags/recall-') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: extension-catalog
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: extension-catalog
+      - uses: actions/download-artifact@v5
+        with:
+          merge-multiple: true
+      - name: Sync main
+        run: git pull --rebase origin main
+      - name: Update catalog
+        env:
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import tomllib
+
+          tag = os.environ["RELEASE_TAG"]
+          version = tag.rsplit("-v", 1)[1]
+          package = tag[: -(len(version) + 2)]
+          manifest = json.loads(subprocess.check_output([
+              "cargo",
+              "run",
+              "-p",
+              package,
+              "--",
+              "--recall-extension-manifest",
+          ], text=True))
+          if manifest["version"] != version:
+              raise SystemExit(f"manifest version mismatch for {tag}")
+
+          cargo = tomllib.loads(pathlib.Path(f"extensions/{package}/Cargo.toml").read_text())
+          description = cargo["package"].get("description", "")
+          prefix = f"{package}-v{version}-"
+          targets = {}
+          for archive in sorted(pathlib.Path(".").glob(f"{prefix}*.tar.gz")) + sorted(pathlib.Path(".").glob(f"{prefix}*.zip")):
+              name = archive.name
+              if name.endswith(".tar.gz"):
+                  target = name.removeprefix(prefix).removesuffix(".tar.gz")
+              elif name.endswith(".zip"):
+                  target = name.removeprefix(prefix).removesuffix(".zip")
+              else:
+                  continue
+              targets[target] = {
+                  "url": f"https://github.com/{os.environ['REPOSITORY']}/releases/download/{tag}/{name}",
+                  "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+              }
+          if not targets:
+              raise SystemExit(f"no release archives found for {tag}")
+
+          path = pathlib.Path("website/public/extensions/catalog.json")
+          catalog = json.loads(path.read_text()) if path.exists() else {"schema": 1, "extensions": {}}
+          if catalog.get("schema") != 1:
+              raise SystemExit("unsupported extension catalog schema")
+
+          extension = manifest["name"]
+          entry = catalog.setdefault("extensions", {}).setdefault(extension, {})
+          entry["description"] = description
+          entry.setdefault("versions", {})[version] = {
+              "commands": manifest["commands"],
+              "min_recall": manifest["min_recall"],
+              "protocol": manifest["protocol"],
+              "targets": targets,
+          }
+          path.write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n")
+          PY
+      - name: Commit catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add website/public/extensions/catalog.json
+          if git diff --cached --quiet; then
+            echo "Catalog already up to date."
+            exit 0
+          fi
+          tag="${RELEASE_TAG}"
+          version="${tag##*-v}"
+          package="${tag:0:${#tag}-${#version}-2}"
+          git commit -m "chore(extensions): publish $package v$version"
+          git push origin HEAD:main
+          gh workflow run pages.yml --ref main

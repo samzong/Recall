@@ -23,21 +23,21 @@ release: ## Release build (LTO + strip)
 
 check: ## Full quality gate — format, lint, test
 	@printf '\n$(BOLD)[1/3] Checking format$(RESET)\n'
-	$(CARGO) fmt -- --check
+	$(CARGO) fmt --all -- --check
 	@printf '\n$(BOLD)[2/3] Running clippy$(RESET)\n'
-	$(CARGO) clippy --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	@printf '\n$(BOLD)[3/3] Running tests$(RESET)\n'
-	$(CARGO) test
+	$(CARGO) test --workspace
 	@printf '\n$(GREEN)  ✓ All checks passed$(RESET)\n\n'
 
 test: ## Run tests
-	$(CARGO) test
+	$(CARGO) test --workspace
 
 lint: ## Run clippy
-	$(CARGO) clippy --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 fmt: ## Format code
-	$(CARGO) fmt
+	$(CARGO) fmt --all
 
 # ── Documentation ────────────────────────────────────────────────────────────
 

@@ -212,7 +212,12 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "recall", &mut std::io::stdout());
         }
-        Some(Commands::External(args)) => crate::extension::run_external(args)?,
+        Some(Commands::External(args)) => {
+            let status = crate::extension::run_external(args)?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
         None => crate::tui::runner::run(None)?,
     }
 
