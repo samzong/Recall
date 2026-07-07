@@ -531,6 +531,28 @@ impl App {
         self.load_preview(store);
     }
 
+    fn page_result_list(&mut self, up: bool, store: &Store) {
+        if self.results.is_empty() {
+            return;
+        }
+
+        let visible_rows = search_layout(self.terminal_area).list_inner().height as usize;
+        if visible_rows == 0 {
+            return;
+        }
+
+        let previous = self.selected_index;
+        if up {
+            self.selected_index = self.selected_index.saturating_sub(visible_rows);
+        } else {
+            self.selected_index = (self.selected_index + visible_rows).min(self.results.len() - 1);
+        }
+        self.result_scroll_offset = self.result_list_start(visible_rows);
+        if self.selected_index != previous {
+            self.load_preview(store);
+        }
+    }
+
     pub(crate) fn result_list_start(&self, visible_rows: usize) -> usize {
         if visible_rows == 0 || self.results.is_empty() {
             return 0;
@@ -570,6 +592,56 @@ impl App {
         }
         self.preview_scroll_offset =
             pane.scroll_start(self.preview_scroll_offset, self.preview_selected_msg, viewport);
+    }
+
+    fn page_preview_selection(&mut self, up: bool) {
+        if self.preview_messages.is_empty() {
+            return;
+        }
+
+        let inner = search_layout(self.terminal_area).preview_inner();
+        let viewport = inner.height as usize;
+        if viewport == 0 {
+            return;
+        }
+
+        let pane = self.preview_pane(inner.width as usize);
+        let current =
+            pane.scroll_start(self.preview_scroll_offset, self.preview_selected_msg, viewport);
+        let max_start = pane.total_rows().saturating_sub(viewport);
+        let target =
+            if up { current.saturating_sub(viewport) } else { (current + viewport).min(max_start) };
+
+        if let Some(index) = pane.index_at(target) {
+            self.preview_selected_msg = index;
+            self.preview_scroll_offset =
+                pane.scroll_start(target, self.preview_selected_msg, viewport);
+        }
+    }
+
+    fn page_viewing_selection(&mut self, up: bool) {
+        if self.viewing_messages.is_empty() {
+            return;
+        }
+
+        let messages = viewing_layout(self.terminal_area).messages;
+        let viewport = messages.height as usize;
+        if viewport == 0 {
+            return;
+        }
+
+        let pane = self.viewing_pane(messages.width as usize);
+        let current =
+            pane.scroll_start(self.viewing_scroll_offset, self.viewing_selected_msg, viewport);
+        let max_start = pane.total_rows().saturating_sub(viewport);
+        let target =
+            if up { current.saturating_sub(viewport) } else { (current + viewport).min(max_start) };
+
+        if let Some(index) = pane.index_at(target) {
+            self.viewing_selected_msg = index;
+            self.viewing_scroll_offset =
+                pane.scroll_start(target, self.viewing_selected_msg, viewport);
+        }
     }
 
     fn anchor_viewing_scroll(&mut self) {
@@ -703,7 +775,12 @@ impl App {
         {
             self.panel_focus = PanelFocus::SessionList;
             self.result_scroll_offset = position;
-            self.selected_index = position.min(self.results.len().saturating_sub(1));
+            let max_position = self.results.len().saturating_sub(list_viewport);
+            self.selected_index = if position == max_position {
+                self.results.len().saturating_sub(1)
+            } else {
+                position.min(self.results.len().saturating_sub(1))
+            };
             self.load_preview(store);
             return true;
         }
@@ -723,7 +800,10 @@ impl App {
         ) {
             self.panel_focus = PanelFocus::Preview;
             self.preview_scroll_offset = position;
-            if let Some(index) = pane.index_at(position) {
+            let max_position = pane.total_rows().saturating_sub(inner.height as usize);
+            if position == max_position {
+                self.preview_selected_msg = self.preview_messages.len() - 1;
+            } else if let Some(index) = pane.index_at(position) {
                 self.preview_selected_msg = index;
             }
             return true;
@@ -748,7 +828,10 @@ impl App {
             messages.height as usize,
         ) {
             self.viewing_scroll_offset = position;
-            if let Some(index) = pane.index_at(position) {
+            let max_position = pane.total_rows().saturating_sub(messages.height as usize);
+            if position == max_position {
+                self.viewing_selected_msg = self.viewing_messages.len() - 1;
+            } else if let Some(index) = pane.index_at(position) {
                 self.viewing_selected_msg = index;
             }
             return true;
@@ -903,6 +986,14 @@ impl App {
             KeyCode::Down => {
                 self.handle_scroll_down(store);
             }
+            KeyCode::PageUp => match self.panel_focus {
+                PanelFocus::SessionList => self.page_result_list(true, store),
+                PanelFocus::Preview => self.page_preview_selection(true),
+            },
+            KeyCode::PageDown => match self.panel_focus {
+                PanelFocus::SessionList => self.page_result_list(false, store),
+                PanelFocus::Preview => self.page_preview_selection(false),
+            },
             KeyCode::Enter if !self.results.is_empty() => {
                 self.enter_viewing(store);
             }
@@ -981,6 +1072,12 @@ impl App {
                 if self.viewing_selected_msg + 1 < self.viewing_messages.len() =>
             {
                 self.viewing_selected_msg += 1;
+            }
+            KeyCode::PageUp => {
+                self.page_viewing_selection(true);
+            }
+            KeyCode::PageDown => {
+                self.page_viewing_selection(false);
             }
             KeyCode::Home | KeyCode::Char('g') => {
                 self.viewing_selected_msg = 0;
@@ -2689,6 +2786,12 @@ mod tests {
         }
     }
 
+    fn tall_message(role: Role, seq: u32) -> Message {
+        let mut msg = message(role, None, seq);
+        msg.content = (0..6).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        msg
+    }
+
     fn usage_event(input_tokens: i64, output_tokens: i64) -> SessionUsageEventRecord {
         SessionUsageEventRecord {
             event_key: "event1".to_string(),
@@ -2777,6 +2880,146 @@ mod tests {
     }
 
     #[test]
+    fn page_keys_move_session_list_by_visible_rows() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 12);
+        app.results = numbered_results(12);
+
+        let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+
+        app.handle_key(down, &store);
+        assert_eq!(app.selected_index, 5);
+        assert_eq!(app.result_list_start(5), 1);
+
+        app.handle_key(down, &store);
+        assert_eq!(app.selected_index, 10);
+        assert_eq!(app.result_list_start(5), 6);
+
+        app.handle_key(up, &store);
+        assert_eq!(app.selected_index, 5);
+        assert_eq!(app.result_list_start(5), 5);
+    }
+
+    #[test]
+    fn page_keys_move_preview_by_visible_message_viewport() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 13);
+        app.results = numbered_results(1);
+        app.preview_messages = (0..5).map(|n| message(Role::User, None, n)).collect();
+        app.panel_focus = PanelFocus::Preview;
+
+        let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+
+        app.handle_key(down, &store);
+        assert_eq!(app.preview_selected_msg, 2);
+
+        app.handle_key(up, &store);
+        assert_eq!(app.preview_selected_msg, 0);
+    }
+
+    #[test]
+    fn page_keys_scroll_within_tall_preview_message() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 12);
+        app.results = numbered_results(1);
+        app.preview_messages = vec![tall_message(Role::User, 0)];
+        app.panel_focus = PanelFocus::Preview;
+
+        let layout = search_layout(app.terminal_area);
+        let inner = layout.preview_inner();
+        let pane = app.preview_pane(inner.width as usize);
+        let max_start = pane.total_rows() - inner.height as usize;
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &store);
+        assert_eq!(app.preview_selected_msg, 0);
+        assert_eq!(app.preview_scroll_offset, max_start);
+        assert_eq!(
+            pane.scroll_start(
+                app.preview_scroll_offset,
+                app.preview_selected_msg,
+                inner.height as usize
+            ),
+            max_start
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &store);
+        assert_eq!(app.preview_selected_msg, 0);
+        assert_eq!(app.preview_scroll_offset, 0);
+    }
+
+    #[test]
+    fn search_scrollbar_bottom_selects_last_session() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 12);
+        app.results = numbered_results(20);
+
+        let layout = search_layout(app.terminal_area);
+        let column = layout.list.x + layout.list.width - 1;
+        let row = layout.list.y + layout.list.height - 2;
+        app.handle_mouse_down(column, row, &store);
+
+        assert_eq!(app.result_scroll_offset, 15);
+        assert_eq!(app.selected_index, 19);
+    }
+
+    #[test]
+    fn preview_scrollbar_bottom_selects_last_message() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 12);
+        app.results = numbered_results(1);
+        app.preview_messages = (0..5).map(|n| message(Role::User, None, n)).collect();
+
+        let layout = search_layout(app.terminal_area);
+        let column = layout.preview.x + layout.preview.width - 1;
+        let row = layout.preview.y + layout.preview.height - 2;
+        app.handle_mouse_down(column, row, &store);
+
+        assert_eq!(app.preview_scroll_offset, 10);
+        assert_eq!(app.preview_selected_msg, 4);
+    }
+
+    #[test]
+    fn preview_scrollbar_bottom_preserves_tall_final_message_bottom() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 12);
+        app.results = numbered_results(1);
+        app.preview_messages = vec![message(Role::User, None, 0), tall_message(Role::Assistant, 1)];
+
+        let layout = search_layout(app.terminal_area);
+        let inner = layout.preview_inner();
+        let pane = app.preview_pane(inner.width as usize);
+        let max_start = pane.total_rows() - inner.height as usize;
+        let column = layout.preview.x + layout.preview.width - 1;
+        let row = layout.preview.y + layout.preview.height - 2;
+        app.handle_mouse_down(column, row, &store);
+
+        assert_eq!(app.preview_selected_msg, 1);
+        assert_eq!(app.preview_scroll_offset, max_start);
+        assert_eq!(
+            pane.scroll_start(
+                app.preview_scroll_offset,
+                app.preview_selected_msg,
+                inner.height as usize
+            ),
+            max_start
+        );
+    }
+
+    #[test]
     fn viewing_selection_anchors_scroll_offset() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
@@ -2800,6 +3043,107 @@ mod tests {
 
         app.handle_key(up, &store);
         assert_eq!((app.viewing_selected_msg, app.viewing_scroll_offset), (2, 5));
+    }
+
+    #[test]
+    fn page_keys_move_viewing_by_visible_message_viewport() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 10);
+        app.mode = AppMode::Viewing;
+        app.viewing_messages = (0..5).map(|n| message(Role::User, None, n)).collect();
+        app.viewing_sanitized_lines = build_viewing_caches(&app.viewing_messages);
+
+        let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+
+        app.handle_key(down, &store);
+        assert_eq!((app.viewing_selected_msg, app.viewing_scroll_offset), (2, 6));
+
+        app.handle_key(up, &store);
+        assert_eq!((app.viewing_selected_msg, app.viewing_scroll_offset), (0, 0));
+    }
+
+    #[test]
+    fn page_keys_scroll_within_tall_viewing_message() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 10);
+        app.mode = AppMode::Viewing;
+        app.viewing_messages = vec![tall_message(Role::User, 0)];
+        app.viewing_sanitized_lines = build_viewing_caches(&app.viewing_messages);
+
+        let layout = viewing_layout(app.terminal_area);
+        let pane = app.viewing_pane(layout.messages.width as usize);
+        let max_start = pane.total_rows() - layout.messages.height as usize;
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &store);
+        assert_eq!(app.viewing_selected_msg, 0);
+        assert_eq!(app.viewing_scroll_offset, max_start);
+        assert_eq!(
+            pane.scroll_start(
+                app.viewing_scroll_offset,
+                app.viewing_selected_msg,
+                layout.messages.height as usize
+            ),
+            max_start
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &store);
+        assert_eq!(app.viewing_selected_msg, 0);
+        assert_eq!(app.viewing_scroll_offset, 0);
+    }
+
+    #[test]
+    fn viewing_scrollbar_bottom_selects_last_message() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 10);
+        app.mode = AppMode::Viewing;
+        app.viewing_messages = (0..5).map(|n| message(Role::User, None, n)).collect();
+        app.viewing_sanitized_lines = build_viewing_caches(&app.viewing_messages);
+
+        let layout = viewing_layout(app.terminal_area);
+        let area = layout.scrollbar_area();
+        let column = area.x + area.width - 1;
+        let row = area.y + area.height - 2;
+        app.handle_mouse_down(column, row, &store);
+
+        assert_eq!(app.viewing_scroll_offset, 9);
+        assert_eq!(app.viewing_selected_msg, 4);
+    }
+
+    #[test]
+    fn viewing_scrollbar_bottom_preserves_tall_final_message_bottom() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 10);
+        app.mode = AppMode::Viewing;
+        app.viewing_messages = vec![message(Role::User, None, 0), tall_message(Role::Assistant, 1)];
+        app.viewing_sanitized_lines = build_viewing_caches(&app.viewing_messages);
+
+        let layout = viewing_layout(app.terminal_area);
+        let pane = app.viewing_pane(layout.messages.width as usize);
+        let max_start = pane.total_rows() - layout.messages.height as usize;
+        let area = layout.scrollbar_area();
+        let column = area.x + area.width - 1;
+        let row = area.y + area.height - 2;
+        app.handle_mouse_down(column, row, &store);
+
+        assert_eq!(app.viewing_selected_msg, 1);
+        assert_eq!(app.viewing_scroll_offset, max_start);
+        assert_eq!(
+            pane.scroll_start(
+                app.viewing_scroll_offset,
+                app.viewing_selected_msg,
+                layout.messages.height as usize
+            ),
+            max_start
+        );
     }
 
     #[test]

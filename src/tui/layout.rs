@@ -120,10 +120,16 @@ impl MessagePane {
         let start = offset.min(max_start);
         let selected = selected.min(self.rows.len() - 1);
         let selected_start = self.start_of(selected);
+        let selected_rows = self.rows[selected];
+        let selected_end = selected_start + selected_rows;
         let focus_end = selected_start + self.focus[selected].min(viewport_rows);
 
         if selected_start < start {
-            selected_start.min(max_start)
+            if selected_rows > viewport_rows && start < selected_end {
+                start
+            } else {
+                selected_start.min(max_start)
+            }
         } else if focus_end > start + viewport_rows {
             (focus_end - viewport_rows).min(max_start)
         } else {
