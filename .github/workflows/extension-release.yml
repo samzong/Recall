@@ -285,14 +285,23 @@ jobs:
           if [ -z "$tag" ]; then
             tag="${GITHUB_REF_NAME}"
           fi
+          version="${tag##*-v}"
+          package="${tag:0:${#tag}-${#version}-2}"
           assets=( ./*.tar.gz ./*.zip )
           sha256sum "${assets[@]}" | sort > checksums.txt
+          cat > release-notes.md <<EOF
+          Official Recall extension release for \`$package\` v$version.
+
+          Assets are published for supported target triples. Checksums are available in \`checksums.txt\`.
+          EOF
           if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --notes-file release-notes.md
             gh release upload "$tag" --clobber "${assets[@]}" checksums.txt
           else
             gh release create "$tag" \
               --title "$tag" \
-              --generate-notes \
+              --latest=false \
+              --notes-file release-notes.md \
               "${assets[@]}" checksums.txt
           fi
 
@@ -396,4 +405,14 @@ jobs:
           package="${tag:0:${#tag}-${#version}-2}"
           git commit -m "chore(extensions): publish $package v$version"
           git push origin HEAD:main
-          gh workflow run pages.yml --ref main
+          expected_sha="$(git rev-parse HEAD)"
+          for _ in $(seq 1 20); do
+            git fetch --quiet origin refs/heads/main:refs/remotes/origin/main
+            if git merge-base --is-ancestor "$expected_sha" origin/main; then
+              gh workflow run pages.yml --ref main
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "main did not contain $expected_sha before Pages dispatch" >&2
+          exit 1
