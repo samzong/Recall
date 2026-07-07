@@ -4,8 +4,15 @@ use crate::adapters;
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::Store;
 use crate::embedding::EmbeddingProvider;
+use crate::session::{self, SessionListFormat, SessionSort};
 use crate::types;
 use crate::utils;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum SearchFormat {
+    Text,
+    Json,
+}
 
 pub(crate) fn run_search(
     query: &str,
@@ -13,7 +20,24 @@ pub(crate) fn run_search(
     time_filter: Option<&str>,
     project_filter: Option<&str>,
     repo_filter: Option<&str>,
+    format: SearchFormat,
 ) -> Result<()> {
+    if matches!(format, SearchFormat::Json) {
+        return session::run_session_list(
+            Some(query),
+            source_filter,
+            time_filter,
+            project_filter,
+            repo_filter,
+            20,
+            0,
+            false,
+            false,
+            Some(SessionSort::Relevance),
+            SessionListFormat::Json,
+        );
+    }
+
     let store = Store::open()?;
     let engine = SearchEngine::new(&store.conn);
     let sources = adapters::source_labels();

@@ -343,7 +343,6 @@ pub(crate) fn schema_version(conn: &Connection) -> anyhow::Result<i64> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(Into::into)
 }
 
-#[cfg(test)]
 pub(crate) const fn current_schema_version() -> i64 {
     SCHEMA_VERSION
 }

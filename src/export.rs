@@ -9,7 +9,7 @@ use crate::db::store::Store;
 use crate::query::{parse_time_range, resolve_source_filter};
 use crate::types::{Message, Role, Session, SessionEventRecord, SessionUsageEventRecord};
 
-const SCHEMA_VERSION: u32 = 4;
+pub(crate) const RECORD_SCHEMA_VERSION: u32 = 4;
 const RECORD_TYPE: &str = "session";
 
 pub(crate) struct ExportOptions {
@@ -178,7 +178,7 @@ fn build_session_record(
     events: Vec<SessionEventRecord>,
 ) -> ExportSessionRecord {
     ExportSessionRecord {
-        schema_version: SCHEMA_VERSION,
+        schema_version: RECORD_SCHEMA_VERSION,
         record_type: RECORD_TYPE,
         session: session.into(),
         messages: messages.into_iter().map(Into::into).collect(),

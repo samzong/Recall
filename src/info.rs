@@ -4,6 +4,13 @@ use crate::adapters;
 use crate::config::AppConfig;
 use crate::db::store::Store;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum InfoFormat {
+    Text,
+    Json,
+}
+
+#[derive(serde::Serialize)]
 struct SourceSummary {
     label: String,
     id: String,
@@ -13,7 +20,7 @@ struct SourceSummary {
     error: Option<String>,
 }
 
-pub(crate) fn run() -> Result<()> {
+pub(crate) fn run(format: InfoFormat) -> Result<()> {
     let all = adapters::all_adapters();
     let labels = adapters::source_labels();
     let mut config = AppConfig::load_or_default();
@@ -86,6 +93,40 @@ pub(crate) fn run() -> Result<()> {
                 });
             }
         }
+    }
+
+    if matches!(format, InfoFormat::Json) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "protocol_version": crate::PROTOCOL_VERSION,
+                "schemas": {
+                    "export_record": crate::export::RECORD_SCHEMA_VERSION,
+                    "database": crate::db::schema::current_schema_version()
+                },
+                "sources": rows,
+                "settings": {
+                    "enabled_sources": labels
+                        .iter()
+                        .filter(|(id, _)| config.is_source_enabled(id))
+                        .map(|(id, label)| serde_json::json!({
+                            "id": id,
+                            "label": label
+                        }))
+                        .collect::<Vec<_>>(),
+                    "time_scope": config.sync_window.label()
+                },
+                "semantic_queue": {
+                    "indexed_sessions": progress.total_sessions,
+                    "done_sessions": progress.done_sessions,
+                    "pending_sessions": progress.pending_sessions + progress.processing_sessions,
+                    "failed_sessions": progress.failed_sessions,
+                    "worker_phase": worker.phase,
+                    "worker_detail": worker.detail
+                }
+            }))?
+        );
+        return Ok(());
     }
 
     let source_width = rows

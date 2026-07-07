@@ -23,6 +23,8 @@ pub(crate) mod types;
 pub(crate) mod usage;
 pub(crate) mod utils;
 
+pub(crate) const PROTOCOL_VERSION: u32 = 1;
+
 #[cfg(test)]
 mod integration;
 

@@ -17,7 +17,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     #[command(about = "Show indexed source and background job status")]
-    Info,
+    Info {
+        #[arg(long, value_enum, default_value_t = crate::info::InfoFormat::Text)]
+        format: crate::info::InfoFormat,
+    },
     #[command(about = "Scan configured AI coding session sources")]
     Sync {
         #[arg(long, help = "Reprocess every session, even if unchanged")]
@@ -57,6 +60,8 @@ enum Commands {
         project: Option<String>,
         #[arg(long, help = "Filter by repository identity")]
         repo: Option<String>,
+        #[arg(long, value_enum, default_value_t = crate::query::SearchFormat::Text)]
+        format: crate::query::SearchFormat,
     },
     #[command(about = "Show token usage reports")]
     Usage {
@@ -146,7 +151,7 @@ pub(crate) fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Info) => crate::info::run()?,
+        Some(Commands::Info { format }) => crate::info::run(format)?,
         Some(Commands::Sync { force, verbose, source }) => {
             crate::sync::run_cli(force, verbose, source.as_deref())?
         }
@@ -159,13 +164,16 @@ pub(crate) fn run() -> Result<()> {
             crate::bench::run_eval(dataset.as_deref(), verbose)?
         }
         Some(Commands::BenchDumpSessions) => crate::bench::dump_sessions()?,
-        Some(Commands::Search { query, source, time, project, repo }) => crate::query::run_search(
-            &query,
-            source.as_deref(),
-            time.as_deref(),
-            project.as_deref(),
-            repo.as_deref(),
-        )?,
+        Some(Commands::Search { query, source, time, project, repo, format }) => {
+            crate::query::run_search(
+                &query,
+                source.as_deref(),
+                time.as_deref(),
+                project.as_deref(),
+                repo.as_deref(),
+                format,
+            )?
+        }
         Some(Commands::Usage { json, source, time }) => {
             crate::usage::run_cli(json, source.as_deref(), time.as_deref())?
         }
@@ -266,6 +274,30 @@ mod tests {
     #[test]
     fn export_rejects_removed_jsonl_flag() {
         assert!(Cli::try_parse_from(["recall", "export", "--jsonl"]).is_err());
+    }
+
+    #[test]
+    fn info_accepts_json_format() {
+        let cli = Cli::try_parse_from(["recall", "info", "--format", "json"]).unwrap();
+        match cli.command {
+            Some(Commands::Info { format }) => {
+                assert_eq!(format, crate::info::InfoFormat::Json);
+            }
+            _ => panic!("expected info command"),
+        }
+    }
+
+    #[test]
+    fn search_accepts_json_format() {
+        let cli =
+            Cli::try_parse_from(["recall", "search", "extension", "--format", "json"]).unwrap();
+        match cli.command {
+            Some(Commands::Search { query, format, .. }) => {
+                assert_eq!(query, "extension");
+                assert_eq!(format, crate::query::SearchFormat::Json);
+            }
+            _ => panic!("expected search command"),
+        }
     }
 
     #[test]

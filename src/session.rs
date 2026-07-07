@@ -207,7 +207,7 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
             sync,
             sort,
             format,
-        } => cmd_session_list(
+        } => run_session_list(
             query.as_deref(),
             source.as_deref(),
             time.as_deref(),
@@ -303,7 +303,7 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_session_list(
+pub(crate) fn run_session_list(
     query: Option<&str>,
     source_filter: Option<&str>,
     time_filter: Option<&str>,
