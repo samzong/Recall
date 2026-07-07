@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -157,11 +157,33 @@ enum SkillCommands {
 
 #[derive(Subcommand)]
 enum ExtensionCommands {
-    #[command(about = "List extensions available on PATH")]
-    List,
+    #[command(about = "List installed official extensions")]
+    List {
+        #[arg(long, help = "List official extensions available to install")]
+        available: bool,
+    },
+    #[command(about = "Install an official extension")]
+    Install {
+        #[arg(help = "Extension name")]
+        name: String,
+    },
+    #[command(about = "Remove an installed official extension")]
+    Remove {
+        #[arg(help = "Extension name")]
+        name: String,
+    },
+    #[command(about = "Upgrade installed official extensions")]
+    Upgrade {
+        #[arg(help = "Extension name; upgrades all installed extensions when omitted")]
+        name: Option<String>,
+    },
 }
 
 pub(crate) fn run() -> Result<()> {
+    if print_root_help_if_requested()? {
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -205,8 +227,17 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Skill {
             command: SkillCommands::Install { scope, agents, dry_run, yes },
         }) => run_skill_install(scope, agents, dry_run, yes)?,
-        Some(Commands::Extension { command: ExtensionCommands::List }) => {
-            crate::extension::run_list()?
+        Some(Commands::Extension { command: ExtensionCommands::List { available } }) => {
+            crate::extension::run_list(available)?
+        }
+        Some(Commands::Extension { command: ExtensionCommands::Install { name } }) => {
+            crate::extension::run_install(&name)?
+        }
+        Some(Commands::Extension { command: ExtensionCommands::Remove { name } }) => {
+            crate::extension::run_remove(&name)?
+        }
+        Some(Commands::Extension { command: ExtensionCommands::Upgrade { name } }) => {
+            crate::extension::run_upgrade(name)?
         }
         Some(Commands::Session { command }) => session::cmd_session(command)?,
         Some(Commands::Completions { shell }) => {
@@ -222,6 +253,35 @@ pub(crate) fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_root_help_if_requested() -> Result<bool> {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.len() != 1 {
+        return Ok(false);
+    }
+    let arg = args[0].as_os_str();
+    if arg != OsStr::new("--help") && arg != OsStr::new("-h") && arg != OsStr::new("help") {
+        return Ok(false);
+    }
+
+    print!("{}", render_root_help());
+    Ok(true)
+}
+
+fn render_root_help() -> String {
+    let mut command = Cli::command();
+    let mut help = command.render_long_help().to_string();
+    insert_installed_help(&mut help, &crate::extension::installed_help());
+    help
+}
+
+fn insert_installed_help(help: &mut String, installed: &str) {
+    if let Some(index) = help.find("\nOptions:") {
+        help.insert_str(index, installed);
+    } else {
+        help.push_str(installed);
+    }
 }
 
 fn run_skill_install(
@@ -276,7 +336,10 @@ fn recall_skill_bundle() -> kitup::SkillBundle {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ExtensionCommands, ShareCommands, Shell, SkillCommands, generate};
+    use super::{
+        Cli, Commands, ExtensionCommands, ShareCommands, Shell, SkillCommands, generate,
+        insert_installed_help,
+    };
     use crate::adapters::{
         adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
     };
@@ -389,6 +452,18 @@ mod tests {
     }
 
     #[test]
+    fn root_help_inserts_installed_extensions_before_options() {
+        let mut help = "Commands:\n  search\n\nOptions:\n  -h\n".to_string();
+        insert_installed_help(&mut help, "\nExtensions:\n  probe\n");
+
+        let commands = help.find("Commands:").unwrap();
+        let installed = help.find("Extensions:").unwrap();
+        let options = help.find("Options:").unwrap();
+        assert!(commands < installed);
+        assert!(installed < options);
+    }
+
+    #[test]
     fn completions_generates_zsh_script() {
         assert!(matches!(
             Cli::try_parse_from(["recall", "completions", "zsh"]).unwrap().command,
@@ -446,7 +521,9 @@ mod tests {
     fn extension_list_parses() {
         let cli = Cli::try_parse_from(["recall", "extension", "list"]).unwrap();
         match cli.command {
-            Some(Commands::Extension { command: ExtensionCommands::List }) => {}
+            Some(Commands::Extension { command: ExtensionCommands::List { available } }) => {
+                assert!(!available);
+            }
             _ => panic!("expected extension list command"),
         }
     }
@@ -455,9 +532,44 @@ mod tests {
     fn extension_list_accepts_ext_alias() {
         let cli = Cli::try_parse_from(["recall", "ext", "list"]).unwrap();
         match cli.command {
-            Some(Commands::Extension { command: ExtensionCommands::List }) => {}
+            Some(Commands::Extension { command: ExtensionCommands::List { available } }) => {
+                assert!(!available);
+            }
             _ => panic!("expected extension list command"),
         }
+    }
+
+    #[test]
+    fn extension_manager_commands_parse() {
+        let cli = Cli::try_parse_from(["recall", "ext", "list", "--available"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Extension { command: ExtensionCommands::List { available: true } })
+        ));
+
+        let cli = Cli::try_parse_from(["recall", "ext", "install", "probe"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Extension {
+                command: ExtensionCommands::Install { name }
+            }) if name == "probe"
+        ));
+
+        let cli = Cli::try_parse_from(["recall", "ext", "remove", "probe"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Extension {
+                command: ExtensionCommands::Remove { name }
+            }) if name == "probe"
+        ));
+
+        let cli = Cli::try_parse_from(["recall", "ext", "upgrade", "probe"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Extension {
+                command: ExtensionCommands::Upgrade { name: Some(name) }
+            }) if name == "probe"
+        ));
     }
 
     #[test]

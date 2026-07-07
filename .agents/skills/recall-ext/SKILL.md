@@ -16,6 +16,8 @@ runtime truth if the doc and implementation disagree.
 - Keep Recall core as the data plane and stable CLI JSON/JSONL protocol.
 - Build extensions as external binaries named `recall-<name>`.
 - Use `recall extension ...` and `recall ext ...` for host commands.
+- Manage only official extensions from the official catalog unless the product
+  explicitly adds third-party distribution later.
 - Do not expose Rust internals, add a `recall-core` crate, or depend on SQLite
   schema from an extension.
 - Do not add permissions/capabilities fields for native binaries; Recall cannot
@@ -54,8 +56,7 @@ Run the smallest relevant set, then `make check` before ship:
 ```bash
 cargo build -p recall-<name>
 cargo run -p recall-<name> -- --recall-extension-manifest
-PATH="$PWD/target/debug:$PATH" cargo run -- ext list
-PATH="$PWD/target/debug:$PATH" cargo run -- <name>
+cargo run -- ext list --available
 cargo test --lib extension::tests
 make check
 ```
@@ -102,9 +103,9 @@ managed model in `docs/extensions.md`:
 - state file: `installed.json`;
 - packages: `packages/<name>/<version>/`;
 - command entries: `bin/recall-<name>`;
-- dispatch order: core command, managed extension, PATH extension, unknown.
+- dispatch order: core command, managed extension, unknown.
 
 Install and upgrade must download from the official catalog, verify `sha256`,
 validate the manifest, move into `packages/`, update the `bin/` entry, then
-write `installed.json`. Remove must delete only managed files, never a
-user-installed PATH extension.
+write `installed.json`. Remove must delete only managed files. Recall does not
+scan PATH for `recall-*` binaries in the managed official extension model.

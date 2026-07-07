@@ -7,8 +7,9 @@ Status: long-lived design draft. Feature migration notes live in
 
 Keep Recall core small and stable: a local session index plus a stable query
 surface. As product features grow, workflow, report, publish, and UI surfaces
-should evolve as optional, independently shippable extensions, including
-third-party extensions.
+should evolve as optional, independently shippable official extensions.
+Third-party distribution is a future option, not part of the first managed
+surface.
 
 ## Problem
 
@@ -30,8 +31,8 @@ Without an explicit boundary, core bloats one reasonable feature at a time.
 1. Core is the data plane plus a stable query protocol.
 2. Extensions are external executables that consume that protocol.
 3. The extension model is Cargo/Git-style external subcommands.
-4. Extension binaries are named `recall-<name>`; `recall <name>` dispatches to
-   them.
+4. Managed extension binaries are named `recall-<name>`; `recall <name>`
+   dispatches to installed official extensions.
 5. The stable contract is CLI JSON/JSONL output, not Rust API and not SQLite
    schema.
 6. Reject Rust dylib plugins, in-process plugin API, and a WASM runtime for now.
@@ -57,7 +58,8 @@ Core owns:
 - session identity and repo/project resolution;
 - minimal session operations: list, show, export, resume, open;
 - machine-readable output for those operations: `--format json|jsonl`;
-- the extension host: discovery, dispatch, and later list/install/remove;
+- the extension host: official catalog discovery, managed install, dispatch,
+  list, remove, and upgrade;
 - bundled Agent Skill install.
 
 Extensions own:
@@ -172,9 +174,9 @@ This is a later concern, not a first-stage requirement.
   `<name>` is not a core subcommand.
 - Host command: `recall extension ...`, with `recall ext ...` as the short
   alias.
-- Current host surface: `recall ext list` plus implicit external dispatch from
-  PATH.
-- Managed official install/upgrade/remove use the distribution model below.
+- Host surface: `recall ext list`, `recall ext install`, `recall ext remove`,
+  and `recall ext upgrade`.
+- Recall manages only official extensions from the official catalog.
 
 ## Manifest
 
@@ -195,6 +197,8 @@ stdout returns JSON:
   "commands": ["reflect"]
 }
 ```
+
+Descriptions are catalog display metadata, not manifest contract.
 
 Do not add `capabilities` or `permissions` fields for native binaries. Recall
 cannot enforce them, so they would be security theater. Permission semantics
@@ -222,8 +226,9 @@ Local verification:
 
 ```bash
 cargo build -p recall-probe
-PATH="$PWD/target/debug:$PATH" cargo run -- ext list
-PATH="$PWD/target/debug:$PATH" cargo run -- probe
+cargo run -- ext list --available
+cargo run -- ext install probe
+cargo run -- probe
 ```
 
 ### Versioning
@@ -336,9 +341,8 @@ Catalog shape:
 
 ### Managed Install Root
 
-Official installs are managed by Recall. They do not mutate the user's PATH.
-`bin/` entries may be symlinks, launcher shims, or copied binaries depending on
-platform support.
+Official installs are managed by Recall. They do not mutate the user's PATH and
+Recall does not scan PATH for `recall-*` binaries.
 
 ```text
 <data_dir>/recall/extensions/
@@ -359,8 +363,7 @@ Dispatch order:
 
 1. core subcommand;
 2. managed extension binary under `<data_dir>/recall/extensions/bin`;
-3. user PATH binary named `recall-<name>`;
-4. unknown command.
+3. unknown command.
 
 ```mermaid
 flowchart TD
@@ -368,9 +371,7 @@ flowchart TD
   Core -- yes --> CoreRun["run core command"]
   Core -- no --> Managed{"managed extension?"}
   Managed -- yes --> ManagedBin["extensions/bin/recall-probe"]
-  Managed -- no --> Path{"PATH recall-probe?"}
-  Path -- yes --> PathBin["run PATH binary"]
-  Path -- no --> Error["unknown command"]
+  Managed -- no --> Error["unknown command"]
   ManagedBin --> Package["packages/probe/0.1.1/recall-probe"]
 ```
 
@@ -393,19 +394,26 @@ flowchart LR
 
 Upgrade is the same flow starting from `installed.json`, selecting a newer
 compatible version. Remove deletes only the managed package, managed bin entry,
-and `installed.json` entry. It must not delete a user-installed PATH extension.
+and `installed.json` entry.
+
+`recall ext list` shows installed official extensions as name, installed version, and
+description. `recall ext list --available` shows official catalog entries and
+the newest compatible version for the current platform and Recall protocol.
+
+Root help (`recall --help` or `recall help`) shows installed official
+extensions between `Commands` and `Options` using command plus the
+catalog description stored in local `installed.json`. It does not fetch the
+catalog at help-render time.
 
 ### Third-Party Extensions
 
-Third-party extensions can live in any repository. If the binary is named
-`recall-<name>` and is on PATH, the host can dispatch it. The important
-distinction is not repository ownership. Official and third-party extensions
-must both integrate through the stable CLI protocol instead of relying on core
-modules or SQLite schema.
+Third-party extension execution is not part of the first managed install
+surface. Third-party code can still use Recall's stable CLI protocol directly,
+but Recall does not install, list, or dispatch third-party extensions.
 
 Do not add an open registry yet. The official catalog is enough for first-party
-binary management. Custom catalogs can be added later if there is real
-third-party distribution demand.
+binary management. Third-party distribution can be designed later if there is
+real demand.
 
 ## Non-Goals
 

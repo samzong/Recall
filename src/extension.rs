@@ -1,12 +1,18 @@
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
+use std::fs;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use flate2::read::GzDecoder;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-#[derive(Debug, Deserialize)]
+const CATALOG_URL: &str = "https://samzong.github.io/Recall/extensions/catalog.json";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ExtensionManifest {
     name: String,
     version: String,
@@ -15,150 +21,395 @@ struct ExtensionManifest {
     commands: Vec<String>,
 }
 
-#[derive(Debug)]
-struct ExtensionEntry {
-    name: String,
-    path: PathBuf,
-    manifest: Option<ExtensionManifest>,
-    error: Option<String>,
+#[derive(Debug, Deserialize)]
+struct Catalog {
+    schema: u32,
+    extensions: BTreeMap<String, CatalogExtension>,
 }
 
-pub(crate) fn run_list() -> Result<()> {
-    let path_env = std::env::var_os("PATH").unwrap_or_default();
-    let extensions = discover_in_path(&path_env);
+#[derive(Debug, Deserialize)]
+struct CatalogExtension {
+    #[serde(default)]
+    description: String,
+    versions: BTreeMap<String, CatalogVersion>,
+}
 
-    if extensions.is_empty() {
-        println!("No extensions found on PATH.");
+#[derive(Clone, Debug, Deserialize)]
+struct CatalogVersion {
+    protocol: u32,
+    min_recall: String,
+    #[serde(default)]
+    commands: Vec<String>,
+    targets: BTreeMap<String, CatalogTarget>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CatalogTarget {
+    url: String,
+    sha256: String,
+}
+
+#[derive(Debug)]
+struct SelectedExtension {
+    version: String,
+    description: String,
+    info: CatalogVersion,
+    target: CatalogTarget,
+    target_triple: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct InstalledState {
+    schema: u32,
+    extensions: BTreeMap<String, InstalledExtension>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct InstalledExtension {
+    version: String,
+    target: String,
+    protocol: u32,
+    min_recall: String,
+    commands: Vec<String>,
+    binary: String,
+    #[serde(default)]
+    description: String,
+}
+
+pub(crate) fn run_list(available: bool) -> Result<()> {
+    let root = extension_root()?;
+    if available { list_available(&root) } else { list_installed(&root) }
+}
+
+pub(crate) fn run_install(name: &str) -> Result<()> {
+    validate_extension_name(name)?;
+    let root = extension_root()?;
+    let catalog = fetch_catalog()?;
+    let selected = select_latest(name, &catalog)?;
+    install_selected(&root, name, &selected)
+}
+
+pub(crate) fn run_remove(name: &str) -> Result<()> {
+    validate_extension_name(name)?;
+    let root = extension_root()?;
+    let mut state = load_installed_state(&root)?;
+    if state.extensions.remove(name).is_none() {
+        bail!("extension is not installed: {name}");
+    }
+
+    remove_if_exists(&managed_binary_path(&root, name))?;
+    remove_dir_if_exists(&root.join("packages").join(name))?;
+    save_installed_state(&root, &state)?;
+    println!("Removed {name}");
+    Ok(())
+}
+
+pub(crate) fn run_upgrade(name: Option<String>) -> Result<()> {
+    let root = extension_root()?;
+    let state = load_installed_state(&root)?;
+    if state.extensions.is_empty() {
+        println!("No installed extensions.");
         return Ok(());
     }
 
-    let name_width = extensions
-        .iter()
-        .map(|extension| extension.name.len())
-        .max()
-        .unwrap_or(9)
-        .max("Extension".len());
-    let version_width = extensions
-        .iter()
-        .filter_map(|extension| extension.manifest.as_ref())
-        .map(|manifest| manifest.version.len())
-        .max()
-        .unwrap_or(7)
-        .max("Version".len());
-    let protocol_width = extensions
-        .iter()
-        .filter_map(|extension| extension.manifest.as_ref())
-        .map(|manifest| manifest.protocol.to_string().len())
-        .max()
-        .unwrap_or(8)
-        .max("Protocol".len());
-    let min_recall_width = extensions
-        .iter()
-        .filter_map(|extension| extension.manifest.as_ref())
-        .map(|manifest| manifest.min_recall.len())
-        .max()
-        .unwrap_or(10)
-        .max("Min Recall".len());
-
-    println!(
-        "{name:<name_width$}  {version:<version_width$}  {protocol:>protocol_width$}  {min_recall:<min_recall_width$}  Commands",
-        name = "Extension",
-        version = "Version",
-        protocol = "Protocol",
-        min_recall = "Min Recall"
-    );
-    for extension in extensions {
-        match (extension.manifest, extension.error) {
-            (Some(manifest), _) => {
-                println!(
-                    "{name:<name_width$}  {version:<version_width$}  {protocol:>protocol_width$}  {min_recall:<min_recall_width$}  {commands}",
-                    name = extension.name,
-                    version = manifest.version,
-                    protocol = manifest.protocol,
-                    min_recall = manifest.min_recall,
-                    commands = manifest.commands.join(",")
-                );
-                println!("  {}", extension.path.display());
-            }
-            (_, Some(error)) => {
-                println!(
-                    "{name:<name_width$}  {version:<version_width$}  {protocol:>protocol_width$}  {min_recall:<min_recall_width$}  error: {error}",
-                    name = extension.name,
-                    version = "-",
-                    protocol = "-",
-                    min_recall = "-"
-                );
-                println!("  {}", extension.path.display());
-            }
-            _ => {}
+    let names = if let Some(name) = name {
+        validate_extension_name(&name)?;
+        if !state.extensions.contains_key(&name) {
+            bail!("extension is not installed: {name}");
         }
-    }
+        vec![name]
+    } else {
+        state.extensions.keys().cloned().collect()
+    };
 
+    let catalog = fetch_catalog()?;
+    for name in names {
+        let current = state.extensions.get(&name).expect("checked installed state");
+        let selected = select_latest(&name, &catalog)?;
+        if semver_key(&selected.version)? <= semver_key(&current.version)? {
+            println!("{name} {} is already up to date", current.version);
+            continue;
+        }
+        install_selected(&root, &name, &selected)?;
+    }
     Ok(())
 }
 
 pub(crate) fn run_external(args: Vec<OsString>) -> Result<ExitStatus> {
-    let path_env = std::env::var_os("PATH").unwrap_or_default();
-    run_external_with_path(args, &path_env)
+    let root = extension_root()?;
+    run_external_with_root(args, &root)
 }
 
-fn run_external_with_path(args: Vec<OsString>, path_env: &OsStr) -> Result<ExitStatus> {
+pub(crate) fn installed_help() -> String {
+    let Ok(root) = extension_root() else {
+        return empty_installed_help();
+    };
+    let Ok(state) = load_installed_state(&root) else {
+        return empty_installed_help();
+    };
+    format_installed_help(state)
+}
+
+fn empty_installed_help() -> String {
+    "\nExtensions:\n  none\n".to_string()
+}
+
+fn format_installed_help(state: InstalledState) -> String {
+    let mut out = String::from("\nExtensions:\n");
+    if state.extensions.is_empty() {
+        out.push_str("  none\n");
+        return out;
+    }
+    for (name, extension) in state.extensions {
+        let commands = if extension.commands.is_empty() { vec![name] } else { extension.commands };
+        for command in commands {
+            if extension.description.is_empty() {
+                out.push_str(&format!("  {command}\n"));
+            } else {
+                out.push_str(&format!("  {command:<12} {}\n", extension.description));
+            }
+        }
+    }
+    out
+}
+
+fn list_installed(root: &Path) -> Result<()> {
+    let state = load_installed_state(root)?;
+    if state.extensions.is_empty() {
+        println!("No installed extensions.");
+        return Ok(());
+    }
+
+    println!("Name              Installed   Description");
+    for (name, extension) in state.extensions {
+        println!("{name:<17} {:<11} {}", extension.version, extension.description);
+    }
+    Ok(())
+}
+
+fn list_available(root: &Path) -> Result<()> {
+    let catalog = fetch_catalog()?;
+    let installed = load_installed_state(root)?;
+    if catalog.extensions.is_empty() {
+        println!("No official extensions available.");
+        return Ok(());
+    }
+
+    println!("Name              Latest      Installed   Description");
+    for (name, extension) in catalog.extensions {
+        let latest = select_latest_from_extension(&name, &extension)
+            .map(|selected| selected.version)
+            .unwrap_or_else(|_| "unsupported".to_string());
+        let installed_version = installed
+            .extensions
+            .get(&name)
+            .map(|extension| extension.version.as_str())
+            .unwrap_or("-");
+        println!("{name:<17} {latest:<11} {installed_version:<11} {}", extension.description);
+    }
+    Ok(())
+}
+
+fn run_external_with_root(args: Vec<OsString>, root: &Path) -> Result<ExitStatus> {
     let mut args = args.into_iter();
     let name = args.next().ok_or_else(|| anyhow!("missing extension name"))?;
     let Some(name) = name.to_str() else {
         bail!("extension name must be valid UTF-8");
     };
-    if name.is_empty() || name.contains('/') || name.contains('\\') {
-        bail!("invalid extension name: {name}");
+    validate_extension_name(name)?;
+    let path = managed_binary_path(root, name);
+    if !is_executable_file(&path) {
+        bail!("unknown recall command '{name}' and official extension is not installed");
     }
-    let path = find_in_path(name, path_env).ok_or_else(|| {
-        anyhow!("unknown recall command '{name}' and recall-{name} was not found on PATH")
-    })?;
     Command::new(&path)
         .args(args)
         .status()
         .with_context(|| format!("failed to run {}", path.display()))
 }
 
-fn discover_in_path(path_env: &OsStr) -> Vec<ExtensionEntry> {
-    let mut extensions = BTreeMap::new();
-    for dir in std::env::split_paths(path_env) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+fn install_selected(root: &Path, name: &str, selected: &SelectedExtension) -> Result<()> {
+    let state = load_installed_state(root)?;
+    if state.extensions.get(name).map(|extension| extension.version.as_str())
+        == Some(selected.version.as_str())
+        && is_executable_file(&managed_binary_path(root, name))
+    {
+        println!("{name} {} is already installed", selected.version);
+        return Ok(());
+    }
+
+    fs::create_dir_all(root)?;
+    fs::create_dir_all(root.join("bin"))?;
+    fs::create_dir_all(root.join("packages").join(name))?;
+
+    println!("Installing {name} {}...", selected.version);
+    let bytes = download(&selected.target.url)?;
+    verify_sha256(&bytes, &selected.target.sha256)?;
+
+    let temp = tempfile::Builder::new()
+        .prefix("install-")
+        .tempdir_in(root)
+        .context("failed to create extension install temp dir")?;
+    unpack_archive(&bytes, &selected.target.url, temp.path())?;
+
+    let binary_name = binary_name(name);
+    let unpacked_binary = find_unpacked_binary(temp.path(), &binary_name)?;
+    let manifest = read_manifest(name, &unpacked_binary)?;
+    validate_manifest(name, &selected.version, &selected.info, &manifest)?;
+
+    let package_dir = root.join("packages").join(name).join(&selected.version);
+    remove_dir_if_exists(&package_dir)?;
+    fs::create_dir_all(&package_dir)?;
+    let package_binary = package_dir.join(&binary_name);
+    fs::copy(&unpacked_binary, &package_binary)
+        .with_context(|| format!("failed to install {}", package_binary.display()))?;
+    make_executable(&package_binary)?;
+    fs::write(package_dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+
+    let bin_path = managed_binary_path(root, name);
+    fs::copy(&package_binary, &bin_path)
+        .with_context(|| format!("failed to install {}", bin_path.display()))?;
+    make_executable(&bin_path)?;
+
+    let mut state = load_installed_state(root)?;
+    state.extensions.insert(
+        name.to_string(),
+        InstalledExtension {
+            version: selected.version.clone(),
+            target: selected.target_triple.clone(),
+            protocol: manifest.protocol,
+            min_recall: manifest.min_recall,
+            commands: manifest.commands,
+            binary: binary_name,
+            description: selected.description.clone(),
+        },
+    );
+    save_installed_state(root, &state)?;
+    println!("Installed {name} {}", selected.version);
+    Ok(())
+}
+
+fn fetch_catalog() -> Result<Catalog> {
+    let mut response =
+        ureq::get(CATALOG_URL).call().with_context(|| format!("failed to fetch {CATALOG_URL}"))?;
+    let body = response.body_mut().read_to_string().context("failed to read catalog")?;
+    let catalog: Catalog = serde_json::from_str(&body).context("invalid extension catalog JSON")?;
+    if catalog.schema != 1 {
+        bail!("unsupported extension catalog schema {}", catalog.schema);
+    }
+    Ok(catalog)
+}
+
+fn download(url: &str) -> Result<Vec<u8>> {
+    let mut response =
+        ureq::get(url).call().with_context(|| format!("failed to download {url}"))?;
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .read_to_end(&mut bytes)
+        .context("failed to read extension archive")?;
+    Ok(bytes)
+}
+
+fn select_latest(name: &str, catalog: &Catalog) -> Result<SelectedExtension> {
+    let extension = catalog
+        .extensions
+        .get(name)
+        .ok_or_else(|| anyhow!("unknown official extension: {name}"))?;
+    select_latest_from_extension(name, extension)
+}
+
+fn select_latest_from_extension(
+    name: &str,
+    extension: &CatalogExtension,
+) -> Result<SelectedExtension> {
+    let target_triple = target_triple()?;
+    let current_recall = semver_key(env!("CARGO_PKG_VERSION"))?;
+    let mut selected: Option<((u64, u64, u64), SelectedExtension)> = None;
+
+    for (version, info) in &extension.versions {
+        if info.protocol > crate::PROTOCOL_VERSION {
+            continue;
+        }
+        if semver_key(&info.min_recall)? > current_recall {
+            continue;
+        }
+        let Some(target) = info.targets.get(&target_triple) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_executable_file(&path) {
-                continue;
-            }
-            let Some(name) = extension_name(&path) else {
-                continue;
-            };
-            extensions.entry(name).or_insert(path);
+        let key = semver_key(version)?;
+        let candidate = SelectedExtension {
+            version: version.clone(),
+            description: extension.description.clone(),
+            info: info.clone(),
+            target: target.clone(),
+            target_triple: target_triple.clone(),
+        };
+        if selected.as_ref().is_none_or(|(selected_key, _)| key > *selected_key) {
+            selected = Some((key, candidate));
         }
     }
 
-    extensions
-        .into_iter()
-        .map(|(name, path)| match read_manifest(&name, &path) {
-            Ok(manifest) => ExtensionEntry { name, path, manifest: Some(manifest), error: None },
-            Err(error) => {
-                ExtensionEntry { name, path, manifest: None, error: Some(error.to_string()) }
-            }
-        })
-        .collect()
+    selected
+        .map(|(_, selected)| selected)
+        .ok_or_else(|| anyhow!("no compatible release for extension {name} on {target_triple}"))
 }
 
-fn find_in_path(name: &str, path_env: &OsStr) -> Option<PathBuf> {
-    let extension = std::env::consts::EXE_EXTENSION;
-    let binary = if extension.is_empty() {
-        format!("recall-{name}")
-    } else {
-        format!("recall-{name}.{extension}")
-    };
-    std::env::split_paths(path_env)
-        .map(|dir| dir.join(&binary))
-        .find(|path| is_executable_file(path))
+fn validate_manifest(
+    name: &str,
+    version: &str,
+    catalog: &CatalogVersion,
+    manifest: &ExtensionManifest,
+) -> Result<()> {
+    if manifest.name != name {
+        bail!("manifest name '{}' does not match extension '{name}'", manifest.name);
+    }
+    if manifest.version != version {
+        bail!("manifest version '{}' does not match catalog version '{version}'", manifest.version);
+    }
+    if manifest.protocol != catalog.protocol {
+        bail!(
+            "manifest protocol {} does not match catalog protocol {}",
+            manifest.protocol,
+            catalog.protocol
+        );
+    }
+    if manifest.min_recall != catalog.min_recall {
+        bail!(
+            "manifest min_recall '{}' does not match catalog min_recall '{}'",
+            manifest.min_recall,
+            catalog.min_recall
+        );
+    }
+    if !catalog.commands.is_empty() && manifest.commands != catalog.commands {
+        bail!("manifest commands do not match catalog commands");
+    }
+    Ok(())
+}
+
+fn load_installed_state(root: &Path) -> Result<InstalledState> {
+    let path = installed_path(root);
+    if !path.exists() {
+        return Ok(InstalledState { schema: 1, extensions: BTreeMap::new() });
+    }
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let state: InstalledState =
+        serde_json::from_str(&content).context("invalid installed extension state")?;
+    if state.schema != 1 {
+        bail!("unsupported installed extension state schema {}", state.schema);
+    }
+    Ok(state)
+}
+
+fn save_installed_state(root: &Path, state: &InstalledState) -> Result<()> {
+    fs::create_dir_all(root)?;
+    let path = installed_path(root);
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, serde_json::to_vec_pretty(state)?)
+        .with_context(|| format!("failed to write {}", temp.display()))?;
+    fs::rename(&temp, &path).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 fn read_manifest(name: &str, path: &Path) -> Result<ExtensionManifest> {
@@ -177,16 +428,107 @@ fn read_manifest(name: &str, path: &Path) -> Result<ExtensionManifest> {
     Ok(manifest)
 }
 
-fn extension_name(path: &Path) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
-    let name = file_name.strip_prefix("recall-")?;
+fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if actual != expected {
+        bail!("sha256 mismatch: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+fn unpack_archive(bytes: &[u8], url: &str, destination: &Path) -> Result<()> {
+    if url.ends_with(".zip") {
+        let cursor = Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(cursor).context("invalid zip archive")?;
+        archive.extract(destination).context("failed to extract zip archive")?;
+        return Ok(());
+    }
+    if url.ends_with(".tar.gz") {
+        let decoder = GzDecoder::new(Cursor::new(bytes));
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(destination).context("failed to extract tar.gz archive")?;
+        return Ok(());
+    }
+    bail!("unsupported extension archive type: {url}");
+}
+
+fn find_unpacked_binary(root: &Path, binary_name: &str) -> Result<PathBuf> {
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry?;
+        if entry.file_type().is_file() && entry.file_name() == binary_name {
+            return Ok(entry.into_path());
+        }
+    }
+    bail!("extension archive did not contain {binary_name}");
+}
+
+fn target_triple() -> Result<String> {
+    match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("aarch64", "macos") => Ok("aarch64-apple-darwin".to_string()),
+        ("x86_64", "macos") => Ok("x86_64-apple-darwin".to_string()),
+        ("x86_64", "linux") => Ok("x86_64-unknown-linux-gnu".to_string()),
+        ("x86_64", "windows") => Ok("x86_64-pc-windows-msvc".to_string()),
+        (arch, os) => bail!("unsupported extension target: {arch}-{os}"),
+    }
+}
+
+fn semver_key(version: &str) -> Result<(u64, u64, u64)> {
+    let core = version.split_once('-').map(|(core, _)| core).unwrap_or(version);
+    let parts = core.split('.').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        bail!("invalid semver: {version}");
+    }
+    Ok((parts[0].parse()?, parts[1].parse()?, parts[2].parse()?))
+}
+
+fn validate_extension_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.starts_with('-')
+        || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        bail!("invalid extension name: {name}");
+    }
+    Ok(())
+}
+
+fn extension_root() -> Result<PathBuf> {
+    Ok(dirs::data_dir()
+        .ok_or_else(|| anyhow!("cannot determine data directory"))?
+        .join("recall")
+        .join("extensions"))
+}
+
+fn installed_path(root: &Path) -> PathBuf {
+    root.join("installed.json")
+}
+
+fn managed_binary_path(root: &Path, name: &str) -> PathBuf {
+    root.join("bin").join(binary_name(name))
+}
+
+fn binary_name(name: &str) -> String {
     let extension = std::env::consts::EXE_EXTENSION;
-    let name = if extension.is_empty() {
-        name
+    if extension.is_empty() {
+        format!("recall-{name}")
     } else {
-        name.strip_suffix(&format!(".{extension}")).unwrap_or(name)
-    };
-    if name.is_empty() { None } else { Some(name.to_string()) }
+        format!("recall-{name}.{extension}")
+    }
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 #[cfg(unix)]
@@ -204,87 +546,169 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed to mark {} executable", path.display()))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{discover_in_path, run_external_with_path};
+    use super::{
+        Catalog, CatalogExtension, CatalogTarget, CatalogVersion, ExtensionManifest,
+        InstalledExtension, InstalledState, format_installed_help, load_installed_state,
+        managed_binary_path, run_external_with_root, save_installed_state, select_latest,
+        validate_manifest,
+    };
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
 
     #[test]
     #[cfg(unix)]
-    fn external_dispatch_runs_recall_binary_from_path() {
-        let dir = temp_dir("dispatch");
-        let output = dir.join("out.txt");
-        let binary = dir.join("recall-demo");
+    fn external_dispatch_runs_managed_binary() {
+        let root = temp_dir("dispatch");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let output = root.join("out.txt");
         write_executable(
-            &binary,
+            &managed_binary_path(&root, "demo"),
             r#"#!/bin/sh
 printf "%s" "$1" > "$2"
 "#,
         );
 
-        let status = run_external_with_path(
+        let status = run_external_with_root(
             vec![
                 OsString::from("demo"),
                 OsString::from("hello"),
                 output.as_os_str().to_os_string(),
             ],
-            dir.as_os_str(),
+            &root,
         )
         .unwrap();
 
         assert!(status.success());
         assert_eq!(fs::read_to_string(output).unwrap(), "hello");
-        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    #[cfg(unix)]
-    fn external_dispatch_returns_child_exit_status() {
-        let dir = temp_dir("exit-status");
-        let binary = dir.join("recall-demo");
-        write_executable(
-            &binary,
-            r#"#!/bin/sh
-exit "$1"
-"#,
+    fn installed_state_round_trips() {
+        let root = temp_dir("state");
+        let mut state = InstalledState { schema: 1, extensions: BTreeMap::new() };
+        state.extensions.insert(
+            "probe".to_string(),
+            InstalledExtension {
+                version: "0.1.0".to_string(),
+                target: "x86_64-unknown-linux-gnu".to_string(),
+                protocol: 1,
+                min_recall: "0.2.10".to_string(),
+                commands: vec!["probe".to_string()],
+                binary: "recall-probe".to_string(),
+                description: "Probe extension".to_string(),
+            },
         );
 
-        let status = run_external_with_path(
-            vec![OsString::from("demo"), OsString::from("7")],
-            dir.as_os_str(),
+        save_installed_state(&root, &state).unwrap();
+        let loaded = load_installed_state(&root).unwrap();
+
+        assert_eq!(loaded.extensions["probe"].version, "0.1.0");
+        assert_eq!(loaded.extensions["probe"].commands, ["probe"]);
+        assert_eq!(loaded.extensions["probe"].description, "Probe extension");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installed_help_does_not_invent_missing_description() {
+        let mut state = InstalledState { schema: 1, extensions: BTreeMap::new() };
+        state.extensions.insert(
+            "probe".to_string(),
+            InstalledExtension {
+                version: "0.1.0".to_string(),
+                target: "x86_64-unknown-linux-gnu".to_string(),
+                protocol: 1,
+                min_recall: "0.2.10".to_string(),
+                commands: vec!["probe".to_string()],
+                binary: "recall-probe".to_string(),
+                description: String::new(),
+            },
+        );
+
+        let help = format_installed_help(state);
+
+        assert_eq!(help, "\nExtensions:\n  probe\n");
+        assert!(!help.contains("Official Recall extension"));
+    }
+
+    #[test]
+    fn catalog_description_is_not_part_of_manifest_validation() {
+        let manifest: ExtensionManifest = serde_json::from_str(
+            r#"{"name":"probe","version":"0.1.0","protocol":1,"min_recall":"0.2.10","commands":["probe"]}"#,
         )
         .unwrap();
+        let catalog = CatalogVersion {
+            protocol: 1,
+            min_recall: "0.2.10".to_string(),
+            commands: vec!["probe".to_string()],
+            targets: BTreeMap::new(),
+        };
 
-        assert_eq!(status.code(), Some(7));
-        fs::remove_dir_all(dir).unwrap();
+        validate_manifest("probe", "0.1.0", &catalog, &manifest).unwrap();
     }
 
     #[test]
-    #[cfg(unix)]
-    fn list_reads_extension_manifest() {
-        let dir = temp_dir("manifest");
-        let binary = dir.join("recall-demo");
-        write_executable(
-            &binary,
-            r#"#!/bin/sh
-cat <<'JSON'
-{"name":"demo","version":"0.1.0","protocol":1,"min_recall":"0.2.10","commands":["demo"]}
-JSON
-"#,
+    fn select_latest_compatible_release_for_current_target() {
+        let target = super::target_triple().unwrap();
+        let mut versions = BTreeMap::new();
+        versions.insert("0.1.0".to_string(), catalog_version(&target, "0.2.10", 1, "old"));
+        versions
+            .insert("0.2.0".to_string(), catalog_version(&target, "999.0.0", 1, "too-new-recall"));
+        versions.insert(
+            "0.3.0".to_string(),
+            catalog_version(&target, "0.2.10", crate::PROTOCOL_VERSION + 1, "too-new-protocol"),
         );
+        versions
+            .insert("0.1.1".to_string(), catalog_version(&target, "0.2.10", 1, "newer-compatible"));
+        let mut extensions = BTreeMap::new();
+        extensions
+            .insert("probe".to_string(), CatalogExtension { description: String::new(), versions });
+        let catalog = Catalog { schema: 1, extensions };
 
-        let extensions = discover_in_path(dir.as_os_str());
+        let selected = select_latest("probe", &catalog).unwrap();
 
-        assert_eq!(extensions.len(), 1);
-        assert_eq!(extensions[0].name, "demo");
-        let manifest = extensions[0].manifest.as_ref().unwrap();
-        assert_eq!(manifest.version, "0.1.0");
-        assert_eq!(manifest.protocol, 1);
-        assert_eq!(manifest.min_recall, "0.2.10");
-        assert_eq!(manifest.commands, ["demo"]);
-        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(selected.version, "0.1.1");
+        assert!(selected.target.url.ends_with("newer-compatible.tar.gz"));
+    }
+
+    fn catalog_version(
+        target: &str,
+        min_recall: &str,
+        protocol: u32,
+        slug: &str,
+    ) -> CatalogVersion {
+        let mut targets = BTreeMap::new();
+        targets.insert(
+            target.to_string(),
+            CatalogTarget {
+                url: format!("https://example.invalid/{slug}.tar.gz"),
+                sha256: "00".repeat(32),
+            },
+        );
+        CatalogVersion {
+            protocol,
+            min_recall: min_recall.to_string(),
+            commands: vec!["probe".to_string()],
+            targets,
+        }
     }
 
     fn temp_dir(label: &str) -> PathBuf {

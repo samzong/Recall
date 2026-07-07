@@ -18,13 +18,18 @@ clap_complete = "4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sqlite-vec = "0.1"
 hf-hub = { version = "0.5", features = ["ureq"] }
+ureq = "3"
 tokenizers = { version = "0.22", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 chrono = "0.4"
 anyhow = "1"
+flate2 = "1"
 kitup = "0.1.1"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
@@ -35,6 +40,7 @@ crossterm = "0.28"
 unicode-width = "0.2"
 fs2 = "0.4"
 pulldown-cmark = "0.13"
+zip = { version = "7", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10", features = ["metal"] }
