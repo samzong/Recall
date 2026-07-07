@@ -5,6 +5,7 @@ pub(crate) mod config;
 pub(crate) mod db;
 pub(crate) mod embedding;
 pub(crate) mod export;
+pub(crate) mod extension;
 pub(crate) mod handoff;
 pub(crate) mod import;
 pub(crate) mod info;

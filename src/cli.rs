@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -16,38 +17,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Show indexed source and background job status")]
-    Info {
-        #[arg(long, value_enum, default_value_t = crate::info::InfoFormat::Text)]
-        format: crate::info::InfoFormat,
-    },
-    #[command(about = "Scan configured AI coding session sources")]
-    Sync {
-        #[arg(long, help = "Reprocess every session, even if unchanged")]
-        force: bool,
-        #[arg(short, long, help = "Show per-source scan progress and settings")]
-        verbose: bool,
-        #[arg(long, help = "Sync only this source (id or label, e.g. cursor or CUR)")]
-        source: Option<String>,
-    },
-    #[command(hide = true, name = "__background-worker")]
-    BackgroundWorker {
-        #[arg(long)]
-        sync_first: bool,
-    },
-    #[command(hide = true, name = "__bench-semantic")]
-    BenchSemantic,
-    #[command(hide = true, name = "__bench-search")]
-    BenchSearch { query: String },
-    #[command(hide = true, name = "__bench-eval")]
-    BenchEval {
-        #[arg(long)]
-        dataset: Option<String>,
-        #[arg(short, long)]
-        verbose: bool,
-    },
-    #[command(hide = true, name = "__bench-dump-sessions")]
-    BenchDumpSessions,
     #[command(about = "Search indexed coding sessions")]
     Search {
         #[arg(help = "Search query text")]
@@ -62,6 +31,25 @@ enum Commands {
         repo: Option<String>,
         #[arg(long, value_enum, default_value_t = crate::query::SearchFormat::Text)]
         format: crate::query::SearchFormat,
+    },
+    #[command(about = "Operate on indexed sessions")]
+    Session {
+        #[command(subcommand)]
+        command: session::SessionCommands,
+    },
+    #[command(about = "Scan configured AI coding session sources")]
+    Sync {
+        #[arg(long, help = "Reprocess every session, even if unchanged")]
+        force: bool,
+        #[arg(short, long, help = "Show per-source scan progress and settings")]
+        verbose: bool,
+        #[arg(long, help = "Sync only this source (id or label, e.g. cursor or CUR)")]
+        source: Option<String>,
+    },
+    #[command(about = "Show indexed source and background job status")]
+    Info {
+        #[arg(long, value_enum, default_value_t = crate::info::InfoFormat::Text)]
+        format: crate::info::InfoFormat,
     },
     #[command(about = "Show token usage reports")]
     Usage {
@@ -106,16 +94,36 @@ enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
-    #[command(about = "Operate on indexed sessions")]
-    Session {
+    #[command(about = "Manage Recall extensions", visible_alias = "ext")]
+    Extension {
         #[command(subcommand)]
-        command: session::SessionCommands,
+        command: ExtensionCommands,
     },
     #[command(about = "Generate shell completion script")]
     Completions {
         #[arg(help = "Target shell")]
         shell: Shell,
     },
+    #[command(hide = true, name = "__background-worker")]
+    BackgroundWorker {
+        #[arg(long)]
+        sync_first: bool,
+    },
+    #[command(hide = true, name = "__bench-semantic")]
+    BenchSemantic,
+    #[command(hide = true, name = "__bench-search")]
+    BenchSearch { query: String },
+    #[command(hide = true, name = "__bench-eval")]
+    BenchEval {
+        #[arg(long)]
+        dataset: Option<String>,
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    #[command(hide = true, name = "__bench-dump-sessions")]
+    BenchDumpSessions,
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
 }
 
 #[derive(Subcommand)]
@@ -145,6 +153,12 @@ enum SkillCommands {
         #[arg(short, long, help = "Skip prompts and accept policy-selected targets")]
         yes: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ExtensionCommands {
+    #[command(about = "List extensions available on PATH")]
+    List,
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -191,10 +205,14 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Skill {
             command: SkillCommands::Install { scope, agents, dry_run, yes },
         }) => run_skill_install(scope, agents, dry_run, yes)?,
+        Some(Commands::Extension { command: ExtensionCommands::List }) => {
+            crate::extension::run_list()?
+        }
         Some(Commands::Session { command }) => session::cmd_session(command)?,
         Some(Commands::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "recall", &mut std::io::stdout());
         }
+        Some(Commands::External(args)) => crate::extension::run_external(args)?,
         None => crate::tui::runner::run(None)?,
     }
 
@@ -253,7 +271,7 @@ fn recall_skill_bundle() -> kitup::SkillBundle {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ShareCommands, Shell, SkillCommands, generate};
+    use super::{Cli, Commands, ExtensionCommands, ShareCommands, Shell, SkillCommands, generate};
     use crate::adapters::{
         adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
     };
@@ -360,6 +378,7 @@ mod tests {
         assert!(compact_help.contains("import Import session records from JSON Lines"));
         assert!(compact_help.contains("share Share session pages"));
         assert!(compact_help.contains("skill Manage bundled Agent Skill"));
+        assert!(compact_help.contains("extension Manage Recall extensions"));
         assert!(compact_help.contains("session Operate on indexed sessions"));
         assert!(compact_help.contains("completions Generate shell completion script"));
     }
@@ -415,6 +434,35 @@ mod tests {
                 assert!(yes);
             }
             _ => panic!("expected skill install command"),
+        }
+    }
+
+    #[test]
+    fn extension_list_parses() {
+        let cli = Cli::try_parse_from(["recall", "extension", "list"]).unwrap();
+        match cli.command {
+            Some(Commands::Extension { command: ExtensionCommands::List }) => {}
+            _ => panic!("expected extension list command"),
+        }
+    }
+
+    #[test]
+    fn extension_list_accepts_ext_alias() {
+        let cli = Cli::try_parse_from(["recall", "ext", "list"]).unwrap();
+        match cli.command {
+            Some(Commands::Extension { command: ExtensionCommands::List }) => {}
+            _ => panic!("expected extension list command"),
+        }
+    }
+
+    #[test]
+    fn unknown_subcommand_parses_as_external_extension() {
+        let cli = Cli::try_parse_from(["recall", "reflect", "--limit", "3"]).unwrap();
+        match cli.command {
+            Some(Commands::External(args)) => {
+                assert_eq!(args, ["reflect", "--limit", "3"]);
+            }
+            _ => panic!("expected external command"),
         }
     }
 
