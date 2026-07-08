@@ -1,14 +1,18 @@
 # AGENTS.md
 
 This file provides guidance to AI coding agents (Claude Code, Codex, OpenCode,
-etc.) when working with code in this repository.
+etc.) when working with code in this repository. Module-level rules live in
+nested AGENTS.md files: `src/adapters/`, `src/db/`, `src/tui/`, `extensions/`,
+`skills/`, and `website/` — read the one for the directory you are changing.
 
 ## Overview
 
 Recall is a Rust CLI/TUI application that indexes AI coding sessions from local
 tools (Claude Code, Codex, OpenCode, Cursor, ...) into one SQLite database for
 full-text/semantic search, usage tracking, JSONL export/import, session
-sharing, and resume. It is an application crate, not a reusable Rust library.
+sharing, and resume. The repo is a Cargo workspace: the core application crate
+at the root plus official extension crates under `extensions/`. Nothing is
+published to crates.io — these are application binaries, not library crates.
 
 ## Commands
 
@@ -24,11 +28,15 @@ cargo test integration::eval_harness  # eval harness
 ```
 
 `make check` must pass before push. CI runs exactly the same command — there is
-no CI-only logic.
+no CI-only logic. The gate uses `--workspace`, so it covers extension crates
+too. Build a single extension with `cargo build -p recall-<name>`.
 
-Releases use cargo-release: `make release-patch` is a dry run; add `EXECUTE=1`
-to bump, commit, tag, and push. The `v*` tag triggers the GitHub Actions binary
-build. One-time setup: `git config core.hooksPath .githooks` enables the DCO
+Core releases use cargo-release: `make release-patch` is a dry run; add
+`EXECUTE=1` to bump, commit, tag, and push. The `v*` tag triggers the GitHub
+Actions binary build. Extensions release independently: bumping an extension's
+package version in a PR is the release intent — after merge, a workflow creates
+the `recall-<name>-v<version>` tag, builds binaries, and regenerates the
+catalog. One-time setup: `git config core.hooksPath .githooks` enables the DCO
 signoff hook.
 
 ## Architecture
@@ -51,8 +59,21 @@ Data flow: source adapters → sync → SQLite → search → CLI/TUI.
 - `src/tui/` — ratatui app: app state, event handling, layout, background
   search worker, share/usage/viewing state, and `ui/` rendering modules.
 - `src/share/` — renders sessions to HTML and publishes share assets.
-- `src/cli.rs` — clap subcommands dispatching to the modules above.
+- `src/cli.rs` — clap subcommands dispatching to the modules above; unknown
+  subcommands fall through to extension dispatch.
+- `src/extension.rs` — extension host: `recall <name>` runs the managed
+  `recall-<name>` binary; `recall ext install/list/remove/upgrade` manages
+  official extensions from the GitHub Pages catalog.
+- `extensions/` — official extension crates (workspace members, independently
+  versioned). Extensions consume core only through the stable CLI JSON/JSONL
+  protocol (`recall ... --format json`, `recall export`), never the SQLite file
+  or Rust internals. `docs/extensions.md` is the design and contract reference.
+- `skills/` — agent skill bundles. `skills/recall/` is embedded into the core
+  binary via `include_bytes!` and installed by `recall skill install` — editing
+  it changes the binary. `skills/reflect/` pairs with the reflect extension.
 - `website/` — Next.js docs site (pnpm), independent of the Rust crate.
+  `website/public/extensions/catalog.json` is generated release state — never
+  hand-edit version entries.
 
 ## Boundaries
 
@@ -69,5 +90,11 @@ Data flow: source adapters → sync → SQLite → search → CLI/TUI.
 - Adapter rules (see DEVELOPMENT.md): return `Ok(vec![])` when a tool is not
   installed; open external databases read-only; extract text content only;
   `tracing::warn!` and skip on recoverable parse errors.
+- Core/extension boundary: anything that writes the Recall index, data plane,
+  or schema migrations belongs in core; extensions only consume the stable CLI
+  protocol. For that protocol, stdout carries only the requested JSON/JSONL,
+  progress and warnings go to stderr, published fields must not be removed or
+  renamed, and breaking changes bump `protocol_version`. The SQLite schema is
+  explicitly not a public contract.
 - `.local/` is local scratch and external comparisons, not an architecture
   source.
