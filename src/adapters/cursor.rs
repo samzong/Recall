@@ -10,8 +10,11 @@ use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::adapters::events;
+use crate::adapters::json_util::json_i64;
+use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
+    first_timestamp, last_timestamp,
 };
 use crate::db::store::{EventSessionStateMeta, Store, UsageSessionStateMeta};
 use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
@@ -333,14 +336,17 @@ fn parse_composer_session(
         return Ok(None);
     }
 
-    let started_at = json_i64(data.get("createdAt"))
-        .or(meta.created_at)
-        .or_else(|| messages.first().and_then(|msg| msg.timestamp))
-        .unwrap_or(0);
-    let updated_at = json_i64(data.get("lastUpdatedAt"))
-        .or(json_i64(data.get("conversationCheckpointLastUpdatedAt")))
-        .or(meta.last_updated_at)
-        .or_else(|| messages.last().and_then(|msg| msg.timestamp));
+    let started_at =
+        first_timestamp(json_i64(data.get("createdAt")).or(meta.created_at), &messages, &[], &[])
+            .unwrap_or(0);
+    let updated_at = last_timestamp(
+        json_i64(data.get("lastUpdatedAt"))
+            .or(json_i64(data.get("conversationCheckpointLastUpdatedAt")))
+            .or(meta.last_updated_at),
+        &messages,
+        &[],
+        &[],
+    );
 
     Ok(Some(ParsedComposerSession {
         messages,
@@ -1005,13 +1011,7 @@ fn collect_cursor_project_key_matches(
 }
 
 fn resolve_projects_dir() -> anyhow::Result<Option<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    let dir = home.join(".cursor").join("projects");
-    if !dir.exists() {
-        debug!("~/.cursor/projects not found, skipping Cursor");
-        return Ok(None);
-    }
-    Ok(Some(dir))
+    resolve_home_dir(".cursor/projects", "~/.cursor/projects not found, skipping Cursor")
 }
 
 fn resolve_global_state_db_path() -> Option<PathBuf> {
@@ -1155,14 +1155,6 @@ fn render_json_fragment(value: &Value) -> Option<String> {
     }
 }
 
-fn json_i64(value: Option<&Value>) -> Option<i64> {
-    value.and_then(|value| {
-        value
-            .as_i64()
-            .or_else(|| value.as_u64().map(|value| value as i64))
-            .or_else(|| value.as_f64().map(|value| value as i64))
-    })
-}
 #[cfg(test)]
 mod tests {
     use std::io::Write;

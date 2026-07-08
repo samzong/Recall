@@ -8,8 +8,11 @@ use walkdir::WalkDir;
 
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
+use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
+    first_timestamp, last_timestamp,
 };
 use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
@@ -98,13 +101,7 @@ fn open_url_command(url: String) -> ResumeCommand {
 }
 
 fn resolve_codex_dir() -> anyhow::Result<Option<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    let dir = home.join(".codex");
-    if !dir.exists() {
-        debug!("~/.codex not found, skipping Codex");
-        return Ok(None);
-    }
-    Ok(Some(dir))
+    resolve_home_dir(".codex", "~/.codex not found, skipping Codex")
 }
 
 fn scan_for_sync_impl(
@@ -226,16 +223,8 @@ fn parse_codex_session_with_options(
     let mut forked_child_inherited_reported_total: Option<i64> = None;
     let source_path = path.to_string_lossy().to_string();
 
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    for item in jsonl_indexed(reader.lines()) {
+        let (line_index, v) = item?;
 
         let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -290,11 +279,7 @@ fn parse_codex_session_with_options(
                             &model,
                         );
                     }
-                    meta_timestamp = payload
-                        .get("timestamp")
-                        .and_then(|t| t.as_str())
-                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                        .map(|dt| dt.timestamp_millis());
+                    meta_timestamp = rfc3339_ms(payload.get("timestamp"));
                     if payload.get("forked_from_id").and_then(|s| s.as_str()).is_some() {
                         forked_child_waiting_for_turn_context = true;
                         forked_child_inherited_baseline = None;
@@ -425,21 +410,14 @@ fn parse_codex_session_with_options(
         path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string()
     });
 
-    let started_at = meta_timestamp
-        .or_else(|| messages.first().and_then(|m| m.timestamp))
-        .or_else(|| usage_events.first().map(|event| event.timestamp))
-        .or_else(|| events.first().and_then(|event| event.timestamp))
-        .unwrap_or(0);
+    let started_at =
+        first_timestamp(meta_timestamp, &messages, &usage_events, &events).unwrap_or(0);
 
     Ok(Some(RawSession {
         source_id,
         directory: meta_cwd,
         started_at,
-        updated_at: messages
-            .last()
-            .and_then(|m| m.timestamp)
-            .or_else(|| usage_events.last().map(|event| event.timestamp))
-            .or_else(|| events.last().and_then(|event| event.timestamp)),
+        updated_at: last_timestamp(None, &messages, &usage_events, &events),
         entrypoint: None,
         messages,
         usage_events,
@@ -850,10 +828,7 @@ fn apply_pending_codex_model(
 }
 
 fn parse_timestamp(v: &Value) -> Option<i64> {
-    v.get("timestamp")
-        .and_then(|t| t.as_str())
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|dt| dt.timestamp_millis())
+    rfc3339_ms(v.get("timestamp"))
 }
 
 fn push_codex_message(

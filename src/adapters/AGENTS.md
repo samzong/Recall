@@ -14,9 +14,14 @@ apply when working here.
   wires the adapter into sync, search, the TUI source filter, and the CLI
   `--source` flag. No schema change is needed — `sessions.source` is a value,
   not a column per tool.
-- `events.rs`, `file_scan.rs`, and `sync_state.rs` are shared helpers, not
-  adapters. Prefer `file_scan::run_file_scan_with_options` over hand-rolled
-  mtime tracking for file-based sources.
+- `events.rs`, `file_scan.rs`, `sync_state.rs`, `json_util.rs`, and `paths.rs`
+  are shared helpers, not adapters. Prefer them over hand-rolling:
+  `file_scan::run_file_scan_with_options` for mtime tracking,
+  `json_util::jsonl_indexed` for per-line JSONL read loops,
+  `json_util::rfc3339_ms` and `json_util::json_i64` for timestamp/number
+  coercion, `paths::resolve_home_dir` for `~/…` directory resolution, and
+  `first_timestamp`/`last_timestamp` (`mod.rs`) for started_at/updated_at
+  fallback chains.
 - Usage and session events are extensions on the same `RawSession`
   (`with_usage`, `with_events`), each with its own parser version. Bump the
   parser version when parsing changes — that is what triggers backfill for

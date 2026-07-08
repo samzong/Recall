@@ -8,6 +8,7 @@ use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
@@ -65,13 +66,10 @@ impl SourceAdapter for AntigravityAdapter {
 }
 
 fn resolve_antigravity_dir() -> anyhow::Result<Option<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    let dir = home.join(".gemini/antigravity-cli");
-    if !dir.exists() {
-        debug!("~/.gemini/antigravity-cli not found, skipping Antigravity CLI");
-        return Ok(None);
-    }
-    Ok(Some(dir))
+    resolve_home_dir(
+        ".gemini/antigravity-cli",
+        "~/.gemini/antigravity-cli not found, skipping Antigravity CLI",
+    )
 }
 
 fn scan_for_sync_impl(

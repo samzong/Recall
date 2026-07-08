@@ -8,8 +8,10 @@ use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
+    first_timestamp,
 };
 use crate::db::store::Store;
 use crate::types::{RawUsageEvent, Role, TokenSource};
@@ -259,11 +261,9 @@ fn parse_pi_session_file(
         return Ok(None);
     }
 
-    let started_at = parsed
-        .started_at
-        .or_else(|| parsed.messages.first().and_then(|message| message.timestamp))
-        .or_else(|| parsed.usage_events.first().map(|event| event.timestamp))
-        .unwrap_or(0);
+    let started_at =
+        first_timestamp(parsed.started_at, &parsed.messages, &parsed.usage_events, &[])
+            .unwrap_or(0);
 
     Ok(Some(RawSession {
         source_id: parsed.session_id.unwrap_or(entry.session_id),
@@ -297,17 +297,8 @@ fn parse_pi_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Pars
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
 
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let entry: Value = match serde_json::from_str(line) {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
+    for item in jsonl_indexed(reader.lines()) {
+        let (line_index, entry) = item?;
 
         match entry.get("type").and_then(|value| value.as_str()).unwrap_or("") {
             "session" => {
@@ -407,9 +398,7 @@ fn parse_pi_message(
     messages: &mut Vec<RawMessage>,
     usage_events: &mut Vec<RawUsageEvent>,
 ) {
-    let timestamp = message
-        .get("timestamp")
-        .and_then(number_to_i64)
+    let timestamp = json_i64(message.get("timestamp"))
         .or_else(|| parse_entry_timestamp(entry))
         .unwrap_or(fallback_timestamp);
 
@@ -551,7 +540,7 @@ fn non_empty_str(value: Option<&Value>) -> Option<&str> {
 }
 
 fn usage_count(usage: &Value, keys: &[&str]) -> i64 {
-    keys.iter().find_map(|key| usage.get(*key).and_then(number_to_i64)).unwrap_or(0).max(0)
+    keys.iter().find_map(|key| json_i64(usage.get(*key))).unwrap_or(0).max(0)
 }
 
 fn extract_content(content: Option<&Value>) -> String {
@@ -630,18 +619,7 @@ fn extract_bash_execution_content(message: &Value) -> String {
 }
 
 fn parse_entry_timestamp(entry: &Value) -> Option<i64> {
-    entry
-        .get("timestamp")
-        .and_then(|value| value.as_str())
-        .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
-        .map(|timestamp| timestamp.timestamp_millis())
-}
-
-fn number_to_i64(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
-        .or_else(|| value.as_f64().map(|value| value as i64))
+    rfc3339_ms(entry.get("timestamp"))
 }
 
 #[cfg(test)]

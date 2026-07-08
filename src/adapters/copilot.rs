@@ -8,8 +8,11 @@ use tracing::debug;
 
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
+use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
+use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
+    first_timestamp, last_timestamp,
 };
 use crate::db::store::Store;
 use crate::types::{RawSessionEvent, Role};
@@ -65,13 +68,10 @@ impl SourceAdapter for CopilotAdapter {
 }
 
 fn resolve_copilot_dir() -> anyhow::Result<Option<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    let dir = home.join(".copilot/session-state");
-    if !dir.exists() {
-        debug!("~/.copilot/session-state not found, skipping Copilot CLI");
-        return Ok(None);
-    }
-    Ok(Some(dir))
+    resolve_home_dir(
+        ".copilot/session-state",
+        "~/.copilot/session-state not found, skipping Copilot CLI",
+    )
 }
 
 fn scan_for_sync_impl(
@@ -212,16 +212,8 @@ where
     let mut messages = Vec::new();
     let mut session_events = Vec::new();
 
-    for line in lines {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    for item in jsonl_indexed(lines) {
+        let (_, v) = item?;
 
         let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let timestamp = parse_timestamp(&v);
@@ -231,11 +223,7 @@ where
             "session.start" => {
                 if let Some(data) = v.get("data") {
                     session_id = data.get("sessionId").and_then(|s| s.as_str()).map(String::from);
-                    meta_started_at = data
-                        .get("startTime")
-                        .and_then(|t| t.as_str())
-                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                        .map(|dt| dt.timestamp_millis());
+                    meta_started_at = rfc3339_ms(data.get("startTime"));
                     directory = data
                         .get("context")
                         .and_then(|c| c.get("cwd"))
@@ -349,9 +337,8 @@ where
     }
 
     let source_id = session_id.unwrap_or_else(|| fallback_id.to_string());
-    let started_at =
-        meta_started_at.or_else(|| messages.first().and_then(|m| m.timestamp)).unwrap_or(0);
-    let updated_at = messages.last().and_then(|m| m.timestamp);
+    let started_at = first_timestamp(meta_started_at, &messages, &[], &[]).unwrap_or(0);
+    let updated_at = last_timestamp(None, &messages, &[], &[]);
 
     let mut session =
         RawSession::search_only(source_id, directory, started_at, updated_at, None, messages);
@@ -411,10 +398,7 @@ fn extract_tool_requests(tool_requests: Option<&Value>) -> String {
 }
 
 fn parse_timestamp(v: &Value) -> Option<i64> {
-    v.get("timestamp")
-        .and_then(|t| t.as_str())
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|dt| dt.timestamp_millis())
+    rfc3339_ms(v.get("timestamp"))
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::json_util::json_i64;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
 use crate::types::{RawUsageEvent, Role, TokenSource};
 
@@ -214,15 +215,6 @@ fn extract_gemini_usage_event(
         parser_version: USAGE_PARSER_VERSION,
         source_path: source_path.map(str::to_string),
         raw_usage_json: Some(tokens.to_string()),
-    })
-}
-
-fn json_i64(value: Option<&Value>) -> Option<i64> {
-    value.and_then(|value| {
-        value
-            .as_i64()
-            .or_else(|| value.as_u64().map(|v| v as i64))
-            .or_else(|| value.as_f64().map(|v| v as i64))
     })
 }
 

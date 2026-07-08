@@ -8,8 +8,10 @@ pub(crate) mod events;
 pub(crate) mod file_scan;
 pub(crate) mod gemini;
 pub(crate) mod grok;
+pub(crate) mod json_util;
 pub(crate) mod kiro;
 pub(crate) mod opencode;
+pub(crate) mod paths;
 pub(crate) mod pi;
 pub(crate) mod sync_state;
 
@@ -108,6 +110,28 @@ pub(crate) struct RawMessage {
     pub(crate) role: Role,
     pub(crate) content: String,
     pub(crate) timestamp: Option<i64>,
+}
+
+pub(crate) fn first_timestamp(
+    meta: Option<i64>,
+    messages: &[RawMessage],
+    usage_events: &[RawUsageEvent],
+    events: &[RawSessionEvent],
+) -> Option<i64> {
+    meta.or_else(|| messages.first().and_then(|message| message.timestamp))
+        .or_else(|| usage_events.first().map(|event| event.timestamp))
+        .or_else(|| events.first().and_then(|event| event.timestamp))
+}
+
+pub(crate) fn last_timestamp(
+    meta: Option<i64>,
+    messages: &[RawMessage],
+    usage_events: &[RawUsageEvent],
+    events: &[RawSessionEvent],
+) -> Option<i64> {
+    meta.or_else(|| messages.last().and_then(|message| message.timestamp))
+        .or_else(|| usage_events.last().map(|event| event.timestamp))
+        .or_else(|| events.last().and_then(|event| event.timestamp))
 }
 
 #[derive(Default)]

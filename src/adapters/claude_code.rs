@@ -9,8 +9,11 @@ use walkdir::WalkDir;
 
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
+use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
+    first_timestamp,
 };
 use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
@@ -92,13 +95,7 @@ fn load_session_indexes(claude_dir: &Path) -> SessionIndexes {
 }
 
 fn resolve_claude_dir() -> anyhow::Result<Option<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    let dir = home.join(".claude");
-    if !dir.exists() {
-        debug!("~/.claude not found, skipping Claude Code");
-        return Ok(None);
-    }
-    Ok(Some(dir))
+    resolve_home_dir(".claude", "~/.claude not found, skipping Claude Code")
 }
 
 fn scan_for_sync_impl(
@@ -302,11 +299,13 @@ fn parse_claude_session_file(
     }
 
     let meta = indexes.live.get(&entry.session_id);
-    let started_at = meta
-        .and_then(|m| m.started_at)
-        .or_else(|| parsed.messages.first().and_then(|m| m.timestamp))
-        .or_else(|| parsed.usage_events.first().map(|event| event.timestamp))
-        .unwrap_or(0);
+    let started_at = first_timestamp(
+        meta.and_then(|m| m.started_at),
+        &parsed.messages,
+        &parsed.usage_events,
+        &[],
+    )
+    .unwrap_or(0);
     let directory =
         meta.and_then(|m| m.cwd.clone()).or_else(|| parsed.cwd.clone()).or(entry.directory);
     let entrypoint = meta.and_then(|m| m.entrypoint.clone());
@@ -364,16 +363,8 @@ fn parse_conversation_jsonl(
     let mut last_ts: Option<i64> = None;
     let source_path = path.to_string_lossy().to_string();
 
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    for item in jsonl_indexed(reader.lines()) {
+        let (line_index, v) = item?;
 
         if cwd.is_none()
             && let Some(c) = v.get("cwd").and_then(|s| s.as_str())
@@ -421,11 +412,7 @@ fn parse_conversation_jsonl(
         };
 
         let text = extract_content(message.get("content"));
-        let timestamp = v
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-            .map(|dt| dt.timestamp_millis());
+        let timestamp = rfc3339_ms(v.get("timestamp"));
 
         let message_seq =
             if !is_machinery && !text.is_empty() { Some(messages.len() as u32) } else { None };

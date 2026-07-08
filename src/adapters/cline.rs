@@ -5,6 +5,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
@@ -67,14 +68,10 @@ fn scan_for_sync_impl(
 }
 
 fn resolve_tasks_dir() -> anyhow::Result<Option<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    let dir = home
-        .join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks");
-    if !dir.exists() {
-        debug!("Cline tasks directory not found, skipping Cline");
-        return Ok(None);
-    }
-    Ok(Some(dir))
+    resolve_home_dir(
+        "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks",
+        "Cline tasks directory not found, skipping Cline",
+    )
 }
 
 fn collect_cline_entries(tasks_dir: &Path) -> Vec<FileScanEntry> {

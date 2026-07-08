@@ -7,6 +7,8 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
+use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
+use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
@@ -102,13 +104,7 @@ struct PendingAgentMessage {
 }
 
 fn resolve_grok_sessions_dir() -> anyhow::Result<Option<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    let dir = home.join(".grok").join("sessions");
-    if !dir.exists() {
-        debug!("~/.grok/sessions not found, skipping Grok");
-        return Ok(None);
-    }
-    Ok(Some(dir))
+    resolve_home_dir(".grok/sessions", "~/.grok/sessions not found, skipping Grok")
 }
 
 fn scan_for_sync_impl(
@@ -332,8 +328,8 @@ fn load_grok_summary(session_dir: &Path, fallback_id: &str) -> anyhow::Result<Gr
         .filter(|model| !model.is_empty())
         .map(str::to_string);
 
-    let started_at = parse_rfc3339_ms(doc.get("created_at")).unwrap_or(0);
-    let updated_at = parse_rfc3339_ms(doc.get("updated_at"));
+    let started_at = rfc3339_ms(doc.get("created_at")).unwrap_or(0);
+    let updated_at = rfc3339_ms(doc.get("updated_at"));
     Ok(GrokSummary { session_id, directory, started_at, updated_at, current_model_id })
 }
 
@@ -352,16 +348,8 @@ fn parse_grok_updates_reader<R: BufRead>(
     let mut prompts: Vec<PromptTokenState> = Vec::new();
     let mut prompt_index: HashMap<String, usize> = HashMap::new();
     let mut last_model: Option<String> = None;
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let Ok(doc) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    for item in jsonl_indexed(reader.lines()) {
+        let (_, doc) = item?;
 
         let params = match doc.get("params") {
             Some(params) => params,
@@ -373,7 +361,7 @@ fn parse_grok_updates_reader<R: BufRead>(
         };
         let session_update =
             update.get("sessionUpdate").and_then(|value| value.as_str()).unwrap_or("");
-        let timestamp_ms = doc.get("timestamp").and_then(json_i64).map(|ts| ts * 1000);
+        let timestamp_ms = json_i64(doc.get("timestamp")).map(|ts| ts * 1000);
         track_prompt_tokens(params, timestamp_ms, &mut prompts, &mut prompt_index, &mut last_model);
 
         match session_update {
@@ -448,7 +436,7 @@ fn track_prompt_tokens(
     else {
         return;
     };
-    let Some(total_tokens) = meta.get("totalTokens").and_then(json_i64) else {
+    let Some(total_tokens) = json_i64(meta.get("totalTokens")) else {
         return;
     };
     let index = match prompt_index.get(prompt_id) {
@@ -512,7 +500,7 @@ fn agent_chunk_key(params: &Value) -> AgentChunkKey {
             .and_then(|prompt| prompt.as_str())
             .filter(|prompt| !prompt.is_empty())
             .map(str::to_string),
-        turn_start_ms: meta.and_then(|meta| meta.get("turnStartMs")).and_then(json_i64),
+        turn_start_ms: json_i64(meta.and_then(|meta| meta.get("turnStartMs"))),
     }
 }
 
@@ -623,18 +611,6 @@ fn format_tool_call_result(update: &Value) -> Option<String> {
         out.push_str(&content);
     }
     Some(out)
-}
-
-fn parse_rfc3339_ms(value: Option<&Value>) -> Option<i64> {
-    let text = value.and_then(|value| value.as_str())?;
-    chrono::DateTime::parse_from_rfc3339(text).ok().map(|dt| dt.timestamp_millis())
-}
-
-fn json_i64(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().map(|value| value as i64))
-        .or_else(|| value.as_f64().map(|value| value as i64))
 }
 
 #[cfg(test)]
