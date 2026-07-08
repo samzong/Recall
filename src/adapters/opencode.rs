@@ -10,7 +10,7 @@ use crate::adapters::{
     SyncScanStats,
 };
 use crate::db::store::Store;
-use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
+use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
 const USAGE_PARSER_VERSION: u32 = 1;
@@ -480,10 +480,6 @@ fn parse_usage_event(
         .unwrap_or("unknown");
 
     Some(RawUsageEvent {
-        event_key: format!("message:{message_id}"),
-        event_seq,
-        message_seq: None,
-        timestamp,
         model: model.to_string(),
         provider: provider.to_string(),
         input_tokens: token_count(tokens, "input"),
@@ -491,9 +487,6 @@ fn parse_usage_event(
         cache_read_tokens: cache_token_count(tokens, "read"),
         cache_write_tokens: cache_token_count(tokens, "write"),
         reasoning_tokens: token_count(tokens, "reasoning"),
-        token_source: TokenSource::Observed,
-        parser_version: USAGE_PARSER_VERSION,
-        source_path: None,
         raw_usage_json: Some(
             serde_json::json!({
                 "providerID": provider,
@@ -502,6 +495,12 @@ fn parse_usage_event(
             })
             .to_string(),
         ),
+        ..RawUsageEvent::observed(
+            format!("message:{message_id}"),
+            event_seq,
+            timestamp,
+            USAGE_PARSER_VERSION,
+        )
     })
 }
 

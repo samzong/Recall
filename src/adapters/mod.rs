@@ -14,6 +14,7 @@ pub(crate) mod opencode;
 pub(crate) mod paths;
 pub(crate) mod pi;
 pub(crate) mod sync_state;
+pub(crate) mod usage;
 
 use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role};

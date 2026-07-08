@@ -9,12 +9,13 @@ use walkdir::WalkDir;
 
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
+use crate::adapters::usage::usage_count;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp,
 };
 use crate::db::store::Store;
-use crate::types::{RawUsageEvent, Role, TokenSource};
+use crate::types::{RawUsageEvent, Role};
 
 pub(crate) struct PiAdapter;
 
@@ -495,10 +496,7 @@ fn extract_pi_usage_event(
         .unwrap_or_else(|| format!("line:{event_seq}"));
 
     Some(RawUsageEvent {
-        event_key,
-        event_seq,
         message_seq,
-        timestamp,
         model,
         provider,
         input_tokens: usage_count(usage, &["input", "inputTokens", "input_tokens"]),
@@ -528,19 +526,14 @@ fn extract_pi_usage_event(
                 "reasoning_output_tokens",
             ],
         ),
-        token_source: TokenSource::Observed,
-        parser_version: USAGE_PARSER_VERSION,
         source_path: Some(source_path.to_string()),
         raw_usage_json: Some(usage.to_string()),
+        ..RawUsageEvent::observed(event_key, event_seq, timestamp, USAGE_PARSER_VERSION)
     })
 }
 
 fn non_empty_str(value: Option<&Value>) -> Option<&str> {
     value.and_then(|value| value.as_str()).filter(|value| !value.trim().is_empty())
-}
-
-fn usage_count(usage: &Value, keys: &[&str]) -> i64 {
-    keys.iter().find_map(|key| json_i64(usage.get(*key))).unwrap_or(0).max(0)
 }
 
 fn extract_content(content: Option<&Value>) -> String {
@@ -831,7 +824,7 @@ mod tests {
         assert_eq!(event.output_tokens, 3);
         assert_eq!(event.cache_read_tokens, 2);
         assert_eq!(event.cache_write_tokens, 1);
-        assert_eq!(event.token_source, TokenSource::Observed);
+        assert_eq!(event.token_source, crate::types::TokenSource::Observed);
         assert_eq!(event.parser_version, USAGE_PARSER_VERSION);
         assert_eq!(event.source_path.as_deref(), Some(path.to_string_lossy().as_ref()));
 

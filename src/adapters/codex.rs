@@ -15,7 +15,7 @@ use crate::adapters::{
     first_timestamp, last_timestamp,
 };
 use crate::db::store::Store;
-use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
+use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 pub(crate) struct CodexAdapter;
 
@@ -778,21 +778,20 @@ fn extract_codex_usage_event(
         .unwrap_or_else(|| "unknown".to_string());
 
     Some(RawUsageEvent {
-        event_key: format!("token_count:{event_seq}"),
-        event_seq,
-        message_seq: None,
-        timestamp,
         model,
         provider: provider.to_string(),
         input_tokens,
         output_tokens,
         cache_read_tokens,
-        cache_write_tokens: 0,
         reasoning_tokens,
-        token_source: TokenSource::Derived,
-        parser_version: USAGE_PARSER_VERSION,
         source_path: Some(source_path.to_string()),
         raw_usage_json: Some(info.to_string()),
+        ..RawUsageEvent::derived(
+            format!("token_count:{event_seq}"),
+            event_seq,
+            timestamp,
+            USAGE_PARSER_VERSION,
+        )
     })
 }
 
@@ -1399,7 +1398,7 @@ mod tests {
         assert_eq!(raw.usage_events[0].cache_read_tokens, 2);
         assert_eq!(raw.usage_events[0].output_tokens, 3);
         assert_eq!(raw.usage_events[0].reasoning_tokens, 1);
-        assert_eq!(raw.usage_events[0].token_source, TokenSource::Derived);
+        assert_eq!(raw.usage_events[0].token_source, crate::types::TokenSource::Derived);
 
         assert_eq!(raw.usage_events[1].input_tokens, 4);
         assert_eq!(raw.usage_events[1].cache_read_tokens, 1);

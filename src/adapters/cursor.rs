@@ -12,12 +12,13 @@ use walkdir::WalkDir;
 use crate::adapters::events;
 use crate::adapters::json_util::json_i64;
 use crate::adapters::paths::resolve_home_dir;
+use crate::adapters::usage::usage_count;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
 };
 use crate::db::store::{EventSessionStateMeta, Store, UsageSessionStateMeta};
-use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
+use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 pub(crate) struct CursorAdapter;
 
@@ -654,31 +655,27 @@ fn extract_bubble_usage_event(
     composer_data: &Value,
 ) -> Option<RawUsageEvent> {
     let token_count = bubble.get("tokenCount")?;
-    let input_tokens =
-        token_count.get("inputTokens").and_then(|value| json_i64(Some(value))).unwrap_or(0).max(0);
-    let output_tokens =
-        token_count.get("outputTokens").and_then(|value| json_i64(Some(value))).unwrap_or(0).max(0);
+    let input_tokens = usage_count(token_count, &["inputTokens"]);
+    let output_tokens = usage_count(token_count, &["outputTokens"]);
     if input_tokens == 0 && output_tokens == 0 {
         return None;
     }
 
     let model = model_from_composer(composer_data);
     Some(RawUsageEvent {
-        event_key: format!("bubble:{bubble_id}"),
-        event_seq,
         message_seq: Some(event_seq),
-        timestamp,
         model: model.clone(),
         provider: infer_cursor_provider(&model),
         input_tokens,
         output_tokens,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        reasoning_tokens: 0,
-        token_source: TokenSource::Observed,
-        parser_version: USAGE_PARSER_VERSION,
         source_path: Some(format!("composer:{composer_id}")),
         raw_usage_json: Some(token_count.to_string()),
+        ..RawUsageEvent::observed(
+            format!("bubble:{bubble_id}"),
+            event_seq,
+            timestamp,
+            USAGE_PARSER_VERSION,
+        )
     })
 }
 
@@ -745,21 +742,18 @@ fn build_session_usage_event(
         .or_else(|| json_i64(composer_data.get("lastUpdatedAt")))
         .unwrap_or(0);
     RawUsageEvent {
-        event_key: "session:prompt-token-breakdown".to_string(),
-        event_seq: 0,
-        message_seq: None,
-        timestamp,
         model: model.clone(),
         provider: infer_cursor_provider(&model),
         input_tokens,
-        output_tokens: 0,
         cache_read_tokens,
-        cache_write_tokens: 0,
-        reasoning_tokens: 0,
-        token_source: TokenSource::Derived,
-        parser_version: USAGE_PARSER_VERSION,
         source_path: Some(format!("composer:{composer_id}")),
         raw_usage_json: if breakdown.is_null() { None } else { Some(breakdown.to_string()) },
+        ..RawUsageEvent::derived(
+            "session:prompt-token-breakdown".to_string(),
+            0,
+            timestamp,
+            USAGE_PARSER_VERSION,
+        )
     }
 }
 

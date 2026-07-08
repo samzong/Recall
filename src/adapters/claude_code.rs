@@ -16,7 +16,7 @@ use crate::adapters::{
     first_timestamp,
 };
 use crate::db::store::Store;
-use crate::types::{RawSessionEvent, RawUsageEvent, Role, TokenSource};
+use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 pub(crate) struct ClaudeCodeAdapter;
 
@@ -557,21 +557,16 @@ fn extract_claude_usage_event(
     };
 
     Some(RawUsageEvent {
-        event_key,
-        event_seq,
         message_seq,
-        timestamp,
         model: model.to_string(),
         provider: "anthropic".to_string(),
         input_tokens,
         output_tokens,
         cache_read_tokens,
         cache_write_tokens,
-        reasoning_tokens: 0,
-        token_source: TokenSource::Observed,
-        parser_version: USAGE_PARSER_VERSION,
         source_path: Some(source_path.to_string()),
         raw_usage_json: Some(usage.to_string()),
+        ..RawUsageEvent::observed(event_key, event_seq, timestamp, USAGE_PARSER_VERSION)
     })
 }
 
@@ -1015,7 +1010,7 @@ mod tests {
         assert_eq!(event.output_tokens, 30);
         assert_eq!(event.cache_read_tokens, 50);
         assert_eq!(event.cache_write_tokens, 5);
-        assert_eq!(event.token_source, TokenSource::Observed);
+        assert_eq!(event.token_source, crate::types::TokenSource::Observed);
 
         let _ = fs::remove_dir_all(&root);
     }

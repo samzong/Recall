@@ -13,7 +13,7 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
 use crate::db::store::Store;
-use crate::types::{RawUsageEvent, Role, TokenSource};
+use crate::types::{RawUsageEvent, Role};
 
 const USAGE_PARSER_VERSION: u32 = 1;
 
@@ -472,21 +472,16 @@ fn prompt_usage_events(prompts: Vec<PromptTokenState>) -> Vec<RawUsageEvent> {
             continue;
         }
         events.push(RawUsageEvent {
-            event_key: format!("prompt:{}", prompt.prompt_id),
-            event_seq: events.len() as u32,
-            message_seq: None,
-            timestamp: prompt.timestamp.unwrap_or_default(),
             model: prompt.model.unwrap_or_default(),
             provider: "xai".to_string(),
             input_tokens: delta,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            reasoning_tokens: 0,
-            token_source: TokenSource::Derived,
-            parser_version: USAGE_PARSER_VERSION,
-            source_path: None,
             raw_usage_json: Some(format!("{{\"totalTokens\":{}}}", prompt.peak_total_tokens)),
+            ..RawUsageEvent::derived(
+                format!("prompt:{}", prompt.prompt_id),
+                events.len() as u32,
+                prompt.timestamp.unwrap_or_default(),
+                USAGE_PARSER_VERSION,
+            )
         });
     }
     events

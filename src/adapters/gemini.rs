@@ -6,9 +6,9 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
-use crate::adapters::json_util::json_i64;
+use crate::adapters::usage::usage_count;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
-use crate::types::{RawUsageEvent, Role, TokenSource};
+use crate::types::{RawUsageEvent, Role};
 
 pub(crate) struct GeminiAdapter;
 
@@ -180,10 +180,10 @@ fn extract_gemini_usage_event(
     source_path: Option<&str>,
 ) -> Option<RawUsageEvent> {
     let tokens = msg.get("tokens")?;
-    let input_tokens = json_i64(tokens.get("input")).unwrap_or(0).max(0);
-    let output_tokens = json_i64(tokens.get("output")).unwrap_or(0).max(0);
-    let cache_read_tokens = json_i64(tokens.get("cached")).unwrap_or(0).max(0);
-    let reasoning_tokens = json_i64(tokens.get("thoughts")).unwrap_or(0).max(0);
+    let input_tokens = usage_count(tokens, &["input"]);
+    let output_tokens = usage_count(tokens, &["output"]);
+    let cache_read_tokens = usage_count(tokens, &["cached"]);
+    let reasoning_tokens = usage_count(tokens, &["thoughts"]);
     if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 && reasoning_tokens == 0 {
         return None;
     }
@@ -200,21 +200,16 @@ fn extract_gemini_usage_event(
         .unwrap_or_else(|| format!("line:{event_seq}"));
 
     Some(RawUsageEvent {
-        event_key,
-        event_seq,
         message_seq: Some(message_seq),
-        timestamp,
         model: model.clone(),
         provider: "google".to_string(),
         input_tokens,
         output_tokens,
         cache_read_tokens,
-        cache_write_tokens: 0,
         reasoning_tokens,
-        token_source: TokenSource::Observed,
-        parser_version: USAGE_PARSER_VERSION,
         source_path: source_path.map(str::to_string),
         raw_usage_json: Some(tokens.to_string()),
+        ..RawUsageEvent::observed(event_key, event_seq, timestamp, USAGE_PARSER_VERSION)
     })
 }
 
@@ -287,6 +282,6 @@ mod tests {
         assert_eq!(event.output_tokens, 20);
         assert_eq!(event.cache_read_tokens, 30);
         assert_eq!(event.reasoning_tokens, 5);
-        assert_eq!(event.token_source, TokenSource::Observed);
+        assert_eq!(event.token_source, crate::types::TokenSource::Observed);
     }
 }
