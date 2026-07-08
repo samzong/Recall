@@ -6,3 +6,4 @@
 
 # Official Recall extensions.
 /extensions/recall-probe/ @samzong
+/extensions/recall-reflect/ @samzong @zhexulong
