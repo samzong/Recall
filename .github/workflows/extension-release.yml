@@ -44,7 +44,6 @@ jobs:
           import os
           import pathlib
           import subprocess
-          import sys
           import tomllib
 
           def run(args, **kwargs):
@@ -121,7 +120,6 @@ jobs:
                   "version": manifest.get("version") == version,
                   "protocol": isinstance(manifest.get("protocol"), int),
                   "min_recall": isinstance(manifest.get("min_recall"), str),
-                  "commands": isinstance(manifest.get("commands"), list),
               }
               for field, ok in checks.items():
                   if not ok:
@@ -226,7 +224,6 @@ jobs:
           {
             echo "PACKAGE=$package"
             echo "VERSION=$version"
-            echo "RELEASE_TAG=$tag"
           } >> "$GITHUB_ENV"
       - name: Validate tag
         shell: bash
@@ -278,7 +275,6 @@ jobs:
           merge-multiple: true
       - name: Create release
         env:
-          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ inputs.tag }}"
@@ -381,7 +377,6 @@ jobs:
           entry = catalog.setdefault("extensions", {}).setdefault(extension, {})
           entry["description"] = description
           entry.setdefault("versions", {})[version] = {
-              "commands": manifest["commands"],
               "min_recall": manifest["min_recall"],
               "protocol": manifest["protocol"],
               "targets": targets,

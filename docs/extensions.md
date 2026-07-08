@@ -1,15 +1,12 @@
 # Recall Extensions Design
 
-Status: long-lived design draft. Feature migration notes live in
-`docs/extension-migrations.md`.
+Status: v0.1 implemented design and long-lived architecture reference.
 
 ## Goal
 
 Keep Recall core small and stable: a local session index plus a stable query
 surface. As product features grow, workflow, report, publish, and UI surfaces
 should evolve as optional, independently shippable official extensions.
-Third-party distribution is a future option, not part of the first managed
-surface.
 
 ## Problem
 
@@ -56,8 +53,6 @@ Core owns:
 - source adapters, sync, import, storage, and schema migrations;
 - full-text search and semantic search;
 - session identity and repo/project resolution;
-- minimal session operations: list, show, export, resume, open;
-- machine-readable output for those operations: `--format json|jsonl`;
 - the extension host: official catalog discovery, managed install, dispatch,
   list, remove, and upgrade;
 - bundled Agent Skill install.
@@ -111,7 +106,7 @@ recall session show --id <id> --format json --include metadata,messages,usage,ev
 recall export --project /repo
 ```
 
-Current core support:
+Core support in v0.1:
 
 - `recall info --format json` exposes `protocol_version`, database schema
   version, and export record schema version;
@@ -163,9 +158,9 @@ of letting each command invent its own shape:
 High-frequency consumers such as live search web UIs pay a process-spawn cost
 per query. Semantic search may also need a resident embedding model. If that
 need becomes real, core should add a long-lived serve mode that speaks the same
-JSON protocol. It should not open SQLite direct access or expose Rust internals.
+JSON protocol.
 
-This is a later concern, not a first-stage requirement.
+This is a later concern, not a v0.1 requirement.
 
 ## Extension Model
 
@@ -180,7 +175,7 @@ This is a later concern, not a first-stage requirement.
 
 ## Manifest
 
-`recall extension list` needs extension metadata. Each extension must support:
+Managed install validates extension metadata. Each extension must support:
 
 ```bash
 recall-<name> --recall-extension-manifest
@@ -193,12 +188,17 @@ stdout returns JSON:
   "name": "reflect",
   "version": "0.1.0",
   "protocol": 1,
-  "min_recall": "0.2.10",
-  "commands": ["reflect"]
+  "min_recall": "0.2.10"
 }
 ```
 
-Descriptions are catalog display metadata, not manifest contract.
+Manifest fields are identity and compatibility metadata. Descriptions are
+catalog display metadata, not manifest contract.
+The command name is the extension name: `recall reflect` dispatches to
+`recall-reflect`.
+Extensions that still advertise `min_recall` 0.2.10 may emit a legacy
+`commands` field for host compatibility; it is not part of the current
+manifest contract.
 
 Do not add `capabilities` or `permissions` fields for native binaries. Recall
 cannot enforce them, so they would be security theater. Permission semantics
@@ -206,7 +206,7 @@ only become meaningful in a sandboxed runtime such as WASM.
 
 ## Official Extension Distribution
 
-Official extensions can live in this repository as workspace binary crates:
+Official extensions live in this repository as workspace binary crates:
 
 ```text
 extensions/recall-probe/
@@ -218,27 +218,18 @@ Each official extension owns its own Cargo package version. Recall core releases
 and official extension releases are related by protocol compatibility, not by a
 shared version number.
 
-`extensions/recall-probe/` is the official no-business-logic extension host
-probe. It exists to show the required crate layout, binary naming, manifest
-output, and `recall <name>` dispatch behavior.
-
-Local verification:
-
-```bash
-cargo build -p recall-probe
-cargo run -- ext list --available
-cargo run -- ext install probe
-cargo run -- probe
-```
+v0.1 includes `extensions/recall-probe/`, the official no-business-logic
+extension host probe. It verifies the required crate layout, binary naming,
+manifest output, managed install, and `recall <name>` dispatch behavior.
 
 ### Versioning
 
 Use independent extension tags:
 
 ```text
-v0.2.11                    # Recall core release
-recall-probe-v0.1.1        # recall-probe release
-recall-reflect-v0.3.0      # recall-reflect release
+v<core-version>               # Recall core release
+recall-probe-v<version>       # recall-probe release
+recall-reflect-v<version>     # recall-reflect release
 ```
 
 An extension update should not require a Recall core tag unless it needs a new
@@ -267,17 +258,15 @@ Official extension release workflow:
    ```
 
 6. The release job uploads binaries and `checksums.txt` to the GitHub Release.
-7. The catalog job updates `website/public/extensions/catalog.json` with the
-   real release URLs and SHA-256 checksums, then commits the generated catalog
-   back to `main`.
+7. The catalog job publishes the generated catalog entry.
 
 Asset names:
 
 ```text
-recall-probe-v0.1.1-aarch64-apple-darwin.tar.gz
-recall-probe-v0.1.1-x86_64-apple-darwin.tar.gz
-recall-probe-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
-recall-probe-v0.1.1-x86_64-pc-windows-msvc.zip
+recall-<name>-v<version>-aarch64-apple-darwin.tar.gz
+recall-<name>-v<version>-x86_64-apple-darwin.tar.gz
+recall-<name>-v<version>-x86_64-unknown-linux-gnu.tar.gz
+recall-<name>-v<version>-x86_64-pc-windows-msvc.zip
 ```
 
 ```mermaid
@@ -286,10 +275,10 @@ flowchart TD
   Version -- no --> MergeOnly["merge only<br/>no extension release"]
   Version -- yes --> Check["PR check<br/>version increased<br/>tag absent<br/>manifest valid"]
   Check --> Merge["merge to main"]
-  Merge --> Tag["workflow creates<br/>recall-probe-v0.1.1"]
+  Merge --> Tag["workflow creates<br/>recall-NAME-vVERSION"]
   Tag --> Build["build target archives"]
   Build --> Release["GitHub Release assets<br/>checksums.txt"]
-  Release --> Catalog["bot commit<br/>website/public/extensions/catalog.json"]
+  Release --> Catalog["publish catalog entry"]
   Catalog --> Pages["GitHub Pages<br/>latest catalog"]
   Pages --> Install["recall ext install / upgrade"]
 ```
@@ -303,11 +292,11 @@ website/public/extensions/catalog.json
 https://samzong.github.io/Recall/extensions/catalog.json
 ```
 
-When implemented, `recall ext install` and `recall ext upgrade` read the latest
-catalog from GitHub Pages. They do not depend on the catalog embedded in the
-user's current Recall binary. A release may also attach a snapshot catalog as a
-GitHub Release asset for audit and reproduction, but the live install source is
-the Pages catalog.
+`recall ext install` and `recall ext upgrade` read the latest catalog from
+GitHub Pages. They do not depend on the catalog embedded in the user's current
+Recall binary. A release may also attach a snapshot catalog as a GitHub Release
+asset for audit and reproduction, but the live install source is the Pages
+catalog.
 
 `website/public/extensions/catalog.json` is generated release state. Humans do
 not hand-edit version entries. The extension release workflow writes them after
@@ -323,12 +312,12 @@ Catalog shape:
     "probe": {
       "description": "Extension host probe",
       "versions": {
-        "0.1.1": {
+        "0.1.0": {
           "protocol": 1,
           "min_recall": "0.2.10",
           "targets": {
             "aarch64-apple-darwin": {
-              "url": "https://github.com/samzong/Recall/releases/download/recall-probe-v0.1.1/recall-probe-v0.1.1-aarch64-apple-darwin.tar.gz",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-probe-v0.1.0/recall-probe-v0.1.0-aarch64-apple-darwin.tar.gz",
               "sha256": "<hex>"
             }
           }
@@ -348,16 +337,35 @@ Recall does not scan PATH for `recall-*` binaries.
 <data_dir>/recall/extensions/
   installed.json
   bin/
-    recall-probe
+    recall-<name>
   packages/
-    probe/
-      0.1.1/
-        recall-probe
+    <name>/
+      <version>/
+        recall-<name>
         manifest.json
 ```
 
 `<data_dir>` follows the same `dirs::data_dir()` convention as
 `<data_dir>/recall/recall.db`.
+
+`installed.json` is local host state, not a copy of the manifest or catalog. It
+stores only the installed version and the offline help description:
+
+```json
+{
+  "schema": 1,
+  "extensions": {
+    "probe": {
+      "version": "0.1.0",
+      "description": "Official Recall extension host probe"
+    }
+  }
+}
+```
+
+Compatibility metadata such as `protocol` and `min_recall` stays in the
+manifest and catalog. The installed package keeps `manifest.json` for audit or
+future compatibility checks, but `installed.json` should not duplicate it.
 
 Dispatch order:
 
@@ -367,12 +375,12 @@ Dispatch order:
 
 ```mermaid
 flowchart TD
-  Command["recall probe"] --> Core{"core command?"}
+  Command["recall NAME"] --> Core{"core command?"}
   Core -- yes --> CoreRun["run core command"]
   Core -- no --> Managed{"managed extension?"}
-  Managed -- yes --> ManagedBin["extensions/bin/recall-probe"]
+  Managed -- yes --> ManagedBin["extensions/bin/recall-NAME"]
   Managed -- no --> Error["unknown command"]
-  ManagedBin --> Package["packages/probe/0.1.1/recall-probe"]
+  ManagedBin --> Package["packages/NAME/VERSION/recall-NAME"]
 ```
 
 ### Install, Upgrade, Remove
@@ -381,13 +389,13 @@ Install:
 
 ```mermaid
 flowchart LR
-  Start["recall ext install probe"] --> CatalogFetch["fetch catalog"]
+  Start["recall ext install NAME"] --> CatalogFetch["fetch catalog"]
   CatalogFetch --> Select["select newest compatible version + target"]
   Select --> Download["download archive"]
   Download --> Checksum["verify sha256"]
   Checksum --> Unpack["unpack to temp dir"]
   Unpack --> Manifest["validate manifest"]
-  Manifest --> Move["move into packages/probe/<version>"]
+  Manifest --> Move["move into packages/NAME/VERSION"]
   Move --> Link["switch bin entry"]
   Link --> State["update installed.json"]
 ```
@@ -401,19 +409,19 @@ description. `recall ext list --available` shows official catalog entries and
 the newest compatible version for the current platform and Recall protocol.
 
 Root help (`recall --help` or `recall help`) shows installed official
-extensions between `Commands` and `Options` using command plus the
+extensions between `Commands` and `Options` using the extension name plus the
 catalog description stored in local `installed.json`. It does not fetch the
 catalog at help-render time.
 
 ### Third-Party Extensions
 
-Third-party extension execution is not part of the first managed install
+Third-party extension execution is not part of the v0.1 managed install
 surface. Third-party code can still use Recall's stable CLI protocol directly,
 but Recall does not install, list, or dispatch third-party extensions.
 
-Do not add an open registry yet. The official catalog is enough for first-party
-binary management. Third-party distribution can be designed later if there is
-real demand.
+Do not add an open registry yet. The official catalog is enough for v0.1 binary
+management. Third-party distribution can be designed later if there is real
+demand.
 
 ## Non-Goals
 
@@ -421,5 +429,4 @@ real demand.
 - in-process plugin API;
 - WASM runtime;
 - plugin marketplace;
-- direct SQLite reads or writes by extensions;
 - a published `recall-core` library crate.

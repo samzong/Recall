@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const CATALOG_URL: &str = "https://samzong.github.io/Recall/extensions/catalog.json";
+const EMPTY_INSTALLED_HELP: &str = "\nExtensions:\n  none\n";
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ExtensionManifest {
     name: String,
     version: String,
     protocol: u32,
     min_recall: String,
-    commands: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,12 +34,10 @@ struct CatalogExtension {
     versions: BTreeMap<String, CatalogVersion>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct CatalogVersion {
     protocol: u32,
     min_recall: String,
-    #[serde(default)]
-    commands: Vec<String>,
     targets: BTreeMap<String, CatalogTarget>,
 }
 
@@ -53,25 +51,20 @@ struct CatalogTarget {
 struct SelectedExtension {
     version: String,
     description: String,
-    info: CatalogVersion,
+    protocol: u32,
+    min_recall: String,
     target: CatalogTarget,
-    target_triple: String,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct InstalledState {
     schema: u32,
     extensions: BTreeMap<String, InstalledExtension>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct InstalledExtension {
     version: String,
-    target: String,
-    protocol: u32,
-    min_recall: String,
-    commands: Vec<String>,
-    binary: String,
     #[serde(default)]
     description: String,
 }
@@ -142,32 +135,24 @@ pub(crate) fn run_external(args: Vec<OsString>) -> Result<ExitStatus> {
 
 pub(crate) fn installed_help() -> String {
     let Ok(root) = extension_root() else {
-        return empty_installed_help();
+        return EMPTY_INSTALLED_HELP.to_string();
     };
     let Ok(state) = load_installed_state(&root) else {
-        return empty_installed_help();
+        return EMPTY_INSTALLED_HELP.to_string();
     };
     format_installed_help(state)
 }
 
-fn empty_installed_help() -> String {
-    "\nExtensions:\n  none\n".to_string()
-}
-
 fn format_installed_help(state: InstalledState) -> String {
-    let mut out = String::from("\nExtensions:\n");
     if state.extensions.is_empty() {
-        out.push_str("  none\n");
-        return out;
+        return EMPTY_INSTALLED_HELP.to_string();
     }
+    let mut out = String::from("\nExtensions:\n");
     for (name, extension) in state.extensions {
-        let commands = if extension.commands.is_empty() { vec![name] } else { extension.commands };
-        for command in commands {
-            if extension.description.is_empty() {
-                out.push_str(&format!("  {command}\n"));
-            } else {
-                out.push_str(&format!("  {command:<12} {}\n", extension.description));
-            }
+        if extension.description.is_empty() {
+            out.push_str(&format!("  {name}\n"));
+        } else {
+            out.push_str(&format!("  {name:<12} {}\n", extension.description));
         }
     }
     out
@@ -253,8 +238,8 @@ fn install_selected(root: &Path, name: &str, selected: &SelectedExtension) -> Re
 
     let binary_name = binary_name(name);
     let unpacked_binary = find_unpacked_binary(temp.path(), &binary_name)?;
-    let manifest = read_manifest(name, &unpacked_binary)?;
-    validate_manifest(name, &selected.version, &selected.info, &manifest)?;
+    let manifest = read_manifest(&unpacked_binary)?;
+    validate_manifest(name, &selected.version, selected.protocol, &selected.min_recall, &manifest)?;
 
     let package_dir = root.join("packages").join(name).join(&selected.version);
     remove_dir_if_exists(&package_dir)?;
@@ -275,11 +260,6 @@ fn install_selected(root: &Path, name: &str, selected: &SelectedExtension) -> Re
         name.to_string(),
         InstalledExtension {
             version: selected.version.clone(),
-            target: selected.target_triple.clone(),
-            protocol: manifest.protocol,
-            min_recall: manifest.min_recall,
-            commands: manifest.commands,
-            binary: binary_name,
             description: selected.description.clone(),
         },
     );
@@ -341,9 +321,9 @@ fn select_latest_from_extension(
         let candidate = SelectedExtension {
             version: version.clone(),
             description: extension.description.clone(),
-            info: info.clone(),
+            protocol: info.protocol,
+            min_recall: info.min_recall.clone(),
             target: target.clone(),
-            target_triple: target_triple.clone(),
         };
         if selected.as_ref().is_none_or(|(selected_key, _)| key > *selected_key) {
             selected = Some((key, candidate));
@@ -358,7 +338,8 @@ fn select_latest_from_extension(
 fn validate_manifest(
     name: &str,
     version: &str,
-    catalog: &CatalogVersion,
+    protocol: u32,
+    min_recall: &str,
     manifest: &ExtensionManifest,
 ) -> Result<()> {
     if manifest.name != name {
@@ -367,22 +348,19 @@ fn validate_manifest(
     if manifest.version != version {
         bail!("manifest version '{}' does not match catalog version '{version}'", manifest.version);
     }
-    if manifest.protocol != catalog.protocol {
+    if manifest.protocol != protocol {
         bail!(
             "manifest protocol {} does not match catalog protocol {}",
             manifest.protocol,
-            catalog.protocol
+            protocol
         );
     }
-    if manifest.min_recall != catalog.min_recall {
+    if manifest.min_recall != min_recall {
         bail!(
             "manifest min_recall '{}' does not match catalog min_recall '{}'",
             manifest.min_recall,
-            catalog.min_recall
+            min_recall
         );
-    }
-    if !catalog.commands.is_empty() && manifest.commands != catalog.commands {
-        bail!("manifest commands do not match catalog commands");
     }
     Ok(())
 }
@@ -412,7 +390,7 @@ fn save_installed_state(root: &Path, state: &InstalledState) -> Result<()> {
     Ok(())
 }
 
-fn read_manifest(name: &str, path: &Path) -> Result<ExtensionManifest> {
+fn read_manifest(path: &Path) -> Result<ExtensionManifest> {
     let output = Command::new(path)
         .arg("--recall-extension-manifest")
         .output()
@@ -422,9 +400,6 @@ fn read_manifest(name: &str, path: &Path) -> Result<ExtensionManifest> {
     }
     let manifest: ExtensionManifest =
         serde_json::from_slice(&output.stdout).context("invalid extension manifest JSON")?;
-    if manifest.name != name {
-        bail!("manifest name '{}' does not match executable name '{}'", manifest.name, name);
-    }
     Ok(manifest)
 }
 
@@ -609,11 +584,6 @@ printf "%s" "$1" > "$2"
             "probe".to_string(),
             InstalledExtension {
                 version: "0.1.0".to_string(),
-                target: "x86_64-unknown-linux-gnu".to_string(),
-                protocol: 1,
-                min_recall: "0.2.10".to_string(),
-                commands: vec!["probe".to_string()],
-                binary: "recall-probe".to_string(),
                 description: "Probe extension".to_string(),
             },
         );
@@ -622,7 +592,37 @@ printf "%s" "$1" > "$2"
         let loaded = load_installed_state(&root).unwrap();
 
         assert_eq!(loaded.extensions["probe"].version, "0.1.0");
-        assert_eq!(loaded.extensions["probe"].commands, ["probe"]);
+        assert_eq!(loaded.extensions["probe"].description, "Probe extension");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installed_state_ignores_removed_metadata_fields() {
+        let root = temp_dir("state-old-fields");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("installed.json"),
+            r#"{
+  "schema": 1,
+  "extensions": {
+    "probe": {
+      "version": "0.1.0",
+      "target": "x86_64-unknown-linux-gnu",
+      "protocol": 1,
+      "min_recall": "0.2.10",
+      "commands": ["probe"],
+      "binary": "recall-probe",
+      "description": "Probe extension"
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_installed_state(&root).unwrap();
+
+        assert_eq!(loaded.extensions["probe"].version, "0.1.0");
         assert_eq!(loaded.extensions["probe"].description, "Probe extension");
         fs::remove_dir_all(root).unwrap();
     }
@@ -632,15 +632,7 @@ printf "%s" "$1" > "$2"
         let mut state = InstalledState { schema: 1, extensions: BTreeMap::new() };
         state.extensions.insert(
             "probe".to_string(),
-            InstalledExtension {
-                version: "0.1.0".to_string(),
-                target: "x86_64-unknown-linux-gnu".to_string(),
-                protocol: 1,
-                min_recall: "0.2.10".to_string(),
-                commands: vec!["probe".to_string()],
-                binary: "recall-probe".to_string(),
-                description: String::new(),
-            },
+            InstalledExtension { version: "0.1.0".to_string(), description: String::new() },
         );
 
         let help = format_installed_help(state);
@@ -652,17 +644,11 @@ printf "%s" "$1" > "$2"
     #[test]
     fn catalog_description_is_not_part_of_manifest_validation() {
         let manifest: ExtensionManifest = serde_json::from_str(
-            r#"{"name":"probe","version":"0.1.0","protocol":1,"min_recall":"0.2.10","commands":["probe"]}"#,
+            r#"{"name":"probe","version":"0.1.0","protocol":1,"min_recall":"0.2.10"}"#,
         )
         .unwrap();
-        let catalog = CatalogVersion {
-            protocol: 1,
-            min_recall: "0.2.10".to_string(),
-            commands: vec!["probe".to_string()],
-            targets: BTreeMap::new(),
-        };
 
-        validate_manifest("probe", "0.1.0", &catalog, &manifest).unwrap();
+        validate_manifest("probe", "0.1.0", 1, "0.2.10", &manifest).unwrap();
     }
 
     #[test]
@@ -703,12 +689,7 @@ printf "%s" "$1" > "$2"
                 sha256: "00".repeat(32),
             },
         );
-        CatalogVersion {
-            protocol,
-            min_recall: min_recall.to_string(),
-            commands: vec!["probe".to_string()],
-            targets,
-        }
+        CatalogVersion { protocol, min_recall: min_recall.to_string(), targets }
     }
 
     fn temp_dir(label: &str) -> PathBuf {

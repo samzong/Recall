@@ -4,9 +4,6 @@
       "description": "Official Recall extension host probe",
       "versions": {
         "0.1.0": {
-          "commands": [
-            "probe"
-          ],
           "min_recall": "0.2.10",
           "protocol": 1,
           "targets": {
