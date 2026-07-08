@@ -1,0 +1,8 @@
+# Default repository owner.
+* @samzong
+
+# Ownership config.
+/.github/CODEOWNERS @samzong
+
+# Official Recall extensions.
+/extensions/recall-probe/ @samzong
