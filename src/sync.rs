@@ -80,79 +80,194 @@ enum ExistingSessionAction {
     RefreshSession,
 }
 
+#[derive(Default)]
+struct SyncStats {
+    new_sessions: u32,
+    updated_sessions: u32,
+    reprocessed_sessions: u32,
+    total_messages: u32,
+    skipped: u32,
+    filtered_out: u32,
+    excluded_out: u32,
+}
+
+impl SyncStats {
+    fn touched(&self) -> u32 {
+        self.new_sessions + self.updated_sessions + self.reprocessed_sessions
+    }
+}
+
+struct ExistingState {
+    meta: HashMap<String, (Option<i64>, u32)>,
+    paths: HashMap<String, SessionPath>,
+    imported_ids: HashSet<String>,
+    usage_meta: HashMap<String, UsageSessionStateMeta>,
+    event_meta: HashMap<String, EventSessionStateMeta>,
+}
+
+impl ExistingState {
+    fn remove(&mut self, source_id: &str) -> bool {
+        if self.meta.remove(source_id).is_some() {
+            self.paths.remove(source_id);
+            self.usage_meta.remove(source_id);
+            self.event_meta.remove(source_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_replaced(
+        &mut self,
+        session: &Session,
+        usage_parser_version: Option<u32>,
+        event_parser_version: Option<u32>,
+    ) {
+        self.meta.insert(session.source_id.clone(), (session.updated_at, session.message_count));
+        self.paths.insert(
+            session.source_id.clone(),
+            SessionPath {
+                source_id: session.source_id.clone(),
+                directory: session.directory.clone(),
+                source_file_path: session.source_file_path.clone(),
+                repo_remote: session.repo_remote.clone(),
+                repo_slug: session.repo_slug.clone(),
+                repo_name: session.repo_name.clone(),
+            },
+        );
+        if let Some(parser_version) = usage_parser_version {
+            self.usage_meta.insert(
+                session.source_id.clone(),
+                UsageSessionStateMeta { parser_version, source_updated_at: session.updated_at },
+            );
+        }
+        if let Some(parser_version) = event_parser_version {
+            self.event_meta.insert(
+                session.source_id.clone(),
+                EventSessionStateMeta { parser_version, source_updated_at: session.updated_at },
+            );
+        }
+    }
+}
+
 pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
-    let store = Store::open()?;
-    let all = adapters::all_adapters();
-    let labels = adapters::source_labels();
-    let mut config = AppConfig::load_or_default();
-    config.normalize_sources(&labels);
-    let since_ts = if options.usage_only { None } else { config.sync_window.to_since_cutoff() };
-    let path_excluder = config.build_path_excluder()?;
-    let mut repo_cache = RepoIdentityCache::default();
+    SyncJob::new(options)?.run()
+}
 
-    let mut new_sessions = 0u32;
-    let mut updated_sessions = 0u32;
-    let mut reprocessed_sessions = 0u32;
-    let mut total_messages = 0u32;
-    let mut skipped = 0u32;
-    let mut filtered_out = 0u32;
-    let mut excluded_out = 0u32;
+struct SyncJob {
+    store: Store,
+    options: SyncRunOptions,
+    config: AppConfig,
+    labels: Vec<(String, String)>,
+    since_ts: Option<i64>,
+    path_excluder: Option<globset::GlobSet>,
+    repo_cache: RepoIdentityCache,
+    stats: SyncStats,
+}
 
-    for adapter in &all {
+impl SyncJob {
+    fn new(options: SyncRunOptions) -> Result<Self> {
+        let store = Store::open()?;
+        let labels = adapters::source_labels();
+        let mut config = AppConfig::load_or_default();
+        config.normalize_sources(&labels);
+        let since_ts = if options.usage_only { None } else { config.sync_window.to_since_cutoff() };
+        let path_excluder = config.build_path_excluder()?;
+        Ok(Self {
+            store,
+            options,
+            config,
+            labels,
+            since_ts,
+            path_excluder,
+            repo_cache: RepoIdentityCache::default(),
+            stats: SyncStats::default(),
+        })
+    }
+
+    fn run(&mut self) -> Result<()> {
+        let all = adapters::all_adapters();
+        for adapter in &all {
+            self.sync_adapter(adapter.as_ref())?;
+        }
+        self.report_progress()
+    }
+
+    fn sync_adapter(&mut self, adapter: &dyn adapters::SourceAdapter) -> Result<()> {
         let source_id = adapter.id();
         let label = adapter.label();
 
-        if options.usage_only
-            && !adapters::adapter_supports_usage_dashboard(
-                adapter.as_ref(),
-                options.backfill_events,
-            )
+        if self.options.usage_only
+            && !adapters::adapter_supports_usage_dashboard(adapter, self.options.backfill_events)
         {
-            continue;
+            return Ok(());
         }
 
-        if let Some(sources) = &options.sources
+        if let Some(sources) = &self.options.sources
             && !sources.iter().any(|id| id == source_id)
         {
-            continue;
+            return Ok(());
         }
 
-        if !config.is_source_enabled(source_id) {
-            if options.verbose {
+        if !self.config.is_source_enabled(source_id) {
+            if self.options.verbose {
                 println!("Skipping {label} (filtered)");
             }
-            continue;
+            return Ok(());
         }
 
         let mut purged_excluded_ids = HashSet::new();
-        if let Some(matcher) = &path_excluder {
-            excluded_out += delete_excluded_sessions_for_source(
-                &store,
+        if let Some(matcher) = &self.path_excluder {
+            let n = delete_excluded_sessions_for_source(
+                &self.store,
                 source_id,
                 matcher,
                 &mut purged_excluded_ids,
             )?;
+            self.stats.excluded_out += n;
         }
 
-        if options.verbose {
+        let Some(raw_sessions) =
+            self.scan_sessions(adapter, source_id, label, &mut purged_excluded_ids)?
+        else {
+            return Ok(());
+        };
+
+        let mut existing = self.load_existing_state(source_id)?;
+        for raw in raw_sessions {
+            self.process_raw_session(source_id, raw, &mut existing, &mut purged_excluded_ids)?;
+        }
+
+        info!("{label} done");
+        Ok(())
+    }
+
+    fn scan_sessions(
+        &mut self,
+        adapter: &dyn adapters::SourceAdapter,
+        source_id: &str,
+        label: &str,
+        purged_excluded_ids: &mut HashSet<String>,
+    ) -> Result<Option<Vec<adapters::RawSession>>> {
+        if self.options.verbose {
             println!("Scanning {label}...");
         }
-        if let Err(e) = adapter.prune(&store)
-            && options.emit
+        if let Err(e) = adapter.prune(&self.store)
+            && self.options.emit
         {
             eprintln!("Error pruning {label}: {e}");
         }
-        let include_events = !options.usage_only || options.backfill_events;
-        let optimized = if options.force {
+        let include_events = !self.options.usage_only || self.options.backfill_events;
+        let optimized = if self.options.force {
             None
         } else {
-            match adapter.scan_for_sync(&store, since_ts, include_events) {
+            match adapter.scan_for_sync(&self.store, self.since_ts, include_events) {
                 Ok(scan) => scan,
                 Err(e) => {
-                    if options.emit {
+                    if self.options.emit {
                         eprintln!("Error scanning {label}: {e}");
                     }
-                    continue;
+                    return Ok(None);
                 }
             }
         };
@@ -164,354 +279,360 @@ pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
                 let raw_sessions = match adapter.scan() {
                     Ok(s) => s,
                     Err(e) => {
-                        if options.emit {
+                        if self.options.emit {
                             eprintln!("Error scanning {label}: {e}");
                         }
-                        continue;
+                        return Ok(None);
                     }
                 };
                 (raw_sessions, 0, 0)
             }
         };
-        skipped += pre_skipped;
-        filtered_out += pre_filtered;
-        if let Some(matcher) = &path_excluder {
-            excluded_out += delete_excluded_sessions_for_source(
-                &store,
+        self.stats.skipped += pre_skipped;
+        self.stats.filtered_out += pre_filtered;
+        if let Some(matcher) = &self.path_excluder {
+            let n = delete_excluded_sessions_for_source(
+                &self.store,
                 source_id,
                 matcher,
-                &mut purged_excluded_ids,
+                purged_excluded_ids,
             )?;
+            self.stats.excluded_out += n;
         }
-        if options.verbose {
+        if self.options.verbose {
             println!("  Found {} sessions", raw_sessions.len());
         }
+        Ok(Some(raw_sessions))
+    }
 
-        let mut existing_meta = store.session_meta_map(source_id)?;
-        let mut existing_paths = HashMap::new();
-        for mut path in store.session_paths_for_source(source_id)? {
+    fn load_existing_state(&mut self, source_id: &str) -> Result<ExistingState> {
+        let meta = self.store.session_meta_map(source_id)?;
+        let mut paths = HashMap::new();
+        for mut path in self.store.session_paths_for_source(source_id)? {
             if path.directory.is_some()
                 && (path.repo_remote.is_none()
                     || path.repo_slug.is_none()
                     || path.repo_name.is_none())
             {
-                let repo_identity = repo_cache.resolve(path.directory.as_deref());
+                let repo_identity = self.repo_cache.resolve(path.directory.as_deref());
                 if let Some(repo) = repo_identity.as_ref() {
-                    store.update_session_repo_identity(source_id, &path.source_id, repo)?;
+                    self.store.update_session_repo_identity(source_id, &path.source_id, repo)?;
                     path.repo_remote = Some(repo.remote.clone());
                     path.repo_slug = Some(repo.slug.clone());
                     path.repo_name = Some(repo.name.clone());
                 }
             }
-            existing_paths.insert(path.source_id.clone(), path);
+            paths.insert(path.source_id.clone(), path);
         }
-        let mut imported_ids = store.imported_source_ids(source_id)?;
-        let mut existing_usage_meta = store.usage_state_meta_map(source_id)?;
-        let mut existing_event_meta = if options.usage_only && !options.backfill_events {
+        let imported_ids = self.store.imported_source_ids(source_id)?;
+        let usage_meta = self.store.usage_state_meta_map(source_id)?;
+        let event_meta = if self.options.usage_only && !self.options.backfill_events {
             Default::default()
         } else {
-            store.event_state_meta_map(source_id)?
+            self.store.event_state_meta_map(source_id)?
         };
+        Ok(ExistingState { meta, paths, imported_ids, usage_meta, event_meta })
+    }
 
-        for raw in raw_sessions {
-            if let Some(cutoff) = since_ts {
-                let ts = raw.updated_at.unwrap_or(raw.started_at);
-                if ts < cutoff {
-                    filtered_out += 1;
-                    continue;
-                }
+    fn process_raw_session(
+        &mut self,
+        source_id: &str,
+        raw: adapters::RawSession,
+        existing: &mut ExistingState,
+        purged_excluded_ids: &mut HashSet<String>,
+    ) -> Result<()> {
+        if let Some(cutoff) = self.since_ts {
+            let ts = raw.updated_at.unwrap_or(raw.started_at);
+            if ts < cutoff {
+                self.stats.filtered_out += 1;
+                return Ok(());
             }
+        }
 
-            let raw_source_id = raw.source_id.clone();
+        let raw_source_id = raw.source_id.clone();
 
-            if let Some(matcher) = &path_excluder
-                && paths_match_excluded(
-                    raw.directory.as_deref(),
-                    raw.source_file_path.as_deref(),
-                    matcher,
-                )
-            {
-                if existing_meta.remove(&raw_source_id).is_some() {
-                    store.delete_session_data(source_id, &raw_source_id)?;
-                    existing_paths.remove(&raw_source_id);
-                    existing_usage_meta.remove(&raw_source_id);
-                    existing_event_meta.remove(&raw_source_id);
-                }
-                if purged_excluded_ids.insert(raw_source_id) {
-                    excluded_out += 1;
-                }
-                continue;
+        if let Some(matcher) = &self.path_excluder
+            && paths_match_excluded(
+                raw.directory.as_deref(),
+                raw.source_file_path.as_deref(),
+                matcher,
+            )
+        {
+            if existing.remove(&raw_source_id) {
+                self.store.delete_session_data(source_id, &raw_source_id)?;
             }
+            if purged_excluded_ids.insert(raw_source_id) {
+                self.stats.excluded_out += 1;
+            }
+            return Ok(());
+        }
 
-            let repo_identity = repo_cache.resolve(raw.directory.as_deref());
-            let existing_repo_fields = existing_paths.get(&raw_source_id).filter(|old| {
-                repo_identity.is_none() && old.directory.as_deref() == raw.directory.as_deref()
-            });
-            let (repo_remote, repo_slug, repo_name) = match repo_identity.as_ref() {
-                Some(repo) => {
-                    (Some(repo.remote.clone()), Some(repo.slug.clone()), Some(repo.name.clone()))
-                }
-                None => existing_repo_fields
-                    .map(|old| {
-                        (old.repo_remote.clone(), old.repo_slug.clone(), old.repo_name.clone())
-                    })
-                    .unwrap_or((None, None, None)),
-            };
-            let msg_count = raw.messages.len() as u32;
-            let usage_backfill_needed = raw.usage_parser_version.is_some_and(|version| {
-                !crate::adapters::sync_state::usage_state_is_current(
+        let repo_identity = self.repo_cache.resolve(raw.directory.as_deref());
+        let existing_repo_fields = existing.paths.get(&raw_source_id).filter(|old| {
+            repo_identity.is_none() && old.directory.as_deref() == raw.directory.as_deref()
+        });
+        let (repo_remote, repo_slug, repo_name) = match repo_identity.as_ref() {
+            Some(repo) => {
+                (Some(repo.remote.clone()), Some(repo.slug.clone()), Some(repo.name.clone()))
+            }
+            None => existing_repo_fields
+                .map(|old| (old.repo_remote.clone(), old.repo_slug.clone(), old.repo_name.clone()))
+                .unwrap_or((None, None, None)),
+        };
+        let msg_count = raw.messages.len() as u32;
+        let usage_backfill_needed = raw.usage_parser_version.is_some_and(|version| {
+            !crate::adapters::sync_state::usage_state_is_current(
+                version,
+                existing.usage_meta.get(&raw_source_id).copied(),
+                raw.updated_at,
+            )
+        });
+        let event_backfill_needed = (self.options.backfill_events || !self.options.usage_only)
+            && raw.event_parser_version.is_some_and(|version| {
+                !crate::adapters::sync_state::event_state_is_current(
                     version,
-                    existing_usage_meta.get(&raw_source_id).copied(),
+                    existing.event_meta.get(&raw_source_id).copied(),
                     raw.updated_at,
                 )
             });
-            let event_backfill_needed = (options.backfill_events || !options.usage_only)
-                && raw.event_parser_version.is_some_and(|version| {
-                    !crate::adapters::sync_state::event_state_is_current(
-                        version,
-                        existing_event_meta.get(&raw_source_id).copied(),
-                        raw.updated_at,
-                    )
+
+        match existing.meta.get(&raw_source_id).copied() {
+            Some((old_updated_at, old_msg_count)) => {
+                let was_imported = existing.imported_ids.remove(&raw_source_id);
+                let metadata_changed = existing.paths.get(&raw_source_id).is_some_and(|old| {
+                    raw_session_metadata_changed(&raw, repo_identity.as_ref(), old)
                 });
-
-            match existing_meta.get(&raw_source_id) {
-                Some(&(old_updated_at, old_msg_count)) => {
-                    let was_imported = imported_ids.remove(&raw_source_id);
-                    let metadata_changed = existing_paths.get(&raw_source_id).is_some_and(|old| {
-                        raw_session_metadata_changed(&raw, repo_identity.as_ref(), old)
-                    });
-                    let content_changed = old_msg_count != msg_count
-                        || metadata_changed
-                        || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
-                    match decide_existing_session_action(
-                        options.usage_only,
-                        options.backfill_events,
-                        options.force,
-                        content_changed,
-                        usage_backfill_needed,
-                        event_backfill_needed,
-                    ) {
-                        ExistingSessionAction::Skip => {
-                            if was_imported {
-                                store.clear_import_marker(source_id, &raw_source_id)?;
-                            }
-                            skipped += 1;
-                            continue;
+                let content_changed = old_msg_count != msg_count
+                    || metadata_changed
+                    || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
+                match decide_existing_session_action(
+                    self.options.usage_only,
+                    self.options.backfill_events,
+                    self.options.force,
+                    content_changed,
+                    usage_backfill_needed,
+                    event_backfill_needed,
+                ) {
+                    ExistingSessionAction::Skip => {
+                        if was_imported {
+                            self.store.clear_import_marker(source_id, &raw_source_id)?;
                         }
-                        ExistingSessionAction::BackfillOnly(plan) => {
-                            let mut reprocessed = false;
-                            if plan.usage
-                                && let Some(parser_version) = raw.usage_parser_version
-                                && store.persist_usage_events_for_existing_session(
-                                    source_id,
-                                    &raw_source_id,
-                                    &raw.usage_events,
-                                    parser_version,
-                                    raw.updated_at,
-                                )?
-                            {
-                                existing_usage_meta.insert(
-                                    raw_source_id.clone(),
-                                    UsageSessionStateMeta {
-                                        parser_version,
-                                        source_updated_at: raw.updated_at,
-                                    },
-                                );
-                                reprocessed = true;
-                            }
-                            if plan.events
-                                && let Some(parser_version) = raw.event_parser_version
-                                && store.persist_session_events_for_existing_session(
-                                    source_id,
-                                    &raw_source_id,
-                                    &raw.events,
-                                    parser_version,
-                                    raw.updated_at,
-                                )?
-                            {
-                                existing_event_meta.insert(
-                                    raw_source_id.clone(),
-                                    EventSessionStateMeta {
-                                        parser_version,
-                                        source_updated_at: raw.updated_at,
-                                    },
-                                );
-                                reprocessed = true;
-                            }
-                            if raw.custom_title.is_some()
-                                || raw.summary.is_some()
-                                || raw.duration_minutes.is_some()
-                            {
-                                store.update_session_fields(
-                                    source_id,
-                                    &raw_source_id,
-                                    raw.custom_title.as_deref(),
-                                    raw.summary.as_deref(),
-                                    raw.duration_minutes,
-                                    None,
-                                )?;
-                            }
-                            if was_imported {
-                                store.clear_import_marker(source_id, &raw_source_id)?;
-                            }
-                            if reprocessed {
-                                reprocessed_sessions += 1;
-                            }
-                            continue;
-                        }
-                        ExistingSessionAction::RefreshSession => {}
+                        self.stats.skipped += 1;
+                        return Ok(());
                     }
-                    existing_usage_meta.remove(&raw_source_id);
-                    existing_event_meta.remove(&raw_source_id);
-                    if content_changed {
-                        updated_sessions += 1;
-                    } else {
-                        reprocessed_sessions += 1;
+                    ExistingSessionAction::BackfillOnly(plan) => {
+                        self.apply_backfill(
+                            source_id,
+                            &raw_source_id,
+                            &raw,
+                            plan,
+                            was_imported,
+                            existing,
+                        )?;
+                        return Ok(());
                     }
+                    ExistingSessionAction::RefreshSession => {}
                 }
-                None => {
-                    new_sessions += 1;
+                existing.usage_meta.remove(&raw_source_id);
+                existing.event_meta.remove(&raw_source_id);
+                if content_changed {
+                    self.stats.updated_sessions += 1;
+                } else {
+                    self.stats.reprocessed_sessions += 1;
                 }
             }
-
-            let session_uuid = uuid::Uuid::new_v4().to_string();
-            let title = raw
-                .custom_title
-                .clone()
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| generate_title(&raw.messages));
-
-            let session = Session {
-                id: session_uuid.clone(),
-                source: source_id.to_string(),
-                source_id: raw.source_id,
-                title,
-                directory: raw.directory,
-                repo_remote,
-                repo_slug,
-                repo_name,
-                started_at: raw.started_at,
-                updated_at: raw.updated_at,
-                message_count: msg_count,
-                entrypoint: raw.entrypoint,
-                custom_title: raw.custom_title,
-                summary: raw.summary,
-                duration_minutes: raw.duration_minutes,
-                source_file_path: raw.source_file_path,
-                is_import: false,
-            };
-
-            let messages: Vec<Message> = raw
-                .messages
-                .into_iter()
-                .enumerate()
-                .map(|(i, m)| Message {
-                    session_id: session_uuid.clone(),
-                    role: m.role,
-                    content: m.content,
-                    timestamp: m.timestamp,
-                    seq: i as u32,
-                })
-                .collect();
-
-            let persist_events = !options.usage_only || options.backfill_events;
-            let (events, event_parser_version) = if persist_events {
-                (raw.events, raw.event_parser_version)
-            } else {
-                (Vec::new(), None)
-            };
-
-            store.replace_session_with_usage_and_events(
-                source_id,
-                &raw_source_id,
-                &session,
-                &messages,
-                &raw.usage_events,
-                raw.usage_parser_version,
-                &events,
-                event_parser_version,
-            )?;
-            existing_meta
-                .insert(session.source_id.clone(), (session.updated_at, session.message_count));
-            existing_paths.insert(
-                session.source_id.clone(),
-                SessionPath {
-                    source_id: session.source_id.clone(),
-                    directory: session.directory.clone(),
-                    source_file_path: session.source_file_path.clone(),
-                    repo_remote: session.repo_remote.clone(),
-                    repo_slug: session.repo_slug.clone(),
-                    repo_name: session.repo_name.clone(),
-                },
-            );
-            if let Some(parser_version) = raw.usage_parser_version {
-                existing_usage_meta.insert(
-                    session.source_id.clone(),
-                    UsageSessionStateMeta { parser_version, source_updated_at: session.updated_at },
-                );
+            None => {
+                self.stats.new_sessions += 1;
             }
-            if let Some(parser_version) = event_parser_version {
-                existing_event_meta.insert(
-                    session.source_id.clone(),
-                    EventSessionStateMeta { parser_version, source_updated_at: session.updated_at },
-                );
-            }
-            total_messages += msg_count;
         }
 
-        info!("{label} done");
-    }
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let title = raw
+            .custom_title
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| generate_title(&raw.messages));
 
-    let touched = new_sessions + updated_sessions + reprocessed_sessions;
+        let session = Session {
+            id: session_uuid.clone(),
+            source: source_id.to_string(),
+            source_id: raw.source_id,
+            title,
+            directory: raw.directory,
+            repo_remote,
+            repo_slug,
+            repo_name,
+            started_at: raw.started_at,
+            updated_at: raw.updated_at,
+            message_count: msg_count,
+            entrypoint: raw.entrypoint,
+            custom_title: raw.custom_title,
+            summary: raw.summary,
+            duration_minutes: raw.duration_minutes,
+            source_file_path: raw.source_file_path,
+            is_import: false,
+        };
 
-    if options.verbose {
-        println!();
-        if options.force {
-            print!(
-                "Force sync: {new_sessions} new, {updated_sessions} updated, {reprocessed_sessions} reprocessed, {total_messages} messages"
-            );
+        let messages: Vec<Message> = raw
+            .messages
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| Message {
+                session_id: session_uuid.clone(),
+                role: m.role,
+                content: m.content,
+                timestamp: m.timestamp,
+                seq: i as u32,
+            })
+            .collect();
+
+        let persist_events = !self.options.usage_only || self.options.backfill_events;
+        let (events, event_parser_version) = if persist_events {
+            (raw.events, raw.event_parser_version)
         } else {
-            print!(
-                "Sync: {new_sessions} new, {updated_sessions} updated, {skipped} unchanged, {total_messages} messages"
-            );
-        }
-        if filtered_out > 0 {
-            print!(", {filtered_out} outside configured time scope");
-        }
-        if excluded_out > 0 {
-            print!(", {excluded_out} excluded by excluded_paths");
-        }
-        println!();
-        println!(
-            "Settings: sources [{}], time scope [{}]",
-            labels
-                .iter()
-                .filter(|(id, _)| config.is_source_enabled(id))
-                .map(|(_, label)| label.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            config.sync_window.label()
-        );
-        let progress = store.semantic_progress()?;
-        if progress.total_sessions > 0 {
-            println!(
-                "Semantic queue: {}/{} done, {} pending, {} failed",
-                progress.done_sessions,
-                progress.total_sessions,
-                progress.pending_sessions + progress.processing_sessions,
-                progress.failed_sessions
-            );
-        }
-    } else if !options.emit {
-    } else if options.force {
-        println!("Reprocessed {touched} sessions, {total_messages} messages");
-    } else if touched == 0 {
-        println!("Up to date.");
-    } else {
-        println!("{new_sessions} new, {updated_sessions} updated, {total_messages} messages");
+            (Vec::new(), None)
+        };
+
+        self.store.replace_session_with_usage_and_events(
+            source_id,
+            &raw_source_id,
+            &session,
+            &messages,
+            &raw.usage_events,
+            raw.usage_parser_version,
+            &events,
+            event_parser_version,
+        )?;
+        existing.record_replaced(&session, raw.usage_parser_version, event_parser_version);
+        self.stats.total_messages += msg_count;
+        Ok(())
     }
 
-    Ok(())
+    fn apply_backfill(
+        &mut self,
+        source_id: &str,
+        raw_source_id: &str,
+        raw: &adapters::RawSession,
+        plan: BackfillPlan,
+        was_imported: bool,
+        existing: &mut ExistingState,
+    ) -> Result<()> {
+        let mut reprocessed = false;
+        if plan.usage
+            && let Some(parser_version) = raw.usage_parser_version
+            && self.store.persist_usage_events_for_existing_session(
+                source_id,
+                raw_source_id,
+                &raw.usage_events,
+                parser_version,
+                raw.updated_at,
+            )?
+        {
+            existing.usage_meta.insert(
+                raw_source_id.to_string(),
+                UsageSessionStateMeta { parser_version, source_updated_at: raw.updated_at },
+            );
+            reprocessed = true;
+        }
+        if plan.events
+            && let Some(parser_version) = raw.event_parser_version
+            && self.store.persist_session_events_for_existing_session(
+                source_id,
+                raw_source_id,
+                &raw.events,
+                parser_version,
+                raw.updated_at,
+            )?
+        {
+            existing.event_meta.insert(
+                raw_source_id.to_string(),
+                EventSessionStateMeta { parser_version, source_updated_at: raw.updated_at },
+            );
+            reprocessed = true;
+        }
+        if raw.custom_title.is_some() || raw.summary.is_some() || raw.duration_minutes.is_some() {
+            self.store.update_session_fields(
+                source_id,
+                raw_source_id,
+                raw.custom_title.as_deref(),
+                raw.summary.as_deref(),
+                raw.duration_minutes,
+                None,
+            )?;
+        }
+        if was_imported {
+            self.store.clear_import_marker(source_id, raw_source_id)?;
+        }
+        if reprocessed {
+            self.stats.reprocessed_sessions += 1;
+        }
+        Ok(())
+    }
+
+    fn report_progress(&self) -> Result<()> {
+        let SyncStats {
+            new_sessions,
+            updated_sessions,
+            reprocessed_sessions,
+            total_messages,
+            skipped,
+            filtered_out,
+            excluded_out,
+        } = self.stats;
+        let touched = self.stats.touched();
+
+        if self.options.verbose {
+            println!();
+            if self.options.force {
+                print!(
+                    "Force sync: {new_sessions} new, {updated_sessions} updated, {reprocessed_sessions} reprocessed, {total_messages} messages"
+                );
+            } else {
+                print!(
+                    "Sync: {new_sessions} new, {updated_sessions} updated, {skipped} unchanged, {total_messages} messages"
+                );
+            }
+            if filtered_out > 0 {
+                print!(", {filtered_out} outside configured time scope");
+            }
+            if excluded_out > 0 {
+                print!(", {excluded_out} excluded by excluded_paths");
+            }
+            println!();
+            println!(
+                "Settings: sources [{}], time scope [{}]",
+                self.labels
+                    .iter()
+                    .filter(|(id, _)| self.config.is_source_enabled(id))
+                    .map(|(_, label)| label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.config.sync_window.label()
+            );
+            let progress = self.store.semantic_progress()?;
+            if progress.total_sessions > 0 {
+                println!(
+                    "Semantic queue: {}/{} done, {} pending, {} failed",
+                    progress.done_sessions,
+                    progress.total_sessions,
+                    progress.pending_sessions + progress.processing_sessions,
+                    progress.failed_sessions
+                );
+            }
+        } else if self.options.emit {
+            if self.options.force {
+                println!("Reprocessed {touched} sessions, {total_messages} messages");
+            } else if touched == 0 {
+                println!("Up to date.");
+            } else {
+                println!(
+                    "{new_sessions} new, {updated_sessions} updated, {total_messages} messages"
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 fn decide_existing_session_action(
