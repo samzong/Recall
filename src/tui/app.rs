@@ -606,17 +606,14 @@ impl App {
         }
 
         let pane = self.preview_pane(inner.width as usize);
-        let current =
-            pane.scroll_start(self.preview_scroll_offset, self.preview_selected_msg, viewport);
-        let max_start = pane.total_rows().saturating_sub(viewport);
-        let target =
-            if up { current.saturating_sub(viewport) } else { (current + viewport).min(max_start) };
-
-        if let Some(index) = pane.index_at(target) {
-            self.preview_selected_msg = index;
-            self.preview_scroll_offset =
-                pane.scroll_start(target, self.preview_selected_msg, viewport);
-        }
+        Self::page_message_selection(
+            &pane,
+            &mut self.preview_selected_msg,
+            &mut self.preview_scroll_offset,
+            self.preview_messages.len(),
+            viewport,
+            up,
+        );
     }
 
     fn page_viewing_selection(&mut self, up: bool) {
@@ -631,17 +628,41 @@ impl App {
         }
 
         let pane = self.viewing_pane(messages.width as usize);
-        let current =
-            pane.scroll_start(self.viewing_scroll_offset, self.viewing_selected_msg, viewport);
+        Self::page_message_selection(
+            &pane,
+            &mut self.viewing_selected_msg,
+            &mut self.viewing_scroll_offset,
+            self.viewing_messages.len(),
+            viewport,
+            up,
+        );
+    }
+
+    fn page_message_selection(
+        pane: &MessagePane,
+        selected: &mut usize,
+        scroll_offset: &mut usize,
+        message_count: usize,
+        viewport: usize,
+        up: bool,
+    ) {
+        if message_count == 0 || pane.total_rows() <= viewport {
+            return;
+        }
+
+        let current = pane.scroll_start(*scroll_offset, *selected, viewport);
         let max_start = pane.total_rows().saturating_sub(viewport);
         let target =
             if up { current.saturating_sub(viewport) } else { (current + viewport).min(max_start) };
+        let Some(index) = (!up && target == max_start)
+            .then_some(message_count - 1)
+            .or_else(|| pane.index_at(target))
+        else {
+            return;
+        };
 
-        if let Some(index) = pane.index_at(target) {
-            self.viewing_selected_msg = index;
-            self.viewing_scroll_offset =
-                pane.scroll_start(target, self.viewing_selected_msg, viewport);
-        }
+        *selected = index;
+        *scroll_offset = pane.scroll_start(target, *selected, viewport);
     }
 
     fn anchor_viewing_scroll(&mut self) {
@@ -2787,8 +2808,12 @@ mod tests {
     }
 
     fn tall_message(role: Role, seq: u32) -> Message {
+        message_with_lines(role, seq, 6)
+    }
+
+    fn message_with_lines(role: Role, seq: u32, line_count: u32) -> Message {
         let mut msg = message(role, None, seq);
-        msg.content = (0..6).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        msg.content = (0..line_count).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
         msg
     }
 
@@ -2953,6 +2978,53 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &store);
         assert_eq!(app.preview_selected_msg, 0);
         assert_eq!(app.preview_scroll_offset, 0);
+    }
+
+    #[test]
+    fn page_down_preview_reaches_last_message_at_bottom() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 12);
+        app.results = numbered_results(1);
+        app.preview_messages = vec![
+            message_with_lines(Role::User, 0, 1),
+            message_with_lines(Role::Assistant, 1, 1),
+            message_with_lines(Role::User, 2, 1),
+            message_with_lines(Role::Assistant, 3, 2),
+        ];
+        app.panel_focus = PanelFocus::Preview;
+
+        let layout = search_layout(app.terminal_area);
+        let inner = layout.preview_inner();
+        let pane = app.preview_pane(inner.width as usize);
+        let max_start = pane.total_rows() - inner.height as usize;
+        let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+
+        app.handle_key(down, &store);
+        app.handle_key(down, &store);
+
+        assert_eq!(app.preview_selected_msg, 3);
+        assert_eq!(app.preview_scroll_offset, max_start);
+    }
+
+    #[test]
+    fn page_keys_keep_fully_visible_viewing_selection() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.set_terminal_size(80, 20);
+        app.mode = AppMode::Viewing;
+        app.viewing_messages = (0..3).map(|n| message(Role::User, None, n)).collect();
+        app.viewing_sanitized_lines = build_viewing_caches(&app.viewing_messages);
+        app.viewing_selected_msg = 2;
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &store);
+        assert_eq!(app.viewing_selected_msg, 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &store);
+        assert_eq!(app.viewing_selected_msg, 2);
+        assert_eq!(app.viewing_scroll_offset, 0);
     }
 
     #[test]
