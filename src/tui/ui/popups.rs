@@ -75,18 +75,18 @@ pub(super) fn render_source_picker(f: &mut Frame, app: &App) {
     let muted_style = Style::default().fg(Color::DarkGray);
 
     let visible_rows = height.saturating_sub(7) as usize;
-    let start = if visible_rows == 0 || app.source_picker_selected < visible_rows {
+    let start = if visible_rows == 0 || app.source_picker.selected < visible_rows {
         0
     } else {
-        app.source_picker_selected + 1 - visible_rows
+        app.source_picker.selected + 1 - visible_rows
     };
     let end = (start + visible_rows).min(rows.len());
 
     let mut lines = Vec::new();
-    let filter_value = if app.source_picker_query.is_empty() && !app.source_picker_typing {
+    let filter_value = if app.source_picker.query.is_empty() && !app.source_picker.typing {
         Span::styled("press / to filter", muted_style)
     } else {
-        Span::styled(app.source_picker_query.clone(), normal_style)
+        Span::styled(app.source_picker.query.clone(), normal_style)
     };
     lines.push(Line::from(vec![
         Span::styled(" Filter: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -100,7 +100,7 @@ pub(super) fn render_source_picker(f: &mut Frame, app: &App) {
         for (offset, row) in rows[start..end].iter().enumerate() {
             let row_index = start + offset;
             let style =
-                if row_index == app.source_picker_selected { selected_style } else { normal_style };
+                if row_index == app.source_picker.selected { selected_style } else { normal_style };
 
             let text = match *row {
                 SourcePickerRow::All => {
@@ -142,10 +142,10 @@ pub(super) fn render_source_picker(f: &mut Frame, app: &App) {
     f.render_widget(Clear, popup);
     f.render_widget(widget, popup);
 
-    if app.source_picker_typing {
+    if app.source_picker.typing {
         let cursor_x = popup.x
             + 9
-            + UnicodeWidthStr::width(&app.source_picker_query[..app.source_picker_cursor]) as u16;
+            + UnicodeWidthStr::width(&app.source_picker.query[..app.source_picker.cursor]) as u16;
         f.set_cursor_position((cursor_x.min(popup.right().saturating_sub(2)), popup.y + 1));
     }
 }
@@ -170,18 +170,18 @@ pub(super) fn render_project_picker(f: &mut Frame, app: &App) {
     let muted_style = Style::default().fg(Color::DarkGray);
 
     let visible_rows = height.saturating_sub(7) as usize;
-    let start = if visible_rows == 0 || app.project_picker_selected < visible_rows {
+    let start = if visible_rows == 0 || app.project_picker.selected < visible_rows {
         0
     } else {
-        app.project_picker_selected + 1 - visible_rows
+        app.project_picker.selected + 1 - visible_rows
     };
     let end = (start + visible_rows).min(rows.len());
 
     let mut lines = Vec::new();
-    let filter_value = if app.project_picker_query.is_empty() && !app.project_picker_typing {
+    let filter_value = if app.project_picker.query.is_empty() && !app.project_picker.typing {
         Span::styled("type to filter paths", muted_style)
     } else {
-        Span::styled(app.project_picker_query.clone(), normal_style)
+        Span::styled(app.project_picker.query.clone(), normal_style)
     };
     lines.push(Line::from(vec![
         Span::styled(" Filter: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -195,7 +195,7 @@ pub(super) fn render_project_picker(f: &mut Frame, app: &App) {
         let path_width = width.saturating_sub(30) as usize;
         for (offset, row) in rows[start..end].iter().enumerate() {
             let row_index = start + offset;
-            let style = if row_index == app.project_picker_selected {
+            let style = if row_index == app.project_picker.selected {
                 selected_style
             } else {
                 normal_style
@@ -247,10 +247,10 @@ pub(super) fn render_project_picker(f: &mut Frame, app: &App) {
     f.render_widget(Clear, popup);
     f.render_widget(widget, popup);
 
-    if app.project_picker_typing {
+    if app.project_picker.typing {
         let cursor_x = popup.x
             + 9
-            + UnicodeWidthStr::width(&app.project_picker_query[..app.project_picker_cursor]) as u16;
+            + UnicodeWidthStr::width(&app.project_picker.query[..app.project_picker.cursor]) as u16;
         f.set_cursor_position((cursor_x.min(popup.right().saturating_sub(2)), popup.y + 1));
     }
 }

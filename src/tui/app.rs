@@ -43,6 +43,80 @@ enum MouseDragTarget {
     Viewing,
 }
 
+fn cursor_prev(text: &str, cursor: usize) -> usize {
+    text[..cursor].char_indices().last().map(|(i, _)| i).unwrap_or(0)
+}
+
+fn cursor_next(text: &str, cursor: usize) -> usize {
+    text[cursor..].char_indices().nth(1).map(|(i, _)| cursor + i).unwrap_or(text.len())
+}
+
+#[derive(Default)]
+pub(crate) struct PickerState {
+    pub(crate) query: String,
+    pub(crate) cursor: usize,
+    pub(crate) selected: usize,
+    pub(crate) dirty: bool,
+    pub(crate) typing: bool,
+}
+
+impl PickerState {
+    fn reset(&mut self) {
+        self.query.clear();
+        self.cursor = 0;
+        self.selected = 0;
+        self.dirty = false;
+        self.typing = false;
+    }
+
+    fn clear_query(&mut self) {
+        self.query.clear();
+        self.cursor = 0;
+        self.selected = 0;
+        self.typing = true;
+    }
+
+    fn clamp_selected(&mut self, row_count: usize) {
+        if row_count == 0 {
+            self.selected = 0;
+        } else if self.selected >= row_count {
+            self.selected = row_count - 1;
+        }
+    }
+
+    fn handle_text_key(&mut self, key: KeyEvent, row_count: usize) {
+        match key.code {
+            KeyCode::Backspace if self.typing && self.cursor > 0 => {
+                let prev = cursor_prev(&self.query, self.cursor);
+                self.query.replace_range(prev..self.cursor, "");
+                self.cursor = prev;
+                self.selected = 0;
+                self.clamp_selected(row_count);
+            }
+            KeyCode::Left if self.typing && self.cursor > 0 => {
+                self.cursor = cursor_prev(&self.query, self.cursor);
+            }
+            KeyCode::Right if self.typing && self.cursor < self.query.len() => {
+                self.cursor = cursor_next(&self.query, self.cursor);
+            }
+            KeyCode::Home if self.typing => {
+                self.cursor = 0;
+            }
+            KeyCode::End if self.typing => {
+                self.cursor = self.query.len();
+            }
+            KeyCode::Char(c) => {
+                self.typing = true;
+                self.query.insert(self.cursor, c);
+                self.cursor += c.len_utf8();
+                self.selected = 0;
+                self.clamp_selected(row_count);
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(crate) struct App {
     terminal_area: Rect,
     pub(crate) mode: AppMode,
@@ -100,22 +174,14 @@ pub(crate) struct App {
     pub(crate) viewing_search_status: Option<String>,
     pub(crate) viewing_sanitized_lines: Vec<Vec<SanitizedLine>>,
     pub(crate) viewing_match_cache: Vec<usize>,
-    pub(crate) source_picker_query: String,
-    pub(crate) source_picker_cursor: usize,
-    pub(crate) source_picker_selected: usize,
+    pub(crate) source_picker: PickerState,
     pub(crate) source_picker_selection: Vec<String>,
-    pub(crate) source_picker_dirty: bool,
-    pub(crate) source_picker_typing: bool,
     pub(crate) filters_editing_source: bool,
     pub(crate) project_directories: Vec<ProjectDirectory>,
     pub(crate) project_filter: Option<String>,
     pub(crate) repo_filter: Option<RepoFilter>,
-    pub(crate) project_picker_query: String,
-    pub(crate) project_picker_cursor: usize,
-    pub(crate) project_picker_selected: usize,
+    pub(crate) project_picker: PickerState,
     pub(crate) project_picker_selection: Option<String>,
-    pub(crate) project_picker_dirty: bool,
-    pub(crate) project_picker_typing: bool,
     pub(crate) filters_editing_project: bool,
     pub(crate) usage_report: Option<UsageReport>,
     pub(crate) usage_year_report: Option<UsageReport>,
@@ -199,22 +265,14 @@ impl App {
             viewing_search_status: None,
             viewing_sanitized_lines: Vec::new(),
             viewing_match_cache: Vec::new(),
-            source_picker_query: String::new(),
-            source_picker_cursor: 0,
-            source_picker_selected: 0,
+            source_picker: PickerState::default(),
             source_picker_selection: Vec::new(),
-            source_picker_dirty: false,
-            source_picker_typing: false,
             filters_editing_source: false,
             project_directories: store.list_project_directories().unwrap_or_default(),
             project_filter: None,
             repo_filter,
-            project_picker_query: String::new(),
-            project_picker_cursor: 0,
-            project_picker_selected: 0,
+            project_picker: PickerState::default(),
             project_picker_selection: None,
-            project_picker_dirty: false,
-            project_picker_typing: false,
             filters_editing_project: false,
             usage_report: None,
             usage_year_report: None,
@@ -442,13 +500,13 @@ impl App {
             AppMode::Settings if self.settings_selected > 0 => {
                 self.settings_selected -= 1;
             }
-            AppMode::Filters if self.filters_editing_source && self.source_picker_selected > 0 => {
-                self.source_picker_selected -= 1;
+            AppMode::Filters if self.filters_editing_source && self.source_picker.selected > 0 => {
+                self.source_picker.selected -= 1;
             }
             AppMode::Filters
-                if self.filters_editing_project && self.project_picker_selected > 0 =>
+                if self.filters_editing_project && self.project_picker.selected > 0 =>
             {
-                self.project_picker_selected -= 1;
+                self.project_picker.selected -= 1;
             }
             AppMode::Filters if !self.filters_editing_source && !self.filters_editing_project => {
                 self.filter_focus = self.filter_focus.previous();
@@ -482,15 +540,15 @@ impl App {
             }
             AppMode::Filters
                 if self.filters_editing_source
-                    && self.source_picker_selected + 1 < self.source_picker_rows().len() =>
+                    && self.source_picker.selected + 1 < self.source_picker_rows().len() =>
             {
-                self.source_picker_selected += 1;
+                self.source_picker.selected += 1;
             }
             AppMode::Filters
                 if self.filters_editing_project
-                    && self.project_picker_selected + 1 < self.project_picker_rows().len() =>
+                    && self.project_picker.selected + 1 < self.project_picker_rows().len() =>
             {
-                self.project_picker_selected += 1;
+                self.project_picker.selected += 1;
             }
             AppMode::Filters if !self.filters_editing_source && !self.filters_editing_project => {
                 self.filter_focus = self.filter_focus.next();
@@ -1068,11 +1126,7 @@ impl App {
             KeyCode::Backspace
                 if self.panel_focus == PanelFocus::SessionList && self.cursor_pos > 0 =>
             {
-                let prev = self.query[..self.cursor_pos]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
+                let prev = cursor_prev(&self.query, self.cursor_pos);
                 self.query.replace_range(prev..self.cursor_pos, "");
                 self.cursor_pos = prev;
                 self.queue_search();
@@ -1081,20 +1135,12 @@ impl App {
                 if self.panel_focus == PanelFocus::Preview {
                     self.panel_focus = PanelFocus::SessionList;
                 } else if self.cursor_pos > 0 {
-                    self.cursor_pos = self.query[..self.cursor_pos]
-                        .char_indices()
-                        .last()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
+                    self.cursor_pos = cursor_prev(&self.query, self.cursor_pos);
                 }
             }
             KeyCode::Right if self.panel_focus == PanelFocus::SessionList => {
                 if self.cursor_pos < self.query.len() {
-                    self.cursor_pos = self.query[self.cursor_pos..]
-                        .char_indices()
-                        .nth(1)
-                        .map(|(i, _)| self.cursor_pos + i)
-                        .unwrap_or(self.query.len());
+                    self.cursor_pos = cursor_next(&self.query, self.cursor_pos);
                 } else if !self.preview_messages.is_empty() {
                     self.panel_focus = PanelFocus::Preview;
                     self.preview_selected_msg = 0;
@@ -1300,29 +1346,17 @@ impl App {
                 self.jump_viewing_match(true);
             }
             KeyCode::Backspace if self.viewing_search_input_cursor > 0 => {
-                let prev = input[..self.viewing_search_input_cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
+                let prev = cursor_prev(input, self.viewing_search_input_cursor);
                 input.replace_range(prev..self.viewing_search_input_cursor, "");
                 self.viewing_search_input_cursor = prev;
             }
             KeyCode::Left if self.viewing_search_input_cursor > 0 => {
-                let prev = input[..self.viewing_search_input_cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                self.viewing_search_input_cursor = prev;
+                self.viewing_search_input_cursor =
+                    cursor_prev(input, self.viewing_search_input_cursor);
             }
             KeyCode::Right if self.viewing_search_input_cursor < input.len() => {
-                let next = input[self.viewing_search_input_cursor..]
-                    .char_indices()
-                    .nth(1)
-                    .map(|(i, _)| self.viewing_search_input_cursor + i)
-                    .unwrap_or(input.len());
-                self.viewing_search_input_cursor = next;
+                self.viewing_search_input_cursor =
+                    cursor_next(input, self.viewing_search_input_cursor);
             }
             KeyCode::Home => {
                 self.viewing_search_input_cursor = 0;
@@ -1642,23 +1676,20 @@ impl App {
 
     fn handle_source_picker_key(&mut self, key: KeyEvent, store: &Store) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
-            self.source_picker_query.clear();
-            self.source_picker_cursor = 0;
-            self.source_picker_selected = 0;
-            self.source_picker_typing = true;
+            self.source_picker.clear_query();
             return;
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
             self.source_picker_selection.clear();
-            self.source_picker_dirty = true;
+            self.source_picker.dirty = true;
             return;
         }
 
         match key.code {
             KeyCode::Esc => {
-                if self.source_picker_typing {
-                    self.source_picker_typing = false;
+                if self.source_picker.typing {
+                    self.source_picker.typing = false;
                 } else {
                     self.close_source_picker();
                 }
@@ -1669,55 +1700,15 @@ impl App {
             KeyCode::Char(' ') => {
                 self.toggle_source_picker_row();
             }
-            KeyCode::Char('/') if !self.source_picker_typing => {
-                self.source_picker_typing = true;
+            KeyCode::Char('/') if !self.source_picker.typing => {
+                self.source_picker.typing = true;
             }
             KeyCode::Up => self.handle_scroll_up(store),
             KeyCode::Down => self.handle_scroll_down(store),
-            KeyCode::Backspace if self.source_picker_typing && self.source_picker_cursor > 0 => {
-                let prev = self.source_picker_query[..self.source_picker_cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                self.source_picker_query.replace_range(prev..self.source_picker_cursor, "");
-                self.source_picker_cursor = prev;
-                self.source_picker_selected = 0;
-                self.clamp_source_picker_selected();
+            _ => {
+                let row_count = self.source_picker_rows().len();
+                self.source_picker.handle_text_key(key, row_count);
             }
-            KeyCode::Left if self.source_picker_typing && self.source_picker_cursor > 0 => {
-                let prev = self.source_picker_query[..self.source_picker_cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                self.source_picker_cursor = prev;
-            }
-            KeyCode::Right
-                if self.source_picker_typing
-                    && self.source_picker_cursor < self.source_picker_query.len() =>
-            {
-                let next = self.source_picker_query[self.source_picker_cursor..]
-                    .char_indices()
-                    .nth(1)
-                    .map(|(i, _)| self.source_picker_cursor + i)
-                    .unwrap_or(self.source_picker_query.len());
-                self.source_picker_cursor = next;
-            }
-            KeyCode::Home if self.source_picker_typing => {
-                self.source_picker_cursor = 0;
-            }
-            KeyCode::End if self.source_picker_typing => {
-                self.source_picker_cursor = self.source_picker_query.len();
-            }
-            KeyCode::Char(c) => {
-                self.source_picker_typing = true;
-                self.source_picker_query.insert(self.source_picker_cursor, c);
-                self.source_picker_cursor += c.len_utf8();
-                self.source_picker_selected = 0;
-                self.clamp_source_picker_selected();
-            }
-            _ => {}
         }
     }
 
@@ -1737,14 +1728,11 @@ impl App {
         self.mode = AppMode::Filters;
         self.filters_editing_source = true;
         self.filters_editing_project = false;
-        self.source_picker_query.clear();
-        self.source_picker_cursor = 0;
-        self.source_picker_selected = 0;
-        self.source_picker_typing = false;
+        self.source_picker.reset();
         self.source_picker_selection =
             self.normalized_source_selection(&self.draft_source_filter_selection);
         if let Some(selected_source) = self.source_picker_selection.first() {
-            self.source_picker_selected = self
+            self.source_picker.selected = self
                 .source_picker_rows()
                 .iter()
                 .position(|row| match row {
@@ -1757,38 +1745,30 @@ impl App {
                 })
                 .unwrap_or(0);
         }
-        self.source_picker_dirty = false;
     }
 
     fn close_source_picker(&mut self) {
         self.filters_editing_source = false;
-        self.source_picker_query.clear();
-        self.source_picker_cursor = 0;
-        self.source_picker_selected = 0;
-        self.source_picker_typing = false;
+        self.source_picker.reset();
         self.source_picker_selection.clear();
-        self.source_picker_dirty = false;
     }
 
     fn handle_project_picker_key(&mut self, key: KeyEvent, store: &Store) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
-            self.project_picker_query.clear();
-            self.project_picker_cursor = 0;
-            self.project_picker_selected = 0;
-            self.project_picker_typing = true;
+            self.project_picker.clear_query();
             return;
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
             self.project_picker_selection = None;
-            self.project_picker_dirty = true;
+            self.project_picker.dirty = true;
             return;
         }
 
         match key.code {
             KeyCode::Esc => {
-                if self.project_picker_typing {
-                    self.project_picker_typing = false;
+                if self.project_picker.typing {
+                    self.project_picker.typing = false;
                 } else {
                     self.close_project_picker();
                 }
@@ -1799,55 +1779,15 @@ impl App {
             KeyCode::Char(' ') => {
                 self.toggle_project_picker_row();
             }
-            KeyCode::Char('/') if !self.project_picker_typing => {
-                self.project_picker_typing = true;
+            KeyCode::Char('/') if !self.project_picker.typing => {
+                self.project_picker.typing = true;
             }
             KeyCode::Up => self.handle_scroll_up(store),
             KeyCode::Down => self.handle_scroll_down(store),
-            KeyCode::Backspace if self.project_picker_typing && self.project_picker_cursor > 0 => {
-                let prev = self.project_picker_query[..self.project_picker_cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                self.project_picker_query.replace_range(prev..self.project_picker_cursor, "");
-                self.project_picker_cursor = prev;
-                self.project_picker_selected = 0;
-                self.clamp_project_picker_selected();
+            _ => {
+                let row_count = self.project_picker_rows().len();
+                self.project_picker.handle_text_key(key, row_count);
             }
-            KeyCode::Left if self.project_picker_typing && self.project_picker_cursor > 0 => {
-                let prev = self.project_picker_query[..self.project_picker_cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                self.project_picker_cursor = prev;
-            }
-            KeyCode::Right
-                if self.project_picker_typing
-                    && self.project_picker_cursor < self.project_picker_query.len() =>
-            {
-                let next = self.project_picker_query[self.project_picker_cursor..]
-                    .char_indices()
-                    .nth(1)
-                    .map(|(i, _)| self.project_picker_cursor + i)
-                    .unwrap_or(self.project_picker_query.len());
-                self.project_picker_cursor = next;
-            }
-            KeyCode::Home if self.project_picker_typing => {
-                self.project_picker_cursor = 0;
-            }
-            KeyCode::End if self.project_picker_typing => {
-                self.project_picker_cursor = self.project_picker_query.len();
-            }
-            KeyCode::Char(c) => {
-                self.project_picker_typing = true;
-                self.project_picker_query.insert(self.project_picker_cursor, c);
-                self.project_picker_cursor += c.len_utf8();
-                self.project_picker_selected = 0;
-                self.clamp_project_picker_selected();
-            }
-            _ => {}
         }
     }
 
@@ -1856,14 +1796,10 @@ impl App {
         self.mode = AppMode::Filters;
         self.filters_editing_source = false;
         self.filters_editing_project = true;
-        self.project_picker_query.clear();
-        self.project_picker_cursor = 0;
-        self.project_picker_selected = 0;
+        self.project_picker.reset();
         self.project_picker_selection = self.draft_project_filter.clone();
-        self.project_picker_dirty = false;
-        self.project_picker_typing = false;
         if let Some(selected_project) = self.draft_project_filter.as_ref() {
-            self.project_picker_selected = self
+            self.project_picker.selected = self
                 .project_picker_rows()
                 .iter()
                 .position(|row| match row {
@@ -1880,12 +1816,8 @@ impl App {
 
     fn close_project_picker(&mut self) {
         self.filters_editing_project = false;
-        self.project_picker_query.clear();
-        self.project_picker_cursor = 0;
-        self.project_picker_selected = 0;
+        self.project_picker.reset();
         self.project_picker_selection = None;
-        self.project_picker_dirty = false;
-        self.project_picker_typing = false;
     }
 
     fn apply_project_picker(&mut self) {
@@ -1901,10 +1833,10 @@ impl App {
     }
 
     fn commit_project_picker_filter(&mut self) {
-        if self.project_picker_dirty {
+        if self.project_picker.dirty {
             self.draft_project_filter = self.project_picker_selection.clone();
             self.draft_repo_filter = None;
-        } else if let Some(row) = self.project_picker_rows().get(self.project_picker_selected) {
+        } else if let Some(row) = self.project_picker_rows().get(self.project_picker.selected) {
             match *row {
                 ProjectPickerRow::All => {
                     self.draft_project_filter = None;
@@ -1921,7 +1853,7 @@ impl App {
     }
 
     fn toggle_project_picker_row(&mut self) {
-        let Some(row) = self.project_picker_rows().get(self.project_picker_selected).copied()
+        let Some(row) = self.project_picker_rows().get(self.project_picker.selected).copied()
         else {
             return;
         };
@@ -1941,19 +1873,15 @@ impl App {
                 }
             }
         }
-        self.project_picker_dirty = true;
+        self.project_picker.dirty = true;
     }
 
     fn apply_source_picker(&mut self) {
         let previous = self.draft_source_filter_selection.clone();
         self.commit_source_picker_filter();
 
-        self.source_picker_query.clear();
-        self.source_picker_cursor = 0;
-        self.source_picker_selected = 0;
-        self.source_picker_typing = false;
+        self.source_picker.reset();
         self.source_picker_selection.clear();
-        self.source_picker_dirty = false;
         self.filters_editing_source = false;
         self.mode = AppMode::Filters;
         if self.draft_source_filter_selection != previous {
@@ -1962,14 +1890,14 @@ impl App {
     }
 
     fn commit_source_picker_filter(&mut self) {
-        let confirming_existing_multi_selection = !self.source_picker_dirty
-            && self.source_picker_query.trim().is_empty()
+        let confirming_existing_multi_selection = !self.source_picker.dirty
+            && self.source_picker.query.trim().is_empty()
             && self.source_picker_selection.len() > 1;
 
-        if self.source_picker_dirty || confirming_existing_multi_selection {
+        if self.source_picker.dirty || confirming_existing_multi_selection {
             self.draft_source_filter_selection =
                 self.normalized_source_selection(&self.source_picker_selection);
-        } else if let Some(row) = self.source_picker_rows().get(self.source_picker_selected) {
+        } else if let Some(row) = self.source_picker_rows().get(self.source_picker.selected) {
             match *row {
                 SourcePickerRow::All => {
                     self.draft_source_filter_selection.clear();
@@ -1984,7 +1912,7 @@ impl App {
     }
 
     fn toggle_source_picker_row(&mut self) {
-        let Some(row) = self.source_picker_rows().get(self.source_picker_selected).copied() else {
+        let Some(row) = self.source_picker_rows().get(self.source_picker.selected).copied() else {
             return;
         };
 
@@ -2007,7 +1935,7 @@ impl App {
                     self.normalized_source_selection(&self.source_picker_selection);
             }
         }
-        self.source_picker_dirty = true;
+        self.source_picker.dirty = true;
     }
 
     fn clear_filters(&mut self) {
@@ -2253,7 +2181,7 @@ impl App {
     }
 
     pub(crate) fn source_picker_rows(&self) -> Vec<SourcePickerRow> {
-        let query = self.source_picker_query.trim().to_lowercase();
+        let query = self.source_picker.query.trim().to_lowercase();
         let mut rows = Vec::new();
         if query.is_empty() {
             rows.push(SourcePickerRow::All);
@@ -2276,7 +2204,7 @@ impl App {
     }
 
     pub(crate) fn project_picker_rows(&self) -> Vec<ProjectPickerRow> {
-        let query = self.project_picker_query.trim().to_lowercase();
+        let query = self.project_picker.query.trim().to_lowercase();
         let mut rows = Vec::new();
         if query.is_empty() {
             rows.push(ProjectPickerRow::All);
@@ -2289,24 +2217,6 @@ impl App {
         }
 
         rows
-    }
-
-    fn clamp_source_picker_selected(&mut self) {
-        let row_count = self.source_picker_rows().len();
-        if row_count == 0 {
-            self.source_picker_selected = 0;
-        } else if self.source_picker_selected >= row_count {
-            self.source_picker_selected = row_count - 1;
-        }
-    }
-
-    fn clamp_project_picker_selected(&mut self) {
-        let row_count = self.project_picker_rows().len();
-        if row_count == 0 {
-            self.project_picker_selected = 0;
-        } else if self.project_picker_selected >= row_count {
-            self.project_picker_selected = row_count - 1;
-        }
     }
 
     fn normalized_source_selection(&self, selection: &[String]) -> Vec<String> {
@@ -2660,27 +2570,15 @@ impl App {
                 self.export_cursor += c.len_utf8();
             }
             KeyCode::Backspace if self.export_cursor > 0 => {
-                let prev = self.export_path[..self.export_cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
+                let prev = cursor_prev(&self.export_path, self.export_cursor);
                 self.export_path.replace_range(prev..self.export_cursor, "");
                 self.export_cursor = prev;
             }
             KeyCode::Left if self.export_cursor > 0 => {
-                self.export_cursor = self.export_path[..self.export_cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
+                self.export_cursor = cursor_prev(&self.export_path, self.export_cursor);
             }
             KeyCode::Right if self.export_cursor < self.export_path.len() => {
-                self.export_cursor = self.export_path[self.export_cursor..]
-                    .char_indices()
-                    .nth(1)
-                    .map(|(i, _)| self.export_cursor + i)
-                    .unwrap_or(self.export_path.len());
+                self.export_cursor = cursor_next(&self.export_path, self.export_cursor);
             }
             _ => {}
         }
@@ -2833,19 +2731,11 @@ mod tests {
             viewing_search_status: None,
             viewing_sanitized_lines: Vec::new(),
             viewing_match_cache: Vec::new(),
-            source_picker_query: String::new(),
-            source_picker_cursor: 0,
-            source_picker_selected: 0,
+            source_picker: PickerState::default(),
             source_picker_selection: Vec::new(),
-            source_picker_dirty: false,
-            source_picker_typing: false,
             filters_editing_source: false,
-            project_picker_query: String::new(),
-            project_picker_cursor: 0,
-            project_picker_selected: 0,
+            project_picker: PickerState::default(),
             project_picker_selection: None,
-            project_picker_dirty: false,
-            project_picker_typing: false,
             filters_editing_project: false,
             usage_report: None,
             usage_year_report: None,
@@ -3525,7 +3415,7 @@ mod tests {
                 last_seen: 1,
             },
         ];
-        app.project_picker_query = "sam recall".to_string();
+        app.project_picker.query = "sam recall".to_string();
 
         let rows = app.project_picker_rows();
 
@@ -3571,20 +3461,20 @@ mod tests {
             sessions: 10,
             last_seen: 2,
         }];
-        app.project_picker_query = "recall".to_string();
+        app.project_picker.query = "recall".to_string();
 
         app.toggle_project_picker_row();
 
         assert_eq!(app.project_picker_selection, Some("/Users/x/git/samzong/Recall".to_string()));
-        assert!(app.project_picker_dirty);
+        assert!(app.project_picker.dirty);
         assert_eq!(app.project_filter, None);
     }
 
     #[test]
     fn source_picker_space_toggles_while_filtering() {
         let mut app = app_with_sources();
-        app.source_picker_query = "cod".to_string();
-        app.source_picker_typing = true;
+        app.source_picker.query = "cod".to_string();
+        app.source_picker.typing = true;
 
         app.toggle_source_picker_row();
         app.commit_source_picker_filter();
@@ -3779,7 +3669,7 @@ mod tests {
         app.mode = AppMode::Filters;
         app.filters_editing_project = true;
         app.project_picker_selection = Some("/Users/x/git/samzong/Recall".to_string());
-        app.project_picker_dirty = true;
+        app.project_picker.dirty = true;
 
         app.apply_project_picker();
 
@@ -3797,7 +3687,7 @@ mod tests {
         app.mode = AppMode::Filters;
         app.filters_editing_source = true;
         app.source_picker_selection = vec!["codex".to_string()];
-        app.source_picker_dirty = true;
+        app.source_picker.dirty = true;
 
         app.apply_source_picker();
 
