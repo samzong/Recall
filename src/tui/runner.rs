@@ -84,6 +84,8 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
         match poll_event(tick_rate)? {
             AppEvent::Key(key) => app.handle_key(key, &store),
             AppEvent::MouseDown { column, row } => app.handle_mouse_down(column, row, &store),
+            AppEvent::MouseDrag { column, row } => app.handle_mouse_drag(column, row, &store),
+            AppEvent::MouseUp => app.handle_mouse_up(),
             AppEvent::ScrollUp { column, row } => app.handle_mouse_scroll_up(column, row, &store),
             AppEvent::ScrollDown { column, row } => {
                 app.handle_mouse_scroll_down(column, row, &store);

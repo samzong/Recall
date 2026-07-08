@@ -8,6 +8,8 @@ use crossterm::event::{
 pub(crate) enum AppEvent {
     Key(KeyEvent),
     MouseDown { column: u16, row: u16 },
+    MouseDrag { column: u16, row: u16 },
+    MouseUp,
     ScrollUp { column: u16, row: u16 },
     ScrollDown { column: u16, row: u16 },
     Tick,
@@ -18,10 +20,13 @@ pub(crate) fn poll_event(tick_rate: Duration) -> Result<AppEvent> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => return Ok(AppEvent::Key(key)),
             Event::Mouse(MouseEvent { kind, column, row, .. }) => match kind {
-                MouseEventKind::Down(MouseButton::Left)
-                | MouseEventKind::Drag(MouseButton::Left) => {
+                MouseEventKind::Down(MouseButton::Left) => {
                     return Ok(AppEvent::MouseDown { column, row });
                 }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    return Ok(AppEvent::MouseDrag { column, row });
+                }
+                MouseEventKind::Up(MouseButton::Left) => return Ok(AppEvent::MouseUp),
                 MouseEventKind::ScrollUp => return Ok(AppEvent::ScrollUp { column, row }),
                 MouseEventKind::ScrollDown => return Ok(AppEvent::ScrollDown { column, row }),
                 _ => {}

@@ -159,8 +159,26 @@ pub(crate) fn vertical_scrollbar_position(
         return None;
     }
 
+    vertical_scrollbar_row_position(row, area, content_len, viewport_len)
+}
+
+pub(crate) fn vertical_scrollbar_row_position(
+    row: u16,
+    area: Rect,
+    content_len: usize,
+    viewport_len: usize,
+) -> Option<usize> {
+    if viewport_len == 0 || content_len <= viewport_len {
+        return None;
+    }
+
+    let track = area.inner(Margin { horizontal: 0, vertical: 1 });
+    if track.width == 0 || track.height == 0 {
+        return None;
+    }
+
     let max_position = content_len - viewport_len;
-    let rel = usize::from(row - track.y);
+    let rel = usize::from(row.saturating_sub(track.y).min(track.height - 1));
     match usize::from(track.height - 1) {
         0 => Some(0),
         denom => Some((rel * max_position + denom / 2) / denom),
@@ -229,5 +247,12 @@ mod tests {
         assert_eq!(vertical_scrollbar_position(bar, 12, area, 100, 8), Some(92));
         assert_eq!(vertical_scrollbar_position(bar - 1, 5, area, 100, 8), None);
         assert_eq!(vertical_scrollbar_position(bar, 5, area, 8, 8), None);
+    }
+
+    #[test]
+    fn scrollbar_row_position_clamps_drag_outside_track() {
+        let area = Rect::new(0, 4, 20, 10);
+        assert_eq!(vertical_scrollbar_row_position(0, area, 100, 8), Some(0));
+        assert_eq!(vertical_scrollbar_row_position(99, area, 100, 8), Some(92));
     }
 }

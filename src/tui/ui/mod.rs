@@ -88,8 +88,10 @@ pub(super) fn render_vertical_scrollbar(
         return;
     }
 
-    let mut state =
-        ScrollbarState::new(content_len).viewport_content_length(viewport_len).position(position);
+    let max_position = content_len - viewport_len;
+    let mut state = ScrollbarState::new(max_position + 1)
+        .viewport_content_length(viewport_len)
+        .position(position.min(max_position));
     f.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .symbols(scrollbar::VERTICAL)
@@ -225,6 +227,19 @@ mod tests {
             .map(|y| buffer_row(terminal.backend().buffer(), y, width))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn render_scrollbar_thumb_touches_bottom_at_max_position() {
+        let backend = TestBackend::new(2, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let frame = terminal
+            .draw(|f| {
+                render_vertical_scrollbar(f, ratatui::layout::Rect::new(0, 0, 2, 10), 20, 5, 15)
+            })
+            .unwrap();
+
+        assert_eq!(frame.buffer[(1, 8)].style().fg, Some(Color::Cyan));
     }
 
     #[test]
