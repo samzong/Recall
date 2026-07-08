@@ -76,6 +76,11 @@ enum Commands {
             help = "Maximum sessions to export; 0 means all (default)"
         )]
         limit: usize,
+        #[arg(
+            long,
+            help = "Comma-separated JSONL fields; messages is required: metadata,messages,usage,events"
+        )]
+        include: Option<String>,
     },
     #[command(about = "Import session records from JSON Lines")]
     Import {
@@ -213,13 +218,16 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Usage { json, source, time }) => {
             crate::usage::run_cli(json, source.as_deref(), time.as_deref())?
         }
-        Some(Commands::Export { source, time, project, repo, limit }) => crate::export::run_cli(
-            source.as_deref(),
-            time.as_deref(),
-            project.as_deref(),
-            repo.as_deref(),
-            limit,
-        )?,
+        Some(Commands::Export { source, time, project, repo, limit, include }) => {
+            crate::export::run_cli(
+                source.as_deref(),
+                time.as_deref(),
+                project.as_deref(),
+                repo.as_deref(),
+                limit,
+                include.as_deref(),
+            )?
+        }
         Some(Commands::Import { file, dry_run }) => crate::import::run_cli(&file, dry_run)?,
         Some(Commands::Share { command: ShareCommands::Init { project_name, publish_dir } }) => {
             crate::share_init::run(project_name, publish_dir)?
@@ -348,10 +356,19 @@ mod tests {
 
     #[test]
     fn export_accepts_default_jsonl_without_format_flag() {
-        let cli = Cli::try_parse_from(["recall", "export", "--source", "grok"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "recall",
+            "export",
+            "--source",
+            "grok",
+            "--include",
+            "metadata,messages",
+        ])
+        .unwrap();
         match cli.command {
-            Some(Commands::Export { source, .. }) => {
+            Some(Commands::Export { source, include, .. }) => {
                 assert_eq!(source.as_deref(), Some("grok"));
+                assert_eq!(include.as_deref(), Some("metadata,messages"));
             }
             _ => panic!("expected export command"),
         }

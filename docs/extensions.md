@@ -103,7 +103,7 @@ recall session list --project /repo --format json
 recall session list --query "query" --project /repo --format json
 recall search "query" --project /repo --format json
 recall session show --id <id> --format json --include metadata,messages,usage,events
-recall export --project /repo
+recall export --project /repo --include metadata,messages,usage,events
 ```
 
 Core support in v0.1:
@@ -115,10 +115,15 @@ Core support in v0.1:
   `recall session list --query ... --format json`;
 - `recall session show` supports `--format json|jsonl`;
 - `recall export` emits JSONL, one session record per line, with export record
-  schema version 4;
+  schema version 4, and supports `--include metadata,messages,usage,events`
+  for field projection. Export projections must include `messages`; `usage`
+  and `events` are optional add-ons;
 - `recall session show --format json` defaults to metadata only. Extensions
   that need transcript data must pass `--messages` or
   `--include metadata,messages,usage,events`.
+
+Transcript-only extensions should use `--include metadata,messages` instead of
+reading usage or event records they do not need.
 
 ### Stability Rules
 

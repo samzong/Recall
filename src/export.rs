@@ -12,6 +12,19 @@ use crate::types::{Message, Role, Session, SessionEventRecord, SessionUsageEvent
 pub(crate) const RECORD_SCHEMA_VERSION: u32 = 4;
 const RECORD_TYPE: &str = "session";
 
+#[derive(Clone, Copy)]
+pub(crate) struct ExportIncludes {
+    pub(crate) messages: bool,
+    pub(crate) usage: bool,
+    pub(crate) events: bool,
+}
+
+impl ExportIncludes {
+    pub(crate) fn full() -> Self {
+        Self { messages: true, usage: true, events: true }
+    }
+}
+
 pub(crate) struct ExportOptions {
     pub(crate) session_ids: Vec<String>,
     pub(crate) sources: Option<Vec<String>>,
@@ -19,6 +32,7 @@ pub(crate) struct ExportOptions {
     pub(crate) project: Option<String>,
     pub(crate) repo: Option<RepoFilter>,
     pub(crate) limit: Option<usize>,
+    pub(crate) includes: ExportIncludes,
 }
 
 pub(crate) fn run_cli(
@@ -27,6 +41,7 @@ pub(crate) fn run_cli(
     project_filter: Option<&str>,
     repo_filter: Option<&str>,
     limit: usize,
+    include_filter: Option<&str>,
 ) -> Result<()> {
     let store = Store::open()?;
     let sources = adapters::source_labels();
@@ -38,10 +53,42 @@ pub(crate) fn run_cli(
         project: directory,
         repo,
         limit: if limit == 0 { None } else { Some(limit) },
+        includes: parse_export_includes(include_filter)?,
     };
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     write_jsonl(&store, &options, &mut handle)
+}
+
+pub(crate) fn parse_export_includes(include: Option<&str>) -> Result<ExportIncludes> {
+    let Some(include) = include else {
+        return Ok(ExportIncludes::full());
+    };
+    let includes = apply_include_filter(
+        ExportIncludes { messages: false, usage: false, events: false },
+        include,
+    )?;
+    if !includes.messages {
+        return Err(anyhow!("--include must include messages"));
+    }
+    Ok(includes)
+}
+
+pub(crate) fn apply_include_filter(
+    mut includes: ExportIncludes,
+    include: &str,
+) -> Result<ExportIncludes> {
+    for part in include.split(',').map(|part| part.trim().to_lowercase()) {
+        match part.as_str() {
+            "all" => includes = ExportIncludes::full(),
+            "metadata" | "" => {}
+            "messages" => includes.messages = true,
+            "usage" => includes.usage = true,
+            "events" => includes.events = true,
+            _ => return Err(anyhow!("unknown include field: {part}")),
+        }
+    }
+    Ok(includes)
 }
 
 #[derive(Serialize)]
@@ -142,7 +189,7 @@ pub(crate) fn write_jsonl<W: Write>(
         sessions
     };
 
-    write_jsonl_for_sessions(store, sessions, &mut writer)
+    write_jsonl_for_sessions(store, sessions, options.includes, &mut writer)
 }
 
 pub(crate) fn session_record_value(
@@ -157,12 +204,22 @@ pub(crate) fn session_record_value(
 fn write_jsonl_for_sessions<W: Write>(
     store: &Store,
     sessions: Vec<Session>,
+    includes: ExportIncludes,
     mut writer: W,
 ) -> Result<()> {
     for session in sessions {
-        let messages = store.get_messages(&session.id)?;
-        let usage_events = store.list_usage_events_for_session(&session.id)?;
-        let events = store.list_session_events_for_session(&session.id)?;
+        let messages =
+            if includes.messages { store.get_messages(&session.id)? } else { Vec::new() };
+        let usage_events = if includes.usage {
+            store.list_usage_events_for_session(&session.id)?
+        } else {
+            Vec::new()
+        };
+        let events = if includes.events {
+            store.list_session_events_for_session(&session.id)?
+        } else {
+            Vec::new()
+        };
         let record = build_session_record(session, messages, usage_events, events);
         serde_json::to_writer(&mut writer, &record)?;
         writer.write_all(b"\n")?;

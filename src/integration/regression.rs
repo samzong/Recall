@@ -5,7 +5,7 @@ use crate::config::AppConfig;
 use crate::db::schema;
 use crate::db::search::{RepoFilter, SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::Store;
-use crate::export::{ExportOptions, write_jsonl};
+use crate::export::{ExportIncludes, ExportOptions, write_jsonl};
 use crate::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource};
 use crate::usage::{UsageFilters, build_usage_report};
 
@@ -311,6 +311,7 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
         project: None,
         repo: None,
         limit: Some(10),
+        includes: ExportIncludes::full(),
     };
     let mut out = Vec::new();
     write_jsonl(&store, &options, &mut out).unwrap();
@@ -350,6 +351,53 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
 }
 
 #[test]
+fn export_jsonl_applies_include_projection() {
+    let store = setup();
+    let session = make_session("s1", "codex", "raw1", "Projected export");
+    let messages = vec![make_message("s1", Role::User, "hello", 0)];
+    let usage = vec![make_usage_event("evt-1", 1_800_000_001_000, "gpt-5")];
+    let events = vec![make_session_event("file_read", Some("read_file"), Some("src/main.rs"))];
+    store
+        .persist_session_with_usage_and_events(
+            &session,
+            &messages,
+            &usage,
+            Some(1),
+            &events,
+            Some(1),
+        )
+        .unwrap();
+
+    let options = ExportOptions {
+        session_ids: Vec::new(),
+        sources: None,
+        time_range: TimeRange::All,
+        project: None,
+        repo: None,
+        limit: None,
+        includes: ExportIncludes { messages: true, usage: false, events: false },
+    };
+    let mut out = Vec::new();
+    write_jsonl(&store, &options, &mut out).unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(value["messages"][0]["content"], "hello");
+    assert_eq!(value["usage_events"].as_array().unwrap().len(), 0);
+    assert_eq!(value["events"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn export_include_requires_messages() {
+    let err = match crate::export::parse_export_includes(Some("metadata,usage")) {
+        Ok(_) => panic!("messages should be required"),
+        Err(err) => err,
+    };
+    assert_eq!(err.to_string(), "--include must include messages");
+    assert!(crate::export::parse_export_includes(Some("metadata,messages")).unwrap().messages);
+}
+
+#[test]
 fn export_jsonl_can_select_sessions_by_id() {
     let store = setup();
     for id in ["s1", "s2", "s3"] {
@@ -365,6 +413,7 @@ fn export_jsonl_can_select_sessions_by_id() {
         project: None,
         repo: None,
         limit: None,
+        includes: ExportIncludes::full(),
     };
     let mut out = Vec::new();
     write_jsonl(&store, &options, &mut out).unwrap();
@@ -411,6 +460,7 @@ fn export_jsonl_applies_source_time_project_and_limit_filters() {
         project: Some("/tmp/project".to_string()),
         repo: None,
         limit: Some(1),
+        includes: ExportIncludes::full(),
     };
     let mut out = Vec::new();
     write_jsonl(&store, &options, &mut out).unwrap();
@@ -667,6 +717,7 @@ fn export_jsonl_applies_repo_filter() {
         project: None,
         repo: Some(RepoFilter::Slug("samzong/Recall".to_string())),
         limit: None,
+        includes: ExportIncludes::full(),
     };
     let mut out = Vec::new();
     write_jsonl(&store, &options, &mut out).unwrap();

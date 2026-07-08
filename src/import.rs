@@ -283,7 +283,7 @@ mod tests {
     use super::*;
     use crate::db::schema;
     use crate::db::search::TimeRange;
-    use crate::export::{ExportOptions, write_jsonl};
+    use crate::export::{ExportIncludes, ExportOptions, write_jsonl};
 
     fn setup() -> Store {
         schema::register_sqlite_vec();
@@ -394,6 +394,7 @@ mod tests {
             project: None,
             repo: None,
             limit: None,
+            includes: ExportIncludes::full(),
         };
         let mut out = Vec::new();
         write_jsonl(store, &options, &mut out).unwrap();

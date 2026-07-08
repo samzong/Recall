@@ -7,7 +7,7 @@ use crate::adapters;
 use crate::config::AppConfig;
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::{SessionListSort, Store};
-use crate::export::ExportOptions;
+use crate::export::{ExportIncludes, ExportOptions};
 use crate::handoff;
 use crate::query::{parse_time_range, query_embedding, resolve_source_filter};
 use crate::semantic;
@@ -77,6 +77,11 @@ pub(crate) enum SessionCommands {
         ids_file: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = SessionExportFormat::Jsonl)]
         format: SessionExportFormat,
+        #[arg(
+            long,
+            help = "Comma-separated JSONL fields; messages is required: metadata,messages,usage,events"
+        )]
+        include: Option<String>,
         #[arg(long, help = "Output path; stdout when omitted")]
         output: Option<PathBuf>,
     },
@@ -187,12 +192,6 @@ struct SessionListRow {
     snippet: Option<String>,
 }
 
-struct SessionIncludes {
-    messages: bool,
-    usage: bool,
-    events: bool,
-}
-
 pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
     match command {
         SessionCommands::List {
@@ -241,13 +240,14 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
             role,
             format,
         ),
-        SessionCommands::Export { ids, source, source_id, ids_file, format, output } => {
+        SessionCommands::Export { ids, source, source_id, ids_file, format, include, output } => {
             cmd_session_export(
                 ids,
                 source.as_deref(),
                 source_id.as_deref(),
                 ids_file,
                 format,
+                include.as_deref(),
                 output,
             )
         }
@@ -423,7 +423,7 @@ fn cmd_session_show(
     let store = Store::open()?;
     let sources = adapters::source_labels();
     let session = resolve_session_ref(&store, &sources, id, source_filter, source_id)?;
-    let includes = parse_session_includes(include, messages_flag, format);
+    let includes = parse_session_includes(include, messages_flag, format)?;
     let messages = if includes.messages {
         filter_session_messages(store.get_messages(&session.id)?, from_seq, to_seq, role)
     } else {
@@ -467,6 +467,7 @@ fn cmd_session_export(
     source_id: Option<&str>,
     ids_file: Option<PathBuf>,
     format: SessionExportFormat,
+    include: Option<&str>,
     output: Option<PathBuf>,
 ) -> Result<()> {
     let store = Store::open()?;
@@ -485,6 +486,7 @@ fn cmd_session_export(
                 project: None,
                 repo: None,
                 limit: None,
+                includes: crate::export::parse_export_includes(include)?,
             };
             if let Some(path) = output {
                 ensure_parent_dir(&path)?;
@@ -733,30 +735,16 @@ fn parse_session_includes(
     include: Option<&str>,
     messages_flag: bool,
     format: SessionDetailFormat,
-) -> SessionIncludes {
-    let mut includes = SessionIncludes {
+) -> Result<ExportIncludes> {
+    let includes = ExportIncludes {
         messages: matches!(format, SessionDetailFormat::Text) || messages_flag,
         usage: false,
         events: false,
     };
     let Some(include) = include else {
-        return includes;
+        return Ok(includes);
     };
-    for part in include.split(',').map(|part| part.trim().to_lowercase()) {
-        match part.as_str() {
-            "all" => {
-                includes.messages = true;
-                includes.usage = true;
-                includes.events = true;
-            }
-            "metadata" | "" => {}
-            "messages" => includes.messages = true,
-            "usage" => includes.usage = true,
-            "events" => includes.events = true,
-            _ => {}
-        }
-    }
-    includes
+    crate::export::apply_include_filter(includes, include)
 }
 
 fn filter_session_messages(
