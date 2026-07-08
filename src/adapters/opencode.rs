@@ -647,17 +647,14 @@ fn scan_for_sync_conn(
             let current_message_count = current_counts.get(&session.id).copied().unwrap_or(0);
             if session.time_updated == old_updated_at
                 && current_message_count == old_message_count
-                && crate::adapters::sync_state::usage_state_is_current(
+                && crate::adapters::sync_state::session_state_is_current(
                     USAGE_PARSER_VERSION,
+                    EVENT_PARSER_VERSION,
                     usage_state.get(&session.id).copied(),
+                    event_state.get(&session.id).copied(),
                     session.time_updated,
+                    include_events,
                 )
-                && (!include_events
-                    || crate::adapters::sync_state::event_state_is_current(
-                        EVENT_PARSER_VERSION,
-                        event_state.get(&session.id).copied(),
-                        session.time_updated,
-                    ))
             {
                 stats.skipped_sessions += 1;
                 continue;

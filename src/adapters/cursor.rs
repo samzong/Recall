@@ -17,7 +17,7 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
 };
-use crate::db::store::{EventSessionStateMeta, Store, UsageSessionStateMeta};
+use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 pub(crate) struct CursorAdapter;
@@ -105,7 +105,9 @@ impl SourceAdapter for CursorAdapter {
             let source_updated_at = updated_at.or(global_mtime);
             if let Some((old_updated_at, _)) = existing.get(&composer_id)
                 && *old_updated_at == source_updated_at
-                && session_state_is_current(
+                && crate::adapters::sync_state::session_state_is_current(
+                    USAGE_PARSER_VERSION,
+                    EVENT_PARSER_VERSION,
                     usage_state.get(&composer_id).copied(),
                     event_state.get(&composer_id).copied(),
                     source_updated_at,
@@ -1033,27 +1035,6 @@ fn open_global_db() -> anyhow::Result<Option<Connection>> {
 
 fn global_db_mtime() -> Option<i64> {
     resolve_global_state_db_path().and_then(|path| stat_mtime_ms(&path))
-}
-
-fn session_state_is_current(
-    usage_state: Option<UsageSessionStateMeta>,
-    event_state: Option<EventSessionStateMeta>,
-    source_updated_at: Option<i64>,
-    include_events: bool,
-) -> bool {
-    if !crate::adapters::sync_state::usage_state_is_current(
-        USAGE_PARSER_VERSION,
-        usage_state,
-        source_updated_at,
-    ) {
-        return false;
-    }
-    !include_events
-        || crate::adapters::sync_state::event_state_is_current(
-            EVENT_PARSER_VERSION,
-            event_state,
-            source_updated_at,
-        )
 }
 
 fn build_agent_cwd_map(db_path: Option<&Path>) -> HashMap<String, String> {

@@ -22,6 +22,19 @@ pub(crate) fn event_state_is_current(
     })
 }
 
+pub(crate) fn session_state_is_current(
+    usage_parser_version: u32,
+    event_parser_version: u32,
+    usage_state: Option<UsageSessionStateMeta>,
+    event_state: Option<EventSessionStateMeta>,
+    source_updated_at: Option<i64>,
+    include_events: bool,
+) -> bool {
+    usage_state_is_current(usage_parser_version, usage_state, source_updated_at)
+        && (!include_events
+            || event_state_is_current(event_parser_version, event_state, source_updated_at))
+}
+
 pub(crate) fn usage_state_is_current_for_mtime(
     required_parser_version: Option<u32>,
     state: Option<UsageSessionStateMeta>,
