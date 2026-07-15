@@ -151,7 +151,9 @@ impl ExistingState {
 }
 
 pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
-    SyncJob::new(options)?.run()
+    let available_adapters = adapters::all_adapters();
+    SyncJob::new(options, Store::open()?, AppConfig::load_or_default(), &available_adapters)?
+        .run(&available_adapters)
 }
 
 struct SyncJob {
@@ -166,10 +168,16 @@ struct SyncJob {
 }
 
 impl SyncJob {
-    fn new(options: SyncRunOptions) -> Result<Self> {
-        let store = Store::open()?;
-        let labels = adapters::source_labels();
-        let mut config = AppConfig::load_or_default();
+    fn new(
+        options: SyncRunOptions,
+        store: Store,
+        mut config: AppConfig,
+        available_adapters: &[Box<dyn adapters::SourceAdapter>],
+    ) -> Result<Self> {
+        let labels: Vec<_> = available_adapters
+            .iter()
+            .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
+            .collect();
         config.normalize_sources(&labels);
         let since_ts = if options.usage_only { None } else { config.sync_window.to_since_cutoff() };
         let path_excluder = config.build_path_excluder()?;
@@ -185,9 +193,8 @@ impl SyncJob {
         })
     }
 
-    fn run(&mut self) -> Result<()> {
-        let all = adapters::all_adapters();
-        for adapter in &all {
+    fn run(&mut self, available_adapters: &[Box<dyn adapters::SourceAdapter>]) -> Result<()> {
+        for adapter in available_adapters {
             self.sync_adapter(adapter.as_ref())?;
         }
         self.report_progress()
@@ -735,17 +742,59 @@ fn path_or_ancestor_matches(path: &str, matcher: &globset::GlobSet) -> bool {
 mod tests {
     use std::collections::HashSet;
 
-    use crate::adapters::RawSession;
+    use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
+    use crate::config::AppConfig;
     use crate::db::{
         schema,
         store::{SessionPath, Store},
     };
-    use crate::types::Session;
+    use crate::types::{Role, Session};
 
     use super::{
-        BackfillPlan, ExistingSessionAction, decide_existing_session_action,
-        delete_excluded_sessions_for_source, raw_session_metadata_changed,
+        BackfillPlan, ExistingSessionAction, SyncJob, SyncRunOptions,
+        decide_existing_session_action, delete_excluded_sessions_for_source,
+        raw_session_metadata_changed,
     };
+
+    struct StaticAdapter {
+        updated_at: i64,
+        messages: &'static [&'static str],
+    }
+
+    impl SourceAdapter for StaticAdapter {
+        fn id(&self) -> &str {
+            "test"
+        }
+
+        fn label(&self) -> &str {
+            "Test"
+        }
+
+        fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
+            let messages = self
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(seq, content)| RawMessage {
+                    role: Role::User,
+                    content: (*content).to_string(),
+                    timestamp: Some(self.updated_at + seq as i64),
+                })
+                .collect();
+            Ok(vec![RawSession::search_only(
+                "raw1",
+                None,
+                1_000,
+                Some(self.updated_at),
+                None,
+                messages,
+            )])
+        }
+
+        fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
+            None
+        }
+    }
 
     fn matcher(pattern: &str) -> globset::GlobSet {
         let mut builder = globset::GlobSetBuilder::new();
@@ -851,6 +900,42 @@ mod tests {
         let mut raw_with_path = RawSession::search_only("raw1", None, 0, Some(1), None, vec![]);
         raw_with_path.source_file_path = Some("/tmp/session.jsonl".to_string());
         assert!(raw_session_metadata_changed(&raw_with_path, None, &missing));
+    }
+
+    #[test]
+    fn sync_job_refreshes_changed_session_through_adapter_seam() {
+        schema::register_sqlite_vec();
+        let initial: Vec<Box<dyn SourceAdapter>> =
+            vec![Box::new(StaticAdapter { updated_at: 2_000, messages: &["first"] })];
+        let mut job = SyncJob::new(
+            SyncRunOptions {
+                force: false,
+                verbose: false,
+                emit: false,
+                usage_only: false,
+                backfill_events: false,
+                sources: None,
+            },
+            Store::open_in_memory().unwrap(),
+            AppConfig::default(),
+            &initial,
+        )
+        .unwrap();
+
+        job.run(&initial).unwrap();
+        assert_eq!(job.store.session_meta("test", "raw1").unwrap(), Some((Some(2_000), 1)));
+
+        let updated: Vec<Box<dyn SourceAdapter>> =
+            vec![Box::new(StaticAdapter { updated_at: 3_000, messages: &["first", "second"] })];
+        job.run(&updated).unwrap();
+
+        assert_eq!(job.store.session_meta("test", "raw1").unwrap(), Some((Some(3_000), 2)));
+        let session = job.store.list_recent_sessions(1).unwrap().pop().unwrap();
+        let messages = job.store.get_messages(&session.id).unwrap();
+        assert_eq!(
+            messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
     }
 
     #[test]

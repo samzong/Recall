@@ -794,70 +794,6 @@ fn f32_slice_to_bytes_roundtrip() {
 }
 
 #[test]
-fn sync_skips_unchanged_session() {
-    let store = setup();
-    let session = Session {
-        id: "s1".to_string(),
-        source: "test".to_string(),
-        source_id: "raw1".to_string(),
-        title: "Original".to_string(),
-        directory: None,
-        repo_remote: None,
-        repo_slug: None,
-        repo_name: None,
-        started_at: 1000,
-        updated_at: Some(2000),
-        message_count: 2,
-        entrypoint: None,
-        custom_title: None,
-        summary: None,
-        duration_minutes: None,
-        source_file_path: None,
-        is_import: false,
-    };
-    store.insert_session(&session).unwrap();
-
-    let meta = store.session_meta("test", "raw1").unwrap();
-    assert_eq!(meta, Some((Some(2000), 2)));
-}
-
-#[test]
-fn sync_detects_new_messages() {
-    let store = setup();
-    let session = Session {
-        id: "s1".to_string(),
-        source: "test".to_string(),
-        source_id: "raw1".to_string(),
-        title: "Original".to_string(),
-        directory: None,
-        repo_remote: None,
-        repo_slug: None,
-        repo_name: None,
-        started_at: 1000,
-        updated_at: Some(2000),
-        message_count: 2,
-        entrypoint: None,
-        custom_title: None,
-        summary: None,
-        duration_minutes: None,
-        source_file_path: None,
-        is_import: false,
-    };
-    store.insert_session(&session).unwrap();
-    store.insert_messages(&[make_message("s1", Role::User, "hello", 0)]).unwrap();
-
-    let meta = store.session_meta("test", "raw1").unwrap().unwrap();
-    let (old_updated_at, old_msg_count) = meta;
-
-    let new_msg_count: u32 = 5;
-    let new_updated_at: Option<i64> = Some(3000);
-
-    let changed = old_msg_count != new_msg_count
-        || (new_updated_at.is_some() && new_updated_at != old_updated_at);
-    assert!(changed, "sync must detect message count change");
-}
-
-#[test]
 fn replace_session_rolls_back_delete_when_reinsert_fails() {
     let store = setup();
     let mut old_session = Session {
@@ -1037,40 +973,6 @@ fn replace_session_clears_import_marker_on_success() {
         count_rows(&store, "SELECT COUNT(*) FROM session_embedding_state WHERE session_id = 's2'"),
         1
     );
-}
-
-#[test]
-fn sync_detects_updated_timestamp() {
-    let store = setup();
-    let session = Session {
-        id: "s1".to_string(),
-        source: "test".to_string(),
-        source_id: "raw1".to_string(),
-        title: "Original".to_string(),
-        directory: None,
-        repo_remote: None,
-        repo_slug: None,
-        repo_name: None,
-        started_at: 1000,
-        updated_at: Some(2000),
-        message_count: 3,
-        entrypoint: None,
-        custom_title: None,
-        summary: None,
-        duration_minutes: None,
-        source_file_path: None,
-        is_import: false,
-    };
-    store.insert_session(&session).unwrap();
-
-    let (old_updated_at, old_msg_count) = store.session_meta("test", "raw1").unwrap().unwrap();
-
-    let new_msg_count: u32 = 3;
-    let new_updated_at: Option<i64> = Some(5000);
-
-    let changed = old_msg_count != new_msg_count
-        || (new_updated_at.is_some() && new_updated_at != old_updated_at);
-    assert!(changed, "sync must detect updated_at change even when message count is same");
 }
 
 #[test]
