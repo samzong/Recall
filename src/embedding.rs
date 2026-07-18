@@ -7,6 +7,10 @@ use std::path::PathBuf;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 const MODEL_ID: &str = "intfloat/multilingual-e5-small";
+// Pinned commit of the model repo — never track the mutable `main` branch,
+// so a compromised upstream push cannot alter the weights we download.
+// Verified 2026-07-17 to still serve config.json/tokenizer.json/model.safetensors.
+const MODEL_REVISION: &str = "614241f622f53c4eeff9890bdc4f31cfecc418b3";
 
 pub(crate) struct EmbeddingProvider {
     model: BertModel,
@@ -119,8 +123,11 @@ fn select_device() -> Result<Device> {
 
 fn download_model(show_progress: bool) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let api = hf_hub::api::sync::ApiBuilder::from_env().build()?;
-    let repo =
-        api.repo(Repo::with_revision(MODEL_ID.to_string(), RepoType::Model, "main".to_string()));
+    let repo = api.repo(Repo::with_revision(
+        MODEL_ID.to_string(),
+        RepoType::Model,
+        MODEL_REVISION.to_string(),
+    ));
 
     if show_progress {
         eprintln!("Downloading model {MODEL_ID} (first run only)...");
