@@ -48,9 +48,122 @@ pub(crate) fn parse_since(s: &str) -> Option<i64> {
     Some(now - n * multiplier)
 }
 
+/// Consumes a CSI parameter/intermediate tail through its final byte
+/// (0x40..=0x7e). Returns whether it was terminated before EOF. Shared by
+/// the `ESC [` and 8-bit `U+009B` (CSI) introducers.
+fn consume_csi_tail(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    for b in chars.by_ref() {
+        if ('\u{40}'..='\u{7e}').contains(&b) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Consumes an OSC string tail, terminated by BEL (0x07), ST (`ESC \`), or
+/// the 8-bit C1 ST (`U+009C`). Returns whether it was terminated before EOF.
+/// Shared by the `ESC ]` and 8-bit `U+009D` (OSC) introducers.
+fn consume_osc_tail(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    while let Some(b) = chars.next() {
+        if b == '\u{07}' || b == '\u{9c}' {
+            return true;
+        }
+        if b == '\u{1b}' {
+            // possible ST: consume the following '\'
+            if chars.peek() == Some(&'\\') {
+                chars.next();
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Consumes a DCS/SOS/PM/APC string tail, terminated by ST (`ESC \`) or the
+/// 8-bit C1 ST (`U+009C`). Returns whether it was terminated before EOF.
+/// Shared by the `ESC P`/`X`/`^`/`_` and 8-bit `U+0090`/`U+0098`/`U+009E`/
+/// `U+009F` introducers.
+fn consume_string_tail(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    while let Some(b) = chars.next() {
+        if b == '\u{9c}' {
+            return true;
+        }
+        if b == '\u{1b}' {
+            if chars.peek() == Some(&'\\') {
+                chars.next();
+            }
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn strip_ansi_sequences(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                // Saw ESC. Dispatch on the introducer byte.
+                let Some(&intro) = chars.peek() else {
+                    break; // lone trailing ESC -> drop (D6)
+                };
+                match intro {
+                    '[' => {
+                        // CSI: ESC [ params/intermediates final(0x40..=0x7e)
+                        chars.next();
+                        if !consume_csi_tail(&mut chars) {
+                            break; // unterminated CSI at EOF -> drop remainder (D6)
+                        }
+                    }
+                    ']' => {
+                        // OSC: ESC ] ... terminated by BEL (0x07) or ST (ESC \)
+                        chars.next();
+                        if !consume_osc_tail(&mut chars) {
+                            break; // unterminated OSC -> drop remainder (D6)
+                        }
+                    }
+                    'P' | 'X' | '^' | '_' => {
+                        // DCS/SOS/PM/APC string: terminated by ST (ESC \)
+                        chars.next();
+                        if !consume_string_tail(&mut chars) {
+                            break; // unterminated string sequence -> drop remainder (D6)
+                        }
+                    }
+                    _ => {
+                        // 2-byte escape (ESC + single byte), e.g. ESC c, ESC 7, SS2/SS3 (D12)
+                        chars.next();
+                    }
+                }
+            }
+            '\u{9b}' => {
+                // 8-bit CSI introducer, equivalent to ESC [
+                if !consume_csi_tail(&mut chars) {
+                    break; // unterminated CSI at EOF -> drop remainder (D6)
+                }
+            }
+            '\u{9d}' => {
+                // 8-bit OSC introducer, equivalent to ESC ]
+                if !consume_osc_tail(&mut chars) {
+                    break; // unterminated OSC -> drop remainder (D6)
+                }
+            }
+            '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => {
+                // 8-bit DCS/SOS/PM/APC introducers, equivalent to ESC P/X/^/_
+                if !consume_string_tail(&mut chars) {
+                    break; // unterminated string sequence -> drop remainder (D6)
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 pub(crate) fn sanitize_line(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    for c in line.chars() {
+    let stripped = strip_ansi_sequences(line);
+    let mut out = String::with_capacity(stripped.len());
+    for c in stripped.chars() {
         if c == '\t' {
             out.push_str("    ");
         } else if c.is_control() {
@@ -193,5 +306,81 @@ mod tests {
     fn title_detects_noise_with_leading_whitespace() {
         let msgs = ["   <command-message>ship</command-message>", "real content"];
         assert_eq!(title_from_user_messages(&msgs), "real content");
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_and_osc_leaving_text() {
+        assert_eq!(strip_ansi_sequences("\x1b[31mred\x1b[0m\x1b]0;title\x07"), "red");
+    }
+
+    #[test]
+    fn strip_ansi_preserves_plain_text_tabs_and_newlines() {
+        assert_eq!(strip_ansi_sequences("a\tb\nc"), "a\tb\nc");
+    }
+
+    #[test]
+    fn strip_ansi_handles_osc_st_terminator() {
+        // OSC terminated by ST (ESC \) instead of BEL
+        assert_eq!(strip_ansi_sequences("x\x1b]0;title\x1b\\y"), "xy");
+    }
+
+    #[test]
+    fn strip_ansi_drops_unterminated_csi_remainder() {
+        assert_eq!(strip_ansi_sequences("ok\x1b[31"), "ok");
+    }
+
+    #[test]
+    fn strip_ansi_drops_unterminated_osc_remainder() {
+        assert_eq!(strip_ansi_sequences("ok\x1b]0;never"), "ok");
+    }
+
+    #[test]
+    fn strip_ansi_drops_lone_trailing_esc() {
+        assert_eq!(strip_ansi_sequences("ok\x1b"), "ok");
+    }
+
+    #[test]
+    fn strip_ansi_drops_two_byte_escape() {
+        // ESC c (RIS reset) is a 2-byte escape; both bytes go, rest stays
+        assert_eq!(strip_ansi_sequences("a\x1bcb"), "ab");
+    }
+
+    #[test]
+    fn strip_ansi_drops_dcs_string_through_st() {
+        assert_eq!(strip_ansi_sequences("\x1bPq;data\x1b\\end"), "end");
+    }
+
+    #[test]
+    fn strip_ansi_handles_c1_csi_introducer() {
+        // U+009B is the 8-bit CSI introducer, equivalent to ESC [
+        assert_eq!(strip_ansi_sequences("\u{9b}31mred\u{9b}0m"), "red");
+    }
+
+    #[test]
+    fn strip_ansi_handles_c1_osc_introducer_bel_terminated() {
+        // U+009D is the 8-bit OSC introducer, equivalent to ESC ]
+        assert_eq!(strip_ansi_sequences("a\u{9d}0;title\u{07}b"), "ab");
+    }
+
+    #[test]
+    fn strip_ansi_handles_c1_osc_introducer_c1_st_terminated() {
+        // U+009C is the 8-bit ST, valid terminator alongside ESC \
+        assert_eq!(strip_ansi_sequences("a\u{9d}0;title\u{9c}b"), "ab");
+    }
+
+    #[test]
+    fn strip_ansi_handles_c1_dcs_introducer_esc_st_terminated() {
+        // U+0090 is the 8-bit DCS introducer, equivalent to ESC P
+        assert_eq!(strip_ansi_sequences("\u{90}payload\u{1b}\\x"), "x");
+    }
+
+    #[test]
+    fn strip_ansi_drops_unterminated_c1_csi_remainder() {
+        assert_eq!(strip_ansi_sequences("a\u{9b}31"), "a");
+    }
+
+    #[test]
+    fn sanitize_line_strips_escape_residue_and_expands_tabs() {
+        assert_eq!(sanitize_line("\x1b[31mred\x1b[0m\tX"), "red    X");
     }
 }

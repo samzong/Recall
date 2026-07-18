@@ -2531,7 +2531,10 @@ impl App {
     }
 
     fn copy_current_message(&mut self) {
-        let text = self.viewing_messages.get(self.viewing_selected_msg).map(|m| m.content.clone());
+        let text = self
+            .viewing_messages
+            .get(self.viewing_selected_msg)
+            .map(|m| crate::utils::strip_ansi_sequences(&m.content));
         if let Some(text) = text {
             self.copy_to_clipboard(&text);
         }
