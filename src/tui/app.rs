@@ -32,6 +32,7 @@ use crate::tui::usage_state::UsageTab;
 use crate::tui::viewing_state::{SanitizedLine, ViewingSessionSummary, build_viewing_caches};
 use crate::types::{BackgroundJobStatus, MatchSource, Message, SearchResult, SemanticProgress};
 use crate::usage::{self, UsageFilters, UsageReport};
+use crate::utils::clipboard_candidates;
 
 const USAGE_LOADING_MIN_MS: u128 = 75;
 const SEARCH_DEBOUNCE_MS: u64 = 250;
@@ -2507,26 +2508,21 @@ impl App {
     }
 
     fn copy_to_clipboard(&mut self, text: &str) {
-        let (cmd, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
-            ("pbcopy", &[])
-        } else if cfg!(target_os = "windows") {
-            ("clip.exe", &[])
-        } else {
-            ("xclip", &["-selection", "clipboard"])
-        };
-
-        match Command::new(cmd).args(args).stdin(Stdio::piped()).spawn() {
-            Ok(mut child) => {
-                if let Some(ref mut stdin) = child.stdin {
-                    let _ = stdin.write_all(text.as_bytes());
+        for (cmd, args) in clipboard_candidates() {
+            match Command::new(cmd).args(*args).stdin(Stdio::piped()).spawn() {
+                Ok(mut child) => {
+                    if let Some(ref mut stdin) = child.stdin {
+                        let _ = stdin.write_all(text.as_bytes());
+                    }
+                    let _ = child.wait();
+                    self.status_message = Some("Copied to clipboard".to_string());
+                    return;
                 }
-                let _ = child.wait();
-                self.status_message = Some("Copied to clipboard".to_string());
-            }
-            Err(_) => {
-                self.status_message = Some(format!("Failed to copy ({cmd} not found)"));
+                Err(_) => continue,
             }
         }
+        self.status_message =
+            Some("Failed to copy (install wl-clipboard, xclip, or xsel)".to_string());
     }
 
     fn start_export(&mut self) {

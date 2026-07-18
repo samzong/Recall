@@ -15,6 +15,20 @@ pub(crate) fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn clipboard_candidates() -> &'static [(&'static str, &'static [&'static str])] {
+    if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(target_os = "windows") {
+        &[("clip.exe", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    }
+}
+
 pub(crate) fn format_age(started_at: i64) -> String {
     let now = chrono::Utc::now().timestamp_millis();
     let diff_hours = (now - started_at) / (1000 * 3600);
@@ -112,6 +126,21 @@ fn is_noise_first_message(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn clipboard_candidates_fall_back_wl_copy_then_xclip_then_xsel_on_linux() {
+        let candidates = clipboard_candidates();
+
+        assert_eq!(
+            candidates,
+            &[
+                ("wl-copy", &[][..]),
+                ("xclip", &["-selection", "clipboard"][..]),
+                ("xsel", &["--clipboard", "--input"][..]),
+            ]
+        );
+    }
 
     #[test]
     fn title_empty_input_returns_untitled() {
