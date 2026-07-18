@@ -48,6 +48,22 @@ impl Store {
         Ok(cleared)
     }
 
+    /// Reset embedding rows stranded in `processing` (e.g. a worker killed
+    /// mid-embed) back to `pending` so the next worker launch resumes them.
+    /// Idempotent to re-run; leaves `done`/`failed`/`pending` rows untouched.
+    /// Returns the number of rows re-queued.
+    pub(crate) fn reset_inflight_embedding_jobs(&self) -> Result<usize> {
+        let reset = self.conn.execute(
+            "UPDATE session_embedding_state
+             SET status = 'pending',
+                 started_at = NULL,
+                 finished_at = NULL
+             WHERE status = 'processing'",
+            [],
+        )?;
+        Ok(reset)
+    }
+
     pub(crate) fn embeddable_messages(&self, session_id: &str) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, content FROM messages

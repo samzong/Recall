@@ -134,7 +134,100 @@ fn try_acquire_worker_lock() -> Result<Option<File>> {
     }
 }
 
-fn worker_lock_path() -> Result<std::path::PathBuf> {
+pub(crate) fn worker_lock_path() -> Result<std::path::PathBuf> {
     let dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
     Ok(dir.join("recall").join("background-worker.lock"))
+}
+
+pub(crate) fn worker_lock_pid() -> Result<Option<u32>> {
+    lock_pid_at(&worker_lock_path()?)
+}
+
+pub(crate) fn worker_lock_is_held() -> Result<bool> {
+    lock_is_held_at(&worker_lock_path()?)
+}
+
+fn lock_pid_at(path: &std::path::Path) -> Result<Option<u32>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(contents.lines().next().and_then(|line| line.trim().parse::<u32>().ok()))
+}
+
+fn lock_is_held_at(path: &std::path::Path) -> Result<bool> {
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    // A live worker holds an exclusive flock on this file for its lifetime.
+    // If we can take the lock, no live holder exists (stale/absent pidfile).
+    // `drop(file)` releases our probe lock. Any lock error means contended -> held.
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(false),
+        Err(_) => Ok(true),
+    }
+}
+
+#[cfg(test)]
+mod worker_lock_tests {
+    use std::fs::OpenOptions;
+
+    use fs2::FileExt;
+
+    use super::{lock_is_held_at, lock_pid_at};
+
+    #[test]
+    fn test_should_report_not_held_when_lock_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("background-worker.lock");
+        assert!(!lock_is_held_at(&path).unwrap());
+    }
+
+    #[test]
+    fn test_should_report_not_held_when_file_exists_but_unlocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("background-worker.lock");
+        std::fs::write(&path, "4242\n").unwrap();
+        assert!(!lock_is_held_at(&path).unwrap());
+    }
+
+    #[test]
+    fn test_should_report_held_while_exclusive_flock_is_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("background-worker.lock");
+        std::fs::write(&path, "4242\n").unwrap();
+
+        let holder = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        holder.try_lock_exclusive().unwrap();
+        assert!(lock_is_held_at(&path).unwrap());
+
+        drop(holder);
+        assert!(!lock_is_held_at(&path).unwrap());
+    }
+
+    #[test]
+    fn test_should_read_pid_from_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("background-worker.lock");
+        std::fs::write(&path, "12345\n").unwrap();
+        assert_eq!(lock_pid_at(&path).unwrap(), Some(12345));
+    }
+
+    #[test]
+    fn test_should_return_none_pid_when_missing_empty_or_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.lock");
+        assert_eq!(lock_pid_at(&missing).unwrap(), None);
+
+        let empty = dir.path().join("empty.lock");
+        std::fs::write(&empty, "").unwrap();
+        assert_eq!(lock_pid_at(&empty).unwrap(), None);
+
+        let garbage = dir.path().join("garbage.lock");
+        std::fs::write(&garbage, "not-a-pid\n").unwrap();
+        assert_eq!(lock_pid_at(&garbage).unwrap(), None);
+    }
 }

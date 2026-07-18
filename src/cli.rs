@@ -101,6 +101,11 @@ enum Commands {
         #[arg(long, help = "Skip the confirmation prompt")]
         yes: bool,
     },
+    #[command(about = "Inspect and control the background embedding worker")]
+    Worker {
+        #[command(subcommand)]
+        command: WorkerAction,
+    },
     #[command(about = "Share session pages")]
     Share {
         #[command(subcommand)]
@@ -141,6 +146,17 @@ enum Commands {
     BenchDumpSessions,
     #[command(external_subcommand)]
     External(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+enum WorkerAction {
+    #[command(about = "Show background worker status")]
+    Status,
+    #[command(about = "Stop the background worker")]
+    Stop {
+        #[arg(long, help = "Also drop computed embeddings and re-queue every session")]
+        clear_queue: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -244,6 +260,12 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Reset { yes }) => crate::maintenance::run_reset(yes)?,
         Some(Commands::Vacuum) => crate::maintenance::run_vacuum()?,
         Some(Commands::Reembed { yes }) => crate::maintenance::run_reembed(yes)?,
+        Some(Commands::Worker { command: WorkerAction::Status }) => {
+            crate::maintenance::run_worker_status()?
+        }
+        Some(Commands::Worker { command: WorkerAction::Stop { clear_queue } }) => {
+            crate::maintenance::run_worker_stop(clear_queue)?
+        }
         Some(Commands::Share { command: ShareCommands::Init { project_name, publish_dir } }) => {
             crate::share_init::run(project_name, publish_dir)?
         }
@@ -360,8 +382,8 @@ fn recall_skill_bundle() -> kitup::SkillBundle {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, ExtensionCommands, ShareCommands, Shell, SkillCommands, generate,
-        insert_installed_help,
+        Cli, Commands, ExtensionCommands, ShareCommands, Shell, SkillCommands, WorkerAction,
+        generate, insert_installed_help,
     };
     use crate::adapters::{
         adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
@@ -481,6 +503,9 @@ mod tests {
         assert!(compact_help.contains("extension Manage Recall extensions"));
         assert!(compact_help.contains("session Operate on indexed sessions"));
         assert!(compact_help.contains("completions Generate shell completion script"));
+        assert!(
+            compact_help.contains("worker Inspect and control the background embedding worker")
+        );
     }
 
     #[test]
@@ -571,6 +596,30 @@ mod tests {
     fn reembed_defaults_to_prompt() {
         let cli = Cli::try_parse_from(["recall", "reembed"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Reembed { yes: false })));
+    }
+
+    #[test]
+    fn worker_status_parses() {
+        let cli = Cli::try_parse_from(["recall", "worker", "status"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Worker { command: WorkerAction::Status })));
+    }
+
+    #[test]
+    fn worker_stop_defaults_to_keep_queue() {
+        let cli = Cli::try_parse_from(["recall", "worker", "stop"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Worker { command: WorkerAction::Stop { clear_queue: false } })
+        ));
+    }
+
+    #[test]
+    fn worker_stop_accepts_clear_queue_flag() {
+        let cli = Cli::try_parse_from(["recall", "worker", "stop", "--clear-queue"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Worker { command: WorkerAction::Stop { clear_queue: true } })
+        ));
     }
 
     #[test]

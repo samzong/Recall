@@ -2765,6 +2765,7 @@ dependencies = [
  "globset",
  "hf-hub",
  "kitup",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "rusqlite",

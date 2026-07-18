@@ -1055,6 +1055,49 @@ fn replace_session_clears_import_marker_on_success() {
 }
 
 #[test]
+fn test_should_requeue_inflight_embedding_job_when_reset() {
+    let store = setup();
+    let session = make_session("s1", "test", "raw1", "In-flight session");
+    store
+        .persist_session_with_usage_and_events(
+            &session,
+            &[make_message("s1", Role::User, "some embeddable content", 0)],
+            &[],
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+
+    // Claim moves the row from 'pending' to 'processing', simulating a
+    // worker that started embedding this session.
+    let claimed = store.claim_next_session_embedding_job().unwrap();
+    assert!(claimed.is_some(), "expected a pending job to claim");
+    assert_eq!(
+        count_rows(
+            &store,
+            "SELECT COUNT(*) FROM session_embedding_state WHERE session_id = 's1' AND status = 'processing'"
+        ),
+        1
+    );
+
+    let reset = store.reset_inflight_embedding_jobs().unwrap();
+    assert_eq!(reset, 1);
+    assert_eq!(
+        count_rows(
+            &store,
+            "SELECT COUNT(*) FROM session_embedding_state WHERE session_id = 's1' AND status = 'pending'"
+        ),
+        1
+    );
+
+    // The reset row must be re-claimable by the next worker launch.
+    let reclaimed = store.claim_next_session_embedding_job().unwrap();
+    assert!(reclaimed.is_some(), "expected the reset job to be re-claimable");
+    assert_eq!(reclaimed.unwrap().session_id, "s1");
+}
+
+#[test]
 fn gemini_parser_plain_conversation() {
     let json = r#"{
         "sessionId": "abc-123",

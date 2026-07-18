@@ -52,6 +52,9 @@ candle-core = "0.10"
 candle-nn = "0.10"
 candle-transformers = "0.10"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
