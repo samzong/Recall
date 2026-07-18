@@ -10,7 +10,7 @@ use crate::tui::layout::search_layout;
 use crate::tui::search_state::{FilterFocus, PanelFocus};
 use crate::tui::text_layout::wrap_visual_rows;
 use crate::tui::theme::THEME;
-use crate::types::{MatchSource, Role};
+use crate::types::MatchSource;
 
 use super::popups::render_status_bar;
 use super::{render_vertical_scrollbar, row_visible, truncate_label};
@@ -313,12 +313,12 @@ pub(super) fn render_preview(f: &mut Frame, app: &App, area: Rect) {
     let viewport_end = viewport_start + inner.height as usize;
     let mut visual_row = 0usize;
     let mut lines: Vec<Line> = Vec::new();
+    let source =
+        app.results.get(app.selected_index).map(|r| r.session.source.as_str()).unwrap_or("");
     for (i, msg) in app.preview_messages.iter().enumerate() {
         let selected = focused && i == app.preview_selected_msg;
-        let (prefix, color) = match msg.role {
-            Role::User => ("User: ", THEME.user),
-            Role::Assistant => ("Asst: ", THEME.assistant),
-        };
+        let prefix = format!("{}: ", crate::utils::role_label(source, &msg.role));
+        let color = crate::tui::theme::role_color(&msg.role);
 
         let time_str = crate::utils::format_message_time(msg.timestamp);
         let header_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {

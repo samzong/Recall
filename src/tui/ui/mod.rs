@@ -391,6 +391,7 @@ mod tests {
                 reasoning_tokens: 2,
                 total_tokens: 31,
             },
+            started_calendar: "2024-01-01".to_string(),
         });
 
         let backend = TestBackend::new(100, 8);

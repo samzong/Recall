@@ -1,5 +1,7 @@
 use std::process::Command;
 
+use crate::types::Role;
+
 pub(crate) fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("open", vec![url])
@@ -173,6 +175,41 @@ pub(crate) fn sanitize_line(line: &str) -> String {
         }
     }
     out
+}
+
+pub(crate) fn role_label(source: &str, role: &Role) -> &'static str {
+    match role {
+        Role::User => "You",
+        Role::Assistant => match source {
+            "claude-code" => "Claude",
+            "opencode" => "OpenCode",
+            "codex" => "Codex",
+            "pi" => "Pi",
+            "antigravity-cli" => "Antigravity",
+            "gemini-cli" => "Gemini",
+            "grok" => "Grok",
+            "kiro-cli" => "Kiro",
+            "copilot-cli" => "Copilot",
+            "cursor" => "Cursor",
+            "cline" => "Cline",
+            _ => "Asst",
+        },
+    }
+}
+
+pub(crate) fn project_label(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    match parts.len() {
+        0 => path.to_string(),
+        1 => parts[0].to_string(),
+        len => format!("{}/{}", parts[len - 2], parts[len - 1]),
+    }
+}
+
+pub(crate) fn format_started_calendar(started_at: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(started_at)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
 }
 
 pub(crate) fn format_message_time(ts: Option<i64>) -> String {
@@ -382,5 +419,50 @@ mod tests {
     #[test]
     fn sanitize_line_strips_escape_residue_and_expands_tabs() {
         assert_eq!(sanitize_line("\x1b[31mred\x1b[0m\tX"), "red    X");
+    }
+
+    #[test]
+    fn role_label_user_is_you_for_any_source() {
+        assert_eq!(role_label("claude-code", &Role::User), "You");
+        assert_eq!(role_label("totally-unknown", &Role::User), "You");
+    }
+
+    #[test]
+    fn role_label_maps_each_assistant_source() {
+        let cases = [
+            ("claude-code", "Claude"),
+            ("opencode", "OpenCode"),
+            ("codex", "Codex"),
+            ("pi", "Pi"),
+            ("antigravity-cli", "Antigravity"),
+            ("gemini-cli", "Gemini"),
+            ("grok", "Grok"),
+            ("kiro-cli", "Kiro"),
+            ("copilot-cli", "Copilot"),
+            ("cursor", "Cursor"),
+            ("cline", "Cline"),
+        ];
+        for (src, expected) in cases {
+            assert_eq!(role_label(src, &Role::Assistant), expected, "source {src}");
+        }
+    }
+
+    #[test]
+    fn role_label_unknown_assistant_falls_back_to_asst() {
+        assert_eq!(role_label("mystery-cli", &Role::Assistant), "Asst");
+    }
+
+    #[test]
+    fn project_label_returns_last_two_components() {
+        assert_eq!(project_label("/home/u/dev/recall"), "dev/recall");
+        assert_eq!(project_label("recall"), "recall");
+        assert_eq!(project_label(""), "");
+    }
+
+    #[test]
+    fn format_started_calendar_returns_iso_date_shape() {
+        let out = format_started_calendar(1_700_000_000_000);
+        assert!(!out.is_empty());
+        assert!(out.contains('-'));
     }
 }

@@ -28,6 +28,7 @@ pub(crate) struct ViewingSessionSummary {
     pub(crate) duration_minutes: Option<u32>,
     pub(crate) usage_events: usize,
     pub(crate) tokens: TokenTotals,
+    pub(crate) started_calendar: String,
 }
 
 impl ViewingSessionSummary {
@@ -35,6 +36,7 @@ impl ViewingSessionSummary {
         messages: &[Message],
         duration_minutes: Option<u32>,
         usage_events: &[SessionUsageEventRecord],
+        started_at: i64,
     ) -> Self {
         let mut tokens = TokenTotals::default();
         for event in usage_events {
@@ -56,6 +58,7 @@ impl ViewingSessionSummary {
             duration_minutes: duration_minutes.or_else(|| message_span_minutes(messages)),
             usage_events: usage_events.len(),
             tokens,
+            started_calendar: crate::utils::format_started_calendar(started_at),
         }
     }
 }

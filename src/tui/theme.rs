@@ -1,5 +1,7 @@
 use ratatui::style::Color;
 
+use crate::types::Role;
+
 pub(crate) struct Theme {
     pub(crate) text: Color,
     pub(crate) text_muted: Color,
@@ -76,3 +78,23 @@ pub(crate) const THEME: Theme = Theme {
     token_cache_write: Color::Magenta,
     token_reasoning: Color::Yellow,
 };
+
+/// Role -> Theme token, so the viewing/search/preview panes share one color decision
+/// instead of each hardcoding a literal (or duplicating a match arm per call site).
+pub(crate) fn role_color(role: &Role) -> Color {
+    match role {
+        Role::User => THEME.user,
+        Role::Assistant => THEME.assistant,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_color_matches_theme_user_and_assistant_tokens() {
+        assert_eq!(role_color(&Role::User), THEME.user);
+        assert_eq!(role_color(&Role::Assistant), THEME.assistant);
+    }
+}

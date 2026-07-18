@@ -10,7 +10,6 @@ use crate::tui::layout::viewing_layout;
 use crate::tui::text_layout::{GUTTER_WIDTH, wrap_spans_to_lines};
 use crate::tui::theme::THEME;
 use crate::tui::viewing_state::SanitizedLine;
-use crate::types::Role;
 
 use super::{format_compact, highlight_spans, render_vertical_scrollbar, truncate_label};
 
@@ -26,10 +25,15 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         .get(app.selected_index)
         .map(|r| {
             let s = &r.session;
-            let dir = s.directory.as_deref().unwrap_or("");
             let count = app.viewing_messages.len();
             let pos = app.viewing_selected_msg + 1;
-            format!(" {} — {dir} [{pos}/{count}] ", s.title)
+            match s.directory.as_deref().filter(|d| !d.is_empty()) {
+                Some(dir) => {
+                    let project = crate::utils::project_label(dir);
+                    format!(" {} — {project} [{pos}/{count}] ", s.title)
+                }
+                None => format!(" {} [{pos}/{count}] ", s.title),
+            }
         })
         .unwrap_or_else(|| " Conversation ".to_string());
 
@@ -49,13 +53,13 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     let needles = app.viewing_search_terms();
     let body_width = inner_width.saturating_sub(GUTTER_WIDTH);
+    let source =
+        app.results.get(app.selected_index).map(|r| r.session.source.as_str()).unwrap_or("");
 
     for (i, msg) in app.viewing_messages.iter().enumerate() {
         let selected = i == app.viewing_selected_msg;
-        let (prefix, color) = match msg.role {
-            Role::User => ("User", THEME.user),
-            Role::Assistant => ("Assistant", THEME.assistant),
-        };
+        let prefix = crate::utils::role_label(source, &msg.role);
+        let color = crate::tui::theme::role_color(&msg.role);
 
         let time_str = crate::utils::format_message_time(msg.timestamp);
         let mut header = vec![
@@ -163,17 +167,18 @@ pub(super) fn render_viewing_summary(f: &mut Frame, app: &App, area: Rect) {
 
 fn viewing_summary_text(app: &App, width: usize) -> String {
     let Some(summary) = app.viewing_session_summary.as_ref() else {
-        return fit_summary_text(vec![" tokens - | time - | user msgs -".to_string()], width);
+        return fit_summary_text(vec![" - | tokens - | time - | user msgs -".to_string()], width);
     };
 
+    let date = &summary.started_calendar;
     let duration = format_duration_minutes(summary.duration_minutes);
     let user_messages = format!("{}/{}", summary.user_messages, summary.total_messages);
 
     if summary.usage_events == 0 {
         return fit_summary_text(
             vec![
-                format!(" tokens - | time {duration} | user msgs {user_messages}"),
-                format!(" tok - | {duration} | user {user_messages}"),
+                format!(" {date} | tokens - | time {duration} | user msgs {user_messages}"),
+                format!(" {date} | tok - | {duration} | user {user_messages}"),
             ],
             width,
         );
@@ -190,12 +195,12 @@ fn viewing_summary_text(app: &App, width: usize) -> String {
     fit_summary_text(
         vec![
             format!(
-                " tokens {total} input {input} output {output} cache r/w {cache_read}/{cache_write} reasoning {reasoning} | time {duration} | user msgs {user_messages}"
+                " {date} | tokens {total} input {input} output {output} cache r/w {cache_read}/{cache_write} reasoning {reasoning} | time {duration} | user msgs {user_messages}"
             ),
             format!(
-                " tok {total} in {input} out {output} cache {cache_read}/{cache_write} reason {reasoning} | {duration} | user {user_messages}"
+                " {date} | tok {total} in {input} out {output} cache {cache_read}/{cache_write} reason {reasoning} | {duration} | user {user_messages}"
             ),
-            format!(" tok {total} | time {duration} | user {user_messages}"),
+            format!(" {date} | tok {total} | time {duration} | user {user_messages}"),
         ],
         width,
     )

@@ -2508,6 +2508,7 @@ impl App {
                 &msgs,
                 result.session.duration_minutes,
                 &usage_events,
+                result.session.started_at,
             ));
             self.viewing_sanitized_lines = build_viewing_caches(&msgs);
             self.viewing_messages = msgs;
@@ -2707,12 +2708,7 @@ impl App {
 }
 
 fn short_project_label(path: &str) -> String {
-    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    match parts.len() {
-        0 => path.to_string(),
-        1 => parts[0].to_string(),
-        len => format!("{}/{}", parts[len - 2], parts[len - 1]),
-    }
+    crate::utils::project_label(path)
 }
 
 fn project_matches_query(path: &str, query: &str) -> bool {
@@ -3391,7 +3387,8 @@ mod tests {
         ];
         let usage_events = vec![usage_event(10, 5), usage_event(-1, 4)];
 
-        let summary = ViewingSessionSummary::from_session(&messages, None, &usage_events);
+        let summary =
+            ViewingSessionSummary::from_session(&messages, None, &usage_events, 1_700_000_000_000);
 
         assert_eq!(summary.user_messages, 2);
         assert_eq!(summary.total_messages, 3);
@@ -3403,6 +3400,7 @@ mod tests {
         assert_eq!(summary.tokens.cache_write_tokens, 4);
         assert_eq!(summary.tokens.reasoning_tokens, 2);
         assert_eq!(summary.tokens.total_tokens, 31);
+        assert!(!summary.started_calendar.is_empty());
     }
 
     #[test]
