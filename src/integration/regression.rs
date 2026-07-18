@@ -237,6 +237,43 @@ fn test_should_clear_all_tables_and_keep_fts_usable_when_reset() {
 }
 
 #[test]
+fn test_should_drop_vectors_and_requeue_state_and_keep_fts_when_reembed() {
+    let store = setup();
+    let s = make_session("a", "claude-code", "src-a", "hello world");
+    store.insert_session(&s).unwrap();
+    store.insert_messages(&[make_message("a", Role::User, "reembed probe unique", 0)]).unwrap();
+    let msg_id = first_message_id(&store, "a");
+    store.upsert_embeddings(&[(msg_id, &vec![0.2f32; 384])]).unwrap();
+    // A completed embedding-state row, as the sync bundle would have written.
+    store
+        .conn
+        .execute(
+            "INSERT INTO session_embedding_state
+                 (session_id, status, units_total, units_done, finished_at)
+             VALUES ('a', 'done', 1, 1, 123)",
+            [],
+        )
+        .unwrap();
+
+    let cleared = store.clear_semantic_queue().unwrap();
+
+    assert_eq!(cleared, 1, "one session-state row requeued");
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM message_vec"), 0, "vectors dropped");
+    assert_eq!(
+        count_rows(
+            &store,
+            "SELECT COUNT(*) FROM session_embedding_state \
+             WHERE status = 'pending' AND units_done = 0 \
+             AND started_at IS NULL AND finished_at IS NULL AND last_error IS NULL",
+        ),
+        1,
+        "state requeued to a clean pending row",
+    );
+    // FTS external-content index untouched: search still works during rebuild.
+    assert_eq!(count_fts_matches(&store, "reembed"), 1, "FTS stays available");
+}
+
+#[test]
 fn persist_session_writes_usage_events_and_report_aggregates() {
     let store = setup();
     let session = make_session("s1", "claude-code", "raw1", "Usage session");

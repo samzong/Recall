@@ -25,6 +25,29 @@ impl Store {
         Ok(())
     }
 
+    /// Drop every vector embedding and re-queue all sessions for a rebuild.
+    /// Deletes `message_vec` and resets `session_embedding_state` rows to
+    /// `pending` (units/timestamps cleared) in ONE transaction so the state
+    /// and the vectors can never diverge. Deliberately leaves `messages` and
+    /// the `messages_fts` index untouched: full-text search stays available
+    /// while the background worker rebuilds vectors. Returns the number of
+    /// session-state rows re-queued.
+    pub(crate) fn clear_semantic_queue(&self) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM message_vec", [])?;
+        let cleared = tx.execute(
+            "UPDATE session_embedding_state
+             SET status = 'pending',
+                 units_done = 0,
+                 started_at = NULL,
+                 finished_at = NULL,
+                 last_error = NULL",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(cleared)
+    }
+
     pub(crate) fn embeddable_messages(&self, session_id: &str) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, content FROM messages

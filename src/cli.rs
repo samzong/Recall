@@ -96,6 +96,11 @@ enum Commands {
     },
     #[command(about = "Compact the database and reclaim disk space")]
     Vacuum,
+    #[command(about = "Rebuild all semantic embeddings from indexed messages")]
+    Reembed {
+        #[arg(long, help = "Skip the confirmation prompt")]
+        yes: bool,
+    },
     #[command(about = "Share session pages")]
     Share {
         #[command(subcommand)]
@@ -238,6 +243,7 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Import { file, dry_run }) => crate::import::run_cli(&file, dry_run)?,
         Some(Commands::Reset { yes }) => crate::maintenance::run_reset(yes)?,
         Some(Commands::Vacuum) => crate::maintenance::run_vacuum()?,
+        Some(Commands::Reembed { yes }) => crate::maintenance::run_reembed(yes)?,
         Some(Commands::Share { command: ShareCommands::Init { project_name, publish_dir } }) => {
             crate::share_init::run(project_name, publish_dir)?
         }
@@ -553,6 +559,18 @@ mod tests {
     fn vacuum_parses() {
         let cli = Cli::try_parse_from(["recall", "vacuum"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Vacuum)));
+    }
+
+    #[test]
+    fn reembed_accepts_yes_flag() {
+        let cli = Cli::try_parse_from(["recall", "reembed", "--yes"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Reembed { yes: true })));
+    }
+
+    #[test]
+    fn reembed_defaults_to_prompt() {
+        let cli = Cli::try_parse_from(["recall", "reembed"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Reembed { yes: false })));
     }
 
     #[test]

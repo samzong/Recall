@@ -36,3 +36,25 @@ pub(crate) fn run_vacuum() -> Result<()> {
     );
     Ok(())
 }
+
+pub(crate) fn run_reembed(yes: bool) -> Result<()> {
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!("reembed requires --yes when not attached to a terminal");
+        }
+        print!("Rebuild all semantic embeddings? Type 'reembed' to confirm: ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if answer.trim() != "reembed" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+    let cleared = Store::open()?.clear_semantic_queue()?;
+    println!(
+        "Cleared embeddings for {cleared} session(s). FTS search stays available; \
+         the background worker rebuilds vectors on the next `recall` or `recall sync`."
+    );
+    Ok(())
+}
