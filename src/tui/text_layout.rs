@@ -1,6 +1,9 @@
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
+/// Columns reserved at the left of each viewing-pane row for the selection gutter (`▌ ` / `  `).
+pub(crate) const GUTTER_WIDTH: usize = 2;
+
 pub(crate) fn wrap_visual_rows(text: &str, width: usize) -> Vec<String> {
     wrap_spans_to_lines(vec![Span::raw(text.to_string())], width)
         .into_iter()

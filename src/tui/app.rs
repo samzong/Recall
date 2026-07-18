@@ -27,7 +27,7 @@ use crate::tui::search_worker::{SearchPhase, SearchRequest, SearchResponse, Sear
 use crate::tui::share_state::{
     AppMode, PendingCommandAction, PendingResume, ResumeOrigin, SharePopup,
 };
-use crate::tui::text_layout::wrap_visual_rows;
+use crate::tui::text_layout::{GUTTER_WIDTH, wrap_visual_rows};
 use crate::tui::usage_state::UsageTab;
 use crate::tui::viewing_state::{SanitizedLine, ViewingSessionSummary, build_viewing_caches};
 use crate::types::{BackgroundJobStatus, MatchSource, Message, SearchResult, SemanticProgress};
@@ -768,7 +768,13 @@ impl App {
             let lines = self.viewing_sanitized_lines.get(index);
             let body: usize = lines
                 .map(|lines| {
-                    lines.iter().map(|line| wrap_visual_rows(&line.text, inner_width).len()).sum()
+                    lines
+                        .iter()
+                        .map(|line| {
+                            wrap_visual_rows(&line.text, inner_width.saturating_sub(GUTTER_WIDTH))
+                                .len()
+                        })
+                        .sum()
                 })
                 .unwrap_or(0);
             rows.push(body + 2);

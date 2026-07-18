@@ -5,9 +5,9 @@ mod viewing;
 
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols::scrollbar;
-use ratatui::text::{Line, Span};
+use ratatui::text::Span;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::tui::app::App;
@@ -63,19 +63,6 @@ pub(super) fn highlight_spans(
 
 pub(super) fn row_visible(row: usize, viewport_start: usize, viewport_end: usize) -> bool {
     row >= viewport_start && row < viewport_end
-}
-
-pub(super) fn line_with_background(mut line: Line<'static>, bg: Color) -> Line<'static> {
-    if bg == Color::Reset {
-        return line;
-    }
-
-    for span in &mut line.spans {
-        if span.style.bg.is_none() {
-            span.style.bg = Some(bg);
-        }
-    }
-    line
 }
 
 pub(super) fn render_vertical_scrollbar(
@@ -533,5 +520,115 @@ mod tests {
             row.push_str(buffer[(x, y)].symbol());
         }
         row
+    }
+
+    fn viewing_app_two_messages(store: &Store, selected: usize) -> App {
+        let mut app =
+            App::new(store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.mode = AppMode::Viewing;
+        app.results = vec![SearchResult {
+            session: Session {
+                id: "session1".to_string(),
+                source: "codex".to_string(),
+                source_id: "source1".to_string(),
+                title: "Test session".to_string(),
+                directory: Some("/tmp/repo".to_string()),
+                repo_remote: None,
+                repo_slug: None,
+                repo_name: None,
+                started_at: 0,
+                updated_at: None,
+                message_count: 2,
+                entrypoint: None,
+                custom_title: None,
+                summary: None,
+                duration_minutes: None,
+                source_file_path: None,
+                is_import: false,
+            },
+            match_source: MatchSource::Fts,
+            snippet: None,
+        }];
+        app.viewing_messages = vec![
+            Message {
+                session_id: "session1".to_string(),
+                role: Role::User,
+                content: "hello".to_string(),
+                timestamp: None,
+                seq: 0,
+            },
+            Message {
+                session_id: "session1".to_string(),
+                role: Role::Assistant,
+                content: "world".to_string(),
+                timestamp: None,
+                seq: 1,
+            },
+        ];
+        app.viewing_sanitized_lines = vec![
+            vec![SanitizedLine { text: "hello".to_string(), lower: "hello".to_string() }],
+            vec![SanitizedLine { text: "world".to_string(), lower: "world".to_string() }],
+        ];
+        app.viewing_selected_msg = selected;
+        app
+    }
+
+    #[test]
+    fn render_viewing_selected_message_shows_role_colored_gutter() {
+        use ratatui::layout::Rect;
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let app = viewing_app_two_messages(&store, 0);
+
+        let width = 40u16;
+        let height = 12u16;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let frame = terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer = frame.buffer;
+
+        let layout = crate::tui::layout::viewing_layout(Rect::new(0, 0, width, height));
+        let msgs = layout.messages;
+
+        // Selected (msg 0) header row: gutter cell is the role-colored half block.
+        assert_eq!(buffer[(msgs.x, msgs.y)].symbol(), "▌");
+        assert_eq!(buffer[(msgs.x, msgs.y)].style().fg, Some(THEME.user));
+        // Header text is no longer bg-filled (ratatui Cell::style() always reports Some(_);
+        // an untouched/no-explicit-bg cell reports Some(Color::Reset), never DarkGray).
+        assert_eq!(buffer[(msgs.x + 2, msgs.y)].style().bg, Some(THEME.background));
+
+        // Selected body line (msg 0, one wrapped line) also carries the gutter,
+        // and the body text keeps its own White fg with no DarkGray fill.
+        assert_eq!(buffer[(msgs.x, msgs.y + 1)].symbol(), "▌");
+        assert_eq!(buffer[(msgs.x, msgs.y + 1)].style().fg, Some(THEME.user));
+        assert_eq!(buffer[(msgs.x + 2, msgs.y + 1)].symbol(), "h");
+        assert_eq!(buffer[(msgs.x + 2, msgs.y + 1)].style().fg, Some(THEME.text));
+        assert_ne!(buffer[(msgs.x + 2, msgs.y + 1)].style().bg, Some(THEME.message_highlight));
+    }
+
+    #[test]
+    fn render_viewing_unselected_message_shows_blank_gutter() {
+        use ratatui::layout::Rect;
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let app = viewing_app_two_messages(&store, 0);
+
+        let width = 40u16;
+        let height = 12u16;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let frame = terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer = frame.buffer;
+
+        let layout = crate::tui::layout::viewing_layout(Rect::new(0, 0, width, height));
+        let msgs = layout.messages;
+
+        // msg 0 occupies rows 0 (header), 1 (body), 2 (blank) -> msg 1 header at row 3.
+        let hdr1_y = msgs.y + 3;
+        assert_eq!(buffer[(msgs.x, hdr1_y)].symbol(), " ");
+        assert_ne!(buffer[(msgs.x, hdr1_y)].symbol(), "▌");
+        // Unselected header text keeps role color, no bg fill.
+        assert_eq!(buffer[(msgs.x + 2, hdr1_y)].style().fg, Some(THEME.assistant));
+        assert_eq!(buffer[(msgs.x + 2, hdr1_y)].style().bg, Some(THEME.background));
     }
 }

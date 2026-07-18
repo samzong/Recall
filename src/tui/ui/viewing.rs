@@ -1,21 +1,22 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::app::App;
 use crate::tui::layout::viewing_layout;
-use crate::tui::text_layout::wrap_spans_to_lines;
+use crate::tui::text_layout::{GUTTER_WIDTH, wrap_spans_to_lines};
 use crate::tui::theme::THEME;
 use crate::tui::viewing_state::SanitizedLine;
 use crate::types::Role;
 
-use super::{
-    format_compact, highlight_spans, line_with_background, render_vertical_scrollbar, row_visible,
-    truncate_label,
-};
+use super::{format_compact, highlight_spans, render_vertical_scrollbar, truncate_label};
+
+fn gutter_span(selected: bool, color: Color) -> Span<'static> {
+    if selected { Span::styled("▌ ", Style::default().fg(color)) } else { Span::raw("  ") }
+}
 
 pub(super) fn render_viewing(f: &mut Frame, app: &App) {
     let layout = viewing_layout(f.area());
@@ -45,10 +46,9 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         app.viewing_selected_msg,
         layout.messages.height as usize,
     );
-    let viewport_end = viewport_start + layout.messages.height as usize;
-    let mut visual_row = 0usize;
     let mut lines: Vec<Line> = Vec::new();
     let needles = app.viewing_search_terms();
+    let body_width = inner_width.saturating_sub(GUTTER_WIDTH);
 
     for (i, msg) in app.viewing_messages.iter().enumerate() {
         let selected = i == app.viewing_selected_msg;
@@ -58,41 +58,30 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         };
 
         let time_str = crate::utils::format_message_time(msg.timestamp);
-        let header_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
-            THEME.message_highlight
-        } else {
-            THEME.background
-        };
-        let mut header = vec![Span::styled(
-            format!("── {prefix} ──"),
-            Style::default().fg(color).bg(header_bg).add_modifier(Modifier::BOLD),
-        )];
+        let mut header = vec![
+            gutter_span(selected, color),
+            Span::styled(
+                format!("── {prefix} ──"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ];
         if !time_str.is_empty() {
-            header.push(Span::styled(
-                format!("  {time_str}"),
-                Style::default().fg(THEME.text_muted).bg(header_bg),
-            ));
+            header
+                .push(Span::styled(format!("  {time_str}"), Style::default().fg(THEME.text_muted)));
         }
         lines.push(Line::from(header));
-        visual_row += 1;
 
         let empty: Vec<SanitizedLine> = Vec::new();
         let cached_lines = app.viewing_sanitized_lines.get(i).unwrap_or(&empty);
         for sl in cached_lines {
             let body_style = Style::default().fg(THEME.text);
             let spans = highlight_spans(&sl.text, &sl.lower, &needles, body_style);
-            for line in wrap_spans_to_lines(spans, inner_width) {
-                let body_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
-                    THEME.message_highlight
-                } else {
-                    THEME.background
-                };
-                lines.push(line_with_background(line, body_bg));
-                visual_row += 1;
+            for mut line in wrap_spans_to_lines(spans, body_width) {
+                line.spans.insert(0, gutter_span(selected, color));
+                lines.push(line);
             }
         }
         lines.push(Line::from(""));
-        visual_row += 1;
     }
 
     render_viewing_summary(f, app, layout.summary);
