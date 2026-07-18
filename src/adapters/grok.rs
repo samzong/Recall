@@ -7,7 +7,9 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
-use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
+use crate::adapters::json_util::{
+    MAX_LINE_BYTES, capped_lines, json_i64, jsonl_indexed, rfc3339_ms,
+};
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
@@ -265,7 +267,7 @@ fn parse_grok_session_for_entry(
     let (messages, mut usage_events) = match parse_grok_updates(&entry.stat_target) {
         Ok(parsed) => parsed,
         Err(err) => {
-            debug!("failed to parse Grok updates {}: {err}", entry.stat_target.display());
+            tracing::warn!("failed to parse Grok updates {}: {err}", entry.stat_target.display());
             return Ok(None);
         }
     };
@@ -348,7 +350,7 @@ fn parse_grok_updates_reader<R: BufRead>(
     let mut prompts: Vec<PromptTokenState> = Vec::new();
     let mut prompt_index: HashMap<String, usize> = HashMap::new();
     let mut last_model: Option<String> = None;
-    for item in jsonl_indexed(reader.lines()) {
+    for item in jsonl_indexed(capped_lines(reader, MAX_LINE_BYTES)) {
         let (_, doc) = item?;
 
         let params = match doc.get("params") {

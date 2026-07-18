@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
-use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
+use crate::adapters::json_util::{MAX_LINE_BYTES, capped_lines, jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
@@ -127,7 +127,7 @@ fn collect_copilot_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
 fn peek_copilot_session_id(events_path: &Path) -> Option<String> {
     let file = fs::File::open(events_path).ok()?;
     let reader = BufReader::new(file);
-    for (idx, line) in reader.lines().enumerate() {
+    for (idx, line) in capped_lines(reader, MAX_LINE_BYTES).enumerate() {
         if idx >= 16 {
             break;
         }
@@ -163,7 +163,7 @@ fn parse_copilot_session_for_entry(
             return Ok(None);
         }
     };
-    let lines = BufReader::new(file).lines();
+    let lines = capped_lines(BufReader::new(file), MAX_LINE_BYTES);
     let source_path = entry.stat_target.display().to_string();
     let mut raw = match parse_copilot_events_from_lines(
         lines,

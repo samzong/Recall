@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
-use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
+use crate::adapters::json_util::{MAX_LINE_BYTES, capped_lines, jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
@@ -289,7 +289,7 @@ fn parse_claude_session_file(
     let parsed = match parse_conversation_jsonl(&entry.stat_target, mtime_ms, include_events) {
         Ok(parsed) => parsed,
         Err(e) => {
-            debug!("failed to parse {}: {e}", entry.stat_target.display());
+            tracing::warn!("failed to parse {}: {e}", entry.stat_target.display());
             return Ok(None);
         }
     };
@@ -363,7 +363,7 @@ fn parse_conversation_jsonl(
     let mut last_ts: Option<i64> = None;
     let source_path = path.to_string_lossy().to_string();
 
-    for item in jsonl_indexed(reader.lines()) {
+    for item in jsonl_indexed(capped_lines(reader, MAX_LINE_BYTES)) {
         let (line_index, v) = item?;
 
         if cwd.is_none()

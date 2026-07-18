@@ -1,10 +1,11 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::adapters::json_util::{MAX_LINE_BYTES, capped_lines};
 use crate::types::{Session, SessionUsageEventRecord};
 
 #[derive(Debug, Default, Clone)]
@@ -69,7 +70,7 @@ fn enrich_display_meta_from_grok(source_id: &str, meta: &mut SessionDisplayMeta)
     }
     let file = fs::File::open(&updates_path)
         .with_context(|| format!("failed to open {}", updates_path.display()))?;
-    for line in BufReader::new(file).lines() {
+    for line in capped_lines(BufReader::new(file), MAX_LINE_BYTES) {
         let line = line?;
         if !line.contains("modelId")
             && !line.contains("thinkingDepth")
@@ -110,7 +111,7 @@ fn enrich_display_meta_from_codex_rollout(
 ) -> Result<()> {
     let file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    for line in BufReader::new(file).lines() {
+    for line in capped_lines(BufReader::new(file), MAX_LINE_BYTES) {
         let line = line?;
         if !line.contains("turn_context") {
             continue;

@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -10,7 +10,7 @@ use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::adapters::events;
-use crate::adapters::json_util::json_i64;
+use crate::adapters::json_util::{MAX_LINE_BYTES, capped_lines, json_i64};
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::usage::usage_count;
 use crate::adapters::{
@@ -797,7 +797,7 @@ fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<O
     let mut session_events = Vec::new();
     let source_path = path.display().to_string();
 
-    for (line_index, line) in reader.lines().enumerate() {
+    for (line_index, line) in capped_lines(reader, MAX_LINE_BYTES).enumerate() {
         let line = line?;
         let line = line.trim();
         if line.is_empty() {

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -8,7 +8,9 @@ use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::adapters::file_scan::{self, FileScanEntry};
-use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
+use crate::adapters::json_util::{
+    MAX_LINE_BYTES, capped_lines, json_i64, jsonl_indexed, rfc3339_ms,
+};
 use crate::adapters::usage::usage_count;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
@@ -253,7 +255,7 @@ fn parse_pi_session_file(
     let parsed = match parse_pi_session(&entry.stat_target, mtime_ms) {
         Ok(parsed) => parsed,
         Err(err) => {
-            debug!("failed to parse Pi session {}: {err}", entry.stat_target.display());
+            tracing::warn!("failed to parse Pi session {}: {err}", entry.stat_target.display());
             return Ok(None);
         }
     };
@@ -298,7 +300,7 @@ fn parse_pi_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Pars
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
 
-    for item in jsonl_indexed(reader.lines()) {
+    for item in jsonl_indexed(capped_lines(reader, MAX_LINE_BYTES)) {
         let (line_index, entry) = item?;
 
         match entry.get("type").and_then(|value| value.as_str()).unwrap_or("") {

@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
-use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
+use crate::adapters::json_util::{MAX_LINE_BYTES, capped_lines, jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
@@ -223,7 +223,7 @@ fn parse_codex_session_with_options(
     let mut forked_child_inherited_reported_total: Option<i64> = None;
     let source_path = path.to_string_lossy().to_string();
 
-    for item in jsonl_indexed(reader.lines()) {
+    for item in jsonl_indexed(capped_lines(reader, MAX_LINE_BYTES)) {
         let (line_index, v) = item?;
 
         let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");

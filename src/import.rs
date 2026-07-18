@@ -4,6 +4,7 @@ use std::io::BufRead;
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 
+use crate::adapters::json_util::{MAX_LINE_BYTES, capped_lines};
 use crate::db::store::Store;
 use crate::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource};
 
@@ -142,7 +143,7 @@ pub(crate) fn import_jsonl<R: BufRead>(
     let mut summary = ImportSummary::default();
     let mut seen: HashSet<(String, String)> = HashSet::new();
 
-    for (idx, line) in reader.lines().enumerate() {
+    for (idx, line) in capped_lines(reader, MAX_LINE_BYTES).enumerate() {
         let line_no = idx + 1;
         let line = line.map_err(|e| anyhow!("line {line_no}: read failed: {e}"))?;
         if line.trim().is_empty() {
@@ -536,6 +537,23 @@ mod tests {
         let err = import_jsonl(&b, false, exported.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("line 2"), "unexpected error: {err}");
         assert_eq!(count(&b, "SELECT COUNT(*) FROM sessions"), 1);
+    }
+
+    #[test]
+    fn test_should_return_clean_err_when_jsonl_line_exceeds_size_cap() {
+        let store = setup();
+        // A single line whose value payload alone exceeds the cap. Wrapping
+        // it in otherwise-valid JSON proves the failure comes from the size
+        // guard, not from a JSON parse error on truncated/garbage input.
+        let oversized_title = "a".repeat(crate::adapters::json_util::MAX_LINE_BYTES + 1);
+        let line = format!(
+            r#"{{"schema_version":3,"record_type":"session","session":{{"source":"codex","source_id":"x","title":"{oversized_title}","started_at":0}}}}"#
+        );
+
+        let err = import_jsonl(&store, false, line.as_bytes()).unwrap_err();
+
+        assert!(err.to_string().contains("exceeds"), "unexpected error: {err}");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM sessions"), 0);
     }
 
     #[test]

@@ -4,10 +4,10 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::json_util::{MAX_LINE_BYTES, capped_lines};
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
@@ -136,7 +136,7 @@ fn load_history_workspace_map(path: &Path) -> anyhow::Result<HashMap<String, Str
 
     let reader = BufReader::new(file);
     let mut map = HashMap::new();
-    for line in reader.lines() {
+    for line in capped_lines(reader, MAX_LINE_BYTES) {
         let line = line?;
         let line = line.trim();
         if line.is_empty() {
@@ -167,7 +167,10 @@ fn parse_antigravity_session_for_entry(
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
         Err(e) => {
-            debug!("failed to parse Antigravity transcript {}: {e}", entry.stat_target.display());
+            tracing::warn!(
+                "failed to parse Antigravity transcript {}: {e}",
+                entry.stat_target.display()
+            );
             return Ok(None);
         }
     };
@@ -191,7 +194,7 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
 ) -> anyhow::Result<Option<RawSession>> {
     let mut messages = Vec::new();
 
-    for line in reader.lines() {
+    for line in capped_lines(reader, MAX_LINE_BYTES) {
         let line = line?;
         let line = line.trim();
         if line.is_empty() {
