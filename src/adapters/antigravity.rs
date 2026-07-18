@@ -117,6 +117,11 @@ fn collect_antigravity_entries(cli_dir: &Path) -> anyhow::Result<Vec<FileScanEnt
             continue;
         }
 
+        if let Err(err) = crate::adapters::paths::confined_path(cli_dir, &transcript_path) {
+            tracing::warn!("skipping session file outside source root: {err}");
+            continue;
+        }
+
         entries.push(FileScanEntry {
             session_id: conversation_id.to_string(),
             stat_target: transcript_path,

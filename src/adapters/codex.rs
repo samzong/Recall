@@ -157,6 +157,10 @@ fn collect_codex_entries(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
             let Some(session_id) = extract_session_id_from_filename(stem) else {
                 continue;
             };
+            if let Err(err) = crate::adapters::paths::confined_path(dir, path) {
+                tracing::warn!("skipping session file outside source root: {err}");
+                continue;
+            }
             entries.push(FileScanEntry {
                 session_id,
                 stat_target: path.to_path_buf(),

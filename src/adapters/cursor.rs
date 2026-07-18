@@ -952,6 +952,10 @@ fn collect_agent_transcript_paths_from_dir(projects_dir: &Path) -> Vec<AgentTran
         if grandparent_name != Some("agent-transcripts") {
             continue;
         }
+        if let Err(err) = crate::adapters::paths::confined_path(projects_dir, path) {
+            tracing::warn!("skipping cursor transcript outside source root: {err}");
+            continue;
+        }
         entries.push(AgentTranscriptPath {
             session_id: stem.to_string(),
             path: path.to_path_buf(),

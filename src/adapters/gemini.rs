@@ -35,38 +35,41 @@ impl SourceAdapter for GeminiAdapter {
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-
         let gemini_tmp = home.join(".gemini/tmp");
         if !gemini_tmp.exists() {
             debug!("~/.gemini/tmp not found, skipping Gemini CLI");
             return Ok(vec![]);
         }
+        Ok(collect_gemini_sessions(&gemini_tmp))
+    }
+}
 
-        let mut sessions = Vec::new();
-
-        for entry in WalkDir::new(&gemini_tmp).into_iter().filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if !path.is_file() {
-                continue;
-            }
-            if path.parent().is_none_or(|p| p.file_name().is_none_or(|n| n != "chats")) {
-                continue;
-            }
-
-            match parse_gemini_session_file(path) {
-                Ok(Some(session)) => sessions.push(session),
-                Ok(None) => {}
-                Err(e) => {
-                    debug!("failed to parse gemini session {}: {e}", path.display());
-                }
+fn collect_gemini_sessions(gemini_tmp: &Path) -> Vec<RawSession> {
+    let mut sessions = Vec::new();
+    for entry in WalkDir::new(gemini_tmp).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        if path.parent().is_none_or(|p| p.file_name().is_none_or(|n| n != "chats")) {
+            continue;
+        }
+        if let Err(err) = crate::adapters::paths::confined_path(gemini_tmp, path) {
+            tracing::warn!("skipping gemini session outside source root: {err}");
+            continue;
+        }
+        match parse_gemini_session_file(path) {
+            Ok(Some(session)) => sessions.push(session),
+            Ok(None) => {}
+            Err(e) => {
+                debug!("failed to parse gemini session {}: {e}", path.display());
             }
         }
-
-        Ok(sessions)
     }
+    sessions
 }
 
 fn parse_gemini_session_file(path: &Path) -> anyhow::Result<Option<RawSession>> {
@@ -283,5 +286,54 @@ mod tests {
         assert_eq!(event.cache_read_tokens, 30);
         assert_eq!(event.reasoning_tokens, 5);
         assert_eq!(event.token_source, crate::types::TokenSource::Observed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_gemini_sessions_skips_symlink_escaping_source_root() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir()
+            .join(format!("recall-gemini-test-escape-{}", uuid::Uuid::new_v4()));
+        let gemini_tmp = base.join("tmp");
+        let good_chats = gemini_tmp.join("hash-good").join("chats");
+        fs::create_dir_all(&good_chats).unwrap();
+
+        let good_json = serde_json::json!({
+            "sessionId": "good-session",
+            "messages": [
+                { "type": "user", "content": "hi", "timestamp": "2026-04-13T10:00:00Z" }
+            ]
+        });
+        {
+            let mut f = fs::File::create(good_chats.join("good.json")).unwrap();
+            writeln!(f, "{good_json}").unwrap();
+        }
+
+        // Secret OUTSIDE gemini_tmp, shaped like a valid gemini session.
+        let secret = base.join("outside.json");
+        let secret_json = serde_json::json!({
+            "sessionId": "evil-session",
+            "messages": [
+                { "type": "user", "content": "secret", "timestamp": "2026-04-13T10:00:00Z" }
+            ]
+        });
+        {
+            let mut f = fs::File::create(&secret).unwrap();
+            writeln!(f, "{secret_json}").unwrap();
+        }
+
+        // Symlink inside a `chats` dir under the root pointing at the outside secret.
+        let evil_chats = gemini_tmp.join("hash-evil").join("chats");
+        fs::create_dir_all(&evil_chats).unwrap();
+        symlink(&secret, evil_chats.join("evil.json")).unwrap();
+
+        let sessions = collect_gemini_sessions(&gemini_tmp);
+
+        assert_eq!(sessions.len(), 1, "escaping symlink must be skipped");
+        assert_eq!(sessions[0].source_id, "good-session");
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

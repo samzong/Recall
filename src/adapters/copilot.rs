@@ -119,6 +119,11 @@ fn collect_copilot_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
         };
         let session_id = peek_copilot_session_id(&events_path).unwrap_or_else(|| dir_name.clone());
 
+        if let Err(err) = crate::adapters::paths::confined_path(sessions_dir, &events_path) {
+            tracing::warn!("skipping session file outside source root: {err}");
+            continue;
+        }
+
         entries.push(FileScanEntry { session_id, stat_target: events_path, directory: None });
     }
     entries
@@ -523,6 +528,47 @@ mod tests {
 
         let entries = collect_copilot_entries(&sessions_dir);
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "f3eca837-818f-44d7-9158-bf242901f960");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_copilot_entries_skips_symlink_escaping_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_copilot_root("symlink-escape");
+        let sessions_dir = root.join("session-state");
+
+        // Legit sibling session INSIDE the source root — must still be indexed.
+        write_copilot_session(
+            &sessions_dir,
+            "good-dir",
+            "f3eca837-818f-44d7-9158-bf242901f960",
+            "hello",
+        );
+
+        // Secret OUTSIDE the source root (simulated /etc/passwd as a copilot event log).
+        let secret = root.join("outside-passwd.jsonl");
+        {
+            let start = serde_json::json!({
+                "type": "session.start",
+                "timestamp": "2026-04-13T10:00:00Z",
+                "data": { "sessionId": "evil-session", "startTime": "2026-04-13T10:00:00Z" }
+            });
+            let mut f = fs::File::create(&secret).unwrap();
+            writeln!(f, "{start}").unwrap();
+        }
+
+        // Malicious session dir whose events.jsonl symlinks to the outside secret.
+        let evil_dir = sessions_dir.join("evil-dir");
+        fs::create_dir_all(&evil_dir).unwrap();
+        symlink(&secret, evil_dir.join("events.jsonl")).unwrap();
+
+        let entries = collect_copilot_entries(&sessions_dir);
+
+        assert_eq!(entries.len(), 1, "escaping symlink must be skipped");
         assert_eq!(entries[0].session_id, "f3eca837-818f-44d7-9158-bf242901f960");
 
         let _ = fs::remove_dir_all(&root);

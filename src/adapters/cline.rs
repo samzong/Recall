@@ -103,6 +103,10 @@ fn collect_cline_entries(tasks_dir: &Path) -> Vec<FileScanEntry> {
         if !messages_path.exists() {
             continue;
         }
+        if let Err(err) = crate::adapters::paths::confined_path(tasks_dir, &messages_path) {
+            tracing::warn!("skipping session file outside source root: {err}");
+            continue;
+        }
         entries.push(FileScanEntry {
             session_id: dir_name,
             stat_target: messages_path,

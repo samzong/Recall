@@ -195,6 +195,11 @@ fn collect_grok_entries(sessions_dir: &Path) -> (Vec<FileScanEntry>, Vec<String>
 
             let directory = summary_directory.or(fallback_directory.clone());
 
+            if let Err(err) = crate::adapters::paths::confined_path(sessions_dir, &updates_path) {
+                tracing::warn!("skipping session file outside source root: {err}");
+                continue;
+            }
+
             entries.push(FileScanEntry { session_id, stat_target: updates_path, directory });
         }
     }

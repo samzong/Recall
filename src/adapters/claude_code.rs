@@ -203,6 +203,11 @@ fn collect_project_entries(claude_dir: &Path, indexes: &mut SessionIndexes) -> V
             let meta_cwd = indexes.live.get(&session_id).and_then(|m| m.cwd.clone());
             let directory = meta_cwd.or_else(|| Some(directory_hint.clone()));
 
+            if let Err(err) = crate::adapters::paths::confined_path(claude_dir, file_path) {
+                tracing::warn!("skipping session file outside source root: {err}");
+                continue;
+            }
+
             entries.push(FileScanEntry {
                 session_id,
                 stat_target: file_path.to_path_buf(),
@@ -269,6 +274,11 @@ fn collect_transcript_entries(claude_dir: &Path) -> Vec<FileScanEntry> {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => continue,
         };
+
+        if let Err(err) = crate::adapters::paths::confined_path(claude_dir, path) {
+            tracing::warn!("skipping session file outside source root: {err}");
+            continue;
+        }
 
         entries.push(FileScanEntry {
             session_id,

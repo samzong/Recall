@@ -228,6 +228,11 @@ fn collect_pi_entries(session_dirs: &[PathBuf]) -> Vec<FileScanEntry> {
                 .and_then(|name| name.to_str())
                 .and_then(decode_session_dir_name);
 
+            if let Err(err) = crate::adapters::paths::confined_path(session_dir, path) {
+                tracing::warn!("skipping session file outside source root: {err}");
+                continue;
+            }
+
             entries.push(FileScanEntry { session_id, stat_target: path.to_path_buf(), directory });
         }
     }
@@ -678,6 +683,44 @@ mod tests {
             Some("019e5af2-5528-7d10-888a-b299c21d0e2e".to_string())
         );
         assert_eq!(extract_session_id_from_filename("not-a-session"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_pi_entries_skips_symlink_escaping_session_dir() {
+        use std::os::unix::fs::symlink;
+
+        let base =
+            std::env::temp_dir().join(format!("recall-pi-test-escape-{}", uuid::Uuid::new_v4()));
+        let session_dir = base.join("--tmp-proj--");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        // Legit transcript inside the session dir — must survive.
+        let good =
+            session_dir.join("2026-05-24T17-04-51-496Z_11111111-1111-1111-1111-111111111111.jsonl");
+        {
+            let mut f = fs::File::create(&good).unwrap();
+            writeln!(f, "{}", serde_json::json!({"type":"user","message":{"content":"hi"}}))
+                .unwrap();
+        }
+
+        // Secret OUTSIDE the session dir.
+        let secret = base.join("outside.jsonl");
+        fs::write(&secret, b"{}\n").unwrap();
+
+        // Symlinked transcript inside the session dir pointing at the outside secret.
+        symlink(
+            &secret,
+            session_dir.join("2026-05-24T17-04-51-496Z_22222222-2222-2222-2222-222222222222.jsonl"),
+        )
+        .unwrap();
+
+        let entries = collect_pi_entries(std::slice::from_ref(&session_dir));
+
+        assert_eq!(entries.len(), 1, "escaping symlink must be skipped");
+        assert!(entries[0].stat_target.ends_with(good.file_name().unwrap()));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
