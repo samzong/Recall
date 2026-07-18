@@ -482,6 +482,56 @@ pub(super) fn render_confirm_resume(f: &mut Frame, app: &App) {
     f.render_widget(widget, popup);
 }
 
+pub(super) fn render_confirm_delete(f: &mut Frame, app: &App) {
+    let Some(pending) = app.pending_delete.as_ref() else {
+        return;
+    };
+
+    let area = f.area();
+    let width = area.width.clamp(40, 76);
+    let height: u16 = 11;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .title(" Delete session ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME.error))
+        .style(Style::default().bg(THEME.popup_bg));
+
+    let title: String = pending.session_title.chars().take(width as usize - 10).collect();
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Source:  ", Style::default().fg(THEME.text_muted)),
+            Span::styled(
+                pending.source_label.clone(),
+                Style::default().fg(THEME.source).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(title, Style::default().fg(THEME.text)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Removes this session from the search index only. The source file on disk is kept - the next sync re-indexes it unless the file is deleted or its path is excluded.",
+            Style::default().fg(THEME.text),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [Y] ", Style::default().fg(THEME.error).add_modifier(Modifier::BOLD)),
+            Span::styled("delete from index   ", Style::default().fg(THEME.text)),
+            Span::styled("[N] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(THEME.text)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(Clear, popup);
+    f.render_widget(widget, popup);
+}
+
 pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let semantic_span = if app.semantic_progress.total_sessions > 0 {
         let mut text = format!(
@@ -529,6 +579,8 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" resume  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Ctrl+O", Style::default().fg(THEME.accent)),
                     Span::styled(" app  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Ctrl+X", Style::default().fg(THEME.accent)),
+                    Span::styled(" delete  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Ctrl+S", Style::default().fg(THEME.accent)),
                     Span::styled(" settings  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Esc", Style::default().fg(THEME.accent)),

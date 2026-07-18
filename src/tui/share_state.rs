@@ -17,6 +17,7 @@ pub(crate) enum AppMode {
     Filters,
     HandoffTarget,
     ConfirmResume,
+    ConfirmDelete,
 }
 
 #[derive(Clone, Copy)]
@@ -31,6 +32,14 @@ pub(crate) struct PendingResume {
     pub(crate) source_label: String,
     pub(crate) session_title: String,
     pub(crate) cwd: Option<String>,
+    pub(crate) origin: ResumeOrigin,
+}
+
+pub(crate) struct PendingDelete {
+    pub(crate) source: String,
+    pub(crate) source_id: String,
+    pub(crate) session_title: String,
+    pub(crate) source_label: String,
     pub(crate) origin: ResumeOrigin,
 }
 

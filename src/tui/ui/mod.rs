@@ -163,6 +163,13 @@ pub(crate) fn render(f: &mut Frame, app: &App) {
             }
             popups::render_confirm_resume(f, app);
         }
+        AppMode::ConfirmDelete => {
+            match app.pending_delete.as_ref().map(|p| p.origin) {
+                Some(ResumeOrigin::Viewing) => viewing::render_viewing(f, app),
+                _ => search::render_search(f, app),
+            }
+            popups::render_confirm_delete(f, app);
+        }
     }
 }
 
@@ -176,6 +183,7 @@ mod tests {
     use crate::db::store::Store;
     use crate::tui::share_state::AppMode;
     use crate::tui::share_state::SharePopup;
+    use crate::tui::share_state::{PendingDelete, ResumeOrigin};
     use crate::tui::viewing_state::SanitizedLine;
     use crate::tui::viewing_state::ViewingSessionSummary;
     use crate::types::{MatchSource, Message, Role, SearchResult, Session};
@@ -394,6 +402,32 @@ mod tests {
             "tokens 31 input 10 output 9 cache r/w 6/4 reasoning 2 | time 2m | user msgs 2/3"
         ));
         assert_eq!(terminal.backend().buffer()[(2, 1)].fg, THEME.summary);
+    }
+
+    #[test]
+    fn render_confirm_delete_popup_shows_index_only_warning() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.mode = AppMode::ConfirmDelete;
+        app.results = vec![numbered_session_result(1)];
+        app.pending_delete = Some(PendingDelete {
+            source: "codex".to_string(),
+            source_id: "source1".to_string(),
+            session_title: "Test session".to_string(),
+            source_label: "CDX".to_string(),
+            origin: ResumeOrigin::Search,
+        });
+
+        let rendered = render_to_text(&app, 100, 18);
+
+        assert!(rendered.contains("Delete session"));
+        assert!(rendered.contains("search index only"));
+        assert!(rendered.contains("kept"));
+        assert!(rendered.contains("[Y]"));
+        assert!(rendered.contains("delete from index"));
+        assert!(rendered.contains("[N]"));
     }
 
     #[test]

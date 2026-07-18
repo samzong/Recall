@@ -114,6 +114,8 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" resume  ", Style::default().fg(THEME.text_muted)),
         Span::styled("Ctrl+O", Style::default().fg(THEME.accent)),
         Span::styled(" app  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("Ctrl+X", Style::default().fg(THEME.accent)),
+        Span::styled(" delete  ", Style::default().fg(THEME.text_muted)),
         Span::styled("Esc/q", Style::default().fg(THEME.accent)),
         Span::styled(" back", Style::default().fg(THEME.text_muted)),
     ];

@@ -25,7 +25,7 @@ use crate::tui::search_state::{
 };
 use crate::tui::search_worker::{SearchPhase, SearchRequest, SearchResponse, SearchWorker};
 use crate::tui::share_state::{
-    AppMode, PendingCommandAction, PendingResume, ResumeOrigin, SharePopup,
+    AppMode, PendingCommandAction, PendingDelete, PendingResume, ResumeOrigin, SharePopup,
 };
 use crate::tui::text_layout::{GUTTER_WIDTH, wrap_visual_rows};
 use crate::tui::usage_state::UsageTab;
@@ -164,6 +164,7 @@ pub(crate) struct App {
     pub(crate) semantic_last_refresh: Instant,
     pub(crate) settings_selected: usize,
     pub(crate) pending_resume: Option<PendingResume>,
+    pub(crate) pending_delete: Option<PendingDelete>,
     pub(crate) handoff_target_selected: usize,
     pub(crate) share_popup: Option<SharePopup>,
     pub(crate) share_publish_rx: Option<mpsc::Receiver<Result<String, String>>>,
@@ -255,6 +256,7 @@ impl App {
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
             pending_resume: None,
+            pending_delete: None,
             handoff_target_selected: 0,
             share_popup: None,
             share_publish_rx: None,
@@ -452,6 +454,7 @@ impl App {
             AppMode::Filters => self.handle_filters_key(key, store),
             AppMode::HandoffTarget => self.handle_handoff_target_key(key),
             AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
+            AppMode::ConfirmDelete => self.handle_confirm_delete_key(key, store),
         }
     }
 
@@ -1107,6 +1110,11 @@ impl App {
             return;
         }
 
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
+            self.start_delete_confirmation(ResumeOrigin::Search);
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q')
                 if self.query.is_empty() && self.panel_focus == PanelFocus::SessionList =>
@@ -1223,6 +1231,10 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
             self.start_app_open_confirmation(ResumeOrigin::Viewing);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
+            self.start_delete_confirmation(ResumeOrigin::Viewing);
             return;
         }
         match key.code {
@@ -1539,6 +1551,70 @@ impl App {
                 };
             }
             _ => {}
+        }
+    }
+
+    fn start_delete_confirmation(&mut self, origin: ResumeOrigin) {
+        let Some(result) = self.results.get(self.selected_index) else {
+            return;
+        };
+        let session = &result.session;
+        self.pending_delete = Some(PendingDelete {
+            source: session.source.clone(),
+            source_id: session.source_id.clone(),
+            session_title: session.title.clone(),
+            source_label: self.source_label_for(&session.source).to_string(),
+            origin,
+        });
+        self.mode = AppMode::ConfirmDelete;
+    }
+
+    fn handle_confirm_delete_key(&mut self, key: KeyEvent, store: &Store) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let Some(pending) = self.pending_delete.take() else {
+                    self.mode = AppMode::Search;
+                    return;
+                };
+                match store.delete_session_data(&pending.source, &pending.source_id) {
+                    Ok(()) => {
+                        self.viewing_messages.clear();
+                        self.viewing_selected_msg = 0;
+                        self.viewing_scroll_offset = 0;
+                        self.viewing_session_summary = None;
+                        self.viewing_search_query.clear();
+                        self.viewing_search_status = None;
+                        self.viewing_sanitized_lines.clear();
+                        self.viewing_match_cache.clear();
+                        self.mode = AppMode::Search;
+                        self.refresh_sessions_after_delete(store);
+                        self.status_message =
+                            Some("Removed from index (file kept on disk)".to_string());
+                    }
+                    Err(err) => {
+                        self.mode = AppMode::Search;
+                        self.status_message = Some(format!("Delete failed: {err}"));
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                let origin =
+                    self.pending_delete.take().map(|p| p.origin).unwrap_or(ResumeOrigin::Search);
+                self.mode = match origin {
+                    ResumeOrigin::Search => AppMode::Search,
+                    ResumeOrigin::Viewing => AppMode::Viewing,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_sessions_after_delete(&mut self, store: &Store) {
+        self.update_scope_metrics(store);
+        if self.query.is_empty() {
+            self.load_recent(store);
+        } else {
+            self.queue_search_now();
         }
     }
 
@@ -2727,6 +2803,7 @@ mod tests {
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
             pending_resume: None,
+            pending_delete: None,
             handoff_target_selected: 0,
             share_popup: None,
             share_publish_rx: None,
@@ -3703,5 +3780,92 @@ mod tests {
         assert_eq!(app.draft_source_filter_selection, vec!["codex".to_string()]);
         assert!(app.filters_dirty);
         assert!(!app.search_pending);
+    }
+
+    #[test]
+    fn test_should_stage_delete_and_enter_confirm_when_ctrl_x_from_search() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.results = vec![codex_search_result()];
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), &store);
+
+        assert!(matches!(app.mode, AppMode::ConfirmDelete));
+        let pending = app.pending_delete.as_ref().unwrap();
+        assert_eq!(pending.source, "codex");
+        assert_eq!(pending.source_id, "019e6d8d-588b-7fd2-a326-c525469ed120");
+        assert!(matches!(pending.origin, ResumeOrigin::Search));
+    }
+
+    #[test]
+    fn test_should_delete_session_and_return_to_search_when_confirmed() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let result = codex_search_result();
+        store.insert_session(&result.session).unwrap();
+        store.insert_messages(&[message(Role::User, None, 0)]).unwrap();
+        let mut app = app_with_sources();
+        app.results = vec![result];
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), &store);
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &store);
+
+        assert!(matches!(app.mode, AppMode::Search));
+        assert!(app.pending_delete.is_none());
+        assert!(store.list_sessions_by_ids(&["session1".to_string()]).unwrap().is_empty());
+        assert_eq!(app.status_message.as_deref(), Some("Removed from index (file kept on disk)"));
+    }
+
+    #[test]
+    fn test_should_restore_viewing_mode_when_delete_cancelled_from_viewing() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let result = codex_search_result();
+        store.insert_session(&result.session).unwrap();
+        let mut app = app_with_sources();
+        app.results = vec![result];
+        app.mode = AppMode::Viewing;
+
+        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(matches!(app.mode, AppMode::ConfirmDelete));
+        assert!(matches!(app.pending_delete.as_ref().unwrap().origin, ResumeOrigin::Viewing));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &store);
+
+        assert!(matches!(app.mode, AppMode::Viewing));
+        assert!(app.pending_delete.is_none());
+        assert!(!store.list_sessions_by_ids(&["session1".to_string()]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_should_restore_search_mode_when_delete_cancelled_with_esc() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.results = vec![codex_search_result()];
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), &store);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);
+
+        assert!(matches!(app.mode, AppMode::Search));
+        assert!(app.pending_delete.is_none());
+    }
+
+    #[test]
+    fn test_should_cancel_delete_when_enter_pressed() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let result = codex_search_result();
+        store.insert_session(&result.session).unwrap();
+        let mut app = app_with_sources();
+        app.results = vec![result];
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), &store);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &store);
+
+        assert!(matches!(app.mode, AppMode::Search));
+        assert!(app.pending_delete.is_none());
+        assert!(!store.list_sessions_by_ids(&["session1".to_string()]).unwrap().is_empty());
     }
 }
