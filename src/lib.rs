@@ -9,6 +9,7 @@ pub(crate) mod extension;
 pub(crate) mod handoff;
 pub(crate) mod import;
 pub(crate) mod info;
+pub(crate) mod maintenance;
 pub(crate) mod query;
 pub(crate) mod repo_identity;
 pub(crate) mod semantic;

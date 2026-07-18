@@ -195,6 +195,48 @@ fn delete_session_cleans_embeddings() {
 }
 
 #[test]
+fn test_should_clear_all_tables_and_keep_fts_usable_when_reset() {
+    let store = setup();
+    let s = make_session("a", "claude-code", "src-a", "hello world");
+    store.insert_session(&s).unwrap();
+    store.insert_messages(&[make_message("a", Role::User, "reset probe unique", 0)]).unwrap();
+
+    store.reset_all_data().unwrap();
+
+    // every data table empty
+    for table in [
+        "sessions",
+        "messages",
+        "message_vec",
+        "session_embedding_state",
+        "session_events",
+        "event_session_state",
+        "usage_events",
+        "usage_session_state",
+        "background_job_state",
+    ] {
+        let n: i64 = store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "{table} not cleared");
+    }
+    // FTS external-content index NOT corrupted: re-insert + search round-trips
+    let s2 = make_session("b", "claude-code", "src-b", "again");
+    store.insert_session(&s2).unwrap();
+    store.insert_messages(&[make_message("b", Role::User, "postreset token", 0)]).unwrap();
+    let hits: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'postreset'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hits, 1);
+}
+
+#[test]
 fn persist_session_writes_usage_events_and_report_aggregates() {
     let store = setup();
     let session = make_session("s1", "claude-code", "raw1", "Usage session");

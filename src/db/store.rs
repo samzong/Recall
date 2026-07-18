@@ -79,12 +79,19 @@ pub(crate) struct SkillAuditEventRow {
 }
 
 impl Store {
-    pub(crate) fn open() -> Result<Self> {
-        let data_dir = dirs::data_dir()
+    pub(crate) fn data_dir() -> Result<std::path::PathBuf> {
+        Ok(dirs::data_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?
-            .join("recall");
-        std::fs::create_dir_all(&data_dir)?;
-        let db_path = data_dir.join("recall.db");
+            .join("recall"))
+    }
+
+    pub(crate) fn db_path() -> Result<std::path::PathBuf> {
+        Ok(Self::data_dir()?.join("recall.db"))
+    }
+
+    pub(crate) fn open() -> Result<Self> {
+        std::fs::create_dir_all(Self::data_dir()?)?;
+        let db_path = Self::db_path()?;
         let conn = Connection::open(&db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -101,6 +108,33 @@ impl Store {
         conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
         crate::db::schema::init(&conn)?;
         Ok(Store { conn })
+    }
+
+    /// Delete every data row in FK dependency order in ONE transaction.
+    /// Deliberately does NOT touch `messages_fts`: it is an FTS5
+    /// external-content table maintained by the `messages_ad` AFTER-DELETE
+    /// trigger (schema.rs:91). Deleting it directly corrupts the index.
+    pub(crate) fn reset_all_data(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             DELETE FROM message_vec;
+             DELETE FROM session_embedding_state;
+             DELETE FROM event_session_state;
+             DELETE FROM session_events;
+             DELETE FROM usage_session_state;
+             DELETE FROM usage_events;
+             DELETE FROM messages;
+             DELETE FROM sessions;
+             DELETE FROM background_job_state;
+             COMMIT;",
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn vacuum(&self) -> Result<()> {
+        // VACUUM cannot run inside a transaction; execute standalone.
+        self.conn.execute_batch("VACUUM; ANALYZE; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
     }
 }
 

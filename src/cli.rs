@@ -89,6 +89,13 @@ enum Commands {
         #[arg(long, help = "Parse and report without writing")]
         dry_run: bool,
     },
+    #[command(about = "Delete all indexed data (keeps config)")]
+    Reset {
+        #[arg(long, help = "Skip the confirmation prompt")]
+        yes: bool,
+    },
+    #[command(about = "Compact the database and reclaim disk space")]
+    Vacuum,
     #[command(about = "Share session pages")]
     Share {
         #[command(subcommand)]
@@ -229,6 +236,8 @@ pub(crate) fn run() -> Result<()> {
             )?
         }
         Some(Commands::Import { file, dry_run }) => crate::import::run_cli(&file, dry_run)?,
+        Some(Commands::Reset { yes }) => crate::maintenance::run_reset(yes)?,
+        Some(Commands::Vacuum) => crate::maintenance::run_vacuum()?,
         Some(Commands::Share { command: ShareCommands::Init { project_name, publish_dir } }) => {
             crate::share_init::run(project_name, publish_dir)?
         }
@@ -532,6 +541,18 @@ mod tests {
             }
             _ => panic!("expected skill install command"),
         }
+    }
+
+    #[test]
+    fn reset_accepts_yes_flag() {
+        let cli = Cli::try_parse_from(["recall", "reset", "--yes"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Reset { yes: true })));
+    }
+
+    #[test]
+    fn vacuum_parses() {
+        let cli = Cli::try_parse_from(["recall", "vacuum"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Vacuum)));
     }
 
     #[test]

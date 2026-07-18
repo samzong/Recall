@@ -79,6 +79,24 @@ pub(crate) fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
     bytes
 }
 
+pub(crate) fn humanize_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+    let mut value = bytes as f64;
+    let mut unit_index = 0;
+    while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{bytes} {}", UNITS[unit_index])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_index])
+    }
+}
+
 const TITLE_MAX_CHARS: usize = 80;
 const TITLE_TRUNCATE_TAIL: usize = 77;
 
@@ -193,5 +211,30 @@ mod tests {
     fn title_detects_noise_with_leading_whitespace() {
         let msgs = ["   <command-message>ship</command-message>", "real content"];
         assert_eq!(title_from_user_messages(&msgs), "real content");
+    }
+
+    #[test]
+    fn humanize_bytes_formats_zero_as_bytes() {
+        assert_eq!(humanize_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn humanize_bytes_formats_sub_kilobyte_as_bytes() {
+        assert_eq!(humanize_bytes(512), "512 B");
+    }
+
+    #[test]
+    fn humanize_bytes_formats_kilobytes_with_one_decimal() {
+        assert_eq!(humanize_bytes(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn humanize_bytes_formats_megabytes() {
+        assert_eq!(humanize_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn humanize_bytes_formats_gigabytes() {
+        assert_eq!(humanize_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
     }
 }
