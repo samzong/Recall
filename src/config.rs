@@ -147,8 +147,171 @@ impl AppConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DoctorLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DoctorCheck {
+    pub(crate) label: String,
+    pub(crate) level: DoctorLevel,
+    pub(crate) detail: String,
+}
+
+impl DoctorCheck {
+    fn info(label: &str, detail: impl Into<String>) -> Self {
+        Self { label: label.to_string(), level: DoctorLevel::Info, detail: detail.into() }
+    }
+
+    fn warn(label: &str, detail: impl Into<String>) -> Self {
+        Self { label: label.to_string(), level: DoctorLevel::Warn, detail: detail.into() }
+    }
+
+    fn error(label: &str, detail: impl Into<String>) -> Self {
+        Self { label: label.to_string(), level: DoctorLevel::Error, detail: detail.into() }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DoctorReport {
+    pub(crate) checks: Vec<DoctorCheck>,
+}
+
+impl DoctorReport {
+    pub(crate) fn has_errors(&self) -> bool {
+        self.checks.iter().any(|c| c.level == DoctorLevel::Error)
+    }
+}
+
+/// Evaluate configuration health from borrowed inputs — no filesystem access,
+/// so it is fully unit-testable. `raw` is `None` when the config file is
+/// absent (defaults apply — fine). `mode` is `st_mode & 0o777` when the file
+/// exists on unix, else `None`. `known_sources` is `(id, label)` from
+/// `adapters::source_labels()`.
+pub(crate) fn evaluate_config(
+    raw: Option<&str>,
+    mode: Option<u32>,
+    known_sources: &[(String, String)],
+) -> DoctorReport {
+    let mut checks = Vec::new();
+
+    match raw {
+        None => checks.push(DoctorCheck::info("config file", "not found; built-in defaults apply")),
+        Some(_) => checks.push(DoctorCheck::info("config file", "present")),
+    }
+
+    if let Some(mode) = mode {
+        let perms = mode & 0o777;
+        if perms & 0o022 != 0 {
+            checks.push(DoctorCheck::warn(
+                "permissions",
+                format!("group/world-writable ({perms:04o}); tighten with `chmod go-w`"),
+            ));
+        } else {
+            checks.push(DoctorCheck::info("permissions", format!("{perms:04o}")));
+        }
+    }
+
+    let parsed = match raw {
+        None => Some(AppConfig::default()),
+        Some(content) => match serde_json::from_str::<AppConfig>(content) {
+            Ok(config) => {
+                checks.push(DoctorCheck::info("json", "valid"));
+                Some(config)
+            }
+            Err(err) => {
+                checks.push(DoctorCheck::error("json", format!("invalid: {err}")));
+                None
+            }
+        },
+    };
+
+    if let Some(config) = parsed {
+        let enabled = known_sources.iter().filter(|(id, _)| config.is_source_enabled(id)).count();
+        if enabled == 0 {
+            checks.push(DoctorCheck::error(
+                "sources",
+                "no sources enabled; every known source is listed in disabled_sources",
+            ));
+        } else {
+            checks.push(DoctorCheck::info(
+                "sources",
+                format!("{enabled} of {} enabled", known_sources.len()),
+            ));
+        }
+    }
+
+    DoctorReport { checks }
+}
+
 pub(crate) fn config_path() -> Result<PathBuf> {
     let dir =
         dirs::config_dir().ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
     Ok(dir.join("recall").join("config.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DoctorLevel, evaluate_config};
+
+    fn known() -> Vec<(String, String)> {
+        vec![
+            ("codex".to_string(), "Codex".to_string()),
+            ("claude-code".to_string(), "Claude Code".to_string()),
+        ]
+    }
+
+    #[test]
+    fn test_should_report_clean_when_config_file_missing() {
+        let report = evaluate_config(None, None, &known());
+        assert!(!report.has_errors());
+        assert!(report.checks.iter().all(|c| c.level != DoctorLevel::Error));
+    }
+
+    #[test]
+    fn test_should_error_when_json_is_invalid() {
+        let report = evaluate_config(Some("{ not json"), Some(0o600), &known());
+        assert!(report.has_errors());
+        assert!(report.checks.iter().any(|c| c.level == DoctorLevel::Error && c.label == "json"));
+    }
+
+    #[test]
+    fn test_should_error_when_no_sources_enabled() {
+        let raw = r#"{"disabled_sources":["codex","claude-code"]}"#;
+        let report = evaluate_config(Some(raw), Some(0o600), &known());
+        assert!(report.has_errors());
+        assert!(
+            report.checks.iter().any(|c| c.level == DoctorLevel::Error && c.label == "sources")
+        );
+    }
+
+    #[test]
+    fn test_should_report_clean_when_default_config_valid() {
+        let raw = serde_json::to_string_pretty(&super::AppConfig::default()).unwrap();
+        let report = evaluate_config(Some(&raw), Some(0o600), &known());
+        assert!(!report.has_errors());
+    }
+
+    #[test]
+    fn test_should_warn_when_config_group_or_world_writable() {
+        let report = evaluate_config(Some("{}"), Some(0o666), &known());
+        assert!(!report.has_errors());
+        assert!(
+            report.checks.iter().any(|c| c.level == DoctorLevel::Warn && c.label == "permissions")
+        );
+    }
+
+    #[test]
+    fn test_should_not_warn_when_config_only_group_world_readable() {
+        let report = evaluate_config(Some("{}"), Some(0o644), &known());
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|c| !(c.level == DoctorLevel::Warn && c.label == "permissions"))
+        );
+    }
 }

@@ -106,6 +106,11 @@ enum Commands {
         #[command(subcommand)]
         command: WorkerAction,
     },
+    #[command(about = "Inspect and manage configuration")]
+    Config {
+        #[command(subcommand)]
+        command: ConfigAction,
+    },
     #[command(about = "Share session pages")]
     Share {
         #[command(subcommand)]
@@ -157,6 +162,16 @@ enum WorkerAction {
         #[arg(long, help = "Also drop computed embeddings and re-queue every session")]
         clear_queue: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    #[command(about = "Print the resolved configuration as JSON")]
+    Show,
+    #[command(about = "Open the configuration file in $EDITOR")]
+    Edit,
+    #[command(about = "Diagnose configuration problems")]
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -265,6 +280,15 @@ pub(crate) fn run() -> Result<()> {
         }
         Some(Commands::Worker { command: WorkerAction::Stop { clear_queue } }) => {
             crate::maintenance::run_worker_stop(clear_queue)?
+        }
+        Some(Commands::Config { command: ConfigAction::Show }) => {
+            crate::maintenance::run_config_show()?
+        }
+        Some(Commands::Config { command: ConfigAction::Edit }) => {
+            crate::maintenance::run_config_edit()?
+        }
+        Some(Commands::Config { command: ConfigAction::Doctor }) => {
+            crate::maintenance::run_config_doctor()?
         }
         Some(Commands::Share { command: ShareCommands::Init { project_name, publish_dir } }) => {
             crate::share_init::run(project_name, publish_dir)?
@@ -382,8 +406,8 @@ fn recall_skill_bundle() -> kitup::SkillBundle {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, ExtensionCommands, ShareCommands, Shell, SkillCommands, WorkerAction,
-        generate, insert_installed_help,
+        Cli, Commands, ConfigAction, ExtensionCommands, ShareCommands, Shell, SkillCommands,
+        WorkerAction, generate, insert_installed_help,
     };
     use crate::adapters::{
         adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
@@ -506,6 +530,7 @@ mod tests {
         assert!(
             compact_help.contains("worker Inspect and control the background embedding worker")
         );
+        assert!(compact_help.contains("config Inspect and manage configuration"));
     }
 
     #[test]
@@ -620,6 +645,24 @@ mod tests {
             cli.command,
             Some(Commands::Worker { command: WorkerAction::Stop { clear_queue: true } })
         ));
+    }
+
+    #[test]
+    fn config_show_parses() {
+        let cli = Cli::try_parse_from(["recall", "config", "show"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Config { command: ConfigAction::Show })));
+    }
+
+    #[test]
+    fn config_edit_parses() {
+        let cli = Cli::try_parse_from(["recall", "config", "edit"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Config { command: ConfigAction::Edit })));
+    }
+
+    #[test]
+    fn config_doctor_parses() {
+        let cli = Cli::try_parse_from(["recall", "config", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Config { command: ConfigAction::Doctor })));
     }
 
     #[test]

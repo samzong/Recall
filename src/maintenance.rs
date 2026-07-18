@@ -188,3 +188,75 @@ fn signal_worker(pid: u32) -> Result<()> {
 fn signal_worker(_pid: u32) -> Result<()> {
     anyhow::bail!("worker stop is only supported on Unix")
 }
+
+pub(crate) fn run_config_show() -> Result<()> {
+    let path = crate::config::config_path()?;
+    let config = crate::config::AppConfig::load_or_default();
+    println!("# {}", path.display());
+    println!("{}", serde_json::to_string_pretty(&config)?);
+    Ok(())
+}
+
+pub(crate) fn run_config_edit() -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("config edit requires an interactive terminal");
+    }
+    let path = crate::config::config_path()?;
+    if !path.exists() {
+        crate::config::AppConfig::default().save()?;
+        println!("Created default config at {}", path.display());
+    }
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    // Command::status() inherits parent stdio, so a full-screen TUI editor works.
+    let status = std::process::Command::new(&editor).arg(&path).status()?;
+    if !status.success() {
+        anyhow::bail!("editor `{editor}` exited with a non-zero status");
+    }
+    match crate::config::AppConfig::load() {
+        Ok(_) => {
+            println!("Config saved and valid.");
+            Ok(())
+        }
+        Err(err) => anyhow::bail!("config is invalid after edit: {err}"),
+    }
+}
+
+pub(crate) fn run_config_doctor() -> Result<()> {
+    let path = crate::config::config_path()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(content) => Some(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    let mode = config_file_mode(&path);
+    let labels = crate::adapters::source_labels();
+    let report = crate::config::evaluate_config(raw.as_deref(), mode, &labels);
+
+    println!("Config Doctor");
+    println!("  Path         {}", path.display());
+    for check in &report.checks {
+        let tag = match check.level {
+            crate::config::DoctorLevel::Info => "info",
+            crate::config::DoctorLevel::Warn => "warn",
+            crate::config::DoctorLevel::Error => "FAIL",
+        };
+        println!("  [{tag}] {:<12} {}", check.label, check.detail);
+    }
+    println!("  [info] {:<12} {}", "embedding", crate::embedding::availability_summary());
+
+    if report.has_errors() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn config_file_mode(path: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).ok().map(|meta| meta.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn config_file_mode(_path: &std::path::Path) -> Option<u32> {
+    None
+}

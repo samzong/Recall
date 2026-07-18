@@ -117,6 +117,20 @@ fn select_device() -> Result<Device> {
     }
 }
 
+/// Cheap, download-free description of the local embedding backend for the
+/// config doctor. Detects the accelerator the same way `select_device` does,
+/// without constructing a model or touching the network.
+pub(crate) fn availability_summary() -> String {
+    let device = if candle_core::utils::cuda_is_available() {
+        "CUDA"
+    } else if candle_core::utils::metal_is_available() {
+        "Metal"
+    } else {
+        "CPU"
+    };
+    format!("local candle {MODEL_ID} (device: {device})")
+}
+
 fn download_model(show_progress: bool) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let api = hf_hub::api::sync::ApiBuilder::from_env().build()?;
     let repo =
