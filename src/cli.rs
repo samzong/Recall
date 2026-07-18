@@ -101,6 +101,13 @@ enum Commands {
         #[arg(long, help = "Skip the confirmation prompt")]
         yes: bool,
     },
+    #[command(about = "Delete indexed sessions for disabled sources or missing backing files")]
+    Gc {
+        #[arg(long, help = "Classify and report without deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip the confirmation prompt")]
+        yes: bool,
+    },
     #[command(about = "Inspect and control the background embedding worker")]
     Worker {
         #[command(subcommand)]
@@ -275,6 +282,7 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Reset { yes }) => crate::maintenance::run_reset(yes)?,
         Some(Commands::Vacuum) => crate::maintenance::run_vacuum()?,
         Some(Commands::Reembed { yes }) => crate::maintenance::run_reembed(yes)?,
+        Some(Commands::Gc { dry_run, yes }) => crate::maintenance::run_gc(dry_run, yes)?,
         Some(Commands::Worker { command: WorkerAction::Status }) => {
             crate::maintenance::run_worker_status()?
         }
@@ -621,6 +629,18 @@ mod tests {
     fn reembed_defaults_to_prompt() {
         let cli = Cli::try_parse_from(["recall", "reembed"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Reembed { yes: false })));
+    }
+
+    #[test]
+    fn gc_defaults_to_delete_with_prompt() {
+        let cli = Cli::try_parse_from(["recall", "gc"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Gc { dry_run: false, yes: false })));
+    }
+
+    #[test]
+    fn gc_accepts_dry_run_and_yes() {
+        let cli = Cli::try_parse_from(["recall", "gc", "--dry-run", "--yes"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Gc { dry_run: true, yes: true })));
     }
 
     #[test]

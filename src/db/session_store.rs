@@ -47,6 +47,12 @@ impl Store {
         rows.collect::<Result<HashSet<_>, _>>().map_err(Into::into)
     }
 
+    pub(crate) fn distinct_session_sources(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT source FROM sessions ORDER BY source")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub(crate) fn clear_import_marker(&self, source: &str, source_id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET is_import = 0 WHERE source = ?1 AND source_id = ?2",

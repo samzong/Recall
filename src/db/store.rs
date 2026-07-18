@@ -203,6 +203,25 @@ mod exclusion_tests {
     }
 
     #[test]
+    fn distinct_session_sources_returns_each_source_once() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut a = sess("a", None);
+        a.source = "claude-code".to_string();
+        let mut b = sess("b", None);
+        b.source = "codex".to_string();
+        let mut c = sess("c", None);
+        c.source = "codex".to_string();
+        store.insert_session(&a).unwrap();
+        store.insert_session(&b).unwrap();
+        store.insert_session(&c).unwrap();
+
+        let mut sources = store.distinct_session_sources().unwrap();
+        sources.sort();
+        assert_eq!(sources, vec!["claude-code".to_string(), "codex".to_string()]);
+    }
+
+    #[test]
     fn session_paths_for_source_round_trips_then_delete_clears() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
