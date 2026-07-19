@@ -6,6 +6,7 @@ pub(crate) mod search_state;
 pub(crate) mod search_worker;
 pub(crate) mod share_state;
 pub(crate) mod text_layout;
+pub(crate) mod theme;
 pub(crate) mod ui;
 pub(crate) mod usage_state;
 pub(crate) mod viewing_state;

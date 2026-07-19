@@ -12,6 +12,7 @@ use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::tui::app::App;
 use crate::tui::share_state::{AppMode, ResumeOrigin};
+use crate::tui::theme::THEME;
 
 pub(super) fn highlight_spans(
     text: &str,
@@ -28,7 +29,7 @@ pub(super) fn highlight_spans(
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cursor = 0usize;
     let match_style =
-        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
+        Style::default().fg(THEME.match_fg).bg(THEME.match_bg).add_modifier(Modifier::BOLD);
     while cursor < text.len() {
         let hit = needles
             .iter()
@@ -99,8 +100,8 @@ pub(super) fn render_vertical_scrollbar(
             .end_symbol(None)
             .thumb_symbol("▌")
             .track_symbol(Some("▌"))
-            .thumb_style(Style::default().fg(Color::Cyan))
-            .track_style(Style::default().fg(Color::DarkGray)),
+            .thumb_style(Style::default().fg(THEME.scrollbar_thumb))
+            .track_style(Style::default().fg(THEME.scrollbar_track)),
         area.inner(Margin { vertical: 1, horizontal: 0 }),
         &mut state,
     );
@@ -239,7 +240,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(frame.buffer[(1, 8)].style().fg, Some(Color::Cyan));
+        assert_eq!(frame.buffer[(1, 8)].style().fg, Some(THEME.scrollbar_thumb));
     }
 
     #[test]
@@ -253,9 +254,9 @@ mod tests {
 
         let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(texts, vec!["Alpha", " beta ", "Gamma"]);
-        assert_eq!(spans[0].style.bg, Some(Color::Yellow));
+        assert_eq!(spans[0].style.bg, Some(THEME.match_bg));
         assert_eq!(spans[1].style.bg, None);
-        assert_eq!(spans[2].style.bg, Some(Color::Yellow));
+        assert_eq!(spans[2].style.bg, Some(THEME.match_bg));
     }
 
     #[test]
@@ -269,7 +270,7 @@ mod tests {
 
         let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(texts, vec!["foobar", " baz"]);
-        assert_eq!(spans[0].style.bg, Some(Color::Yellow));
+        assert_eq!(spans[0].style.bg, Some(THEME.match_bg));
     }
 
     #[test]
@@ -333,13 +334,13 @@ mod tests {
         for x in inner.x..inner.x + inner.width {
             assert_eq!(
                 buffer[(x, selected_y)].style().bg,
-                Some(Color::Cyan),
-                "selected row x={x} should have cyan background"
+                Some(THEME.selected_bg),
+                "selected row x={x} should have the selected background"
             );
         }
         assert!(
             (inner.x..inner.x + inner.width)
-                .all(|x| buffer[(x, unselected_y)].style().bg != Some(Color::Cyan))
+                .all(|x| buffer[(x, unselected_y)].style().bg != Some(THEME.selected_bg))
         );
     }
 
@@ -405,7 +406,7 @@ mod tests {
         assert!(summary.contains(
             "tokens 31 input 10 output 9 cache r/w 6/4 reasoning 2 | time 2m | user msgs 2/3"
         ));
-        assert_eq!(terminal.backend().buffer()[(2, 1)].fg, Color::Green);
+        assert_eq!(terminal.backend().buffer()[(2, 1)].fg, THEME.summary);
     }
 
     #[test]

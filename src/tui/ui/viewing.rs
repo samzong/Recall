@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::app::App;
 use crate::tui::layout::viewing_layout;
 use crate::tui::text_layout::wrap_spans_to_lines;
+use crate::tui::theme::THEME;
 use crate::tui::viewing_state::SanitizedLine;
 use crate::types::Role;
 
@@ -34,7 +35,7 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(session_info)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(THEME.border_focus));
     f.render_widget(block, layout.content);
 
     let inner_width = layout.messages.width as usize;
@@ -52,15 +53,15 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
     for (i, msg) in app.viewing_messages.iter().enumerate() {
         let selected = i == app.viewing_selected_msg;
         let (prefix, color) = match msg.role {
-            Role::User => ("User", Color::Cyan),
-            Role::Assistant => ("Assistant", Color::Green),
+            Role::User => ("User", THEME.user),
+            Role::Assistant => ("Assistant", THEME.assistant),
         };
 
         let time_str = crate::utils::format_message_time(msg.timestamp);
         let header_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
-            Color::DarkGray
+            THEME.message_highlight
         } else {
-            Color::Reset
+            THEME.background
         };
         let mut header = vec![Span::styled(
             format!("── {prefix} ──"),
@@ -69,7 +70,7 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         if !time_str.is_empty() {
             header.push(Span::styled(
                 format!("  {time_str}"),
-                Style::default().fg(Color::DarkGray).bg(header_bg),
+                Style::default().fg(THEME.text_muted).bg(header_bg),
             ));
         }
         lines.push(Line::from(header));
@@ -78,13 +79,13 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         let empty: Vec<SanitizedLine> = Vec::new();
         let cached_lines = app.viewing_sanitized_lines.get(i).unwrap_or(&empty);
         for sl in cached_lines {
-            let body_style = Style::default().fg(Color::White);
+            let body_style = Style::default().fg(THEME.text);
             let spans = highlight_spans(&sl.text, &sl.lower, &needles, body_style);
             for line in wrap_spans_to_lines(spans, inner_width) {
                 let body_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
-                    Color::DarkGray
+                    THEME.message_highlight
                 } else {
-                    Color::Reset
+                    THEME.background
                 };
                 lines.push(line_with_background(line, body_bg));
                 visual_row += 1;
@@ -106,39 +107,39 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
     );
 
     let help_spans = vec![
-        Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
-        Span::styled(" messages  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("/", Style::default().fg(Color::Yellow)),
-        Span::styled(" find  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("n/N", Style::default().fg(Color::Yellow)),
-        Span::styled(" next/prev  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("c", Style::default().fg(Color::Yellow)),
-        Span::styled(" copy  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("e", Style::default().fg(Color::Yellow)),
-        Span::styled(" export  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("s", Style::default().fg(Color::Yellow)),
-        Span::styled(" share  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("h", Style::default().fg(Color::Yellow)),
-        Span::styled(" handoff  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Ctrl+R", Style::default().fg(Color::Yellow)),
-        Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Ctrl+O", Style::default().fg(Color::Yellow)),
-        Span::styled(" app  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc/q", Style::default().fg(Color::Yellow)),
-        Span::styled(" back", Style::default().fg(Color::DarkGray)),
+        Span::styled(" ↑/↓", Style::default().fg(THEME.accent)),
+        Span::styled(" messages  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("/", Style::default().fg(THEME.accent)),
+        Span::styled(" find  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("n/N", Style::default().fg(THEME.accent)),
+        Span::styled(" next/prev  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("c", Style::default().fg(THEME.accent)),
+        Span::styled(" copy  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("e", Style::default().fg(THEME.accent)),
+        Span::styled(" export  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("s", Style::default().fg(THEME.accent)),
+        Span::styled(" share  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("h", Style::default().fg(THEME.accent)),
+        Span::styled(" handoff  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("Ctrl+R", Style::default().fg(THEME.accent)),
+        Span::styled(" resume  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("Ctrl+O", Style::default().fg(THEME.accent)),
+        Span::styled(" app  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("Esc/q", Style::default().fg(THEME.accent)),
+        Span::styled(" back", Style::default().fg(THEME.text_muted)),
     ];
 
     let status_line = if let Some(ref input) = app.viewing_search_input {
         Line::from(vec![
-            Span::styled(" /", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(input.clone(), Style::default().fg(Color::White)),
+            Span::styled(" /", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(input.clone(), Style::default().fg(THEME.text)),
         ])
     } else if let Some(ref msg) = app.status_message {
-        Line::from(vec![Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))])
+        Line::from(vec![Span::styled(format!(" {msg}"), Style::default().fg(THEME.success))])
     } else if let Some(ref note) = app.viewing_search_status {
         Line::from(vec![Span::styled(
             format!(" {note}: \"{}\"", app.viewing_search_query),
-            Style::default().fg(Color::Red),
+            Style::default().fg(THEME.error),
         )])
     } else if !app.viewing_search_query.is_empty() {
         let matches = app.viewing_match_indices();
@@ -148,7 +149,7 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         let mut spans = help_spans.clone();
         spans.push(Span::styled(
             format!("  [{current_pos}/{total} \"{}\"]", app.viewing_search_query),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(THEME.accent),
         ));
         Line::from(spans)
     } else {
@@ -165,7 +166,7 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
 }
 pub(super) fn render_viewing_summary(f: &mut Frame, app: &App, area: Rect) {
     let text = viewing_summary_text(app, area.width as usize);
-    let line = Line::from(Span::styled(text, Style::default().fg(Color::Green)));
+    let line = Line::from(Span::styled(text, Style::default().fg(THEME.summary)));
     f.render_widget(Paragraph::new(line), area);
 }
 

@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
@@ -9,6 +9,7 @@ use crate::tui::app::App;
 use crate::tui::layout::search_layout;
 use crate::tui::search_state::{FilterFocus, PanelFocus};
 use crate::tui::text_layout::wrap_visual_rows;
+use crate::tui::theme::THEME;
 use crate::types::{MatchSource, Role};
 
 use super::popups::render_status_bar;
@@ -28,21 +29,21 @@ pub(super) fn render_search_box(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Recall ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(THEME.border_focus));
 
     let line = if app.query.is_empty() {
         if let Some(feedback) = app.search_feedback.as_deref() {
-            Line::from(Span::styled(feedback.to_string(), Style::default().fg(Color::Yellow)))
+            Line::from(Span::styled(feedback.to_string(), Style::default().fg(THEME.accent)))
         } else {
-            Line::from(Span::styled("Type to search...", Style::default().fg(Color::DarkGray)))
+            Line::from(Span::styled("Type to search...", Style::default().fg(THEME.text_muted)))
         }
     } else if let Some(feedback) = app.search_feedback.as_deref() {
         Line::from(vec![
-            Span::styled(app.query.clone(), Style::default().fg(Color::White)),
-            Span::styled(format!("  {feedback}"), Style::default().fg(Color::Yellow)),
+            Span::styled(app.query.clone(), Style::default().fg(THEME.text)),
+            Span::styled(format!("  {feedback}"), Style::default().fg(THEME.accent)),
         ])
     } else {
-        Line::from(Span::styled(app.query.clone(), Style::default().fg(Color::White)))
+        Line::from(Span::styled(app.query.clone(), Style::default().fg(THEME.text)))
     };
 
     let input = Paragraph::new(line).block(block);
@@ -61,27 +62,27 @@ pub(super) fn render_filters(f: &mut Frame, app: &App, area: Rect) {
     let sort_label = app.sort_label();
 
     let line = Line::from(vec![
-        Span::styled(" S:", Style::default().fg(Color::DarkGray)),
+        Span::styled(" S:", Style::default().fg(THEME.text_muted)),
         Span::styled(
             format!("[{source_label}]"),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  P:", Style::default().fg(Color::DarkGray)),
+        Span::styled("  P:", Style::default().fg(THEME.text_muted)),
         Span::styled(
             format!("[{project_label}]"),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  T:", Style::default().fg(Color::DarkGray)),
+        Span::styled("  T:", Style::default().fg(THEME.text_muted)),
         Span::styled(
             format!("[{time_label}]"),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  Sort:", Style::default().fg(Color::DarkGray)),
+        Span::styled("  Sort:", Style::default().fg(THEME.text_muted)),
         Span::styled(
             format!("[{sort_label}]"),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  Ctrl+F", Style::default().fg(Color::DarkGray)),
+        Span::styled("  Ctrl+F", Style::default().fg(THEME.text_muted)),
     ]);
 
     f.render_widget(Paragraph::new(line), area);
@@ -109,7 +110,7 @@ pub(super) fn render_filter_overview(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" Filters ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(THEME.border_focus));
 
     let mut lines = vec![Line::from("")];
     lines.push(filter_overview_line(
@@ -138,16 +139,16 @@ pub(super) fn render_filter_overview(f: &mut Frame, app: &App) {
     ));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
-        Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("←/→", Style::default().fg(Color::Yellow)),
-        Span::styled(" adjust  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Enter", Style::default().fg(Color::Yellow)),
-        Span::styled(" edit  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("c", Style::default().fg(Color::Yellow)),
-        Span::styled(" clear  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc", Style::default().fg(Color::Yellow)),
-        Span::styled(" apply", Style::default().fg(Color::DarkGray)),
+        Span::styled(" ↑/↓", Style::default().fg(THEME.accent)),
+        Span::styled(" nav  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("←/→", Style::default().fg(THEME.accent)),
+        Span::styled(" adjust  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("Enter", Style::default().fg(THEME.accent)),
+        Span::styled(" edit  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("c", Style::default().fg(THEME.accent)),
+        Span::styled(" clear  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("Esc", Style::default().fg(THEME.accent)),
+        Span::styled(" apply", Style::default().fg(THEME.text_muted)),
     ]));
 
     let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
@@ -162,9 +163,9 @@ fn filter_overview_line(
     selected: bool,
 ) -> Line<'static> {
     let style = if selected {
-        Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+        Style::default().bg(THEME.selected_bg).fg(THEME.selected_fg).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(THEME.text)
     };
     Line::from(Span::styled(
         format!(" {label:<12} {:<22} {hint}", truncate_label(value, 22)),
@@ -173,7 +174,7 @@ fn filter_overview_line(
 }
 pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.panel_focus == PanelFocus::SessionList;
-    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let border_color = if focused { THEME.border_focus } else { THEME.border_idle };
     let title = if app.results.is_empty() {
         " Sessions (0) ".to_string()
     } else {
@@ -186,7 +187,7 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
 
     if app.results.is_empty() {
         let msg = "No results";
-        let p = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)).block(block);
+        let p = Paragraph::new(msg).style(Style::default().fg(THEME.text_muted)).block(block);
         f.render_widget(p, area);
         return;
     }
@@ -213,9 +214,9 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
             let active_selected = focused && selected;
             let passive_selected = selected && !focused;
             let selected_text_style = if active_selected {
-                Style::default().fg(Color::Black)
+                Style::default().fg(THEME.selected_fg)
             } else if passive_selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(THEME.border_focus).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -223,7 +224,7 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
             let line = Line::from(vec![
                 Span::styled(
                     source_label.to_string(),
-                    if selected { selected_text_style } else { Style::default().fg(Color::Green) },
+                    if selected { selected_text_style } else { Style::default().fg(THEME.source) },
                 ),
                 Span::raw(" "),
                 Span::styled(
@@ -231,26 +232,26 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
                     if selected {
                         selected_text_style
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(THEME.text_muted)
                     },
                 ),
                 Span::raw(" "),
                 Span::styled(
                     title,
-                    if selected { selected_text_style } else { Style::default().fg(Color::White) },
+                    if selected { selected_text_style } else { Style::default().fg(THEME.text) },
                 ),
                 Span::styled(
                     format!("  {age}"),
                     if selected {
                         selected_text_style
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(THEME.text_muted)
                     },
                 ),
             ]);
 
             ListItem::new(line).style(if active_selected {
-                Style::default().bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().bg(THEME.selected_bg).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             })
@@ -264,7 +265,7 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
         let row_y = list_inner.y + (app.selected_index - start) as u16;
         f.buffer_mut().set_style(
             Rect::new(list_inner.x, row_y, list_inner.width, 1),
-            Style::default().bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().bg(THEME.selected_bg).add_modifier(Modifier::BOLD),
         );
     }
     render_vertical_scrollbar(f, area, app.results.len(), visible_rows, start);
@@ -272,7 +273,7 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
 
 pub(super) fn render_preview(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.panel_focus == PanelFocus::Preview;
-    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let border_color = if focused { THEME.border_focus } else { THEME.border_idle };
 
     let title = if let Some(result) = app.results.get(app.selected_index) {
         let dir = result.session.directory.as_deref().unwrap_or("-");
@@ -296,7 +297,7 @@ pub(super) fn render_preview(f: &mut Frame, app: &App, area: Rect) {
 
     if app.preview_messages.is_empty() {
         let p =
-            Paragraph::new("No messages").style(Style::default().fg(Color::DarkGray)).block(block);
+            Paragraph::new("No messages").style(Style::default().fg(THEME.text_muted)).block(block);
         f.render_widget(p, area);
         return;
     }
@@ -315,22 +316,23 @@ pub(super) fn render_preview(f: &mut Frame, app: &App, area: Rect) {
     for (i, msg) in app.preview_messages.iter().enumerate() {
         let selected = focused && i == app.preview_selected_msg;
         let (prefix, color) = match msg.role {
-            Role::User => ("User: ", Color::Cyan),
-            Role::Assistant => ("Asst: ", Color::Green),
+            Role::User => ("User: ", THEME.user),
+            Role::Assistant => ("Asst: ", THEME.assistant),
         };
 
         let time_str = crate::utils::format_message_time(msg.timestamp);
         let header_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
-            Color::DarkGray
+            THEME.message_highlight
         } else {
-            Color::Reset
+            THEME.background
         };
         let mut header = vec![Span::styled(
             prefix,
             Style::default().fg(color).bg(header_bg).add_modifier(Modifier::BOLD),
         )];
         if !time_str.is_empty() {
-            header.push(Span::styled(time_str, Style::default().fg(Color::DarkGray).bg(header_bg)));
+            header
+                .push(Span::styled(time_str, Style::default().fg(THEME.text_muted).bg(header_bg)));
         }
         lines.push(Line::from(header));
         visual_row += 1;
@@ -341,13 +343,13 @@ pub(super) fn render_preview(f: &mut Frame, app: &App, area: Rect) {
             let line = format!("  {line}");
             for row in wrap_visual_rows(&line, inner_width) {
                 let body_bg = if selected && row_visible(visual_row, viewport_start, viewport_end) {
-                    Color::DarkGray
+                    THEME.message_highlight
                 } else {
-                    Color::Reset
+                    THEME.background
                 };
                 lines.push(Line::from(Span::styled(
                     row,
-                    Style::default().fg(Color::White).bg(body_bg),
+                    Style::default().fg(THEME.text).bg(body_bg),
                 )));
                 visual_row += 1;
             }

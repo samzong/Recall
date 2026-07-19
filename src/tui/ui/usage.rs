@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::db::search::TimeRange;
 use crate::skill_audit::{SkillTier, SkillUsageEntry, format_last_used, format_signals};
 use crate::tui::app::App;
+use crate::tui::theme::THEME;
 use crate::tui::usage_state::UsageTab;
 use crate::usage::{TokenTotals, UsageReport};
 
@@ -50,10 +51,10 @@ pub(super) fn render_usage_header(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Recall Usage Dashboard ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(THEME.border_focus));
 
-    let chip = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(Color::DarkGray);
+    let chip = Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(THEME.text_muted);
 
     let control = vec![
         Span::styled(" range ", muted),
@@ -69,7 +70,7 @@ pub(super) fn render_usage_header(f: &mut Frame, app: &App, area: Rect) {
     if app.usage_is_loading() {
         lines.push(Line::from(Span::styled(
             " Loading usage data...",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
     } else if let Some(report) = app.usage_report.as_ref() {
@@ -86,29 +87,29 @@ pub(super) fn render_usage_header(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" tokens ", muted),
             Span::styled(
                 format_compact(report.summary.tokens.total_tokens),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default().fg(THEME.success).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" sessions ", muted),
             Span::styled(
                 format_count(report.summary.sessions),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" events ", muted),
-            Span::styled(format_count(report.summary.events), Style::default().fg(Color::White)),
+            Span::styled(format_count(report.summary.events), Style::default().fg(THEME.text)),
             Span::styled(" active-days ", muted),
-            Span::styled(format_count(active_days), Style::default().fg(Color::White)),
+            Span::styled(format_count(active_days), Style::default().fg(THEME.text)),
         ]));
         lines.push(Line::from(vec![
             Span::styled(" top-source ", muted),
             Span::styled(
                 truncate_label(top_source, 18),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" top-model ", muted),
-            Span::styled(truncate_label(top_model, 32), Style::default().fg(Color::White)),
+            Span::styled(truncate_label(top_model, 32), Style::default().fg(THEME.text)),
         ]));
     } else if let Some(error) = app.usage_error.as_ref() {
-        lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))));
+        lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(THEME.error))));
         lines.push(Line::from(""));
     } else {
         lines.push(Line::from(Span::styled("No usage data loaded", muted)));
@@ -122,12 +123,12 @@ pub(super) fn render_activity_map(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Token Activity Map ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
+        .border_style(Style::default().fg(THEME.success));
 
     if app.usage_is_loading() {
         f.render_widget(
             Paragraph::new("Loading usage data...")
-                .style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(THEME.accent))
                 .block(block),
             area,
         );
@@ -138,7 +139,7 @@ pub(super) fn render_activity_map(f: &mut Frame, app: &App, area: Rect) {
     let Some(report) = report else {
         f.render_widget(
             Paragraph::new("No usage events")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(THEME.text_muted))
                 .block(block),
             area,
         );
@@ -177,8 +178,8 @@ pub(super) fn render_activity_map(f: &mut Frame, app: &App, area: Rect) {
             cells.push_str(&heatmap_cell(value, max_value).to_string().repeat(cell_width));
         }
         lines.push(Line::from(vec![
-            Span::styled(format!(" {label} "), Style::default().fg(Color::DarkGray)),
-            Span::styled(cells, Style::default().fg(Color::Green)),
+            Span::styled(format!(" {label} "), Style::default().fg(THEME.text_muted)),
+            Span::styled(cells, Style::default().fg(THEME.success)),
         ]));
     }
 
@@ -189,12 +190,12 @@ pub(super) fn render_daily_token_chart(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Daily Token Usage ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(THEME.border_focus));
 
     if app.usage_is_loading() {
         f.render_widget(
             Paragraph::new("Loading usage data...")
-                .style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(THEME.accent))
                 .block(block),
             area,
         );
@@ -204,7 +205,7 @@ pub(super) fn render_daily_token_chart(f: &mut Frame, app: &App, area: Rect) {
     let Some(report) = app.usage_report.as_ref() else {
         f.render_widget(
             Paragraph::new("No token usage")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(THEME.text_muted))
                 .block(block),
             area,
         );
@@ -219,7 +220,7 @@ pub(super) fn render_daily_token_chart(f: &mut Frame, app: &App, area: Rect) {
     if points.is_empty() || max_tokens == 0 {
         f.render_widget(
             Paragraph::new("No token usage in this range")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(THEME.text_muted))
                 .block(block),
             area,
         );
@@ -246,17 +247,17 @@ pub(super) fn render_daily_token_chart(f: &mut Frame, app: &App, area: Rect) {
             }
         }
         lines.push(Line::from(vec![
-            Span::styled(format!("{label} "), Style::default().fg(Color::DarkGray)),
-            Span::styled(bars, Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{label} "), Style::default().fg(THEME.text_muted)),
+            Span::styled(bars, Style::default().fg(THEME.highlight)),
         ]));
     }
 
     if let (Some((first, _)), Some((last, _))) = (points.first(), points.last()) {
         lines.push(Line::from(vec![
-            Span::styled("        ", Style::default().fg(Color::DarkGray)),
+            Span::styled("        ", Style::default().fg(THEME.text_muted)),
             Span::styled(
                 endpoint_labels(first, last, plot_width),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(THEME.text_muted),
             ),
         ]));
     }
@@ -268,12 +269,12 @@ pub(super) fn render_usage_breakdown(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Breakdown ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(THEME.accent));
 
     if app.usage_is_loading() {
         f.render_widget(
             Paragraph::new("Loading usage data...")
-                .style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(THEME.accent))
                 .block(block),
             area,
         );
@@ -283,7 +284,7 @@ pub(super) fn render_usage_breakdown(f: &mut Frame, app: &App, area: Rect) {
     let Some(report) = app.usage_report.as_ref() else {
         f.render_widget(
             Paragraph::new("No usage data")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(THEME.text_muted))
                 .block(block),
             area,
         );
@@ -327,7 +328,7 @@ fn build_usage_source_lines(
         report.by_source.iter().map(|source| source.tokens.total_tokens).max().unwrap_or(0);
     let mut lines = vec![Line::from(Span::styled(
         format!(" Sources ({})", report.by_source.len()),
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        Style::default().fg(THEME.text_muted).add_modifier(Modifier::BOLD),
     ))];
 
     for source in &report.by_source {
@@ -336,11 +337,11 @@ fn build_usage_source_lines(
             source.tokens.total_tokens,
             source_max,
             inner_width,
-            Color::Cyan,
+            THEME.highlight,
         ));
     }
     if report.by_source.is_empty() {
-        lines.push(Line::from(Span::styled("  -", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled("  -", Style::default().fg(THEME.text_muted))));
     }
     lines.push(Line::from(""));
     lines
@@ -349,7 +350,7 @@ fn build_usage_source_lines(
 fn build_usage_token_mix_lines(report: &UsageReport, inner_width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         " Token Mix",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        Style::default().fg(THEME.text_muted).add_modifier(Modifier::BOLD),
     ))];
     lines.extend(token_mix_lines(&report.summary.tokens, inner_width));
     lines.push(Line::from(""));
@@ -365,7 +366,7 @@ fn build_usage_model_lines(
         report.by_model.iter().map(|model| model.tokens.total_tokens).max().unwrap_or(0);
     let mut lines = vec![Line::from(Span::styled(
         format!(" Models ({})", report.by_model.len()),
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        Style::default().fg(THEME.text_muted).add_modifier(Modifier::BOLD),
     ))];
 
     for model in &report.by_model {
@@ -375,11 +376,11 @@ fn build_usage_model_lines(
             model.tokens.total_tokens,
             model_max,
             inner_width,
-            Color::Green,
+            THEME.success,
         ));
     }
     if report.by_model.is_empty() {
-        lines.push(Line::from(Span::styled("  -", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled("  -", Style::default().fg(THEME.text_muted))));
     }
     lines
 }
@@ -387,34 +388,34 @@ fn build_usage_model_lines(
 pub(super) fn render_usage_status(f: &mut Frame, app: &App, area: Rect) {
     let line = match app.usage_tab {
         UsageTab::Tokens => Line::from(vec![
-            Span::styled("m", Style::default().fg(Color::Yellow)),
-            Span::styled(" tab  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("t", Style::default().fg(Color::Yellow)),
-            Span::styled(" time  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("s", Style::default().fg(Color::Yellow)),
-            Span::styled(" source  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("↑↓", Style::default().fg(Color::Yellow)),
-            Span::styled(" breakdown  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("r", Style::default().fg(Color::Yellow)),
-            Span::styled(" reset  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc/q", Style::default().fg(Color::Yellow)),
-            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+            Span::styled("m", Style::default().fg(THEME.accent)),
+            Span::styled(" tab  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("t", Style::default().fg(THEME.accent)),
+            Span::styled(" time  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("s", Style::default().fg(THEME.accent)),
+            Span::styled(" source  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("↑↓", Style::default().fg(THEME.accent)),
+            Span::styled(" breakdown  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("r", Style::default().fg(THEME.accent)),
+            Span::styled(" reset  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("Esc/q", Style::default().fg(THEME.accent)),
+            Span::styled(" quit", Style::default().fg(THEME.text_muted)),
         ]),
         UsageTab::Skills => Line::from(vec![
-            Span::styled("m", Style::default().fg(Color::Yellow)),
-            Span::styled(" tab  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("t", Style::default().fg(Color::Yellow)),
-            Span::styled(" time  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("s", Style::default().fg(Color::Yellow)),
-            Span::styled(" source  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("↑↓", Style::default().fg(Color::Yellow)),
-            Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::styled(" sessions  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("r", Style::default().fg(Color::Yellow)),
-            Span::styled(" reset  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc/q", Style::default().fg(Color::Yellow)),
-            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+            Span::styled("m", Style::default().fg(THEME.accent)),
+            Span::styled(" tab  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("t", Style::default().fg(THEME.accent)),
+            Span::styled(" time  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("s", Style::default().fg(THEME.accent)),
+            Span::styled(" source  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("↑↓", Style::default().fg(THEME.accent)),
+            Span::styled(" select  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("Enter", Style::default().fg(THEME.accent)),
+            Span::styled(" sessions  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("r", Style::default().fg(THEME.accent)),
+            Span::styled(" reset  ", Style::default().fg(THEME.text_muted)),
+            Span::styled("Esc/q", Style::default().fg(THEME.accent)),
+            Span::styled(" quit", Style::default().fg(THEME.text_muted)),
         ]),
     };
     f.render_widget(Paragraph::new(line), area);
@@ -544,10 +545,10 @@ fn usage_bar_line(
     Line::from(vec![
         Span::styled(
             format!(" {:<label_width$}", truncate_label(label, label_width)),
-            Style::default().fg(Color::White),
+            Style::default().fg(THEME.text),
         ),
         Span::styled(bar, Style::default().fg(color)),
-        Span::styled(format!(" {value_text}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" {value_text}"), Style::default().fg(THEME.text_muted)),
     ])
 }
 
@@ -564,11 +565,11 @@ fn token_mix_lines(tokens: &TokenTotals, width: usize) -> Vec<Line<'static>> {
     .unwrap_or(0);
 
     [
-        ("input", tokens.input_tokens, Color::Cyan),
-        ("output", tokens.output_tokens, Color::Green),
-        ("cache read", tokens.cache_read_tokens, Color::Blue),
-        ("cache write", tokens.cache_write_tokens, Color::Magenta),
-        ("reasoning", tokens.reasoning_tokens, Color::Yellow),
+        ("input", tokens.input_tokens, THEME.token_input),
+        ("output", tokens.output_tokens, THEME.token_output),
+        ("cache read", tokens.cache_read_tokens, THEME.token_cache_read),
+        ("cache write", tokens.cache_write_tokens, THEME.token_cache_write),
+        ("reasoning", tokens.reasoning_tokens, THEME.token_reasoning),
     ]
     .into_iter()
     .map(|(label, value, color)| usage_bar_line(label, value, max_value, width, color))
@@ -591,10 +592,10 @@ pub(super) fn render_skill_audit_header(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Recall Skill Audit ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(Style::default().fg(THEME.skill));
 
-    let chip = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(Color::DarkGray);
+    let chip = Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(THEME.text_muted);
 
     let control = vec![
         Span::styled(" range ", muted),
@@ -610,36 +611,39 @@ pub(super) fn render_skill_audit_header(f: &mut Frame, app: &App, area: Rect) {
     if app.usage_is_loading() {
         lines.push(Line::from(Span::styled(
             " Loading skill audit...",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
         )));
     } else if let Some(error) = app.skill_audit_error.as_ref() {
-        lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))));
+        lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(THEME.error))));
     } else if let Some(report) = app.skill_audit_report.as_ref() {
         lines.push(Line::from(vec![
             Span::styled(" installed ", muted),
             Span::styled(
                 format_count(report.summary.installed),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" core ", muted),
             Span::styled(
                 format_count(report.summary.core),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default().fg(THEME.success).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" occasional ", muted),
-            Span::styled(format_count(report.summary.occasional), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format_count(report.summary.occasional),
+                Style::default().fg(THEME.highlight),
+            ),
             Span::styled(" dormant ", muted),
             Span::styled(
                 format_count(report.summary.dormant),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(THEME.text_muted),
             ),
         ]));
         lines.push(Line::from(Span::styled(
             " core ≥10 calls · occasional 1-9 · dormant installed but unused in range",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME.text_muted),
         )));
         if let Some(note) = report.coverage_note.as_ref() {
-            lines.push(Line::from(Span::styled(note.clone(), Style::default().fg(Color::Yellow))));
+            lines.push(Line::from(Span::styled(note.clone(), Style::default().fg(THEME.accent))));
         }
     } else {
         lines.push(Line::from(Span::styled("No skill audit loaded", muted)));
@@ -652,12 +656,12 @@ pub(super) fn render_skill_audit_list(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Skills ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(Style::default().fg(THEME.skill));
 
     if app.usage_is_loading() {
         f.render_widget(
             Paragraph::new("Loading skill audit...")
-                .style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(THEME.accent))
                 .block(block),
             area,
         );
@@ -667,7 +671,7 @@ pub(super) fn render_skill_audit_list(f: &mut Frame, app: &App, area: Rect) {
     let Some(report) = app.skill_audit_report.as_ref() else {
         f.render_widget(
             Paragraph::new("No skill audit data")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(THEME.text_muted))
                 .block(block),
             area,
         );
@@ -713,7 +717,7 @@ fn build_skill_audit_lines(
         }
         lines.push(Line::from(Span::styled(
             format!(" {title} ({})", entries.len()),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::default().fg(THEME.text_muted).add_modifier(Modifier::BOLD),
         )));
         for entry in entries {
             if entry_index == selected {
@@ -728,7 +732,7 @@ fn build_skill_audit_lines(
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             " No personal skills found in ~/.claude/skills, ~/.codex/skills, or ~/.agents/skills",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME.text_muted),
         )));
     }
 
@@ -752,7 +756,7 @@ fn skill_audit_columns(width: usize) -> SkillAuditColumns {
 }
 
 fn skill_audit_table_header(cols: &SkillAuditColumns) -> Line<'static> {
-    let style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
+    let style = Style::default().fg(THEME.text_muted).add_modifier(Modifier::BOLD);
     Line::from(vec![
         Span::styled(format!("  {:<skill_w$}", "SKILL", skill_w = cols.skill), style),
         Span::styled(format!(" {:>calls_w$}", "CALLS", calls_w = cols.calls), style),
@@ -764,7 +768,7 @@ fn skill_audit_table_header(cols: &SkillAuditColumns) -> Line<'static> {
 fn skill_audit_metrics_legend() -> Line<'static> {
     Line::from(Span::styled(
         "  CALLS session uses · LAST last use · VIA invoke/read/both",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(THEME.text_muted),
     ))
 }
 
@@ -775,14 +779,14 @@ fn skill_audit_entry_line(
     cols: &SkillAuditColumns,
 ) -> Line<'static> {
     let base = if selected {
-        Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD)
+        Style::default().fg(THEME.selected_fg).bg(THEME.skill).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(THEME.text)
     };
     let muted = if selected {
-        Style::default().fg(Color::Black).bg(Color::Magenta)
+        Style::default().fg(THEME.selected_fg).bg(THEME.skill)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(THEME.text_muted)
     };
 
     let skill = truncate_label(&entry.id, cols.skill);

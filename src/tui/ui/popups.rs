@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
@@ -9,6 +9,7 @@ use crate::handoff;
 use crate::tui::app::App;
 use crate::tui::search_state::{PanelFocus, ProjectPickerRow, SourcePickerRow};
 use crate::tui::share_state::PendingCommandAction;
+use crate::tui::theme::THEME;
 
 use super::truncate_start;
 
@@ -23,8 +24,8 @@ pub(super) fn render_handoff_target_picker(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" Handoff target ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Black));
+        .border_style(Style::default().fg(THEME.accent))
+        .style(Style::default().bg(THEME.popup_bg));
 
     let mut lines = Vec::new();
     lines.push(Line::from(""));
@@ -32,9 +33,9 @@ pub(super) fn render_handoff_target_picker(f: &mut Frame, app: &App) {
         let selected = index == app.handoff_target_selected;
         let marker = if selected { ">" } else { " " };
         let style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default().fg(THEME.selected_fg).bg(THEME.accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(THEME.text)
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {marker} "), style),
@@ -44,10 +45,10 @@ pub(super) fn render_handoff_target_picker(f: &mut Frame, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(" [Enter] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("select  ", Style::default().fg(Color::White)),
-        Span::styled("[Esc] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("cancel", Style::default().fg(Color::White)),
+        Span::styled(" [Enter] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("select  ", Style::default().fg(THEME.text)),
+        Span::styled("[Esc] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("cancel", Style::default().fg(THEME.text)),
     ]));
 
     let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
@@ -68,11 +69,11 @@ pub(super) fn render_source_picker(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" Filters > Source ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(THEME.border_focus));
 
-    let selected_style = Style::default().bg(Color::Cyan).fg(Color::Black);
-    let normal_style = Style::default().fg(Color::White);
-    let muted_style = Style::default().fg(Color::DarkGray);
+    let selected_style = Style::default().bg(THEME.selected_bg).fg(THEME.selected_fg);
+    let normal_style = Style::default().fg(THEME.text);
+    let muted_style = Style::default().fg(THEME.text_muted);
 
     let visible_rows = height.saturating_sub(7) as usize;
     let start = if visible_rows == 0 || app.source_picker.selected < visible_rows {
@@ -89,7 +90,10 @@ pub(super) fn render_source_picker(f: &mut Frame, app: &App) {
         Span::styled(app.source_picker.query.clone(), normal_style)
     };
     lines.push(Line::from(vec![
-        Span::styled(" Filter: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Filter: ",
+            Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
+        ),
         filter_value,
     ]));
     lines.push(Line::from(""));
@@ -122,19 +126,19 @@ pub(super) fn render_source_picker(f: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(" Space", Style::default().fg(Color::Yellow)),
+        Span::styled(" Space", Style::default().fg(THEME.accent)),
         Span::styled(" select/clear  ", muted_style),
-        Span::styled("/", Style::default().fg(Color::Yellow)),
+        Span::styled("/", Style::default().fg(THEME.accent)),
         Span::styled(" filter  ", muted_style),
-        Span::styled("Enter", Style::default().fg(Color::Yellow)),
+        Span::styled("Enter", Style::default().fg(THEME.accent)),
         Span::styled(" apply  ", muted_style),
-        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::styled("Esc", Style::default().fg(THEME.accent)),
         Span::styled(" back", muted_style),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("Ctrl+A", Style::default().fg(Color::Yellow)),
+        Span::styled("Ctrl+A", Style::default().fg(THEME.accent)),
         Span::styled(" all  ", muted_style),
-        Span::styled("Ctrl+U", Style::default().fg(Color::Yellow)),
+        Span::styled("Ctrl+U", Style::default().fg(THEME.accent)),
         Span::styled(" clear input", muted_style),
     ]));
 
@@ -163,11 +167,11 @@ pub(super) fn render_project_picker(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" Filters > Project ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(THEME.border_focus));
 
-    let selected_style = Style::default().bg(Color::Cyan).fg(Color::Black);
-    let normal_style = Style::default().fg(Color::White);
-    let muted_style = Style::default().fg(Color::DarkGray);
+    let selected_style = Style::default().bg(THEME.selected_bg).fg(THEME.selected_fg);
+    let normal_style = Style::default().fg(THEME.text);
+    let muted_style = Style::default().fg(THEME.text_muted);
 
     let visible_rows = height.saturating_sub(7) as usize;
     let start = if visible_rows == 0 || app.project_picker.selected < visible_rows {
@@ -184,7 +188,10 @@ pub(super) fn render_project_picker(f: &mut Frame, app: &App) {
         Span::styled(app.project_picker.query.clone(), normal_style)
     };
     lines.push(Line::from(vec![
-        Span::styled(" Filter: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Filter: ",
+            Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
+        ),
         filter_value,
     ]));
     lines.push(Line::from(""));
@@ -227,19 +234,19 @@ pub(super) fn render_project_picker(f: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(" Space", Style::default().fg(Color::Yellow)),
+        Span::styled(" Space", Style::default().fg(THEME.accent)),
         Span::styled(" select/clear  ", muted_style),
-        Span::styled("/", Style::default().fg(Color::Yellow)),
+        Span::styled("/", Style::default().fg(THEME.accent)),
         Span::styled(" filter  ", muted_style),
-        Span::styled("Enter", Style::default().fg(Color::Yellow)),
+        Span::styled("Enter", Style::default().fg(THEME.accent)),
         Span::styled(" apply  ", muted_style),
-        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::styled("Esc", Style::default().fg(THEME.accent)),
         Span::styled(" back", muted_style),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("Ctrl+A", Style::default().fg(Color::Yellow)),
+        Span::styled("Ctrl+A", Style::default().fg(THEME.accent)),
         Span::styled(" all  ", muted_style),
-        Span::styled("Ctrl+U", Style::default().fg(Color::Yellow)),
+        Span::styled("Ctrl+U", Style::default().fg(THEME.accent)),
         Span::styled(" clear input", muted_style),
     ]));
 
@@ -264,11 +271,11 @@ pub(super) fn render_export_input(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" Export to (Enter confirm, Esc cancel) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Black));
+        .border_style(Style::default().fg(THEME.accent))
+        .style(Style::default().bg(THEME.popup_bg));
 
     let input = Paragraph::new(app.export_path.as_str())
-        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .style(Style::default().fg(THEME.text).bg(THEME.popup_bg))
         .block(block);
 
     f.render_widget(Clear, popup_area);
@@ -290,15 +297,15 @@ pub(super) fn render_settings(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" Settings (Enter/Space toggle, Esc close) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Black));
+        .border_style(Style::default().fg(THEME.accent))
+        .style(Style::default().bg(THEME.popup_bg));
 
     let mut lines = Vec::new();
-    let selected_style = Style::default().bg(Color::Yellow).fg(Color::Black);
-    let normal_style = Style::default().fg(Color::White);
+    let selected_style = Style::default().bg(THEME.accent).fg(THEME.selected_fg);
+    let normal_style = Style::default().fg(THEME.text);
 
     lines.push(Line::from(vec![
-        Span::styled(" Time Scope: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Time Scope: ", Style::default().fg(THEME.text_muted)),
         Span::styled(
             app.config.sync_window.label(),
             if app.settings_selected == 0 { selected_style } else { normal_style },
@@ -333,54 +340,54 @@ pub(super) fn render_share_result(f: &mut Frame, app: &App) {
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let rect = Rect::new(x, y, width, height);
 
-    let border = if popup.is_error { Color::Red } else { Color::Green };
+    let border = if popup.is_error { THEME.error } else { THEME.success };
     let title = if popup.is_error { " Share failed " } else { " Session shared " };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(THEME.popup_bg));
 
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             popup.message.clone(),
             if popup.is_error {
-                Style::default().fg(Color::Red)
+                Style::default().fg(THEME.error)
             } else {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                Style::default().fg(THEME.success).add_modifier(Modifier::BOLD)
             },
         )),
     ];
     if let Some(url) = popup.url.as_ref() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(url.clone(), Style::default().fg(Color::Cyan))));
+        lines.push(Line::from(Span::styled(url.clone(), Style::default().fg(THEME.highlight))));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled(" [O] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("open   ", Style::default().fg(Color::White)),
-            Span::styled(" [C] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("copy URL   ", Style::default().fg(Color::White)),
+            Span::styled(" [O] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("open   ", Style::default().fg(THEME.text)),
+            Span::styled(" [C] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("copy URL   ", Style::default().fg(THEME.text)),
             Span::styled(
                 "[Enter/Esc] ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("close", Style::default().fg(Color::White)),
+            Span::styled("close", Style::default().fg(THEME.text)),
         ]));
     } else if popup.is_error {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled(
                 " [Enter/Esc] ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("close", Style::default().fg(Color::White)),
+            Span::styled("close", Style::default().fg(THEME.text)),
         ]));
     } else {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             " Publishing with Wrangler...",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME.text_muted),
         )));
     }
 
@@ -415,8 +422,8 @@ pub(super) fn render_confirm_resume(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(block_title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Black));
+        .border_style(Style::default().fg(THEME.accent))
+        .style(Style::default().bg(THEME.popup_bg));
 
     let title: String = pending.session_title.chars().take(width as usize - 10).collect();
     let command_text: String =
@@ -441,32 +448,32 @@ pub(super) fn render_confirm_resume(f: &mut Frame, app: &App) {
                     PendingCommandAction::Handoff => " Target:  ",
                     _ => " Source:  ",
                 },
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(THEME.text_muted),
             ),
             Span::styled(
                 pending.source_label.clone(),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default().fg(THEME.source).add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
-            Span::styled(title, Style::default().fg(Color::White)),
+            Span::styled(title, Style::default().fg(THEME.text)),
         ]),
         Line::from(vec![
-            Span::styled(" Cwd:     ", Style::default().fg(Color::DarkGray)),
-            Span::styled(cwd_text, Style::default().fg(Color::White)),
+            Span::styled(" Cwd:     ", Style::default().fg(THEME.text_muted)),
+            Span::styled(cwd_text, Style::default().fg(THEME.text)),
         ]),
         Line::from(vec![
-            Span::styled(" Command: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Command: ", Style::default().fg(THEME.text_muted)),
             Span::styled(
                 command_text,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  [Y] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(confirm_label, Style::default().fg(Color::White)),
-            Span::styled("[N] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::White)),
+            Span::styled("  [Y] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(confirm_label, Style::default().fg(THEME.text)),
+            Span::styled("[N] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(THEME.text)),
         ]),
     ];
 
@@ -489,18 +496,18 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 app.semantic_progress.failed_sessions
             );
         }
-        Some(Span::styled(text, Style::default().fg(Color::Blue)))
+        Some(Span::styled(text, Style::default().fg(THEME.info)))
     } else {
         None
     };
 
     let stats_span = Span::styled(
         format!(" [{} sessions, {} messages]", app.total_sessions, app.total_messages),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(THEME.text_muted),
     );
 
     let line = if let Some(ref msg) = app.status_message {
-        let mut spans = vec![Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))];
+        let mut spans = vec![Span::styled(format!(" {msg}"), Style::default().fg(THEME.success))];
         if let Some(span) = semantic_span.clone() {
             spans.push(span);
         }
@@ -510,26 +517,26 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         match app.panel_focus {
             PanelFocus::SessionList => {
                 let mut spans = vec![
-                    Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
-                    Span::styled(" sessions  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("→", Style::default().fg(Color::Yellow)),
-                    Span::styled(" preview  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                    Span::styled(" detail  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Ctrl+F", Style::default().fg(Color::Yellow)),
-                    Span::styled(" filter  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Ctrl+R", Style::default().fg(Color::Yellow)),
-                    Span::styled(" resume  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Ctrl+O", Style::default().fg(Color::Yellow)),
-                    Span::styled(" app  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Ctrl+S", Style::default().fg(Color::Yellow)),
-                    Span::styled(" settings  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                    Span::styled(" clear  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" ↑/↓", Style::default().fg(THEME.accent)),
+                    Span::styled(" sessions  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("→", Style::default().fg(THEME.accent)),
+                    Span::styled(" preview  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Enter", Style::default().fg(THEME.accent)),
+                    Span::styled(" detail  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Ctrl+F", Style::default().fg(THEME.accent)),
+                    Span::styled(" filter  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Ctrl+R", Style::default().fg(THEME.accent)),
+                    Span::styled(" resume  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Ctrl+O", Style::default().fg(THEME.accent)),
+                    Span::styled(" app  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Ctrl+S", Style::default().fg(THEME.accent)),
+                    Span::styled(" settings  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Esc", Style::default().fg(THEME.accent)),
+                    Span::styled(" clear  ", Style::default().fg(THEME.text_muted)),
                 ];
                 if app.query.is_empty() {
-                    spans.push(Span::styled("q", Style::default().fg(Color::Yellow)));
-                    spans.push(Span::styled(" quit", Style::default().fg(Color::DarkGray)));
+                    spans.push(Span::styled("q", Style::default().fg(THEME.accent)));
+                    spans.push(Span::styled(" quit", Style::default().fg(THEME.text_muted)));
                 }
                 if let Some(span) = semantic_span.clone() {
                     spans.push(span);
@@ -539,14 +546,14 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             }
             PanelFocus::Preview => {
                 let mut spans = vec![
-                    Span::styled(" ↑/↓", Style::default().fg(Color::Yellow)),
-                    Span::styled(" messages  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("←", Style::default().fg(Color::Yellow)),
-                    Span::styled(" sessions  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                    Span::styled(" detail  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                    Span::styled(" back", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" ↑/↓", Style::default().fg(THEME.accent)),
+                    Span::styled(" messages  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("←", Style::default().fg(THEME.accent)),
+                    Span::styled(" sessions  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Enter", Style::default().fg(THEME.accent)),
+                    Span::styled(" detail  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Esc", Style::default().fg(THEME.accent)),
+                    Span::styled(" back", Style::default().fg(THEME.text_muted)),
                 ];
                 if let Some(span) = semantic_span {
                     spans.push(span);
