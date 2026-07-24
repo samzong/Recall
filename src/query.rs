@@ -29,6 +29,7 @@ pub(crate) fn run_search(
             time_filter,
             project_filter,
             repo_filter,
+            None,
             20,
             0,
             false,
@@ -46,7 +47,8 @@ pub(crate) fn run_search(
     let (directory, repo) = store.resolve_project_repo_filters(project_filter, repo_filter)?;
     let embedding = query_embedding(&store, query, |message| println!("{message}"))?;
 
-    let filters = SearchFilters { sources: resolved_source, time_range, directory, repo };
+    let filters =
+        SearchFilters { sources: resolved_source, time_range, directory, repo, thread_role: None };
 
     let results = engine.hybrid_search(query, embedding.as_deref(), &filters, 20, 3)?;
 

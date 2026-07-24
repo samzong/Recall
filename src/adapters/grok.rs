@@ -120,6 +120,7 @@ fn scan_for_sync_impl(
         FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
             event_parser_version: None,
+            metadata_parser_version: None,
         },
         entries,
         |entry, mtime_ms| parse_grok_session_for_entry(&entry, mtime_ms),

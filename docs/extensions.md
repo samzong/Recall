@@ -115,12 +115,16 @@ Core support in v0.1:
   `recall session list --query ... --format json`;
 - `recall session show` supports `--format json|jsonl`;
 - `recall export` emits JSONL, one session record per line, with export record
-  schema version 4, and supports `--include metadata,messages,usage,events`
+  schema version 5, and supports `--include metadata,messages,usage,events`
   for field projection. Export projections must include `messages`; `usage`
-  and `events` are optional add-ons;
+  and `events` are optional add-ons. `recall session list` and `recall export`
+  also accept `--thread-role primary|subagent|unknown` to filter by topology;
 - `recall session show --format json` defaults to metadata only. Extensions
   that need transcript data must pass `--messages` or
   `--include metadata,messages,usage,events`.
+- every session record carries `session.topology` (`thread_role` plus portable
+  `parents[]`); it is additive over schema v4, so `protocol_version` stays `1`.
+  Import accepts records from schema v2 through v5.
 
 Transcript-only extensions should use `--include metadata,messages` instead of
 reading usage or event records they do not need.

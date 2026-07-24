@@ -56,6 +56,81 @@ impl std::str::FromStr for Role {
     }
 }
 
+/// `None` means the source provided no reliable classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ThreadRole {
+    Primary,
+    Subagent,
+}
+
+impl ThreadRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ThreadRole::Primary => "primary",
+            ThreadRole::Subagent => "subagent",
+        }
+    }
+}
+
+impl std::str::FromStr for ThreadRole {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "primary" => Ok(ThreadRole::Primary),
+            "subagent" => Ok(ThreadRole::Subagent),
+            _ => Err(()),
+        }
+    }
+}
+
+/// `Fork` alone never implies a subagent role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ParentRelation {
+    Spawn,
+    Fork,
+    Resume,
+}
+
+impl ParentRelation {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ParentRelation::Spawn => "spawn",
+            ParentRelation::Fork => "fork",
+            ParentRelation::Resume => "resume",
+        }
+    }
+}
+
+impl std::str::FromStr for ParentRelation {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "spawn" => Ok(ParentRelation::Spawn),
+            "fork" => Ok(ParentRelation::Fork),
+            "resume" => Ok(ParentRelation::Resume),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Parent identity is `(source, source_id)`; the parent may not be indexed locally.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ParentLink {
+    pub(crate) relation: ParentRelation,
+    pub(crate) source: String,
+    pub(crate) source_id: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct SessionTopology {
+    pub(crate) thread_role: Option<ThreadRole>,
+    pub(crate) parents: Vec<ParentLink>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Session {
     pub(crate) id: String,

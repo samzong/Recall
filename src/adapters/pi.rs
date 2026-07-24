@@ -15,9 +15,11 @@ use crate::adapters::{
     first_timestamp,
 };
 use crate::db::store::Store;
-use crate::types::{RawUsageEvent, Role};
+use crate::types::{ParentLink, ParentRelation, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) struct PiAdapter;
+
+const METADATA_PARSER_VERSION: u32 = 1;
 
 const USAGE_PARSER_VERSION: u32 = 1;
 
@@ -64,14 +66,14 @@ impl SourceAdapter for PiAdapter {
         &self,
         store: &Store,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let session_dirs = resolve_pi_session_dirs()?;
         if session_dirs.is_empty() {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
         }
 
-        Ok(Some(scan_for_sync_impl(&session_dirs, store, since_ts)?))
+        Ok(Some(scan_for_sync_impl(&session_dirs, store, since_ts, include_events)?))
     }
 }
 
@@ -81,6 +83,7 @@ struct ParsedPiSession {
     started_at: Option<i64>,
     messages: Vec<RawMessage>,
     usage_events: Vec<RawUsageEvent>,
+    parent_session: Option<String>,
 }
 
 fn resolve_pi_session_dirs() -> anyhow::Result<Vec<PathBuf>> {
@@ -176,6 +179,7 @@ fn scan_for_sync_impl(
     session_dirs: &[PathBuf],
     store: &Store,
     since_ts: Option<i64>,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let entries = collect_pi_entries(session_dirs);
     file_scan::run_file_scan_with_options(
@@ -185,6 +189,7 @@ fn scan_for_sync_impl(
         file_scan::FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
             event_parser_version: None,
+            metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
         },
         entries,
         parse_pi_session_file,
@@ -238,6 +243,12 @@ fn extract_session_id_from_filename(stem: &str) -> Option<String> {
     uuid::Uuid::try_parse(candidate).ok().map(|_| candidate.to_string())
 }
 
+/// Pi `parentSession` is a local path; return the portable id or `None` (never store a path).
+fn normalize_pi_parent_id(parent: &str) -> Option<String> {
+    let stem = Path::new(parent).file_stem().and_then(|stem| stem.to_str()).unwrap_or(parent);
+    extract_session_id_from_filename(stem)
+}
+
 fn decode_session_dir_name(name: &str) -> Option<String> {
     let inner = name.strip_prefix("--")?.strip_suffix("--")?;
     if inner.is_empty() {
@@ -266,8 +277,24 @@ fn parse_pi_session_file(
         first_timestamp(parsed.started_at, &parsed.messages, &parsed.usage_events, &[])
             .unwrap_or(0);
 
+    let source_id = parsed.session_id.unwrap_or(entry.session_id);
+    // Pi has no subagent role; parentSession is a fork lineage path (not a UUID).
+    let parent_links = match parsed
+        .parent_session
+        .as_deref()
+        .and_then(normalize_pi_parent_id)
+        .filter(|parent| parent != &source_id)
+    {
+        Some(parent) => vec![ParentLink {
+            relation: ParentRelation::Fork,
+            source: "pi".to_string(),
+            source_id: parent,
+        }],
+        None => Vec::new(),
+    };
+
     Ok(Some(RawSession {
-        source_id: parsed.session_id.unwrap_or(entry.session_id),
+        source_id,
         directory: parsed.cwd.or(entry.directory),
         started_at,
         updated_at: Some(mtime_ms),
@@ -281,6 +308,9 @@ fn parse_pi_session_file(
         custom_title: None,
         summary: None,
         duration_minutes: None,
+        thread_role: Some(ThreadRole::Primary),
+        parent_links,
+        metadata_parser_version: Some(METADATA_PARSER_VERSION),
     }))
 }
 
@@ -295,6 +325,7 @@ fn parse_pi_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Pars
     let mut current_provider: Option<String> = None;
     let mut current_model: Option<String> = None;
     let mut inherited_usage_cutoff = None;
+    let mut parent_session = None;
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
 
@@ -317,12 +348,14 @@ fn parse_pi_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Pars
                     .map(str::to_string)
                     .or(cwd);
                 started_at = header_timestamp.or(started_at);
-                if entry
+                if let Some(parent) = entry
                     .get("parentSession")
                     .and_then(|value| value.as_str())
-                    .is_some_and(|value| !value.trim().is_empty())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
                 {
                     inherited_usage_cutoff = header_timestamp;
+                    parent_session = Some(parent.to_string());
                 }
             }
             "model_change" => {
@@ -383,7 +416,7 @@ fn parse_pi_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Pars
         }
     }
 
-    Ok(ParsedPiSession { session_id, cwd, started_at, messages, usage_events })
+    Ok(ParsedPiSession { session_id, cwd, started_at, messages, usage_events, parent_session })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1077,10 +1110,118 @@ mod tests {
                 Some(mtime),
             )
             .unwrap();
+        store
+            .persist_topology_for_existing_session(
+                "pi",
+                session_id,
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION),
+                },
+            )
+            .unwrap();
 
-        let result = scan_for_sync_impl(&[root.join("--tmp-pi-project--")], &store, None).unwrap();
+        let result =
+            scan_for_sync_impl(&[root.join("--tmp-pi-project--")], &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_pi_session_maps_parent_session_to_primary_fork() {
+        let root = temp_pi_root("parent-session");
+        let session_dir = root.join("--tmp-pi-project--");
+        let session_id = "019e5af2-5528-7d10-888a-b299c21d0e2e";
+        let path = write_pi_session(
+            &session_dir,
+            session_id,
+            &[
+                serde_json::json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": session_id,
+                    "parentSession": "/home/x/.pi/agent/sessions/--proj--/2026-05-24T17-04-51-496Z_019e0000-0000-0000-0000-000000000001.jsonl",
+                    "timestamp": "1970-01-01T00:00:01.000Z",
+                    "cwd": "/tmp/pi-project"
+                }),
+                serde_json::json!({
+                    "type": "message",
+                    "id": "user1",
+                    "timestamp": "1970-01-01T00:00:02.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "hello pi"}],
+                        "timestamp": 2000
+                    }
+                }),
+            ],
+        );
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+        let entry = FileScanEntry {
+            session_id: session_id.to_string(),
+            stat_target: path,
+            directory: None,
+        };
+
+        let raw = parse_pi_session_file(entry, mtime).unwrap().unwrap();
+
+        assert_eq!(raw.thread_role, Some(ThreadRole::Primary));
+        assert_eq!(
+            raw.parent_links,
+            vec![ParentLink {
+                relation: ParentRelation::Fork,
+                source: "pi".to_string(),
+                source_id: "019e0000-0000-0000-0000-000000000001".to_string(),
+            }]
+        );
+        assert_eq!(raw.metadata_parser_version, Some(METADATA_PARSER_VERSION));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_pi_session_drops_unresolvable_parent_session() {
+        let root = temp_pi_root("parent-unresolvable");
+        let session_dir = root.join("--tmp-pi-project--");
+        let session_id = "019e5af2-5528-7d10-888a-b299c21d0e2f";
+        let path = write_pi_session(
+            &session_dir,
+            session_id,
+            &[
+                serde_json::json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": session_id,
+                    "parentSession": "not-a-session-path",
+                    "timestamp": "1970-01-01T00:00:01.000Z",
+                    "cwd": "/tmp/pi-project"
+                }),
+                serde_json::json!({
+                    "type": "message",
+                    "id": "user1",
+                    "timestamp": "1970-01-01T00:00:02.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "hello pi"}],
+                        "timestamp": 2000
+                    }
+                }),
+            ],
+        );
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+        let entry = FileScanEntry {
+            session_id: session_id.to_string(),
+            stat_target: path,
+            directory: None,
+        };
+
+        let raw = parse_pi_session_file(entry, mtime).unwrap().unwrap();
+
+        assert_eq!(raw.thread_role, Some(ThreadRole::Primary));
+        assert!(raw.parent_links.is_empty(), "an unparseable parent must not leak a path");
 
         let _ = fs::remove_dir_all(&root);
     }

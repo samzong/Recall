@@ -17,7 +17,7 @@ pub(crate) mod sync_state;
 pub(crate) mod usage;
 
 use crate::db::store::Store;
-use crate::types::{RawSessionEvent, RawUsageEvent, Role};
+use crate::types::{ParentLink, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) trait SourceAdapter {
     fn id(&self) -> &str;
@@ -61,6 +61,9 @@ pub(crate) struct RawSession {
     pub(crate) custom_title: Option<String>,
     pub(crate) summary: Option<String>,
     pub(crate) duration_minutes: Option<u32>,
+    pub(crate) thread_role: Option<ThreadRole>,
+    pub(crate) parent_links: Vec<ParentLink>,
+    pub(crate) metadata_parser_version: Option<u32>,
 }
 
 impl RawSession {
@@ -87,6 +90,9 @@ impl RawSession {
             custom_title: None,
             summary: None,
             duration_minutes: None,
+            thread_role: None,
+            parent_links: Vec::new(),
+            metadata_parser_version: None,
         }
     }
 

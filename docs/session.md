@@ -89,6 +89,8 @@ Options:
 - `--source <source>`: source id or label, matching existing source filters.
 - `--project <path>`: project directory boundary, including child paths.
 - `--time <today|7d|week|30d|month|all>`: time window, default `all`.
+- `--thread-role <primary|subagent|unknown>`: filter by topology role. `unknown`
+  selects sessions the source could not classify.
 - `--limit <n>`: maximum sessions to return, default `50`.
 - `--offset <n>`: skip sessions for pagination, default `0`.
 - `--sort <newest|oldest|updated|relevance>`: default `newest`, or `relevance`
@@ -106,6 +108,7 @@ JSON output:
     "source": "codex",
     "project": "/path/to/repo",
     "time": "7d",
+    "thread_role": "primary",
     "limit": 20,
     "offset": 0,
     "sort": "relevance"
@@ -122,6 +125,7 @@ JSON output:
       "updated_at": 1781235567890,
       "message_count": 42,
       "is_import": false,
+      "topology": { "thread_role": "primary", "parents": [] },
       "match_source": "hybrid",
       "snippet": "wrangler pages deploy failed..."
     }
@@ -129,6 +133,12 @@ JSON output:
   "next_offset": null
 }
 ```
+
+`topology` is always present. `thread_role` is `primary`, `subagent`, or `null`
+when the source provides no reliable classification. `parents` lists portable
+parent links `{ "relation": "spawn|fork|resume", "source": ..., "source_id": ... }`;
+a parent may not be indexed locally. A `fork` relation alone never implies a
+subagent role.
 
 ### `recall session show`
 
@@ -165,7 +175,13 @@ JSON output:
     "started_at": 1781234567890,
     "updated_at": 1781235567890,
     "message_count": 42,
-    "is_import": false
+    "is_import": false,
+    "topology": {
+      "thread_role": "subagent",
+      "parents": [
+        { "relation": "spawn", "source": "codex", "source_id": "019e6d8d-parent" }
+      ]
+    }
   },
   "messages": [
     {
@@ -362,6 +378,36 @@ Example JSON error:
 - `session share --dry-run` should be cheap and safe enough for agents to run
   before asking for final user approval.
 
+## Session Topology
+
+Session topology records provenance without title/directory/time heuristics. It
+appears in `session list`/`show` JSON and JSONL export under `session.topology`,
+and both `recall session list` and bulk `recall export` accept
+`--thread-role <primary|subagent|unknown>`.
+
+Model (source-neutral):
+
+- `thread_role`: `primary` (top-level user-owned execution), `subagent`, or
+  `null` when the source gives no reliable classification. `primary` does not
+  mean the session has no fork history.
+- `parents[]`: portable `{ relation, source, source_id }` links. `relation` is
+  `spawn`, `fork`, or `resume`. A session may have several parents. Missing
+  parent sessions are valid — the unresolved portable identity is still exported.
+  A `fork` relation alone is never proof of a subagent.
+
+Per-adapter coverage:
+
+| Source | Role | Parent links | Source signal |
+| --- | --- | --- | --- |
+| Codex | primary / subagent | spawn + fork | `session_meta.thread_source` / `source`, `parent_thread_id` / `thread_spawn`, `forked_from_id` |
+| Claude Code | primary / subagent | spawn | `subagents/<agent>.jsonl` path + transcript `sessionId` parent |
+| Pi | primary | fork | session-header `parentSession` |
+| Others (OpenCode, Cursor, Copilot, Gemini, Grok, Antigravity, Cline, Kiro) | `null` | none | not yet classified |
+
+Grok retains its current skip-and-prune behavior; enabling classified Grok
+ingestion is a separate search/TUI visibility review before the path is turned
+on.
+
 ## Backward Compatibility
 
 - Existing commands keep working: `recall search`, `recall export`,
@@ -369,7 +415,9 @@ Example JSON error:
   unchanged.
 - Existing `recall export` remains the bulk export command.
 - Existing TUI shortcuts keep using the same internal session operations.
-- No existing JSONL export schema changes are required for the MVP.
+- Export record schema is `v5`: `session.topology` is additive, so `protocol_version`
+  stays `1`. Import accepts `v2`-`v5`; pre-topology records default to
+  `thread_role = null` with no parent links, and `v5` round-trips topology losslessly.
 
 ## Implementation Notes
 

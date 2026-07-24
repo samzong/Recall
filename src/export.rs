@@ -4,12 +4,14 @@ use anyhow::{Result, anyhow};
 use serde::Serialize;
 
 use crate::adapters;
-use crate::db::search::{RepoFilter, TimeRange};
+use crate::db::search::{RepoFilter, ThreadRoleFilter, TimeRange};
 use crate::db::store::Store;
 use crate::query::{parse_time_range, resolve_source_filter};
-use crate::types::{Message, Role, Session, SessionEventRecord, SessionUsageEventRecord};
+use crate::types::{
+    Message, Role, Session, SessionEventRecord, SessionTopology, SessionUsageEventRecord,
+};
 
-pub(crate) const RECORD_SCHEMA_VERSION: u32 = 4;
+pub(crate) const RECORD_SCHEMA_VERSION: u32 = 5;
 const RECORD_TYPE: &str = "session";
 
 #[derive(Clone, Copy)]
@@ -31,6 +33,7 @@ pub(crate) struct ExportOptions {
     pub(crate) time_range: TimeRange,
     pub(crate) project: Option<String>,
     pub(crate) repo: Option<RepoFilter>,
+    pub(crate) thread_role: Option<ThreadRoleFilter>,
     pub(crate) limit: Option<usize>,
     pub(crate) includes: ExportIncludes,
 }
@@ -40,6 +43,7 @@ pub(crate) fn run_cli(
     time_filter: Option<&str>,
     project_filter: Option<&str>,
     repo_filter: Option<&str>,
+    thread_role: Option<ThreadRoleFilter>,
     limit: usize,
     include_filter: Option<&str>,
 ) -> Result<()> {
@@ -52,6 +56,7 @@ pub(crate) fn run_cli(
         time_range: parse_time_range(time_filter),
         project: directory,
         repo,
+        thread_role,
         limit: if limit == 0 { None } else { Some(limit) },
         includes: parse_export_includes(include_filter)?,
     };
@@ -119,6 +124,7 @@ struct ExportSession {
     summary: Option<String>,
     duration_minutes: Option<u32>,
     source_file_path: Option<String>,
+    topology: SessionTopology,
 }
 
 #[derive(Serialize)]
@@ -176,6 +182,7 @@ pub(crate) fn write_jsonl<W: Write>(
             options.time_range,
             options.project.as_deref(),
             options.repo.as_ref(),
+            options.thread_role,
             options.limit,
         )?
     } else {
@@ -194,11 +201,18 @@ pub(crate) fn write_jsonl<W: Write>(
 
 pub(crate) fn session_record_value(
     session: Session,
+    topology: SessionTopology,
     messages: Vec<Message>,
     usage_events: Vec<SessionUsageEventRecord>,
     events: Vec<SessionEventRecord>,
 ) -> Result<serde_json::Value> {
-    Ok(serde_json::to_value(build_session_record(session, messages, usage_events, events))?)
+    Ok(serde_json::to_value(build_session_record(
+        session,
+        topology,
+        messages,
+        usage_events,
+        events,
+    ))?)
 }
 
 fn write_jsonl_for_sessions<W: Write>(
@@ -208,6 +222,7 @@ fn write_jsonl_for_sessions<W: Write>(
     mut writer: W,
 ) -> Result<()> {
     for session in sessions {
+        let topology = store.session_topology(&session.id)?;
         let messages =
             if includes.messages { store.get_messages(&session.id)? } else { Vec::new() };
         let usage_events = if includes.usage {
@@ -220,7 +235,7 @@ fn write_jsonl_for_sessions<W: Write>(
         } else {
             Vec::new()
         };
-        let record = build_session_record(session, messages, usage_events, events);
+        let record = build_session_record(session, topology, messages, usage_events, events);
         serde_json::to_writer(&mut writer, &record)?;
         writer.write_all(b"\n")?;
     }
@@ -230,6 +245,7 @@ fn write_jsonl_for_sessions<W: Write>(
 
 fn build_session_record(
     session: Session,
+    topology: SessionTopology,
     messages: Vec<Message>,
     usage_events: Vec<SessionUsageEventRecord>,
     events: Vec<SessionEventRecord>,
@@ -237,33 +253,32 @@ fn build_session_record(
     ExportSessionRecord {
         schema_version: RECORD_SCHEMA_VERSION,
         record_type: RECORD_TYPE,
-        session: session.into(),
+        session: export_session(session, topology),
         messages: messages.into_iter().map(Into::into).collect(),
         usage_events: usage_events.into_iter().map(Into::into).collect(),
         events: events.into_iter().map(Into::into).collect(),
     }
 }
 
-impl From<Session> for ExportSession {
-    fn from(session: Session) -> Self {
-        Self {
-            id: session.id,
-            source: session.source,
-            source_id: session.source_id,
-            title: session.title,
-            directory: session.directory,
-            repo_remote: session.repo_remote,
-            repo_slug: session.repo_slug,
-            repo_name: session.repo_name,
-            started_at: session.started_at,
-            updated_at: session.updated_at,
-            message_count: session.message_count,
-            entrypoint: session.entrypoint,
-            custom_title: session.custom_title,
-            summary: session.summary,
-            duration_minutes: session.duration_minutes,
-            source_file_path: session.source_file_path,
-        }
+fn export_session(session: Session, topology: SessionTopology) -> ExportSession {
+    ExportSession {
+        id: session.id,
+        source: session.source,
+        source_id: session.source_id,
+        title: session.title,
+        directory: session.directory,
+        repo_remote: session.repo_remote,
+        repo_slug: session.repo_slug,
+        repo_name: session.repo_name,
+        started_at: session.started_at,
+        updated_at: session.updated_at,
+        message_count: session.message_count,
+        entrypoint: session.entrypoint,
+        custom_title: session.custom_title,
+        summary: session.summary,
+        duration_minutes: session.duration_minutes,
+        source_file_path: session.source_file_path,
+        topology,
     }
 }
 

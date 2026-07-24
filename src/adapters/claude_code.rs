@@ -16,12 +16,13 @@ use crate::adapters::{
     first_timestamp,
 };
 use crate::db::store::Store;
-use crate::types::{RawSessionEvent, RawUsageEvent, Role};
+use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 5;
 const EVENT_PARSER_VERSION: u32 = 2;
+const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &str {
@@ -115,6 +116,7 @@ fn scan_for_sync_impl(
         file_scan::FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+            metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
         },
         entries,
         |entry, mtime_ms| parse_claude_session_file(entry, mtime_ms, &indexes, include_events),
@@ -316,6 +318,8 @@ fn parse_claude_session_file(
     };
     let summary =
         parsed.summary.or_else(|| indexes.project_summaries.get(&entry.session_id).cloned());
+    let (thread_role, parent_links) =
+        claude_topology(&entry.stat_target, &entry.session_id, parsed.session_id.as_deref());
     Ok(Some(RawSession {
         source_id: entry.session_id,
         directory,
@@ -331,6 +335,9 @@ fn parse_claude_session_file(
         custom_title: parsed.custom_title,
         summary,
         duration_minutes,
+        thread_role,
+        parent_links,
+        metadata_parser_version: Some(METADATA_PARSER_VERSION),
     }))
 }
 
@@ -343,6 +350,7 @@ struct ParsedConversation {
     summary: Option<String>,
     first_ts: Option<i64>,
     last_ts: Option<i64>,
+    session_id: Option<String>,
 }
 
 fn parse_conversation_jsonl(
@@ -361,6 +369,7 @@ fn parse_conversation_jsonl(
     let mut summary: Option<String> = None;
     let mut first_ts: Option<i64> = None;
     let mut last_ts: Option<i64> = None;
+    let mut session_id: Option<String> = None;
     let source_path = path.to_string_lossy().to_string();
 
     for item in jsonl_indexed(reader.lines()) {
@@ -371,6 +380,13 @@ fn parse_conversation_jsonl(
             && !c.is_empty()
         {
             cwd = Some(c.to_string());
+        }
+
+        if session_id.is_none()
+            && let Some(sid) = v.get("sessionId").and_then(|s| s.as_str())
+            && !sid.is_empty()
+        {
+            session_id = Some(sid.to_string());
         }
 
         let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -474,7 +490,31 @@ fn parse_conversation_jsonl(
         summary,
         first_ts,
         last_ts,
+        session_id,
     })
+}
+
+/// Subagent path → role subagent; parent id is the transcript's own `sessionId` field.
+/// Claude stores subagents under `…/<parent>/subagents/<agent>.jsonl`.
+fn claude_topology(
+    path: &Path,
+    own_source_id: &str,
+    parent_session_id: Option<&str>,
+) -> (Option<ThreadRole>, Vec<ParentLink>) {
+    if !path.components().any(|c| c.as_os_str() == "subagents") {
+        return (Some(ThreadRole::Primary), Vec::new());
+    }
+    let parents = parent_session_id
+        .filter(|parent| !parent.is_empty() && *parent != own_source_id)
+        .map(|parent| {
+            vec![ParentLink {
+                relation: ParentRelation::Spawn,
+                source: "claude-code".to_string(),
+                source_id: parent.to_string(),
+            }]
+        })
+        .unwrap_or_default();
+    (Some(ThreadRole::Subagent), parents)
 }
 
 fn collect_claude_content_events(
@@ -1125,6 +1165,17 @@ mod tests {
                 Some(mtime),
             )
             .unwrap();
+        store
+            .persist_topology_for_existing_session(
+                "claude-code",
+                "sess-skip",
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION),
+                },
+            )
+            .unwrap();
 
         let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 0);
@@ -1207,5 +1258,38 @@ mod tests {
             "usage event from the machinery turn must be preserved"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_topology_classifies_primary_and_subagent() {
+        let primary = Path::new("/home/x/.claude/projects/proj/parent-uuid.jsonl");
+        assert_eq!(
+            claude_topology(primary, "parent-uuid", Some("parent-uuid")),
+            (Some(ThreadRole::Primary), Vec::new())
+        );
+
+        let sub = Path::new("/home/x/.claude/projects/proj/parent-uuid/subagents/agent-abc.jsonl");
+        assert_eq!(
+            claude_topology(sub, "agent-abc", Some("parent-uuid")),
+            (
+                Some(ThreadRole::Subagent),
+                vec![ParentLink {
+                    relation: ParentRelation::Spawn,
+                    source: "claude-code".to_string(),
+                    source_id: "parent-uuid".to_string(),
+                }]
+            )
+        );
+
+        // A subagent without a resolvable parent, or a self-referential parent,
+        // stays a subagent with no invented link.
+        assert_eq!(
+            claude_topology(sub, "agent-abc", None),
+            (Some(ThreadRole::Subagent), Vec::new())
+        );
+        assert_eq!(
+            claude_topology(sub, "agent-abc", Some("agent-abc")),
+            (Some(ThreadRole::Subagent), Vec::new())
+        );
     }
 }

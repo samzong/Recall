@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::types::Session;
+use crate::types::{ParentLink, Session, ThreadRole};
 
 pub(crate) const SESSION_COLUMNS: &str = "id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import";
 
@@ -65,6 +65,26 @@ pub(crate) struct UsageSessionStateMeta {
 pub(crate) struct EventSessionStateMeta {
     pub(crate) parser_version: u32,
     pub(crate) source_updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetadataSessionStateMeta {
+    pub(crate) parser_version: u32,
+    pub(crate) source_updated_at: Option<i64>,
+}
+
+/// `parser_version: None` leaves topology and the version unset (import path).
+pub(crate) struct SessionTopologyWrite<'a> {
+    pub(crate) thread_role: Option<ThreadRole>,
+    pub(crate) parents: &'a [ParentLink],
+    pub(crate) parser_version: Option<u32>,
+}
+
+impl SessionTopologyWrite<'_> {
+    #[cfg(test)]
+    pub(crate) fn none() -> SessionTopologyWrite<'static> {
+        SessionTopologyWrite { thread_role: None, parents: &[], parser_version: None }
+    }
 }
 
 #[derive(Debug, Clone)]

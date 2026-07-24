@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -40,8 +40,11 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 9 {
         migrate_v9(conn)?;
     }
-    if version < SCHEMA_VERSION {
+    if version < 10 {
         migrate_v10(conn)?;
+    }
+    if version < SCHEMA_VERSION {
+        migrate_v11(conn)?;
     }
     Ok(())
 }
@@ -324,7 +327,33 @@ fn migrate_v10(conn: &Connection) -> anyhow::Result<()> {
     if table_exists("usage_session_state")? {
         conn.execute("DELETE FROM usage_session_state WHERE source = 'grok'", [])?;
     }
-    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    conn.execute_batch("PRAGMA user_version = 10;")?;
+    Ok(())
+}
+
+fn migrate_v11(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE sessions ADD COLUMN thread_role TEXT
+             CHECK (thread_role IN ('primary', 'subagent'))",
+    )?;
+    add_column_if_missing(conn, "ALTER TABLE sessions ADD COLUMN metadata_parser_version INTEGER")?;
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS session_parent_links (
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            relation TEXT NOT NULL CHECK (relation IN ('spawn', 'fork', 'resume')),
+            parent_source TEXT NOT NULL,
+            parent_source_id TEXT NOT NULL,
+            PRIMARY KEY (session_id, relation, parent_source, parent_source_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_parent_links_parent
+            ON session_parent_links(parent_source, parent_source_id);
+
+        PRAGMA user_version = 11;
+        ",
+    )?;
     Ok(())
 }
 
@@ -505,6 +534,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (0, 1, 0, 1));
+    }
+
+    #[test]
+    fn migrate_v11_adds_topology_columns_and_table_to_existing_v10_db() {
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        migrate_v10(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES ('s1', 'codex', 'c1', 'existing', 0);",
+        )
+        .unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), 10);
+        init(&conn).unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        for col in ["thread_role", "metadata_parser_version"] {
+            let sql = format!("SELECT {col} FROM sessions");
+            conn.prepare(&sql)
+                .unwrap_or_else(|e| panic!("column {col} missing after migrate_v11: {e}"));
+        }
+        let (role, version): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT thread_role, metadata_parser_version FROM sessions WHERE id = 's1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(role, None, "existing sessions default to unknown role");
+        assert_eq!(version, None);
+
+        conn.execute(
+            "INSERT INTO session_parent_links (session_id, relation, parent_source, parent_source_id)
+             VALUES ('s1', 'spawn', 'codex', 'p1')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM sessions WHERE id = 's1'", []).unwrap();
+        let links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_parent_links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(links, 0, "parent links cascade when their session is removed");
+    }
+
+    #[test]
+    fn migrate_v11_rejects_invalid_thread_role() {
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let err = conn.execute(
+            "INSERT INTO sessions (id, source, source_id, title, started_at, thread_role)
+             VALUES ('s1', 'codex', 'c1', 't', 0, 'bogus')",
+            [],
+        );
+        assert!(err.is_err(), "thread_role CHECK must reject values outside primary/subagent");
     }
 
     #[test]

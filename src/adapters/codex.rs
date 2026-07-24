@@ -15,12 +15,13 @@ use crate::adapters::{
     first_timestamp, last_timestamp,
 };
 use crate::db::store::Store;
-use crate::types::{RawSessionEvent, RawUsageEvent, Role};
+use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) struct CodexAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 4;
 const EVENT_PARSER_VERSION: u32 = 1;
+const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for CodexAdapter {
     fn id(&self) -> &str {
@@ -120,6 +121,7 @@ fn scan_for_sync_impl(
         file_scan::FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+            metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
         },
         entries,
         |entry, mtime_ms| {
@@ -196,6 +198,56 @@ fn extract_session_id_from_filename(stem: &str) -> Option<String> {
     uuid::Uuid::try_parse(tail).ok().map(|_| tail.to_string())
 }
 
+/// Keyed by payload id so forked rollouts pick the child's meta, not an inherited parent's.
+struct CodexMetaTopology {
+    meta_id: Option<String>,
+    thread_role: Option<ThreadRole>,
+    parent_links: Vec<ParentLink>,
+}
+
+fn codex_thread_role(payload: &Value) -> Option<ThreadRole> {
+    match payload.get("thread_source").and_then(|v| v.as_str()) {
+        Some("user") => return Some(ThreadRole::Primary),
+        Some("subagent") => return Some(ThreadRole::Subagent),
+        _ => {}
+    }
+    let source = payload.get("source")?;
+    if source.get("subagent").is_some() || source.as_str() == Some("subagent") {
+        return Some(ThreadRole::Subagent);
+    }
+    source.as_str().filter(|s| !s.trim().is_empty()).map(|_| ThreadRole::Primary)
+}
+
+/// `spawn` ← `parent_thread_id` / `source.subagent.thread_spawn`; `fork` ← `forked_from_id`.
+fn codex_parent_links(payload: &Value) -> Vec<ParentLink> {
+    let mut links = Vec::new();
+    let mut push = |relation: ParentRelation, id: &str| {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let link = ParentLink { relation, source: "codex".to_string(), source_id: id.to_string() };
+        if !links.contains(&link) {
+            links.push(link);
+        }
+    };
+    let spawn_parent = payload.get("parent_thread_id").and_then(|v| v.as_str()).or_else(|| {
+        payload
+            .get("source")
+            .and_then(|s| s.get("subagent"))
+            .and_then(|s| s.get("thread_spawn"))
+            .and_then(|s| s.get("parent_thread_id"))
+            .and_then(|v| v.as_str())
+    });
+    if let Some(parent) = spawn_parent {
+        push(ParentRelation::Spawn, parent);
+    }
+    if let Some(parent) = payload.get("forked_from_id").and_then(|v| v.as_str()) {
+        push(ParentRelation::Fork, parent);
+    }
+    links
+}
+
 #[cfg(test)]
 fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
     parse_codex_session_with_options(path, true)
@@ -211,6 +263,7 @@ fn parse_codex_session_with_options(
     let mut meta_id: Option<String> = None;
     let mut meta_cwd: Option<String> = None;
     let mut meta_timestamp: Option<i64> = None;
+    let mut meta_topologies: Vec<CodexMetaTopology> = Vec::new();
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
     let mut events = Vec::new();
@@ -280,6 +333,11 @@ fn parse_codex_session_with_options(
                         );
                     }
                     meta_timestamp = rfc3339_ms(payload.get("timestamp"));
+                    meta_topologies.push(CodexMetaTopology {
+                        meta_id: meta_id.clone(),
+                        thread_role: codex_thread_role(payload),
+                        parent_links: codex_parent_links(payload),
+                    });
                     if payload.get("forked_from_id").and_then(|s| s.as_str()).is_some() {
                         forked_child_waiting_for_turn_context = true;
                         forked_child_inherited_baseline = None;
@@ -413,6 +471,19 @@ fn parse_codex_session_with_options(
     let started_at =
         first_timestamp(meta_timestamp, &messages, &usage_events, &events).unwrap_or(0);
 
+    // Prefer the metadata record whose payload id matches the source id derived
+    // from the rollout filename so inherited parent metadata in forked rollouts
+    // never overwrites the child identity; fall back to the last processed
+    // record (the child's own, since inherited parent metadata is skipped).
+    let filename_id =
+        path.file_stem().and_then(|s| s.to_str()).and_then(extract_session_id_from_filename);
+    let (thread_role, parent_links) = meta_topologies
+        .iter()
+        .find(|topo| topo.meta_id.is_some() && topo.meta_id.as_deref() == filename_id.as_deref())
+        .or_else(|| meta_topologies.last())
+        .map(|topo| (topo.thread_role, topo.parent_links.clone()))
+        .unwrap_or((None, Vec::new()));
+
     Ok(Some(RawSession {
         source_id,
         directory: meta_cwd,
@@ -428,6 +499,9 @@ fn parse_codex_session_with_options(
         custom_title: None,
         summary: None,
         duration_minutes: None,
+        thread_role,
+        parent_links,
+        metadata_parser_version: Some(METADATA_PARSER_VERSION),
     }))
 }
 
@@ -1455,6 +1529,140 @@ mod tests {
         assert_eq!(raw.usage_events[0].output_tokens, 200);
         assert_eq!(raw.usage_events[0].reasoning_tokens, 50);
 
+        assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));
+        assert_eq!(
+            raw.parent_links,
+            vec![
+                ParentLink {
+                    relation: ParentRelation::Spawn,
+                    source: "codex".to_string(),
+                    source_id: "parent-session".to_string(),
+                },
+                ParentLink {
+                    relation: ParentRelation::Fork,
+                    source: "codex".to_string(),
+                    source_id: "parent-session".to_string(),
+                },
+            ]
+        );
+        assert_eq!(raw.metadata_parser_version, Some(METADATA_PARSER_VERSION));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn write_codex_topology_rollout(sessions_dir: &Path, uuid: &str, payload: Value) -> PathBuf {
+        fs::create_dir_all(sessions_dir).unwrap();
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let meta = serde_json::json!({ "type": "session_meta", "payload": payload });
+        // A turn_context clears the forked-child inheritance guard so the message
+        // that follows is retained, matching real forked rollouts.
+        let turn_context = serde_json::json!({
+            "type": "turn_context",
+            "timestamp": "2026-04-13T10:00:29Z",
+            "payload": { "model": "gpt-5.5", "cwd": "/repo" }
+        });
+        let msg = serde_json::json!({
+            "type": "event_msg",
+            "timestamp": "2026-04-13T10:00:30Z",
+            "payload": { "type": "user_message", "message": "hi" }
+        });
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{meta}").unwrap();
+        writeln!(f, "{turn_context}").unwrap();
+        writeln!(f, "{msg}").unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_codex_session_classifies_user_source_as_primary_without_parents() {
+        let root = temp_codex_root("primary-topology");
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2401";
+        let path = write_codex_topology_rollout(
+            &root.join("sessions"),
+            uuid,
+            serde_json::json!({
+                "id": uuid,
+                "thread_source": "user",
+                "source": "interactive",
+                "cwd": "/repo"
+            }),
+        );
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+
+        assert_eq!(raw.thread_role, Some(ThreadRole::Primary));
+        assert!(raw.parent_links.is_empty());
+        assert_eq!(raw.metadata_parser_version, Some(METADATA_PARSER_VERSION));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_keeps_user_fork_primary_with_fork_link() {
+        let root = temp_codex_root("fork-primary");
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2402";
+        let path = write_codex_topology_rollout(
+            &root.join("sessions"),
+            uuid,
+            serde_json::json!({
+                "id": uuid,
+                "thread_source": "user",
+                "forked_from_id": "parent-abc",
+                "cwd": "/repo"
+            }),
+        );
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+
+        assert_eq!(raw.thread_role, Some(ThreadRole::Primary));
+        assert_eq!(
+            raw.parent_links,
+            vec![ParentLink {
+                relation: ParentRelation::Fork,
+                source: "codex".to_string(),
+                source_id: "parent-abc".to_string(),
+            }]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_keeps_legacy_subagent_without_parent() {
+        let root = temp_codex_root("legacy-subagent");
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2403";
+        let path = write_codex_topology_rollout(
+            &root.join("sessions"),
+            uuid,
+            serde_json::json!({ "id": uuid, "thread_source": "subagent", "cwd": "/repo" }),
+        );
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+
+        assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));
+        assert!(raw.parent_links.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_leaves_role_unknown_without_markers() {
+        let root = temp_codex_root("unknown-topology");
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2404";
+        let path = write_codex_topology_rollout(
+            &root.join("sessions"),
+            uuid,
+            serde_json::json!({ "id": uuid, "cwd": "/repo" }),
+        );
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+
+        assert_eq!(raw.thread_role, None);
+        assert!(raw.parent_links.is_empty());
+        // Even unknown-role sessions get a metadata parser version so topology
+        // backfill runs for them once a classifier improves.
+        assert_eq!(raw.metadata_parser_version, Some(METADATA_PARSER_VERSION));
+
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1510,6 +1718,17 @@ mod tests {
                 &[],
                 EVENT_PARSER_VERSION,
                 Some(mtime),
+            )
+            .unwrap();
+        store
+            .persist_topology_for_existing_session(
+                "codex",
+                uuid,
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION),
+                },
             )
             .unwrap();
 

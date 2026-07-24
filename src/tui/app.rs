@@ -2111,6 +2111,7 @@ impl App {
             time_range: self.time_filter,
             directory: self.project_filter.clone(),
             repo: self.repo_filter.clone(),
+            thread_role: None,
         }
     }
 

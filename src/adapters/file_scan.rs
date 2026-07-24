@@ -5,7 +5,8 @@ use std::time::UNIX_EPOCH;
 use anyhow::Result;
 
 use crate::adapters::sync_state::{
-    event_state_is_current_for_mtime, usage_state_is_current_for_mtime,
+    event_state_is_current_for_mtime, metadata_state_is_current_for_mtime,
+    usage_state_is_current_for_mtime,
 };
 use crate::adapters::{RawSession, SyncScanResult, SyncScanStats};
 use crate::db::store::Store;
@@ -14,6 +15,7 @@ use crate::db::store::Store;
 pub(crate) struct FileScanOptions {
     pub(crate) usage_parser_version: Option<u32>,
     pub(crate) event_parser_version: Option<u32>,
+    pub(crate) metadata_parser_version: Option<u32>,
 }
 
 pub(crate) struct FileScanEntry {
@@ -65,6 +67,10 @@ where
         Some(_) => store.event_state_meta_map(source_id)?,
         None => Default::default(),
     };
+    let metadata_state = match options.metadata_parser_version {
+        Some(_) => store.metadata_state_meta_map(source_id)?,
+        None => Default::default(),
+    };
     let mut sessions = Vec::new();
     let mut stats = SyncScanStats::default();
 
@@ -106,6 +112,11 @@ where
             && event_state_is_current_for_mtime(
                 options.event_parser_version,
                 event_state.get(&entry.session_id).copied(),
+                mtime_ms,
+            )
+            && metadata_state_is_current_for_mtime(
+                options.metadata_parser_version,
+                metadata_state.get(&entry.session_id).copied(),
                 mtime_ms,
             )
         {
@@ -295,7 +306,11 @@ mod tests {
             &store,
             "test-source",
             None,
-            FileScanOptions { usage_parser_version: Some(1), event_parser_version: None },
+            FileScanOptions {
+                usage_parser_version: Some(1),
+                event_parser_version: None,
+                metadata_parser_version: None,
+            },
             vec![entry],
             |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
         )
@@ -321,7 +336,11 @@ mod tests {
             &store,
             "test-source",
             None,
-            FileScanOptions { usage_parser_version: Some(1), event_parser_version: None },
+            FileScanOptions {
+                usage_parser_version: Some(1),
+                event_parser_version: None,
+                metadata_parser_version: None,
+            },
             vec![entry],
             |_, _| panic!("current usage state should skip parsing"),
         )
@@ -347,7 +366,11 @@ mod tests {
             &store,
             "test-source",
             None,
-            FileScanOptions { usage_parser_version: None, event_parser_version: Some(1) },
+            FileScanOptions {
+                usage_parser_version: None,
+                event_parser_version: Some(1),
+                metadata_parser_version: None,
+            },
             vec![entry],
             |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
         )
@@ -373,9 +396,74 @@ mod tests {
             &store,
             "test-source",
             None,
-            FileScanOptions { usage_parser_version: None, event_parser_version: Some(1) },
+            FileScanOptions {
+                usage_parser_version: None,
+                event_parser_version: Some(1),
+                metadata_parser_version: None,
+            },
             vec![entry],
             |_, _| panic!("current event state should skip parsing"),
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 0);
+        assert_eq!(result.stats.skipped_sessions, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn matching_mtime_reparses_until_metadata_state_is_current() {
+        use crate::db::store::SessionTopologyWrite;
+        let store = setup_store();
+        let path = temp_file_with_mtime("metadata-backfill");
+        let mtime_ms = stat_mtime_ms(&path).unwrap();
+        store.insert_session(&make_session("s1", "sess-meta", Some(mtime_ms), 1)).unwrap();
+
+        // An unchanged file whose topology parser version is stale must reparse,
+        // even though usage and events are not tracked here.
+        let entry = FileScanEntry {
+            session_id: "sess-meta".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+        let result = run_file_scan_with_options(
+            &store,
+            "test-source",
+            None,
+            FileScanOptions {
+                usage_parser_version: None,
+                event_parser_version: None,
+                metadata_parser_version: Some(1),
+            },
+            vec![entry],
+            |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.stats.skipped_sessions, 0);
+
+        store
+            .persist_topology_for_existing_session(
+                "test-source",
+                "sess-meta",
+                &SessionTopologyWrite { thread_role: None, parents: &[], parser_version: Some(1) },
+            )
+            .unwrap();
+        let entry = FileScanEntry {
+            session_id: "sess-meta".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+        let result = run_file_scan_with_options(
+            &store,
+            "test-source",
+            None,
+            FileScanOptions {
+                usage_parser_version: None,
+                event_parser_version: None,
+                metadata_parser_version: Some(1),
+            },
+            vec![entry],
+            |_, _| panic!("current metadata state should skip parsing"),
         )
         .unwrap();
         assert_eq!(result.sessions.len(), 0);

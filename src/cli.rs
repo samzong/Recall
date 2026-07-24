@@ -70,6 +70,8 @@ enum Commands {
         project: Option<String>,
         #[arg(long, help = "Filter by repository identity")]
         repo: Option<String>,
+        #[arg(long, value_enum, help = "Filter by topology thread role")]
+        thread_role: Option<crate::db::search::ThreadRoleFilter>,
         #[arg(
             long,
             default_value_t = 0,
@@ -218,12 +220,13 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Usage { json, source, time }) => {
             crate::usage::run_cli(json, source.as_deref(), time.as_deref())?
         }
-        Some(Commands::Export { source, time, project, repo, limit, include }) => {
+        Some(Commands::Export { source, time, project, repo, thread_role, limit, include }) => {
             crate::export::run_cli(
                 source.as_deref(),
                 time.as_deref(),
                 project.as_deref(),
                 repo.as_deref(),
+                thread_role,
                 limit,
                 include.as_deref(),
             )?

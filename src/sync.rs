@@ -5,7 +5,10 @@ use tracing::info;
 
 use crate::adapters;
 use crate::config::AppConfig;
-use crate::db::store::{EventSessionStateMeta, SessionPath, Store, UsageSessionStateMeta};
+use crate::db::store::{
+    EventSessionStateMeta, MetadataSessionStateMeta, SessionPath, SessionTopologyWrite, Store,
+    UsageSessionStateMeta,
+};
 use crate::query::resolve_source_filter;
 use crate::repo_identity::{RepoIdentity, RepoIdentityCache};
 use crate::semantic;
@@ -71,6 +74,7 @@ pub(crate) fn run_background_worker(sync_first: bool) -> Result<()> {
 struct BackfillPlan {
     usage: bool,
     events: bool,
+    metadata: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +107,7 @@ struct ExistingState {
     imported_ids: HashSet<String>,
     usage_meta: HashMap<String, UsageSessionStateMeta>,
     event_meta: HashMap<String, EventSessionStateMeta>,
+    metadata_meta: HashMap<String, MetadataSessionStateMeta>,
 }
 
 impl ExistingState {
@@ -111,6 +116,7 @@ impl ExistingState {
             self.paths.remove(source_id);
             self.usage_meta.remove(source_id);
             self.event_meta.remove(source_id);
+            self.metadata_meta.remove(source_id);
             true
         } else {
             false
@@ -122,6 +128,7 @@ impl ExistingState {
         session: &Session,
         usage_parser_version: Option<u32>,
         event_parser_version: Option<u32>,
+        metadata_parser_version: Option<u32>,
     ) {
         self.meta.insert(session.source_id.clone(), (session.updated_at, session.message_count));
         self.paths.insert(
@@ -145,6 +152,12 @@ impl ExistingState {
             self.event_meta.insert(
                 session.source_id.clone(),
                 EventSessionStateMeta { parser_version, source_updated_at: session.updated_at },
+            );
+        }
+        if let Some(parser_version) = metadata_parser_version {
+            self.metadata_meta.insert(
+                session.source_id.clone(),
+                MetadataSessionStateMeta { parser_version, source_updated_at: session.updated_at },
             );
         }
     }
@@ -338,7 +351,12 @@ impl SyncJob {
         } else {
             self.store.event_state_meta_map(source_id)?
         };
-        Ok(ExistingState { meta, paths, imported_ids, usage_meta, event_meta })
+        let metadata_meta = if self.options.usage_only {
+            Default::default()
+        } else {
+            self.store.metadata_state_meta_map(source_id)?
+        };
+        Ok(ExistingState { meta, paths, imported_ids, usage_meta, event_meta, metadata_meta })
     }
 
     fn process_raw_session(
@@ -402,6 +420,15 @@ impl SyncJob {
                     raw.updated_at,
                 )
             });
+        let metadata_parser_version = raw.metadata_parser_version;
+        let metadata_backfill_needed = !self.options.usage_only
+            && metadata_parser_version.is_some_and(|version| {
+                !crate::adapters::sync_state::metadata_state_is_current(
+                    version,
+                    existing.metadata_meta.get(&raw_source_id).copied(),
+                    raw.updated_at,
+                )
+            });
 
         match existing.meta.get(&raw_source_id).copied() {
             Some((old_updated_at, old_msg_count)) => {
@@ -419,6 +446,7 @@ impl SyncJob {
                     content_changed,
                     usage_backfill_needed,
                     event_backfill_needed,
+                    metadata_backfill_needed,
                 ) {
                     ExistingSessionAction::Skip => {
                         if was_imported {
@@ -442,6 +470,7 @@ impl SyncJob {
                 }
                 existing.usage_meta.remove(&raw_source_id);
                 existing.event_meta.remove(&raw_source_id);
+                existing.metadata_meta.remove(&raw_source_id);
                 if content_changed {
                     self.stats.updated_sessions += 1;
                 } else {
@@ -500,7 +529,12 @@ impl SyncJob {
             (Vec::new(), None)
         };
 
-        self.store.replace_session_with_usage_and_events(
+        let topology = SessionTopologyWrite {
+            thread_role: raw.thread_role,
+            parents: &raw.parent_links,
+            parser_version: metadata_parser_version,
+        };
+        self.store.replace_session_with_usage_and_events_with_topology(
             source_id,
             &raw_source_id,
             &session,
@@ -509,8 +543,14 @@ impl SyncJob {
             raw.usage_parser_version,
             &events,
             event_parser_version,
+            &topology,
         )?;
-        existing.record_replaced(&session, raw.usage_parser_version, event_parser_version);
+        existing.record_replaced(
+            &session,
+            raw.usage_parser_version,
+            event_parser_version,
+            metadata_parser_version,
+        );
         self.stats.total_messages += msg_count;
         Ok(())
     }
@@ -556,6 +596,26 @@ impl SyncJob {
                 EventSessionStateMeta { parser_version, source_updated_at: raw.updated_at },
             );
             reprocessed = true;
+        }
+        if plan.metadata
+            && let Some(parser_version) = raw.metadata_parser_version
+        {
+            let topology = SessionTopologyWrite {
+                thread_role: raw.thread_role,
+                parents: &raw.parent_links,
+                parser_version: Some(parser_version),
+            };
+            if self.store.persist_topology_for_existing_session(
+                source_id,
+                raw_source_id,
+                &topology,
+            )? {
+                existing.metadata_meta.insert(
+                    raw_source_id.to_string(),
+                    MetadataSessionStateMeta { parser_version, source_updated_at: raw.updated_at },
+                );
+                reprocessed = true;
+            }
         }
         if raw.custom_title.is_some() || raw.summary.is_some() || raw.duration_minutes.is_some() {
             self.store.update_session_fields(
@@ -642,6 +702,7 @@ impl SyncJob {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide_existing_session_action(
     usage_only: bool,
     backfill_events: bool,
@@ -649,6 +710,7 @@ fn decide_existing_session_action(
     content_changed: bool,
     usage_backfill_needed: bool,
     event_backfill_needed: bool,
+    metadata_backfill_needed: bool,
 ) -> ExistingSessionAction {
     if usage_only {
         let needs_usage = usage_backfill_needed;
@@ -657,6 +719,7 @@ fn decide_existing_session_action(
             ExistingSessionAction::BackfillOnly(BackfillPlan {
                 usage: needs_usage,
                 events: needs_events,
+                metadata: false,
             })
         } else {
             ExistingSessionAction::Skip
@@ -664,10 +727,11 @@ fn decide_existing_session_action(
     }
 
     if !content_changed && !force {
-        return if usage_backfill_needed || event_backfill_needed {
+        return if usage_backfill_needed || event_backfill_needed || metadata_backfill_needed {
             ExistingSessionAction::BackfillOnly(BackfillPlan {
                 usage: usage_backfill_needed,
                 events: event_backfill_needed,
+                metadata: metadata_backfill_needed,
             })
         } else {
             ExistingSessionAction::Skip
@@ -827,11 +891,15 @@ mod tests {
     #[test]
     fn usage_only_never_refreshes_existing_session() {
         assert_eq!(
-            decide_existing_session_action(true, false, false, true, true, true),
-            ExistingSessionAction::BackfillOnly(BackfillPlan { usage: true, events: false })
+            decide_existing_session_action(true, false, false, true, true, true, true),
+            ExistingSessionAction::BackfillOnly(BackfillPlan {
+                usage: true,
+                events: false,
+                metadata: false
+            })
         );
         assert_eq!(
-            decide_existing_session_action(true, false, false, true, false, true),
+            decide_existing_session_action(true, false, false, true, false, true, true),
             ExistingSessionAction::Skip
         );
     }
@@ -839,19 +907,27 @@ mod tests {
     #[test]
     fn usage_only_can_backfill_events_without_refresh() {
         assert_eq!(
-            decide_existing_session_action(true, true, false, true, false, true),
-            ExistingSessionAction::BackfillOnly(BackfillPlan { usage: false, events: true })
+            decide_existing_session_action(true, true, false, true, false, true, false),
+            ExistingSessionAction::BackfillOnly(BackfillPlan {
+                usage: false,
+                events: true,
+                metadata: false
+            })
         );
         assert_eq!(
-            decide_existing_session_action(true, true, false, true, true, true),
-            ExistingSessionAction::BackfillOnly(BackfillPlan { usage: true, events: true })
+            decide_existing_session_action(true, true, false, true, true, true, false),
+            ExistingSessionAction::BackfillOnly(BackfillPlan {
+                usage: true,
+                events: true,
+                metadata: false
+            })
         );
     }
 
     #[test]
     fn full_sync_refreshes_changed_existing_session() {
         assert_eq!(
-            decide_existing_session_action(false, false, false, true, true, true),
+            decide_existing_session_action(false, false, false, true, true, true, false),
             ExistingSessionAction::RefreshSession
         );
     }
@@ -859,11 +935,31 @@ mod tests {
     #[test]
     fn full_sync_backfills_unchanged_existing_session_in_place() {
         assert_eq!(
-            decide_existing_session_action(false, false, false, false, true, true),
-            ExistingSessionAction::BackfillOnly(BackfillPlan { usage: true, events: true })
+            decide_existing_session_action(false, false, false, false, true, true, false),
+            ExistingSessionAction::BackfillOnly(BackfillPlan {
+                usage: true,
+                events: true,
+                metadata: false
+            })
         );
         assert_eq!(
-            decide_existing_session_action(false, false, false, false, false, false),
+            decide_existing_session_action(false, false, false, false, false, false, false),
+            ExistingSessionAction::Skip
+        );
+    }
+
+    #[test]
+    fn full_sync_backfills_metadata_only_when_topology_parser_advances() {
+        assert_eq!(
+            decide_existing_session_action(false, false, false, false, false, false, true),
+            ExistingSessionAction::BackfillOnly(BackfillPlan {
+                usage: false,
+                events: false,
+                metadata: true
+            })
+        );
+        assert_eq!(
+            decide_existing_session_action(true, false, false, false, false, false, true),
             ExistingSessionAction::Skip
         );
     }

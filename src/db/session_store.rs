@@ -6,9 +6,14 @@ use rusqlite::OptionalExtension;
 
 use super::event_store::replace_session_events;
 use super::project_store::apply_scope_filters;
-use super::store::{SESSION_COLUMNS, SessionListSort, Store, session_from_row};
-use crate::db::search::{RepoFilter, TimeRange};
-use crate::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session};
+use super::store::{
+    MetadataSessionStateMeta, SESSION_COLUMNS, SessionListSort, SessionTopologyWrite, Store,
+    session_from_row,
+};
+use crate::db::search::{RepoFilter, ThreadRoleFilter, TimeRange};
+use crate::types::{
+    Message, ParentLink, RawSessionEvent, RawUsageEvent, Role, Session, SessionTopology, ThreadRole,
+};
 
 impl Store {
     pub(crate) fn session_meta(
@@ -155,6 +160,7 @@ impl Store {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn persist_session_with_usage_and_events(
         &self,
         session: &Session,
@@ -163,6 +169,28 @@ impl Store {
         usage_parser_version: Option<u32>,
         session_events: &[RawSessionEvent],
         event_parser_version: Option<u32>,
+    ) -> Result<()> {
+        self.persist_session_with_usage_and_events_with_topology(
+            session,
+            messages,
+            usage_events,
+            usage_parser_version,
+            session_events,
+            event_parser_version,
+            &SessionTopologyWrite::none(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn persist_session_with_usage_and_events_with_topology(
+        &self,
+        session: &Session,
+        messages: &[Message],
+        usage_events: &[RawUsageEvent],
+        usage_parser_version: Option<u32>,
+        session_events: &[RawSessionEvent],
+        event_parser_version: Option<u32>,
+        topology: &SessionTopologyWrite<'_>,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         persist_session_with_usage_and_events_tx(
@@ -173,11 +201,13 @@ impl Store {
             usage_parser_version,
             session_events,
             event_parser_version,
+            topology,
         )?;
         tx.commit()?;
         Ok(())
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn replace_session_with_usage_and_events(
         &self,
@@ -190,6 +220,32 @@ impl Store {
         session_events: &[RawSessionEvent],
         event_parser_version: Option<u32>,
     ) -> Result<()> {
+        self.replace_session_with_usage_and_events_with_topology(
+            old_source,
+            old_source_id,
+            session,
+            messages,
+            usage_events,
+            usage_parser_version,
+            session_events,
+            event_parser_version,
+            &SessionTopologyWrite::none(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn replace_session_with_usage_and_events_with_topology(
+        &self,
+        old_source: &str,
+        old_source_id: &str,
+        session: &Session,
+        messages: &[Message],
+        usage_events: &[RawUsageEvent],
+        usage_parser_version: Option<u32>,
+        session_events: &[RawSessionEvent],
+        event_parser_version: Option<u32>,
+        topology: &SessionTopologyWrite<'_>,
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         delete_session_data_tx(&tx, old_source, old_source_id)?;
         persist_session_with_usage_and_events_tx(
@@ -200,9 +256,93 @@ impl Store {
             usage_parser_version,
             session_events,
             event_parser_version,
+            topology,
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Topology-only write for an already-indexed session: does not touch
+    /// messages, usage, events, embeddings, or the local session id.
+    pub(crate) fn persist_topology_for_existing_session(
+        &self,
+        source: &str,
+        source_id: &str,
+        topology: &SessionTopologyWrite<'_>,
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let session_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM sessions WHERE source = ?1 AND source_id = ?2",
+                rusqlite::params![source, source_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(session_id) = session_id else {
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE sessions SET thread_role = ?1, metadata_parser_version = ?2 WHERE id = ?3",
+            rusqlite::params![
+                topology.thread_role.map(|role| role.as_str()),
+                topology.parser_version,
+                session_id,
+            ],
+        )?;
+        replace_parent_links_tx(&tx, &session_id, topology.parents)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn session_topology(&self, session_id: &str) -> Result<SessionTopology> {
+        let thread_role = self
+            .conn
+            .query_row(
+                "SELECT thread_role FROM sessions WHERE id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .and_then(|role| role.parse::<ThreadRole>().ok());
+        let mut stmt = self.conn.prepare(
+            "SELECT relation, parent_source, parent_source_id
+             FROM session_parent_links
+             WHERE session_id = ?1
+             ORDER BY relation, parent_source, parent_source_id",
+        )?;
+        let parents = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|(relation, source, source_id)| {
+                relation.parse().ok().map(|relation| ParentLink { relation, source, source_id })
+            })
+            .collect();
+        Ok(SessionTopology { thread_role, parents })
+    }
+
+    pub(crate) fn metadata_state_meta_map(
+        &self,
+        source: &str,
+    ) -> Result<HashMap<String, MetadataSessionStateMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_id, metadata_parser_version, updated_at
+             FROM sessions
+             WHERE source = ?1 AND metadata_parser_version IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                MetadataSessionStateMeta {
+                    parser_version: row.get(1)?,
+                    source_updated_at: row.get(2)?,
+                },
+            ))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
 
     pub(crate) fn delete_session_data(&self, source: &str, source_id: &str) -> Result<()> {
@@ -393,39 +533,7 @@ impl Store {
         time_range: TimeRange,
         directory: Option<&str>,
         repo: Option<&RepoFilter>,
-        limit: Option<usize>,
-        offset: usize,
-        sort: SessionListSort,
-    ) -> Result<Vec<Session>> {
-        self.list_sessions_for_scope(sources, time_range, directory, repo, limit, offset, sort)
-    }
-
-    pub(crate) fn list_export_sessions(
-        &self,
-        sources: Option<&[String]>,
-        time_range: TimeRange,
-        directory: Option<&str>,
-        repo: Option<&RepoFilter>,
-        limit: Option<usize>,
-    ) -> Result<Vec<Session>> {
-        self.list_sessions_for_scope(
-            sources,
-            time_range,
-            directory,
-            repo,
-            limit,
-            0,
-            SessionListSort::Newest,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn list_sessions_for_scope(
-        &self,
-        sources: Option<&[String]>,
-        time_range: TimeRange,
-        directory: Option<&str>,
-        repo: Option<&RepoFilter>,
+        thread_role: Option<ThreadRoleFilter>,
         limit: Option<usize>,
         offset: usize,
         sort: SessionListSort,
@@ -446,6 +554,9 @@ impl Store {
             directory,
             repo,
         );
+        if let Some(thread_role) = thread_role {
+            sql.push_str(thread_role.sql_predicate());
+        }
         let order_by = match sort {
             SessionListSort::Newest => "s.started_at DESC, source ASC, source_id ASC",
             SessionListSort::Oldest => "s.started_at ASC, source ASC, source_id ASC",
@@ -472,6 +583,55 @@ impl Store {
         let rows = stmt.query_map(param_refs.as_slice(), session_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    pub(crate) fn list_export_sessions(
+        &self,
+        sources: Option<&[String]>,
+        time_range: TimeRange,
+        directory: Option<&str>,
+        repo: Option<&RepoFilter>,
+        thread_role: Option<ThreadRoleFilter>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Session>> {
+        self.list_indexed_sessions(
+            sources,
+            time_range,
+            directory,
+            repo,
+            thread_role,
+            limit,
+            0,
+            SessionListSort::Newest,
+        )
+    }
+}
+
+fn replace_parent_links_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    parents: &[ParentLink],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM session_parent_links WHERE session_id = ?1",
+        rusqlite::params![session_id],
+    )?;
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO session_parent_links
+            (session_id, relation, parent_source, parent_source_id)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for parent in parents {
+        stmt.execute(rusqlite::params![
+            session_id,
+            parent.relation.as_str(),
+            parent.source,
+            parent.source_id,
+        ])?;
+    }
+    Ok(())
 }
 
 fn delete_session_data_tx(
@@ -507,10 +667,11 @@ fn persist_session_with_usage_and_events_tx(
     usage_parser_version: Option<u32>,
     session_events: &[RawSessionEvent],
     event_parser_version: Option<u32>,
+    topology: &SessionTopologyWrite<'_>,
 ) -> Result<()> {
     tx.execute(
-        "INSERT INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        "INSERT INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import, thread_role, metadata_parser_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         rusqlite::params![
             session.id,
             session.source,
@@ -529,8 +690,12 @@ fn persist_session_with_usage_and_events_tx(
             session.duration_minutes,
             session.source_file_path,
             session.is_import,
+            topology.thread_role.map(|role| role.as_str()),
+            topology.parser_version,
         ],
     )?;
+
+    replace_parent_links_tx(tx, &session.id, topology.parents)?;
 
     {
         let mut stmt = tx.prepare(
@@ -679,4 +844,235 @@ fn persist_session_with_usage_and_events_tx(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::*;
+    use crate::db::schema;
+    use crate::db::store::SessionListSort;
+    use crate::types::{Message, ParentLink, ParentRelation, Role, Session, ThreadRole};
+
+    fn store() -> Store {
+        schema::register_sqlite_vec();
+        Store::open_in_memory().unwrap()
+    }
+
+    fn sess(source_id: &str) -> Session {
+        Session {
+            id: format!("local-{source_id}"),
+            source: "codex".to_string(),
+            source_id: source_id.to_string(),
+            title: "t".to_string(),
+            directory: None,
+            repo_remote: None,
+            repo_slug: None,
+            repo_name: None,
+            started_at: 0,
+            updated_at: Some(10),
+            message_count: 1,
+            entrypoint: None,
+            custom_title: None,
+            summary: None,
+            duration_minutes: None,
+            source_file_path: None,
+            is_import: false,
+        }
+    }
+
+    fn msg(session_id: &str) -> Vec<Message> {
+        vec![Message {
+            session_id: session_id.to_string(),
+            role: Role::User,
+            content: "hello world".to_string(),
+            timestamp: Some(1),
+            seq: 0,
+        }]
+    }
+
+    fn persist(store: &Store, session: &Session, topology: &SessionTopologyWrite<'_>) {
+        store
+            .persist_session_with_usage_and_events_with_topology(
+                session,
+                &msg(&session.id),
+                &[],
+                None,
+                &[],
+                None,
+                topology,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn session_topology_round_trips_role_and_parents() {
+        let store = store();
+        let session = sess("s1");
+        let parents = vec![
+            ParentLink {
+                relation: ParentRelation::Spawn,
+                source: "codex".to_string(),
+                source_id: "p-spawn".to_string(),
+            },
+            ParentLink {
+                relation: ParentRelation::Fork,
+                source: "codex".to_string(),
+                source_id: "p-fork".to_string(),
+            },
+        ];
+        persist(
+            &store,
+            &session,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Subagent),
+                parents: &parents,
+                parser_version: Some(1),
+            },
+        );
+
+        let topology = store.session_topology(&session.id).unwrap();
+        assert_eq!(topology.thread_role, Some(ThreadRole::Subagent));
+        assert_eq!(
+            topology.parents,
+            vec![
+                ParentLink {
+                    relation: ParentRelation::Fork,
+                    source: "codex".to_string(),
+                    source_id: "p-fork".to_string(),
+                },
+                ParentLink {
+                    relation: ParentRelation::Spawn,
+                    source: "codex".to_string(),
+                    source_id: "p-spawn".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_backfill_updates_topology_without_touching_messages() {
+        let store = store();
+        let session = sess("s1");
+        persist(
+            &store,
+            &session,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Primary),
+                parents: &[],
+                parser_version: Some(1),
+            },
+        );
+        let embedding_before: i64 = store
+            .conn
+            .query_row(
+                "SELECT units_total FROM session_embedding_state WHERE session_id = ?1",
+                [&session.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let parents = vec![ParentLink {
+            relation: ParentRelation::Fork,
+            source: "codex".to_string(),
+            source_id: "p1".to_string(),
+        }];
+        let updated = store
+            .persist_topology_for_existing_session(
+                "codex",
+                "s1",
+                &SessionTopologyWrite {
+                    thread_role: Some(ThreadRole::Subagent),
+                    parents: &parents,
+                    parser_version: Some(2),
+                },
+            )
+            .unwrap();
+        assert!(updated);
+
+        let topology = store.session_topology(&session.id).unwrap();
+        assert_eq!(topology.thread_role, Some(ThreadRole::Subagent));
+        assert_eq!(topology.parents, parents);
+
+        assert_eq!(store.get_messages(&session.id).unwrap().len(), 1);
+        let same_id: String = store
+            .conn
+            .query_row(
+                "SELECT id FROM sessions WHERE source = 'codex' AND source_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(same_id, session.id);
+        let embedding_after: i64 = store
+            .conn
+            .query_row(
+                "SELECT units_total FROM session_embedding_state WHERE session_id = ?1",
+                [&session.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedding_before, embedding_after);
+
+        let meta = store.metadata_state_meta_map("codex").unwrap();
+        assert_eq!(meta.get("s1").map(|m| m.parser_version), Some(2));
+    }
+
+    #[test]
+    fn persist_topology_for_missing_session_reports_false() {
+        let store = store();
+        let updated = store
+            .persist_topology_for_existing_session("codex", "absent", &SessionTopologyWrite::none())
+            .unwrap();
+        assert!(!updated);
+    }
+
+    #[test]
+    fn list_indexed_sessions_filters_by_thread_role() {
+        let store = store();
+        persist(
+            &store,
+            &sess("primary"),
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Primary),
+                parents: &[],
+                parser_version: Some(1),
+            },
+        );
+        persist(
+            &store,
+            &sess("subagent"),
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Subagent),
+                parents: &[],
+                parser_version: Some(1),
+            },
+        );
+        persist(
+            &store,
+            &sess("unknown"),
+            &SessionTopologyWrite { thread_role: None, parents: &[], parser_version: Some(1) },
+        );
+
+        let ids = |filter| {
+            store
+                .list_indexed_sessions(
+                    None,
+                    TimeRange::All,
+                    None,
+                    None,
+                    Some(filter),
+                    None,
+                    0,
+                    SessionListSort::Newest,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|s| s.source_id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(ThreadRoleFilter::Primary), vec!["primary".to_string()]);
+        assert_eq!(ids(ThreadRoleFilter::Subagent), vec!["subagent".to_string()]);
+        assert_eq!(ids(ThreadRoleFilter::Unknown), vec!["unknown".to_string()]);
+    }
 }

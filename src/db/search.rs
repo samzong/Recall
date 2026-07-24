@@ -17,6 +17,7 @@ pub(crate) struct SearchFilters {
     pub(crate) time_range: TimeRange,
     pub(crate) directory: Option<String>,
     pub(crate) repo: Option<RepoFilter>,
+    pub(crate) thread_role: Option<ThreadRoleFilter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,32 @@ impl RepoFilter {
             RepoFilter::Remote(remote) => ("repo_remote", remote),
             RepoFilter::Slug(slug) => ("repo_slug", slug),
             RepoFilter::Name(name) => ("repo_name", name),
+        }
+    }
+}
+
+/// `Unknown` maps to persisted `thread_role IS NULL` (source could not classify).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ThreadRoleFilter {
+    Primary,
+    Subagent,
+    Unknown,
+}
+
+impl ThreadRoleFilter {
+    pub(crate) fn sql_predicate(self) -> &'static str {
+        match self {
+            ThreadRoleFilter::Primary => " AND s.thread_role = 'primary'",
+            ThreadRoleFilter::Subagent => " AND s.thread_role = 'subagent'",
+            ThreadRoleFilter::Unknown => " AND s.thread_role IS NULL",
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ThreadRoleFilter::Primary => "primary",
+            ThreadRoleFilter::Subagent => "subagent",
+            ThreadRoleFilter::Unknown => "unknown",
         }
     }
 }
@@ -253,6 +280,9 @@ fn apply_filters(
         sql.push_str(&format!(" AND s.{column} = ?{}", *param_idx));
         params.push(Box::new(value.to_string()));
         *param_idx += 1;
+    }
+    if let Some(thread_role) = filters.thread_role {
+        sql.push_str(thread_role.sql_predicate());
     }
 }
 

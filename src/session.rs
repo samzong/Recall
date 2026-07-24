@@ -5,14 +5,14 @@ use std::process::{Command, Stdio};
 
 use crate::adapters;
 use crate::config::AppConfig;
-use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
+use crate::db::search::{SearchEngine, SearchFilters, ThreadRoleFilter, TimeRange};
 use crate::db::store::{SessionListSort, Store};
 use crate::export::{ExportIncludes, ExportOptions};
 use crate::handoff;
 use crate::query::{parse_time_range, query_embedding, resolve_source_filter};
 use crate::semantic;
 use crate::session_action::{self, SessionAction};
-use crate::types::{MatchSource, Message, Role, Session};
+use crate::types::{MatchSource, Message, Role, Session, SessionTopology};
 use crate::{sync::SyncRunOptions, sync::run_sync_job_inner, transcript};
 use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
@@ -31,6 +31,8 @@ pub(crate) enum SessionCommands {
         project: Option<String>,
         #[arg(long, help = "Filter by repository identity")]
         repo: Option<String>,
+        #[arg(long, value_enum, help = "Filter by topology thread role")]
+        thread_role: Option<ThreadRoleFilter>,
         #[arg(long, default_value_t = 50, help = "Maximum sessions to return")]
         limit: usize,
         #[arg(long, default_value_t = 0, help = "Skip sessions for pagination")]
@@ -200,6 +202,7 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
             time,
             project,
             repo,
+            thread_role,
             limit,
             offset,
             all,
@@ -212,6 +215,7 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
             time.as_deref(),
             project.as_deref(),
             repo.as_deref(),
+            thread_role,
             limit,
             offset,
             all,
@@ -309,6 +313,7 @@ pub(crate) fn run_session_list(
     time_filter: Option<&str>,
     project_filter: Option<&str>,
     repo_filter: Option<&str>,
+    thread_role: Option<ThreadRoleFilter>,
     limit: usize,
     offset: usize,
     all: bool,
@@ -349,6 +354,7 @@ pub(crate) fn run_session_list(
             time_range,
             directory: directory.clone(),
             repo: repo.clone(),
+            thread_role,
         };
         let search_limit = effective_limit.unwrap_or(10_000).saturating_add(offset).max(1);
         let results =
@@ -375,6 +381,7 @@ pub(crate) fn run_session_list(
                 time_range,
                 directory.as_deref(),
                 repo.as_ref(),
+                thread_role,
                 effective_limit,
                 offset,
                 sort,
@@ -387,6 +394,7 @@ pub(crate) fn run_session_list(
     match format {
         SessionListFormat::Table => print_session_list_table(&rows, &sources),
         SessionListFormat::Json => print_session_list_json(
+            &store,
             &rows,
             &sources,
             query,
@@ -394,6 +402,7 @@ pub(crate) fn run_session_list(
             time_filter,
             project_filter,
             effective_repo_filter,
+            thread_role,
             limit,
             offset,
             all,
@@ -401,7 +410,10 @@ pub(crate) fn run_session_list(
         )?,
         SessionListFormat::Jsonl => {
             for row in &rows {
-                println!("{}", serde_json::to_string(&session_list_row_json(row, &sources))?);
+                println!(
+                    "{}",
+                    serde_json::to_string(&session_list_row_json(&store, row, &sources)?)?
+                );
             }
         }
     }
@@ -448,13 +460,25 @@ fn cmd_session_show(
             }
         }
         SessionDetailFormat::Json => {
-            let value =
-                crate::export::session_record_value(session, messages, usage_events, events)?;
+            let topology = store.session_topology(&session.id)?;
+            let value = crate::export::session_record_value(
+                session,
+                topology,
+                messages,
+                usage_events,
+                events,
+            )?;
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         SessionDetailFormat::Jsonl => {
-            let value =
-                crate::export::session_record_value(session, messages, usage_events, events)?;
+            let topology = store.session_topology(&session.id)?;
+            let value = crate::export::session_record_value(
+                session,
+                topology,
+                messages,
+                usage_events,
+                events,
+            )?;
             println!("{}", serde_json::to_string(&value)?);
         }
     }
@@ -485,6 +509,7 @@ fn cmd_session_export(
                 time_range: TimeRange::All,
                 project: None,
                 repo: None,
+                thread_role: None,
                 limit: None,
                 includes: crate::export::parse_export_includes(include)?,
             };
@@ -786,6 +811,7 @@ fn print_session_list_table(rows: &[SessionListRow], sources: &[(String, String)
 
 #[allow(clippy::too_many_arguments)]
 fn print_session_list_json(
+    store: &Store,
     rows: &[SessionListRow],
     sources: &[(String, String)],
     query: Option<&str>,
@@ -793,11 +819,16 @@ fn print_session_list_json(
     time: Option<&str>,
     project: Option<&str>,
     repo: Option<&str>,
+    thread_role: Option<ThreadRoleFilter>,
     limit: usize,
     offset: usize,
     all: bool,
     sort: Option<SessionSort>,
 ) -> Result<()> {
+    let sessions = rows
+        .iter()
+        .map(|row| session_list_row_json(store, row, sources))
+        .collect::<Result<Vec<_>>>()?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -807,11 +838,12 @@ fn print_session_list_json(
                 "project": project,
                 "repo": repo,
                 "time": time.unwrap_or("all"),
+                "thread_role": thread_role.map(|role| role.as_str()),
                 "limit": if all { serde_json::Value::Null } else { serde_json::json!(limit) },
                 "offset": offset,
                 "sort": sort.map(session_sort_label)
             },
-            "sessions": rows.iter().map(|row| session_list_row_json(row, sources)).collect::<Vec<_>>(),
+            "sessions": sessions,
             "next_offset": if all || rows.len() < limit {
                 serde_json::Value::Null
             } else {
@@ -822,9 +854,14 @@ fn print_session_list_json(
     Ok(())
 }
 
-fn session_list_row_json(row: &SessionListRow, sources: &[(String, String)]) -> serde_json::Value {
+fn session_list_row_json(
+    store: &Store,
+    row: &SessionListRow,
+    sources: &[(String, String)],
+) -> Result<serde_json::Value> {
     let session = &row.session;
-    let mut value = session_json(session, sources);
+    let topology = store.session_topology(&session.id)?;
+    let mut value = session_json(session, &topology, sources);
     if let Some(map) = value.as_object_mut() {
         map.insert(
             "match_source".to_string(),
@@ -842,10 +879,14 @@ fn session_list_row_json(row: &SessionListRow, sources: &[(String, String)]) -> 
                 .unwrap_or(serde_json::Value::Null),
         );
     }
-    value
+    Ok(value)
 }
 
-fn session_json(session: &Session, sources: &[(String, String)]) -> serde_json::Value {
+fn session_json(
+    session: &Session,
+    topology: &SessionTopology,
+    sources: &[(String, String)],
+) -> serde_json::Value {
     serde_json::json!({
         "id": session.id,
         "source": session.source,
@@ -864,7 +905,23 @@ fn session_json(session: &Session, sources: &[(String, String)]) -> serde_json::
         "summary": session.summary,
         "duration_minutes": session.duration_minutes,
         "source_file_path": session.source_file_path,
-        "is_import": session.is_import
+        "is_import": session.is_import,
+        "topology": topology_json(topology)
+    })
+}
+
+fn topology_json(topology: &SessionTopology) -> serde_json::Value {
+    serde_json::json!({
+        "thread_role": topology.thread_role.map(|role| role.as_str()),
+        "parents": topology
+            .parents
+            .iter()
+            .map(|parent| serde_json::json!({
+                "relation": parent.relation.as_str(),
+                "source": parent.source,
+                "source_id": parent.source_id
+            }))
+            .collect::<Vec<_>>()
     })
 }
 

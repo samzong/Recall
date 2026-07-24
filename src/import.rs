@@ -4,8 +4,10 @@ use std::io::BufRead;
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 
-use crate::db::store::Store;
-use crate::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource};
+use crate::db::store::{SessionTopologyWrite, Store};
+use crate::types::{
+    Message, ParentLink, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource,
+};
 
 const RECORD_TYPE: &str = "session";
 
@@ -73,6 +75,23 @@ struct ImportSession {
     duration_minutes: Option<u32>,
     #[serde(default)]
     source_file_path: Option<String>,
+    #[serde(default)]
+    topology: ImportTopology,
+}
+
+#[derive(Deserialize, Default)]
+struct ImportTopology {
+    #[serde(default)]
+    thread_role: Option<String>,
+    #[serde(default)]
+    parents: Vec<ImportParentLink>,
+}
+
+#[derive(Deserialize)]
+struct ImportParentLink {
+    relation: String,
+    source: String,
+    source_id: String,
 }
 
 #[derive(Deserialize)]
@@ -154,7 +173,7 @@ pub(crate) fn import_jsonl<R: BufRead>(
         if record.record_type != RECORD_TYPE {
             bail!("line {line_no}: unsupported record_type '{}'", record.record_type);
         }
-        if !matches!(record.schema_version, 2..=4) {
+        if !matches!(record.schema_version, 2..=5) {
             bail!("line {line_no}: unsupported schema_version {}", record.schema_version);
         }
 
@@ -268,13 +287,32 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
         })
         .collect();
 
-    store.persist_session_with_usage_and_events(
+    // Persist topology without a metadata parser version so a later local sync of
+    // the same source still backfills from source. Missing/invalid values default
+    // to unknown role and no parents, keeping v2-v4 imports safe.
+    let thread_role = s.topology.thread_role.and_then(|role| role.parse().ok());
+    let parents: Vec<ParentLink> = s
+        .topology
+        .parents
+        .into_iter()
+        .filter_map(|parent| {
+            Some(ParentLink {
+                relation: parent.relation.parse().ok()?,
+                source: parent.source,
+                source_id: parent.source_id,
+            })
+        })
+        .collect();
+    let topology = SessionTopologyWrite { thread_role, parents: &parents, parser_version: None };
+
+    store.persist_session_with_usage_and_events_with_topology(
         &session,
         &messages,
         &usage_events,
         None,
         &events,
         None,
+        &topology,
     )
 }
 
@@ -284,6 +322,7 @@ mod tests {
     use crate::db::schema;
     use crate::db::search::TimeRange;
     use crate::export::{ExportIncludes, ExportOptions, write_jsonl};
+    use crate::types::{ParentRelation, ThreadRole};
 
     fn setup() -> Store {
         schema::register_sqlite_vec();
@@ -372,8 +411,25 @@ mod tests {
     fn persist_full(store: &Store, source: &str, source_id: &str, title: &str) {
         let session = full_session(source, source_id, title);
         let messages = full_messages(&session.id);
+        let parents = vec![
+            ParentLink {
+                relation: ParentRelation::Spawn,
+                source: "codex".to_string(),
+                source_id: "parent-session".to_string(),
+            },
+            ParentLink {
+                relation: ParentRelation::Fork,
+                source: "codex".to_string(),
+                source_id: "parent-session".to_string(),
+            },
+        ];
+        let topology = SessionTopologyWrite {
+            thread_role: Some(ThreadRole::Subagent),
+            parents: &parents,
+            parser_version: Some(1),
+        };
         store
-            .replace_session_with_usage_and_events(
+            .replace_session_with_usage_and_events_with_topology(
                 source,
                 source_id,
                 &session,
@@ -382,6 +438,7 @@ mod tests {
                 Some(4),
                 &[full_event()],
                 Some(5),
+                &topology,
             )
             .unwrap();
     }
@@ -393,6 +450,7 @@ mod tests {
             time_range: TimeRange::All,
             project: None,
             repo: None,
+            thread_role: None,
             limit: None,
             includes: ExportIncludes::full(),
         };

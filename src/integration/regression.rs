@@ -111,7 +111,13 @@ fn first_message_id(store: &Store, session_id: &str) -> i64 {
 }
 
 fn no_filters() -> SearchFilters {
-    SearchFilters { sources: None, time_range: TimeRange::All, directory: None, repo: None }
+    SearchFilters {
+        sources: None,
+        time_range: TimeRange::All,
+        directory: None,
+        repo: None,
+        thread_role: None,
+    }
 }
 
 #[test]
@@ -310,6 +316,7 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
         time_range: TimeRange::All,
         project: None,
         repo: None,
+        thread_role: None,
         limit: Some(10),
         includes: ExportIncludes::full(),
     };
@@ -320,10 +327,12 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     let lines: Vec<_> = text.lines().collect();
     assert_eq!(lines.len(), 1);
     let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(value["schema_version"], 4);
+    assert_eq!(value["schema_version"], 5);
     assert_eq!(value["record_type"], "session");
     assert_eq!(value["session"]["source"], "codex");
     assert_eq!(value["session"]["source_id"], "raw1");
+    assert_eq!(value["session"]["topology"]["thread_role"], serde_json::Value::Null);
+    assert_eq!(value["session"]["topology"]["parents"], serde_json::json!([]));
     assert_eq!(value["session"]["directory"], "/tmp/test");
     assert_eq!(value["session"]["repo_remote"], "github.com/samzong/Recall");
     assert_eq!(value["session"]["repo_slug"], "samzong/Recall");
@@ -374,6 +383,7 @@ fn export_jsonl_applies_include_projection() {
         time_range: TimeRange::All,
         project: None,
         repo: None,
+        thread_role: None,
         limit: None,
         includes: ExportIncludes { messages: true, usage: false, events: false },
     };
@@ -412,6 +422,7 @@ fn export_jsonl_can_select_sessions_by_id() {
         time_range: TimeRange::All,
         project: None,
         repo: None,
+        thread_role: None,
         limit: None,
         includes: ExportIncludes::full(),
     };
@@ -459,6 +470,7 @@ fn export_jsonl_applies_source_time_project_and_limit_filters() {
         time_range: TimeRange::Month,
         project: Some("/tmp/project".to_string()),
         repo: None,
+        thread_role: None,
         limit: Some(1),
         includes: ExportIncludes::full(),
     };
@@ -595,6 +607,7 @@ fn search_with_source_filter() {
         time_range: TimeRange::All,
         directory: None,
         repo: None,
+        thread_role: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
     assert_eq!(results.len(), 1);
@@ -630,6 +643,7 @@ fn search_with_directory_filter_respects_project_boundary() {
         time_range: TimeRange::All,
         directory: Some("/tmp/project".to_string()),
         repo: None,
+        thread_role: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
     let mut ids: Vec<String> = results.into_iter().map(|result| result.session.id).collect();
@@ -687,6 +701,7 @@ fn search_with_repo_filter_matches_sibling_worktrees() {
         time_range: TimeRange::All,
         directory: None,
         repo: Some(RepoFilter::Slug("samzong/Recall".to_string())),
+        thread_role: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
     let mut ids: Vec<String> = results.into_iter().map(|result| result.session.id).collect();
@@ -716,6 +731,7 @@ fn export_jsonl_applies_repo_filter() {
         time_range: TimeRange::All,
         project: None,
         repo: Some(RepoFilter::Slug("samzong/Recall".to_string())),
+        thread_role: None,
         limit: None,
         includes: ExportIncludes::full(),
     };
@@ -1321,4 +1337,62 @@ fn config_drops_obsolete_disabled_entries() {
 
     assert!(!config.disabled_sources.iter().any(|id| id == "ghost-adapter"));
     assert!(config.is_source_enabled("claude-code"), "cleared to avoid zero-source state");
+}
+
+#[test]
+fn hybrid_search_filters_by_thread_role_in_sql() {
+    use crate::db::search::ThreadRoleFilter;
+    use crate::db::store::SessionTopologyWrite;
+    use crate::types::ThreadRole;
+
+    let store = setup();
+    let persist = |id: &str, source_id: &str, role: ThreadRole| {
+        let session = make_session(id, "codex", source_id, "Topology search");
+        let messages = vec![make_message(id, Role::User, "cloudflare deploy token", 0)];
+        store
+            .persist_session_with_usage_and_events_with_topology(
+                &session,
+                &messages,
+                &[],
+                None,
+                &[],
+                None,
+                &SessionTopologyWrite {
+                    thread_role: Some(role),
+                    parents: &[],
+                    parser_version: Some(1),
+                },
+            )
+            .unwrap();
+    };
+    persist("p", "primary-src", ThreadRole::Primary);
+    persist("s", "sub-src", ThreadRole::Subagent);
+
+    let engine = SearchEngine::new(&store.conn);
+    let filter = |thread_role| SearchFilters {
+        sources: None,
+        time_range: TimeRange::All,
+        directory: None,
+        repo: None,
+        thread_role,
+    };
+    let source_ids = |results: Vec<crate::types::SearchResult>| {
+        let mut ids = results.into_iter().map(|r| r.session.source_id).collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+
+    // Role filtering happens in the SQL, so limit/offset apply to the filtered set.
+    let all = engine.hybrid_search("cloudflare", None, &filter(None), 10, 3).unwrap();
+    assert_eq!(source_ids(all), vec!["primary-src".to_string(), "sub-src".to_string()]);
+
+    let subs = engine
+        .hybrid_search("cloudflare", None, &filter(Some(ThreadRoleFilter::Subagent)), 10, 3)
+        .unwrap();
+    assert_eq!(source_ids(subs), vec!["sub-src".to_string()]);
+
+    let prims = engine
+        .hybrid_search("cloudflare", None, &filter(Some(ThreadRoleFilter::Primary)), 10, 3)
+        .unwrap();
+    assert_eq!(source_ids(prims), vec!["primary-src".to_string()]);
 }

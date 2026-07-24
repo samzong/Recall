@@ -88,6 +88,7 @@ fn scan_for_sync_impl(
         FileScanOptions {
             usage_parser_version: None,
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+            metadata_parser_version: None,
         },
         entries,
         |entry, mtime_ms| parse_copilot_session_for_entry(entry, mtime_ms, include_events),
