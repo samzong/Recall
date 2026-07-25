@@ -1,5 +1,32 @@
-use crate::types::{Message, Role, SessionUsageEventRecord};
+use crate::types::{Message, ParentRelation, Role, Session, SessionUsageEventRecord, ThreadRole};
 use crate::usage::TokenTotals;
+
+/// A saved viewer position, pushed onto the back-stack when drilling into a
+/// subagent so `q`/`Esc` can restore the parent session and cursor.
+#[derive(Debug, Clone)]
+pub(crate) struct ViewingFrame {
+    pub(crate) session: Session,
+    pub(crate) selected_msg: usize,
+    pub(crate) scroll_offset: usize,
+}
+
+/// One resolved parent link for the viewing header. `indexed` records whether
+/// the portable `(source, source_id)` parent is present in the local index.
+#[derive(Debug, Clone)]
+pub(crate) struct ViewingParent {
+    pub(crate) relation: ParentRelation,
+    pub(crate) source: String,
+    pub(crate) source_id: String,
+    pub(crate) indexed: bool,
+}
+
+/// Read-only topology snapshot for the currently viewed session, resolved once
+/// on entering the viewer so rendering never touches the store.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ViewingLineage {
+    pub(crate) role: Option<ThreadRole>,
+    pub(crate) parents: Vec<ViewingParent>,
+}
 
 pub(crate) struct SanitizedLine {
     pub(crate) text: String,

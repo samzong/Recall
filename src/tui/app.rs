@@ -29,8 +29,13 @@ use crate::tui::share_state::{
 };
 use crate::tui::text_layout::wrap_visual_rows;
 use crate::tui::usage_state::UsageTab;
-use crate::tui::viewing_state::{SanitizedLine, ViewingSessionSummary, build_viewing_caches};
-use crate::types::{BackgroundJobStatus, MatchSource, Message, SearchResult, SemanticProgress};
+use crate::tui::viewing_state::{
+    SanitizedLine, ViewingFrame, ViewingLineage, ViewingParent, ViewingSessionSummary,
+    build_viewing_caches,
+};
+use crate::types::{
+    BackgroundJobStatus, MatchSource, Message, SearchResult, SemanticProgress, Session,
+};
 use crate::usage::{self, UsageFilters, UsageReport};
 
 const USAGE_LOADING_MIN_MS: u128 = 75;
@@ -134,6 +139,16 @@ pub(crate) struct App {
     pub(crate) viewing_scroll_offset: usize,
     mouse_drag_target: Option<MouseDragTarget>,
     pub(crate) viewing_session_summary: Option<ViewingSessionSummary>,
+    pub(crate) viewing_lineage: Option<ViewingLineage>,
+    /// The session currently shown in the viewer, independent of the search
+    /// selection. Diverges from `results[selected_index]` after drilling into a
+    /// subagent. Viewing-mode actions target this session.
+    pub(crate) viewing_session: Option<Session>,
+    /// Subagents (spawn children) of `viewing_session`, for the picker.
+    pub(crate) viewing_children: Vec<Session>,
+    /// Back-stack of parent viewer positions for subagent drill-down.
+    pub(crate) viewing_stack: Vec<ViewingFrame>,
+    pub(crate) subagent_selected: usize,
     pub(crate) all_sources: Vec<(String, String)>,
     pub(crate) config: AppConfig,
     pub(crate) source_filter_selection: Vec<String>,
@@ -225,6 +240,11 @@ impl App {
             viewing_scroll_offset: 0,
             mouse_drag_target: None,
             viewing_session_summary: None,
+            viewing_lineage: None,
+            viewing_session: None,
+            viewing_children: Vec::new(),
+            viewing_stack: Vec::new(),
+            subagent_selected: 0,
             all_sources,
             config,
             source_filter_selection: Vec::new(),
@@ -441,7 +461,7 @@ impl App {
             AppMode::Usage => self.handle_usage_key(key, store),
             AppMode::Viewing => {
                 let before = self.viewing_selected_msg;
-                self.handle_viewing_key(key);
+                self.handle_viewing_key(key, store);
                 if matches!(self.mode, AppMode::Viewing) && self.viewing_selected_msg != before {
                     self.anchor_viewing_scroll();
                 }
@@ -451,6 +471,7 @@ impl App {
             AppMode::Settings => self.handle_settings_key(key, store),
             AppMode::Filters => self.handle_filters_key(key, store),
             AppMode::HandoffTarget => self.handle_handoff_target_key(key),
+            AppMode::Subagents => self.handle_subagents_key(key, store),
             AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
         }
     }
@@ -1205,7 +1226,7 @@ impl App {
         }
     }
 
-    fn handle_viewing_key(&mut self, key: KeyEvent) {
+    fn handle_viewing_key(&mut self, key: KeyEvent, store: &Store) {
         if self.viewing_search_input.is_some() {
             self.handle_viewing_search_input(key);
             return;
@@ -1221,16 +1242,10 @@ impl App {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.mode = AppMode::Search;
-                self.viewing_messages.clear();
-                self.viewing_selected_msg = 0;
-                self.viewing_scroll_offset = 0;
-                self.viewing_session_summary = None;
-                self.viewing_search_query.clear();
-                self.viewing_search_status = None;
-                self.viewing_sanitized_lines.clear();
-                self.viewing_match_cache.clear();
-                self.share_popup = None;
+                self.back_out_of_viewing(store);
+            }
+            KeyCode::Char('a') => {
+                self.open_subagents_picker();
             }
             KeyCode::Up | KeyCode::Char('k') if self.viewing_selected_msg > 0 => {
                 self.viewing_selected_msg -= 1;
@@ -1443,10 +1458,15 @@ impl App {
         source_action: session_action::SessionAction,
         action: PendingCommandAction,
     ) {
-        let Some(result) = self.results.get(self.selected_index) else {
+        let session = match origin {
+            ResumeOrigin::Viewing => self.viewing_session.clone(),
+            ResumeOrigin::Search => {
+                self.results.get(self.selected_index).map(|r| r.session.clone())
+            }
+        };
+        let Some(session) = session else {
             return;
         };
-        let session = &result.session;
         if session.is_import {
             self.status_message =
                 Some("Imported session: not resumable on this machine".to_string());
@@ -1497,10 +1517,9 @@ impl App {
     }
 
     fn start_handoff_confirmation(&mut self, target: &handoff::HandoffTarget) {
-        let Some(result) = self.results.get(self.selected_index) else {
+        let Some(session) = self.viewing_session.as_ref() else {
             return;
         };
-        let session = &result.session;
         let prompt = handoff::build_prompt(session, &self.viewing_messages);
         let command = handoff::command_for_target(target, prompt);
         self.pending_resume = Some(PendingResume {
@@ -2282,6 +2301,9 @@ impl App {
                 Some(format!("No indexed sessions for skill '{skill_id}' in this range"));
             return;
         }
+        // Skill drill-down deliberately shows the exact sessions that used the
+        // skill, including subagents — this is targeted evidence, not the
+        // browse list, so it is exempt from the list's subagent hiding.
         match store.list_sessions_by_ids(&session_ids) {
             Ok(sessions) if sessions.is_empty() => {
                 self.status_message =
@@ -2417,36 +2439,151 @@ impl App {
         }
     }
 
+    /// Load one session's transcript, summary, lineage, and subagents into the
+    /// viewer state. Does not seed the search query, jump to a match, or change
+    /// mode — callers own entry semantics. Returns false if messages can't load.
+    fn load_into_viewing(&mut self, session: Session, store: &Store) -> bool {
+        let Ok(msgs) = store.get_messages(&session.id) else {
+            return false;
+        };
+        let usage_events = store.list_usage_events_for_session(&session.id).unwrap_or_default();
+        self.viewing_session_summary = Some(ViewingSessionSummary::from_session(
+            &msgs,
+            session.duration_minutes,
+            &usage_events,
+        ));
+        let topology = store.session_topology(&session.id).unwrap_or_default();
+        let parents = topology
+            .parents
+            .iter()
+            .map(|parent| {
+                let indexed = store
+                    .get_session_by_source_id(&parent.source, &parent.source_id)
+                    .map(|found| found.is_some())
+                    .unwrap_or(false);
+                ViewingParent {
+                    relation: parent.relation,
+                    source: parent.source.clone(),
+                    source_id: parent.source_id.clone(),
+                    indexed,
+                }
+            })
+            .collect();
+        self.viewing_lineage = Some(ViewingLineage { role: topology.thread_role, parents });
+        self.viewing_children =
+            store.child_subagents(&session.source, &session.source_id).unwrap_or_default();
+        self.viewing_sanitized_lines = build_viewing_caches(&msgs);
+        self.viewing_messages = msgs;
+        self.viewing_session = Some(session);
+        self.viewing_selected_msg = 0;
+        self.viewing_scroll_offset = 0;
+        self.viewing_search_input = None;
+        self.viewing_search_input_cursor = 0;
+        self.viewing_search_status = None;
+        self.recompute_viewing_matches();
+        true
+    }
+
     fn enter_viewing(&mut self, store: &Store) {
-        if let Some(result) = self.results.get(self.selected_index)
-            && let Ok(msgs) = store.get_messages(&result.session.id)
-        {
-            let usage_events =
-                store.list_usage_events_for_session(&result.session.id).unwrap_or_default();
-            self.viewing_session_summary = Some(ViewingSessionSummary::from_session(
-                &msgs,
-                result.session.duration_minutes,
-                &usage_events,
-            ));
-            self.viewing_sanitized_lines = build_viewing_caches(&msgs);
-            self.viewing_messages = msgs;
-            self.viewing_selected_msg = 0;
-            self.viewing_scroll_offset = 0;
-            self.viewing_search_query = self
-                .query
-                .split(|c: char| !c.is_alphanumeric() && c != '_')
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            self.viewing_search_input = None;
-            self.viewing_search_input_cursor = 0;
-            self.viewing_search_status = None;
-            self.recompute_viewing_matches();
+        let Some(session) = self.results.get(self.selected_index).map(|r| r.session.clone()) else {
+            return;
+        };
+        self.viewing_search_query = self
+            .query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if self.load_into_viewing(session, store) {
+            self.viewing_stack.clear();
             if let Some(&first) = self.viewing_match_cache.first() {
                 self.viewing_selected_msg = first;
             }
             self.mode = AppMode::Viewing;
         }
+    }
+
+    fn open_subagents_picker(&mut self) {
+        if self.viewing_children.is_empty() {
+            self.status_message = Some("No subagents".to_string());
+            return;
+        }
+        self.subagent_selected = 0;
+        self.mode = AppMode::Subagents;
+    }
+
+    fn handle_subagents_key(&mut self, key: KeyEvent, store: &Store) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = AppMode::Viewing;
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.subagent_selected > 0 => {
+                self.subagent_selected -= 1;
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if self.subagent_selected + 1 < self.viewing_children.len() =>
+            {
+                self.subagent_selected += 1;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.drill_into_subagent(store);
+            }
+            _ => {}
+        }
+    }
+
+    fn drill_into_subagent(&mut self, store: &Store) {
+        let Some(child) = self.viewing_children.get(self.subagent_selected).cloned() else {
+            return;
+        };
+        if let Some(session) = self.viewing_session.clone() {
+            self.viewing_stack.push(ViewingFrame {
+                session,
+                selected_msg: self.viewing_selected_msg,
+                scroll_offset: self.viewing_scroll_offset,
+            });
+        }
+        if self.load_into_viewing(child, store) {
+            if let Some(&first) = self.viewing_match_cache.first() {
+                self.viewing_selected_msg = first;
+            }
+            self.anchor_viewing_scroll();
+        }
+        self.mode = AppMode::Viewing;
+    }
+
+    /// `q`/`Esc` in the viewer: pop back to the parent session if we drilled
+    /// into a subagent, otherwise leave the viewer for the search list.
+    fn back_out_of_viewing(&mut self, store: &Store) {
+        let Some(frame) = self.viewing_stack.pop() else {
+            self.exit_viewing_to_search();
+            return;
+        };
+        let selected_msg = frame.selected_msg;
+        let scroll_offset = frame.scroll_offset;
+        if self.load_into_viewing(frame.session, store) {
+            self.viewing_selected_msg =
+                selected_msg.min(self.viewing_messages.len().saturating_sub(1));
+            self.viewing_scroll_offset = scroll_offset;
+            self.anchor_viewing_scroll();
+        }
+    }
+
+    fn exit_viewing_to_search(&mut self) {
+        self.mode = AppMode::Search;
+        self.viewing_messages.clear();
+        self.viewing_selected_msg = 0;
+        self.viewing_scroll_offset = 0;
+        self.viewing_session_summary = None;
+        self.viewing_lineage = None;
+        self.viewing_session = None;
+        self.viewing_children.clear();
+        self.viewing_stack.clear();
+        self.viewing_search_query.clear();
+        self.viewing_search_status = None;
+        self.viewing_sanitized_lines.clear();
+        self.viewing_match_cache.clear();
+        self.share_popup = None;
     }
 
     fn copy_current_message(&mut self) {
@@ -2457,10 +2594,9 @@ impl App {
     }
 
     fn preview_current_session(&mut self) {
-        let Some(result) = self.results.get(self.selected_index) else {
+        let Some(session) = self.viewing_session.clone() else {
             return;
         };
-        let session = result.session.clone();
         let messages = self.viewing_messages.clone();
         let session_id = session.id.clone();
         let usage_events = crate::db::store::Store::open()
@@ -2479,14 +2615,13 @@ impl App {
     }
 
     fn share_current_session(&mut self) {
-        let Some(result) = self.results.get(self.selected_index) else {
+        let Some(session) = self.viewing_session.clone() else {
             return;
         };
         if self.share_publish_rx.is_some() {
             return;
         }
         let config = self.config.clone();
-        let session = result.session.clone();
         let messages = self.viewing_messages.clone();
         let session_id = session.id.clone();
         let (tx, rx) = mpsc::channel();
@@ -2531,8 +2666,8 @@ impl App {
     }
 
     fn start_export(&mut self) {
-        let session = match self.results.get(self.selected_index) {
-            Some(r) => &r.session,
+        let session = match self.viewing_session.as_ref() {
+            Some(session) => session,
             None => return,
         };
 
@@ -2586,8 +2721,8 @@ impl App {
     }
 
     fn do_export(&mut self, path: &str) {
-        let session = match self.results.get(self.selected_index) {
-            Some(r) => &r.session,
+        let session = match self.viewing_session.as_ref() {
+            Some(session) => session,
             None => return,
         };
 
@@ -2685,6 +2820,11 @@ mod tests {
             viewing_scroll_offset: 0,
             mouse_drag_target: None,
             viewing_session_summary: None,
+            viewing_lineage: None,
+            viewing_session: None,
+            viewing_children: Vec::new(),
+            viewing_stack: Vec::new(),
+            subagent_selected: 0,
             all_sources: vec![
                 source("claude", "Claude"),
                 source("cursor", "Cursor"),
@@ -3371,14 +3511,17 @@ mod tests {
 
     #[test]
     fn imported_session_can_handoff_from_detail_view() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
         let mut app = app_with_sources();
         let mut result = codex_search_result();
         result.session.is_import = true;
+        app.viewing_session = Some(result.session.clone());
         app.results = vec![result];
         app.viewing_messages = vec![message(Role::User, None, 0)];
         app.mode = AppMode::Viewing;
 
-        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), &store);
         assert!(matches!(app.mode, AppMode::HandoffTarget));
 
         app.handle_handoff_target_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -3388,6 +3531,70 @@ mod tests {
         assert_eq!(pending.action, PendingCommandAction::Handoff);
         assert_eq!(pending.command.program, "codex");
         assert!(pending.command.args[0].contains("This is a handoff, not a native resume."));
+    }
+
+    #[test]
+    fn subagent_drilldown_switches_viewing_session_and_pops_back() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+
+        let mut primary = codex_search_result();
+        primary.session.id = "primary1".to_string();
+        primary.session.source_id = "P".to_string();
+        primary.session.title = "Primary task".to_string();
+        let mut child = codex_search_result();
+        child.session.id = "child1".to_string();
+        child.session.source_id = "C".to_string();
+        child.session.title = "review-diff".to_string();
+        store.insert_session(&primary.session).unwrap();
+        store.insert_session(&child.session).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO session_parent_links
+                     (session_id, relation, parent_source, parent_source_id)
+                 VALUES (?1, 'spawn', ?2, ?3)",
+                rusqlite::params!["child1", "codex", "P"],
+            )
+            .unwrap();
+
+        app.results = vec![primary];
+        app.selected_index = 0;
+        app.enter_viewing(&store);
+
+        assert_eq!(app.viewing_children.len(), 1, "primary should list its spawn child");
+        assert_eq!(app.viewing_children[0].source_id, "C");
+        assert_eq!(app.viewing_session.as_ref().unwrap().source_id, "P");
+
+        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &store);
+        assert!(matches!(app.mode, AppMode::Subagents));
+
+        app.handle_subagents_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &store);
+        assert!(matches!(app.mode, AppMode::Viewing));
+        assert_eq!(app.viewing_session.as_ref().unwrap().source_id, "C", "drilled into the child");
+        assert_eq!(app.viewing_stack.len(), 1);
+
+        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &store);
+        assert!(matches!(app.mode, AppMode::Viewing), "q pops back to the parent, not search");
+        assert_eq!(app.viewing_session.as_ref().unwrap().source_id, "P");
+        assert!(app.viewing_stack.is_empty());
+
+        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &store);
+        assert!(matches!(app.mode, AppMode::Search), "q at the root leaves the viewer");
+    }
+
+    #[test]
+    fn subagent_picker_no_op_without_children() {
+        let mut app = app_with_sources();
+        app.viewing_session = Some(codex_search_result().session);
+        app.viewing_children.clear();
+        app.mode = AppMode::Viewing;
+
+        app.open_subagents_picker();
+
+        assert!(matches!(app.mode, AppMode::Viewing), "no picker without subagents");
+        assert_eq!(app.status_message.as_deref(), Some("No subagents"));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::tui::layout::search_layout;
 use crate::tui::search_state::{FilterFocus, PanelFocus};
 use crate::tui::text_layout::wrap_visual_rows;
 use crate::tui::theme::THEME;
-use crate::types::{MatchSource, Role};
+use crate::types::Role;
 
 use super::popups::render_status_bar;
 use super::{render_vertical_scrollbar, row_visible, truncate_label};
@@ -204,11 +204,6 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
             let s = &result.session;
             let age = crate::utils::format_age(s.started_at);
             let source_label = app.source_label_for(&s.source);
-            let match_label = match result.match_source {
-                MatchSource::Fts => "F",
-                MatchSource::Vector => "V",
-                MatchSource::Hybrid => "H",
-            };
             let title: String = s.title.chars().take(40).collect();
             let selected = i == app.selected_index;
             let active_selected = focused && selected;
@@ -225,15 +220,6 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(
                     source_label.to_string(),
                     if selected { selected_text_style } else { Style::default().fg(THEME.source) },
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    match_label.to_string(),
-                    if selected {
-                        selected_text_style
-                    } else {
-                        Style::default().fg(THEME.text_muted)
-                    },
                 ),
                 Span::raw(" "),
                 Span::styled(

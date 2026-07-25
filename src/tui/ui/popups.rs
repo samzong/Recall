@@ -3,7 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::handoff;
 use crate::tui::app::App;
@@ -12,6 +12,102 @@ use crate::tui::share_state::PendingCommandAction;
 use crate::tui::theme::THEME;
 
 use super::truncate_start;
+
+/// Truncate `s` to at most `max` terminal columns (CJK-aware), appending `…`.
+fn truncate_to_width(s: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > max.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+
+pub(super) fn render_subagents_picker(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(48, 96).min(area.width);
+    let count = app.viewing_children.len();
+    let desired_height = count as u16 + 5;
+    let height = desired_height.clamp(8, area.height.saturating_sub(2).max(8));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .title(format!(" Subagents ({count}) "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME.accent))
+        .style(Style::default().bg(THEME.popup_bg));
+
+    // Inner width available for one row, minus the leading " > " marker.
+    let inner = (width as usize).saturating_sub(2);
+    let marker_w = 3;
+
+    // Scroll the row window so the selected subagent stays visible. Rows share
+    // the popup with the border (2), a top blank (1), and a blank + help (2).
+    let visible_rows = (height as usize).saturating_sub(5).max(1);
+    let start = if app.subagent_selected < visible_rows {
+        0
+    } else {
+        app.subagent_selected + 1 - visible_rows
+    };
+    let end = (start + visible_rows).min(count);
+
+    let mut lines = vec![Line::from("")];
+    for (offset, child) in app.viewing_children[start..end].iter().enumerate() {
+        let index = start + offset;
+        let selected = index == app.subagent_selected;
+        let marker = if selected { ">" } else { " " };
+        let style = if selected {
+            Style::default().fg(THEME.selected_fg).bg(THEME.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(THEME.text)
+        };
+        let meta = format!(
+            "{} · {} · {} msgs",
+            app.source_label_for(&child.source),
+            crate::utils::format_age(child.started_at),
+            child.message_count
+        );
+        let meta_w = UnicodeWidthStr::width(meta.as_str());
+        let title_budget = inner.saturating_sub(marker_w + meta_w + 2);
+        let title = truncate_to_width(&child.title, title_budget);
+        let gap =
+            inner.saturating_sub(marker_w + UnicodeWidthStr::width(title.as_str()) + meta_w).max(1);
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker} "), style),
+            Span::styled(title, style),
+            Span::styled(" ".repeat(gap), style),
+            Span::styled(
+                meta,
+                if selected { style } else { Style::default().fg(THEME.text_muted) },
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" [Enter] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("open  ", Style::default().fg(THEME.text)),
+        Span::styled("[Esc] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("close", Style::default().fg(THEME.text)),
+    ]));
+
+    let widget = Paragraph::new(lines).block(block);
+    f.render_widget(Clear, rect);
+    f.render_widget(widget, rect);
+}
 
 pub(super) fn render_handoff_target_picker(f: &mut Frame, app: &App) {
     let area = f.area();

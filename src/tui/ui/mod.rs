@@ -161,6 +161,10 @@ pub(crate) fn render(f: &mut Frame, app: &App) {
             viewing::render_viewing(f, app);
             popups::render_handoff_target_picker(f, app);
         }
+        AppMode::Subagents => {
+            viewing::render_viewing(f, app);
+            popups::render_subagents_picker(f, app);
+        }
         AppMode::ExportInput => {
             viewing::render_viewing(f, app);
             popups::render_export_input(f, app);
@@ -288,6 +292,52 @@ mod tests {
         assert!(!rendered.contains("Session 1"));
         assert!(rendered.contains("Session 2"));
         assert!(rendered.contains("Session 4"));
+    }
+
+    #[test]
+    fn render_viewing_shows_subagent_hint_and_picker() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.viewing_session = Some(numbered_session_result(1).session);
+        app.viewing_children =
+            vec![numbered_session_result(2).session, numbered_session_result(3).session];
+        app.viewing_messages = vec![Message {
+            session_id: "session1".to_string(),
+            role: Role::User,
+            content: "hello".to_string(),
+            timestamp: None,
+            seq: 0,
+        }];
+
+        app.mode = AppMode::Viewing;
+        let viewing = render_to_text(&app, 80, 12);
+        assert!(viewing.contains("▾ 2 subs"), "header hints at subagents:\n{viewing}");
+
+        app.mode = AppMode::Subagents;
+        let picker = render_to_text(&app, 80, 12);
+        assert!(picker.contains("Subagents (2)"), "picker title:\n{picker}");
+        assert!(picker.contains("Session 2"));
+        assert!(picker.contains("Session 3"));
+    }
+
+    #[test]
+    fn render_subagents_picker_scrolls_selection_into_view() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.viewing_session = Some(numbered_session_result(1).session);
+        app.viewing_children = (1..=20).map(|n| numbered_session_result(n).session).collect();
+        app.subagent_selected = 19;
+        app.mode = AppMode::Subagents;
+
+        let picker = render_to_text(&app, 80, 12);
+
+        assert!(picker.contains("Session 20"), "selected last row is visible:\n{picker}");
+        assert!(picker.contains("Session 16"), "window keeps rows near the selection:\n{picker}");
+        assert!(!picker.contains("Session 15"), "rows above the window are hidden:\n{picker}");
     }
 
     #[test]

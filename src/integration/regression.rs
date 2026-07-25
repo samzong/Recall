@@ -615,6 +615,38 @@ fn search_with_source_filter() {
 }
 
 #[test]
+fn search_surfaces_subagent_content_when_parent_does_not_match() {
+    let store = setup();
+    store.insert_session(&make_session("parent", "codex", "P", "Primary")).unwrap();
+    store.insert_session(&make_session("child", "codex", "C", "Subagent")).unwrap();
+    // Child is a subagent spawned by the indexed parent — but only the child's
+    // transcript matches the query, so hiding it would make the hit unreachable.
+    store
+        .conn
+        .execute("UPDATE sessions SET thread_role = 'subagent' WHERE id = 'child'", [])
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO session_parent_links
+                 (session_id, relation, parent_source, parent_source_id)
+             VALUES ('child', 'spawn', 'codex', 'P')",
+            [],
+        )
+        .unwrap();
+    let messages = vec![
+        make_message("parent", Role::User, "set up deployment", 0),
+        make_message("child", Role::User, "investigate the flaky wombat test", 0),
+    ];
+    store.insert_messages(&messages).unwrap();
+
+    let engine = SearchEngine::new(&store.conn);
+    let results = engine.hybrid_search("wombat", None, &no_filters(), 10, 3).unwrap();
+    let ids: Vec<String> = results.into_iter().map(|result| result.session.id).collect();
+    assert_eq!(ids, vec!["child".to_string()], "subagent content stays searchable");
+}
+
+#[test]
 fn search_with_directory_filter_respects_project_boundary() {
     let store = setup();
     let mut exact = make_session("s1", "codex", "raw1", "Exact project");

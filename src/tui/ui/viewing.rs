@@ -17,18 +17,50 @@ use super::{
     truncate_label,
 };
 
+/// Compact parent-lineage segment for the viewing header title. Empty when the
+/// session has no recorded parents. Long lists are truncated by the block title.
+fn lineage_suffix(app: &App) -> String {
+    let Some(lineage) = app.viewing_lineage.as_ref() else {
+        return String::new();
+    };
+    if lineage.parents.is_empty() {
+        return String::new();
+    }
+    let parents = lineage
+        .parents
+        .iter()
+        .map(|parent| {
+            let short_id: String = parent.source_id.chars().take(8).collect();
+            let marker = if parent.indexed { "" } else { " (ext)" };
+            format!("{} {}/{short_id}{marker}", parent.relation.as_str(), parent.source)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" · parents: {parents}")
+}
+
 pub(super) fn render_viewing(f: &mut Frame, app: &App) {
     let layout = viewing_layout(f.area());
 
     let session_info = app
-        .results
-        .get(app.selected_index)
-        .map(|r| {
-            let s = &r.session;
+        .viewing_session
+        .as_ref()
+        .map(|s| {
             let dir = s.directory.as_deref().unwrap_or("");
             let count = app.viewing_messages.len();
             let pos = app.viewing_selected_msg + 1;
-            format!(" {} — {dir} [{pos}/{count}] ", s.title)
+            let role = app
+                .viewing_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.role)
+                .map(|role| format!(" [{}]", role.as_str()))
+                .unwrap_or_default();
+            let subs = if app.viewing_children.is_empty() {
+                String::new()
+            } else {
+                format!("  ▾ {} subs", app.viewing_children.len())
+            };
+            format!(" {}{role} — {dir} [{pos}/{count}]{}{subs} ", s.title, lineage_suffix(app))
         })
         .unwrap_or_else(|| " Conversation ".to_string());
 
@@ -106,7 +138,7 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         viewport_start,
     );
 
-    let help_spans = vec![
+    let mut help_spans = vec![
         Span::styled(" ↑/↓", Style::default().fg(THEME.accent)),
         Span::styled(" messages  ", Style::default().fg(THEME.text_muted)),
         Span::styled("/", Style::default().fg(THEME.accent)),
@@ -121,13 +153,19 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" share  ", Style::default().fg(THEME.text_muted)),
         Span::styled("h", Style::default().fg(THEME.accent)),
         Span::styled(" handoff  ", Style::default().fg(THEME.text_muted)),
+    ];
+    if !app.viewing_children.is_empty() {
+        help_spans.push(Span::styled("a", Style::default().fg(THEME.accent)));
+        help_spans.push(Span::styled(" subs  ", Style::default().fg(THEME.text_muted)));
+    }
+    help_spans.extend([
         Span::styled("Ctrl+R", Style::default().fg(THEME.accent)),
         Span::styled(" resume  ", Style::default().fg(THEME.text_muted)),
         Span::styled("Ctrl+O", Style::default().fg(THEME.accent)),
         Span::styled(" app  ", Style::default().fg(THEME.text_muted)),
         Span::styled("Esc/q", Style::default().fg(THEME.accent)),
         Span::styled(" back", Style::default().fg(THEME.text_muted)),
-    ];
+    ]);
 
     let status_line = if let Some(ref input) = app.viewing_search_input {
         Line::from(vec![

@@ -16,6 +16,7 @@ pub(crate) enum AppMode {
     Settings,
     Filters,
     HandoffTarget,
+    Subagents,
     ConfirmResume,
 }
 

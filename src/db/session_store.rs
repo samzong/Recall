@@ -324,6 +324,23 @@ impl Store {
         Ok(SessionTopology { thread_role, parents })
     }
 
+    /// Sessions whose `spawn` parent is the given portable identity — the
+    /// subagents this session directly spawned. `fork`/`resume` links are not
+    /// subagents and are excluded. Uses `idx_session_parent_links_parent`.
+    pub(crate) fn child_subagents(&self, source: &str, source_id: &str) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS}
+             FROM sessions s
+             JOIN session_parent_links l ON l.session_id = s.id
+             WHERE l.parent_source = ?1
+               AND l.parent_source_id = ?2
+               AND l.relation = 'spawn'
+             ORDER BY s.started_at, s.id"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![source, source_id], session_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub(crate) fn metadata_state_meta_map(
         &self,
         source: &str,
@@ -523,7 +540,46 @@ impl Store {
         for row in rows {
             sessions.push(row?);
         }
+        drop(stmt);
+
+        // Hide a subagent only when its spawn parent is present in this same
+        // scoped result set — then it is reachable through the parent's picker.
+        // Orphaned subagents, and children whose parent falls outside the active
+        // scope or the result limit, stay visible so nothing becomes unreachable.
+        self.retain_visible_subagents(&mut sessions)?;
         Ok(sessions)
+    }
+
+    fn retain_visible_subagents(&self, sessions: &mut Vec<Session>) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
+        let child_ph: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+        let parent_ph: Vec<String> =
+            ((ids.len() + 1)..=(2 * ids.len())).map(|i| format!("?{i}")).collect();
+        let hide_sql = format!(
+            "SELECT s.id
+             FROM sessions s
+             JOIN session_parent_links l ON l.session_id = s.id AND l.relation = 'spawn'
+             JOIN sessions p ON p.source = l.parent_source AND p.source_id = l.parent_source_id
+             WHERE s.thread_role = 'subagent'
+               AND s.id IN ({})
+               AND p.id IN ({})",
+            child_ph.join(", "),
+            parent_ph.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .chain(ids.iter().map(|id| id as &dyn rusqlite::types::ToSql))
+            .collect();
+        let mut stmt = self.conn.prepare(&hide_sql)?;
+        let hidden: HashSet<String> = stmt
+            .query_map(params.as_slice(), |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        sessions.retain(|session| !hidden.contains(&session.id));
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1074,5 +1130,112 @@ mod topology_tests {
         assert_eq!(ids(ThreadRoleFilter::Primary), vec!["primary".to_string()]);
         assert_eq!(ids(ThreadRoleFilter::Subagent), vec!["subagent".to_string()]);
         assert_eq!(ids(ThreadRoleFilter::Unknown), vec!["unknown".to_string()]);
+    }
+
+    #[test]
+    fn recent_sessions_for_search_scope_hides_only_reachable_subagents() {
+        let store = store();
+        persist(
+            &store,
+            &sess("primary"),
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Primary),
+                parents: &[],
+                parser_version: Some(1),
+            },
+        );
+        // Reachable subagent: spawn parent is the indexed "primary" — hidden,
+        // because it can be opened from primary's subagent picker.
+        let spawn_parent = ParentLink {
+            relation: ParentRelation::Spawn,
+            source: "codex".to_string(),
+            source_id: "primary".to_string(),
+        };
+        persist(
+            &store,
+            &sess("child"),
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Subagent),
+                parents: std::slice::from_ref(&spawn_parent),
+                parser_version: Some(1),
+            },
+        );
+        // Orphaned subagent: no parent link — must stay visible in the list.
+        persist(
+            &store,
+            &sess("orphan"),
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Subagent),
+                parents: &[],
+                parser_version: Some(1),
+            },
+        );
+        persist(
+            &store,
+            &sess("unknown"),
+            &SessionTopologyWrite { thread_role: None, parents: &[], parser_version: Some(1) },
+        );
+
+        let mut ids = store
+            .list_recent_sessions_for_search_scope(None, TimeRange::All, None, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.source_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["orphan".to_string(), "primary".to_string(), "unknown".to_string()],
+            "reachable child hidden; orphaned subagent stays visible"
+        );
+    }
+
+    #[test]
+    fn recent_sessions_keeps_subagent_when_parent_is_out_of_scope() {
+        let store = store();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut parent = sess("primary");
+        parent.started_at = now - 3 * 86_400_000;
+        parent.updated_at = Some(parent.started_at);
+        let mut child = sess("child");
+        child.started_at = now;
+        child.updated_at = Some(now);
+        persist(
+            &store,
+            &parent,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Primary),
+                parents: &[],
+                parser_version: Some(1),
+            },
+        );
+        let spawn = ParentLink {
+            relation: ParentRelation::Spawn,
+            source: "codex".to_string(),
+            source_id: "primary".to_string(),
+        };
+        persist(
+            &store,
+            &child,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Subagent),
+                parents: std::slice::from_ref(&spawn),
+                parser_version: Some(1),
+            },
+        );
+
+        // Under Today, the parent (3 days ago) is filtered out; the child must
+        // stay visible because its picker is unreachable without the parent.
+        let ids: Vec<String> = store
+            .list_recent_sessions_for_search_scope(None, TimeRange::Today, None, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.source_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["child".to_string()],
+            "subagent stays visible when its parent is out of the active scope"
+        );
     }
 }
