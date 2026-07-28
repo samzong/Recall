@@ -1,6 +1,6 @@
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,6 @@ use crate::tui::usage_state::UsageTab;
 use crate::tui::viewing_state::{SanitizedLine, ViewingSessionSummary, build_viewing_caches};
 use crate::types::{BackgroundJobStatus, MatchSource, Message, SearchResult, SemanticProgress};
 use crate::usage::{self, UsageFilters, UsageReport};
-use crate::utils::clipboard_candidates;
 
 const USAGE_LOADING_MIN_MS: u128 = 75;
 const SEARCH_DEBOUNCE_MS: u64 = 250;
@@ -2508,21 +2507,10 @@ impl App {
     }
 
     fn copy_to_clipboard(&mut self, text: &str) {
-        for (cmd, args) in clipboard_candidates() {
-            match Command::new(cmd).args(*args).stdin(Stdio::piped()).spawn() {
-                Ok(mut child) => {
-                    if let Some(ref mut stdin) = child.stdin {
-                        let _ = stdin.write_all(text.as_bytes());
-                    }
-                    let _ = child.wait();
-                    self.status_message = Some("Copied to clipboard".to_string());
-                    return;
-                }
-                Err(_) => continue,
-            }
-        }
-        self.status_message =
-            Some("Failed to copy (install wl-clipboard, xclip, or xsel)".to_string());
+        self.status_message = Some(match crate::utils::copy_to_clipboard(text) {
+            Ok(()) => "Copied to clipboard".to_string(),
+            Err(error) => error.to_string(),
+        });
     }
 
     fn start_export(&mut self) {

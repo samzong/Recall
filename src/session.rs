@@ -1,7 +1,5 @@
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use crate::adapters;
 use crate::config::AppConfig;
@@ -14,7 +12,7 @@ use crate::semantic;
 use crate::session_action::{self, SessionAction};
 use crate::types::{MatchSource, Message, Role, Session};
 use crate::{sync::SyncRunOptions, sync::run_sync_job_inner, transcript};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Subcommand)]
@@ -558,7 +556,7 @@ fn cmd_session_share(
     };
 
     if copy_url {
-        copy_to_clipboard(&url)?;
+        crate::utils::copy_to_clipboard(&url)?;
     }
     if open {
         crate::utils::open_url_in_default_browser(&url)?;
@@ -923,43 +921,6 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn try_clipboard_candidates(candidates: &[(&str, &[&str])], text: &str) -> Result<()> {
-    let mut last_err: Option<anyhow::Error> = None;
-    for (program, args) in candidates {
-        let mut child = match Command::new(program).args(*args).stdin(Stdio::piped()).spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                last_err = Some(err.into());
-                continue;
-            }
-        };
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let status = match child.wait() {
-            Ok(status) => status,
-            Err(err) => {
-                last_err = Some(
-                    anyhow::Error::new(err)
-                        .context(format!("{program} failed while waiting for exit")),
-                );
-                continue;
-            }
-        };
-        if !status.success() {
-            last_err = Some(anyhow::anyhow!("{program} exited with status {status}"));
-            continue;
-        }
-        return Ok(());
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no clipboard utility found")))
-        .context("Failed to copy to clipboard (install wl-clipboard, xclip, or xsel)")
-}
-
-fn copy_to_clipboard(text: &str) -> Result<()> {
-    try_clipboard_candidates(crate::utils::clipboard_candidates(), text)
-}
-
 fn read_tldr_file(path: &Path) -> Option<String> {
     match fs::read_to_string(path) {
         Ok(content) => {
@@ -1012,34 +973,5 @@ mod tests {
         assert_eq!(read_tldr_file(&path), None);
 
         let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn try_clipboard_candidates_falls_through_after_spawn_failure() {
-        let candidates: &[(&str, &[&str])] = &[
-            ("recall-test-nonexistent-clipboard-tool-xyz", &[]),
-            ("sh", &["-c", "cat >/dev/null; exit 0"]),
-        ];
-
-        assert!(try_clipboard_candidates(candidates, "hello").is_ok());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn try_clipboard_candidates_falls_through_after_nonzero_exit() {
-        let candidates: &[(&str, &[&str])] =
-            &[("sh", &["-c", "cat >/dev/null; exit 1"]), ("sh", &["-c", "cat >/dev/null; exit 0"])];
-
-        assert!(try_clipboard_candidates(candidates, "hello").is_ok());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn try_clipboard_candidates_errors_when_all_candidates_fail() {
-        let candidates: &[(&str, &[&str])] = &[("sh", &["-c", "cat >/dev/null; exit 1"])];
-
-        let err = try_clipboard_candidates(candidates, "hello").unwrap_err();
-        assert!(err.to_string().contains("Failed to copy to clipboard"));
     }
 }

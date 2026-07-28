@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::Write as _;
+use std::process::{Command, Stdio};
 
 pub(crate) fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
@@ -27,6 +28,46 @@ pub(crate) fn clipboard_candidates() -> &'static [(&'static str, &'static [&'sta
             ("xsel", &["--clipboard", "--input"]),
         ]
     }
+}
+
+fn try_clipboard_candidates(candidates: &[(&str, &[&str])], text: &str) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for (program, args) in candidates {
+        let mut child = match Command::new(program).args(*args).stdin(Stdio::piped()).spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                last_error = Some(error.into());
+                continue;
+            }
+        };
+        let write_error = match child.stdin.take() {
+            Some(mut stdin) => stdin.write_all(text.as_bytes()).err().map(anyhow::Error::from),
+            None => Some(anyhow::anyhow!("{program} stdin unavailable")),
+        };
+        let status = child.wait();
+        if let Some(error) = write_error {
+            last_error = Some(anyhow::anyhow!("{program} stdin write failed: {error}"));
+            continue;
+        }
+        match status {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_error = Some(anyhow::anyhow!("{program} exited with status {status}"));
+            }
+            Err(error) => {
+                last_error = Some(anyhow::anyhow!("{program} wait failed: {error}"));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no clipboard utility found")))
+}
+
+pub(crate) fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
+    try_clipboard_candidates(clipboard_candidates(), text).map_err(|error| {
+        anyhow::anyhow!(
+            "Failed to copy to clipboard (install wl-clipboard, xclip, or xsel): {error}"
+        )
+    })
 }
 
 pub(crate) fn format_age(started_at: i64) -> String {
@@ -140,6 +181,46 @@ mod tests {
                 ("xsel", &["--clipboard", "--input"][..]),
             ]
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn clipboard_candidates_fall_through_after_spawn_failure() {
+        let candidates: &[(&str, &[&str])] = &[
+            ("recall-test-nonexistent-clipboard-tool-xyz", &[]),
+            ("sh", &["-c", "cat >/dev/null; exit 0"]),
+        ];
+
+        assert!(try_clipboard_candidates(candidates, "hello").is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn clipboard_candidates_fall_through_after_nonzero_exit() {
+        let candidates: &[(&str, &[&str])] =
+            &[("sh", &["-c", "cat >/dev/null; exit 1"]), ("sh", &["-c", "cat >/dev/null; exit 0"])];
+
+        assert!(try_clipboard_candidates(candidates, "hello").is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn clipboard_candidates_reject_partial_stdin_write() {
+        let candidates: &[(&str, &[&str])] = &[
+            ("sh", &["-c", "dd bs=1 count=1 of=/dev/null 2>/dev/null"]),
+            ("sh", &["-c", "cat >/dev/null; exit 1"]),
+        ];
+        let text = "x".repeat(1024 * 1024);
+
+        assert!(try_clipboard_candidates(candidates, &text).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn clipboard_candidates_error_when_all_fail() {
+        let candidates: &[(&str, &[&str])] = &[("sh", &["-c", "cat >/dev/null; exit 1"])];
+
+        assert!(try_clipboard_candidates(candidates, "hello").is_err());
     }
 
     #[test]
