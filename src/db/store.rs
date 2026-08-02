@@ -81,7 +81,7 @@ pub(crate) struct SessionTopologyWrite<'a> {
 }
 
 impl SessionTopologyWrite<'_> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench"))]
     pub(crate) fn none() -> SessionTopologyWrite<'static> {
         SessionTopologyWrite { thread_role: None, parents: &[], parser_version: None }
     }
@@ -115,7 +115,7 @@ impl Store {
         Ok(Store { conn })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench"))]
     pub(crate) fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;

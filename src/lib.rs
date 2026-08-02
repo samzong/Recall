@@ -1,5 +1,7 @@
 pub(crate) mod adapters;
 pub(crate) mod bench;
+#[cfg(feature = "bench")]
+pub mod bench_api;
 pub(crate) mod cli;
 pub(crate) mod config;
 pub(crate) mod db;

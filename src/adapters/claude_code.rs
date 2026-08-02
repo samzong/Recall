@@ -341,10 +341,10 @@ fn parse_claude_session_file(
     }))
 }
 
-struct ParsedConversation {
-    messages: Vec<RawMessage>,
-    usage_events: Vec<RawUsageEvent>,
-    events: Vec<RawSessionEvent>,
+pub(crate) struct ParsedConversation {
+    pub(crate) messages: Vec<RawMessage>,
+    pub(crate) usage_events: Vec<RawUsageEvent>,
+    pub(crate) events: Vec<RawSessionEvent>,
     cwd: Option<String>,
     custom_title: Option<String>,
     summary: Option<String>,
@@ -353,7 +353,7 @@ struct ParsedConversation {
     session_id: Option<String>,
 }
 
-fn parse_conversation_jsonl(
+pub(crate) fn parse_conversation_jsonl(
     path: &Path,
     fallback_timestamp: i64,
     include_events: bool,

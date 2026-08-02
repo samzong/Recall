@@ -2,6 +2,8 @@
 
 # Recall
 
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/samzong/Recall?utm_source=badge)
+
 > Local-first search across every AI coding session on your machine.
 
 [![Recall](docs/recall.png)](https://asciinema.org/a/909453)

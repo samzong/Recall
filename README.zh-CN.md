@@ -2,6 +2,8 @@
 
 # Recall
 
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/samzong/Recall?utm_source=badge)
+
 > 本地优先，搜索你机器上所有 AI 编程会话。
 
 [![Recall](docs/recall.png)](https://asciinema.org/a/909453)

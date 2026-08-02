@@ -253,7 +253,7 @@ fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
     parse_codex_session_with_options(path, true)
 }
 
-fn parse_codex_session_with_options(
+pub(crate) fn parse_codex_session_with_options(
     path: &Path,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {

@@ -1,7 +1,7 @@
 mod assets;
-mod meta;
+pub(crate) mod meta;
 mod publish;
-mod render;
+pub(crate) mod render;
 
 pub(crate) use publish::{
     default_project_name, default_publish_dir, expand_path, init_cloudflare_pages,

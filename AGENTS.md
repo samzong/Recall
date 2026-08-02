@@ -22,6 +22,7 @@ make build                            # debug build
 make run                              # launch TUI
 make sync                             # cargo run -- sync (FORCE=1 reprocesses all)
 make search Q="query"                 # CLI search
+make bench                            # CodSpeed benchmarks (needs the codspeed CLI)
 cargo test <name>                     # run a single test by name filter
 cargo test integration::regression    # regression suite
 cargo test integration::eval_harness  # eval harness
@@ -81,6 +82,12 @@ Data flow: source adapters → sync → SQLite → search → CLI/TUI.
   initializes tracing and calls them. Internal modules are `pub(crate)` by
   default — do not widen module, type, or function visibility unless a current
   in-repo caller requires it.
+- The optional `bench` feature is the one exception to that rule: it compiles
+  `src/bench_api.rs` as `pub mod bench_api` so `benches/recall.rs` can drive
+  internal hot paths and build deterministic fixtures. Default builds and the
+  shipped binary are unaffected. Add new benchmark fixtures inside `bench_api`
+  instead of widening visibility further, and keep them side-effect free
+  (temp dirs, in-memory SQLite) so they never touch a real `recall.db`.
 - `publish = false` in Cargo.toml is intentional: Recall ships binaries and
   Homebrew assets, not a crates.io package. Do not remove it or add public
   Rust API for external consumers unless the release strategy changes.

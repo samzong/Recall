@@ -186,6 +186,39 @@ The former standalone targets `cargo test --test regression` and `cargo test --t
 
 Always run `make check` before pushing. If it passes locally, CI will pass.
 
+## Benchmarks
+
+Performance is tracked on every push and pull request by
+[CodSpeed](https://app.codspeed.io/samzong/Recall) via
+`.github/workflows/codspeed.yml`, using CPU simulation so results do not depend
+on runner noise.
+
+`benches/recall.rs` is a single [divan](https://github.com/nvzqz/divan) target
+grouped by pipeline stage:
+
+| Group       | Covers                                                        |
+| ----------- | ------------------------------------------------------------- |
+| `parsing`   | Claude Code and Codex JSONL transcript parsing                |
+| `indexing`  | session/message writes, including FTS5 index maintenance      |
+| `search`    | FTS5 keyword search, hybrid FTS + sqlite-vec search, export   |
+| `analytics` | usage dashboard aggregation, embedding text, remote URL parse |
+| `rendering` | plain-text transcript and shareable HTML rendering            |
+
+Benchmarks sit behind the `bench` feature, which exposes `recall::bench_api` —
+the shim that lets the bench binary reach crate-private hot paths and build
+deterministic fixtures. Nothing in it is compiled into the shipped binary, and
+every fixture uses a temporary directory or an in-memory SQLite database, so
+running benchmarks never touches your `recall.db`.
+
+```bash
+make bench                                   # build + run through the codspeed CLI
+cargo codspeed build --features bench         # build only
+```
+
+Add a benchmark by extending `src/bench_api.rs` with the fixture (it can reach
+any internal module) and wiring it into the matching group in
+`benches/recall.rs`.
+
 ## Releases
 
 Releases are driven by `cargo-release`, which bumps `Cargo.toml`, updates

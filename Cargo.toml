@@ -55,11 +55,27 @@ candle-transformers = "0.10"
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Exposes `recall::bench_api`, the shim the `benches/` targets use to reach
+# internal hot paths. Never enabled for the shipped binary.
+bench = []
 
 [profile.release]
 opt-level = 3
 lto = true
 strip = true
+
+# Benchmarks are compiled with the release profile; thin LTO keeps build times
+# reasonable in CI without giving up cross-crate inlining.
+[profile.bench]
+lto = "thin"
+
+[dev-dependencies]
+divan = { version = "5.0.1", package = "codspeed-divan-compat" }
+
+[[bench]]
+name = "recall"
+harness = false
+required-features = ["bench"]
 
 [package.metadata.release]
 publish = false

@@ -39,6 +39,14 @@ lint: ## Run clippy
 fmt: ## Format code
 	$(CARGO) fmt --all
 
+# ── Benchmarks ───────────────────────────────────────────────────────────────
+
+.PHONY: bench
+
+bench: ## Build and run the CodSpeed benchmarks (needs the codspeed CLI)
+	$(CARGO) codspeed build --features bench
+	codspeed run --mode simulation -- $(CARGO) codspeed run
+
 # ── Documentation ────────────────────────────────────────────────────────────
 
 .PHONY: doc
