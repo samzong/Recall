@@ -151,27 +151,42 @@ mod analytics {
         bencher.bench(aggregate);
     }
 
-    #[divan::bench]
-    fn embedding_text(bencher: divan::Bencher) {
+    /// The instrumented region costs a few microseconds no matter what runs
+    /// inside it. These two helpers take ~80 ns and ~226 ns per call, so a
+    /// single call would report almost pure overhead — which is how a URL parse
+    /// came to be measured at 31.6 us, and why its reported value moved by
+    /// double digits without the code changing. Measure a batch instead, so the
+    /// work dominates. The batch size is part of the benchmark name, so the
+    /// reported figure is never mistaken for a per-call cost.
+    const MICRO_BATCH: usize = 4_096;
+
+    #[divan::bench(args = [MICRO_BATCH])]
+    fn embedding_text(bencher: divan::Bencher, batch: usize) {
         let content = "\
             Recall keeps every local coding session in one SQLite index, then \
             layers FTS5 keyword search and sqlite-vec similarity on top of it.";
         let build = || {
-            divan::black_box(build_embedding_text(
-                divan::black_box("Index a long session"),
-                content,
-            ))
+            let mut bytes = 0;
+            for _ in 0..batch {
+                bytes +=
+                    build_embedding_text(divan::black_box("Index a long session"), content).len();
+            }
+            divan::black_box(bytes)
         };
         warm_up(&build);
         bencher.bench(build);
     }
 
-    #[divan::bench]
-    fn remote_url_normalization(bencher: divan::Bencher) {
+    #[divan::bench(args = [MICRO_BATCH])]
+    fn remote_url_normalization(bencher: divan::Bencher, batch: usize) {
         let normalize = || {
-            divan::black_box(normalize_remote_url(divan::black_box(
-                "git@github.com:samzong/Recall.git",
-            )))
+            let mut matched = 0;
+            for _ in 0..batch {
+                matched +=
+                    normalize_remote_url(divan::black_box("git@github.com:samzong/Recall.git"))
+                        .map_or(0, |slug| slug.len());
+            }
+            divan::black_box(matched)
         };
         warm_up(&normalize);
         bencher.bench(normalize);
