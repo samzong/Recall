@@ -145,6 +145,15 @@ pub(crate) fn last_timestamp(
 pub(crate) struct SyncScanStats {
     pub(crate) skipped_sessions: u32,
     pub(crate) filtered_sessions: u32,
+    /// Every session the adapter considered, before any filtering. The three
+    /// counters below partition it, so `candidates - skipped - filtered -
+    /// parsed` is the number an adapter dropped without accounting for it.
+    pub(crate) candidates: u32,
+    /// Candidates rejected without reading their transcript. This is the
+    /// counter a scan-level optimisation has to move; sessions dropped after
+    /// parsing cost the same as sessions that were kept.
+    pub(crate) rejected_before_parse: u32,
+    pub(crate) parsed: u32,
 }
 
 pub(crate) struct SyncScanResult {

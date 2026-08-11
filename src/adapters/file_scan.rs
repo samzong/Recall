@@ -75,7 +75,9 @@ where
     let mut stats = SyncScanStats::default();
 
     for entry in entries {
+        stats.candidates += 1;
         let Some(mtime_ms) = stat_mtime_ms(&entry.stat_target) else {
+            stats.rejected_before_parse += 1;
             continue;
         };
 
@@ -99,6 +101,7 @@ where
             && mtime_ms < cutoff
         {
             stats.filtered_sessions += 1;
+            stats.rejected_before_parse += 1;
             continue;
         }
 
@@ -121,9 +124,11 @@ where
             )
         {
             stats.skipped_sessions += 1;
+            stats.rejected_before_parse += 1;
             continue;
         }
 
+        stats.parsed += 1;
         if let Some(raw) = parse_fn(entry, mtime_ms)? {
             sessions.push(raw);
         }

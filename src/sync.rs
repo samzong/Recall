@@ -116,6 +116,17 @@ struct SyncStats {
     out_of_scope: u32,
 }
 
+/// Per-adapter accounting for `--verbose`. Without it a sync reports only
+/// totals, which cannot show whether a candidate was rejected before its
+/// transcript was read — the only rejection that saves work.
+struct AdapterRun {
+    label: String,
+    scan: adapters::SyncScanStats,
+    out_of_scope: u32,
+    touched: u32,
+    elapsed_ms: u128,
+}
+
 impl SyncStats {
     fn touched(&self) -> u32 {
         self.new_sessions + self.updated_sessions + self.reprocessed_sessions
@@ -199,6 +210,7 @@ struct SyncJob {
     path_excluder: Option<globset::GlobSet>,
     repo_cache: RepoIdentityCache,
     stats: SyncStats,
+    adapter_runs: Vec<AdapterRun>,
 }
 
 impl SyncJob {
@@ -224,6 +236,7 @@ impl SyncJob {
             path_excluder,
             repo_cache: RepoIdentityCache::default(),
             stats: SyncStats::default(),
+            adapter_runs: Vec::new(),
         })
     }
 
@@ -257,6 +270,10 @@ impl SyncJob {
             return Ok(());
         }
 
+        let started = std::time::Instant::now();
+        let touched_before = self.stats.touched();
+        let out_of_scope_before = self.stats.out_of_scope;
+
         let mut purged_excluded_ids = HashSet::new();
         if let Some(matcher) = &self.path_excluder {
             let n = delete_excluded_sessions_for_source(
@@ -269,7 +286,7 @@ impl SyncJob {
             self.stats.excluded_out += n;
         }
 
-        let Some(raw_sessions) =
+        let Some((raw_sessions, scan)) =
             self.scan_sessions(adapter, source_id, label, &mut purged_excluded_ids)?
         else {
             return Ok(());
@@ -279,6 +296,14 @@ impl SyncJob {
         for raw in raw_sessions {
             self.process_raw_session(source_id, raw, &mut existing, &mut purged_excluded_ids)?;
         }
+
+        self.adapter_runs.push(AdapterRun {
+            label: label.to_string(),
+            scan,
+            out_of_scope: self.stats.out_of_scope - out_of_scope_before,
+            touched: self.stats.touched() - touched_before,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
 
         info!("{label} done");
         Ok(())
@@ -290,7 +315,7 @@ impl SyncJob {
         source_id: &str,
         label: &str,
         purged_excluded_ids: &mut HashSet<String>,
-    ) -> Result<Option<Vec<adapters::RawSession>>> {
+    ) -> Result<Option<(Vec<adapters::RawSession>, adapters::SyncScanStats)>> {
         if self.options.verbose {
             println!("Scanning {label}...");
         }
@@ -317,10 +342,8 @@ impl SyncJob {
                 }
             }
         };
-        let (raw_sessions, pre_skipped, pre_filtered) = match optimized {
-            Some(scan) => {
-                (scan.sessions, scan.stats.skipped_sessions, scan.stats.filtered_sessions)
-            }
+        let (raw_sessions, scan_stats) = match optimized {
+            Some(scan) => (scan.sessions, scan.stats),
             None => {
                 let raw_sessions = match adapter.scan() {
                     Ok(s) => s,
@@ -331,11 +354,17 @@ impl SyncJob {
                         return Ok(None);
                     }
                 };
-                (raw_sessions, 0, 0)
+                // A full scan parses everything it finds; there is no
+                // candidate stage to account for separately.
+                let parsed = raw_sessions.len() as u32;
+                (
+                    raw_sessions,
+                    adapters::SyncScanStats { candidates: parsed, parsed, ..Default::default() },
+                )
             }
         };
-        self.stats.skipped += pre_skipped;
-        self.stats.filtered_out += pre_filtered;
+        self.stats.skipped += scan_stats.skipped_sessions;
+        self.stats.filtered_out += scan_stats.filtered_sessions;
         if let Some(matcher) = &self.path_excluder {
             let n = delete_excluded_sessions_for_source(
                 &self.store,
@@ -349,7 +378,7 @@ impl SyncJob {
         if self.options.verbose {
             println!("  Found {} sessions", raw_sessions.len());
         }
-        Ok(Some(raw_sessions))
+        Ok(Some((raw_sessions, scan_stats)))
     }
 
     fn load_existing_state(&mut self, source_id: &str) -> Result<ExistingState> {
@@ -679,6 +708,45 @@ impl SyncJob {
         Ok(())
     }
 
+    /// The evidence a scan-level optimisation has to move: how many candidates
+    /// each adapter considered, how many it rejected without reading the
+    /// transcript, and how many transcripts it actually parsed.
+    fn report_adapter_breakdown(&self) {
+        let runs: Vec<&AdapterRun> = self.adapter_runs.iter().collect();
+        if runs.is_empty() {
+            return;
+        }
+
+        println!();
+        println!(
+            "{:<6} {:>10} {:>14} {:>8} {:>8} {:>9} {:>8}",
+            "Source", "candidates", "pre-parse rej", "parsed", "scoped", "touched", "ms"
+        );
+        for run in &runs {
+            println!(
+                "{:<6} {:>10} {:>14} {:>8} {:>8} {:>9} {:>8}",
+                run.label,
+                run.scan.candidates,
+                run.scan.rejected_before_parse,
+                run.scan.parsed,
+                run.out_of_scope,
+                run.touched,
+                run.elapsed_ms
+            );
+        }
+        let total = |f: fn(&AdapterRun) -> u32| runs.iter().map(|run| f(run)).sum::<u32>();
+        println!(
+            "{:<6} {:>10} {:>14} {:>8} {:>8} {:>9} {:>8}",
+            "total",
+            total(|run| run.scan.candidates),
+            total(|run| run.scan.rejected_before_parse),
+            total(|run| run.scan.parsed),
+            total(|run| run.out_of_scope),
+            total(|run| run.touched),
+            runs.iter().map(|run| run.elapsed_ms).sum::<u128>()
+        );
+    }
+
     fn report_progress(&self) -> Result<()> {
         let SyncStats {
             new_sessions,
@@ -713,6 +781,7 @@ impl SyncJob {
                 print!(", {excluded_out} excluded by excluded_paths");
             }
             println!();
+            self.report_adapter_breakdown();
             println!(
                 "Settings: sources [{}], time scope [{}]",
                 self.labels
