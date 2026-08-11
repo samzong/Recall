@@ -79,7 +79,7 @@ jobs:
 
       # release-please already created the tag and the GitHub release with its
       # changelog entry; this job only attaches the built binaries to it.
-      - name: Create release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -92,6 +92,15 @@ jobs:
             capture && /^## \[/ { exit }
             capture { print }
           ' CHANGELOG.md > release-notes.md
+          # Creating the release and uploading its assets are separate calls, so
+          # a run can leave the release in place with assets missing. Manual
+          # dispatch is also documented as the way to reattach binaries to an
+          # existing release, and both paths reach this step.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists; attaching binaries to it"
+            gh release upload "$tag" --clobber recall-*.tar.gz recall-*.zip
+            exit 0
+          fi
           if [ -s release-notes.md ]; then
             notes_args=(--notes-file release-notes.md)
           else
