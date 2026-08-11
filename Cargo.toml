@@ -76,11 +76,3 @@ divan = { version = "5.0.1", package = "codspeed-divan-compat" }
 name = "recall"
 harness = false
 required-features = ["bench"]
-
-[package.metadata.release]
-publish = false
-verify = false
-push-remote = "origin"
-pre-release-commit-message = "chore(release): bump to v{{version}}"
-tag-message = "v{{version}}"
-tag-name = "v{{version}}"

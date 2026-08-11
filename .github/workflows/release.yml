@@ -69,18 +69,22 @@ jobs:
         with:
           merge-multiple: true
 
-      - name: Create release
+      # release-please already created the tag and the GitHub release with its
+      # changelog entry; this job only attaches the built binaries to it.
+      - name: Attach binaries to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          previous_tag="$(git tag --list 'v[0-9]*' --sort=-version:refname | awk -v tag="$tag" '$0 != tag { print; exit }')"
-          notes_args=()
-          if [ -n "$previous_tag" ]; then
-            notes_args=(--notes-start-tag "$previous_tag")
+          for attempt in 1 2 3 4 5; do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              break
+            fi
+            echo "release $tag not visible yet (attempt $attempt), waiting"
+            sleep 10
+          done
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag was never created; refusing to guess release notes" >&2
+            exit 1
           fi
-          gh release create "$tag" \
-            --title "$tag" \
-            --generate-notes \
-            "${notes_args[@]}" \
-            recall-*.tar.gz recall-*.zip
+          gh release upload "$tag" --clobber recall-*.tar.gz recall-*.zip

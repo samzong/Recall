@@ -33,13 +33,20 @@ no CI-only logic. The gate uses `--workspace` and `--features bench`, so it
 covers extension crates and the `bench_api` shim that `benches/` compiles
 against. Build a single extension with `cargo build -p recall-<name>`.
 
-Core releases use cargo-release: `make release-patch` is a dry run; add
-`EXECUTE=1` to bump, commit, tag, and push. The `v*` tag triggers the GitHub
-Actions binary build. Extensions release independently: bumping an extension's
-package version in a PR is the release intent — after merge, a workflow creates
-the `recall-<name>-v<version>` tag, builds binaries, and regenerates the
-catalog. One-time setup: `git config core.hooksPath .githooks` enables the DCO
-signoff hook.
+Core releases run through release-please: every merge to `main` updates a
+release PR that carries the next version, the `CHANGELOG.md` entries derived
+from the conventional commits, and the `Cargo.toml`/`Cargo.lock` bump. Merging
+that PR is what cuts the release — it creates the `v*` tag and the GitHub
+release, and `release.yml` then attaches the built binaries to it. Nothing is
+released from a developer machine, and the release notes can be edited in the
+release PR before they are published, which is where an upgrade note for a
+breaking change belongs. Extensions keep their own independent flow: bumping an
+extension's package version in a PR is the release intent — after merge, a
+workflow creates the `recall-<name>-v<version>` tag, builds binaries, and
+regenerates the catalog.
+
+One-time setup: `git config core.hooksPath .githooks` enables the DCO signoff
+hook.
 
 ## Architecture
 
