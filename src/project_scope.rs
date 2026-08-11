@@ -87,8 +87,11 @@ impl<'a> SessionScopeFields<'a> {
         let Some(directory) = self.directory else {
             return false;
         };
-        let root = root.strip_suffix('/').unwrap_or(root);
-        directory == root || directory.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
+        let root = root.strip_suffix(['/', '\\']).unwrap_or(root);
+        directory == root
+            || directory
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
     }
 }
 

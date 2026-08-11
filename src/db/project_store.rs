@@ -158,14 +158,11 @@ impl Store {
         let found = self
             .conn
             .query_row(
-                "SELECT 1
-                 FROM sessions
-                 WHERE directory = ?1 OR directory LIKE ?2
-                 LIMIT 1",
-                rusqlite::params![
-                    directory_root(value),
-                    directory_child_pattern(directory_root(value))
-                ],
+                &format!(
+                    "SELECT 1 FROM sessions WHERE directory = ?1 OR {} LIMIT 1",
+                    directory_child_sql("directory", 2)
+                ),
+                rusqlite::params![directory_root(value), escaped_directory_root(value)],
                 |_| Ok(()),
             )
             .optional()?
@@ -246,14 +243,14 @@ pub(crate) fn apply_project_scope(
             // columns, so an auto-derived scope also accepts the checkout it
             // came from; otherwise they would silently disappear.
             sql.push_str(&format!(
-                " AND (s.{column} = ?{} OR s.directory = ?{} OR s.directory LIKE ?{})",
+                " AND (s.{column} = ?{} OR s.directory = ?{} OR {})",
                 *param_idx,
                 *param_idx + 1,
-                *param_idx + 2
+                directory_child_sql("s.directory", *param_idx + 2)
             ));
             params.push(Box::new(value.to_string()));
             params.push(Box::new(directory_root(local_root).to_string()));
-            params.push(Box::new(directory_child_pattern(directory_root(local_root))));
+            params.push(Box::new(escaped_directory_root(local_root)));
             *param_idx += 3;
         }
     }
@@ -265,25 +262,37 @@ fn push_directory_predicate(
     param_idx: &mut usize,
     directory: &str,
 ) {
-    let root = directory_root(directory);
     sql.push_str(&format!(
-        " AND (s.directory = ?{} OR s.directory LIKE ?{})",
+        " AND (s.directory = ?{} OR {})",
         *param_idx,
-        *param_idx + 1
+        directory_child_sql("s.directory", *param_idx + 1)
     ));
-    params.push(Box::new(root.to_string()));
-    params.push(Box::new(directory_child_pattern(root)));
+    params.push(Box::new(directory_root(directory).to_string()));
+    params.push(Box::new(escaped_directory_root(directory)));
     *param_idx += 2;
 }
 
-/// A trailing slash must not change what a directory boundary means, so both
-/// the SQL predicate and `ProjectScope::matches` compare against this form.
+/// A trailing separator must not change what a directory boundary means, so
+/// both the SQL predicate and `ProjectScope::matches` compare against this form.
 fn directory_root(dir: &str) -> &str {
-    dir.strip_suffix('/').unwrap_or(dir)
+    dir.strip_suffix(['/', '\\']).unwrap_or(dir)
 }
 
-fn directory_child_pattern(root: &str) -> String {
-    format!("{root}/%")
+/// One pattern per separator, so Windows paths are not silently excluded. The
+/// parameter carries only the escaped root; the separator and wildcard are
+/// appended in SQL.
+fn directory_child_sql(column: &str, param_idx: usize) -> String {
+    format!(
+        "({column} LIKE ?{param_idx} || '/%' ESCAPE '\\' \
+         OR {column} LIKE ?{param_idx} || '\\\\%' ESCAPE '\\')"
+    )
+}
+
+/// `_` and `%` are LIKE wildcards and common in directory names, so an
+/// unescaped root would pull in unrelated sibling directories that
+/// `ProjectScope::matches` rejects.
+fn escaped_directory_root(dir: &str) -> String {
+    directory_root(dir).replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {

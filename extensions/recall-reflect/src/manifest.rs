@@ -4,8 +4,8 @@ pub fn manifest_json() -> Value {
     json!({
         "name": "reflect",
         "version": env!("CARGO_PKG_VERSION"),
-        "protocol": 1,
-        "min_recall": "0.2.10"
+        "protocol": 2,
+        "min_recall": "0.4.0"
     })
 }
 
@@ -18,7 +18,7 @@ mod tests {
         let manifest = manifest_json();
         assert_eq!(manifest["name"], "reflect");
         assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(manifest["protocol"], 1);
-        assert_eq!(manifest["min_recall"], "0.2.10");
+        assert_eq!(manifest["protocol"], 2);
+        assert_eq!(manifest["min_recall"], "0.4.0");
     }
 }

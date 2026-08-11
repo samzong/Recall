@@ -858,6 +858,13 @@ fn scope_predicate_matches_sql_and_rust_paths() {
         ("raw4", Some("/repo/rootless"), None, None),
         ("raw5", Some("/elsewhere"), Some("github.com/other/Repo"), Some("other/Repo")),
         ("raw6", None, None, None),
+        ("raw7", Some("/work/foo_bar/child"), None, None),
+        ("raw8", Some("/work/fooXbar/child"), None, None),
+        ("raw9", Some("/work/100%/child"), None, None),
+        ("raw10", Some("/work/100X/child"), None, None),
+        ("raw11", Some(r"C:\\repo"), None, None),
+        ("raw12", Some(r"C:\\repo\\child"), None, None),
+        ("raw13", Some(r"C:\\repository\\child"), None, None),
     ];
     for (index, (source_id, directory, remote, slug)) in fixtures.iter().enumerate() {
         let mut session = make_session(&format!("s{index}"), "codex", source_id, "Fixture");
@@ -885,6 +892,10 @@ fn scope_predicate_matches_sql_and_rust_paths() {
             filter: RepoFilter::Slug("samzong/Recall".to_string()),
             local_root: None,
         },
+        ProjectScope::Directory("/work/foo_bar".to_string()),
+        ProjectScope::Directory("/work/100%".to_string()),
+        ProjectScope::Directory(r"C:\\repo".to_string()),
+        ProjectScope::Directory(r"C:\\repo\\".to_string()),
     ];
 
     for scope in scopes {
@@ -911,6 +922,19 @@ fn scope_predicate_matches_sql_and_rust_paths() {
         rust_ids.sort();
 
         assert_eq!(sql_ids, rust_ids, "scope {scope:?} disagrees between SQL and Rust");
+
+        // Parity alone would also hold if both sides were wrong the same way.
+        let expected: Option<&[&str]> = match &scope {
+            ProjectScope::Directory(directory) if directory == "/work/foo_bar" => Some(&["raw7"]),
+            ProjectScope::Directory(directory) if directory == "/work/100%" => Some(&["raw9"]),
+            ProjectScope::Directory(directory) if directory == r"C:\\repo" => {
+                Some(&["raw11", "raw12"])
+            }
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            assert_eq!(sql_ids, expected, "scope {scope:?} matched the wrong sessions");
+        }
     }
 }
 
