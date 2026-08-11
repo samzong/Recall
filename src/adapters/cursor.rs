@@ -87,13 +87,14 @@ impl SourceAdapter for CursorAdapter {
         let event_state =
             if include_events { store.event_state_meta_map(self.id())? } else { HashMap::new() };
         let global_mtime = global_db_mtime();
+        let lookup = ComposerLookup::load(&conn);
         let composer_ids = discover_composer_ids(&conn)?;
         let transcript_paths = collect_agent_transcript_paths();
         let mut sessions = Vec::new();
         let mut stats = SyncScanStats::default();
 
         for composer_id in composer_ids {
-            let meta = load_composer_meta(&conn, &composer_id);
+            let meta = load_composer_meta(&conn, &composer_id, &lookup);
             let updated_at = meta.last_updated_at.or(meta.created_at);
             if let Some(cutoff) = since_ts
                 && updated_at.is_some_and(|ts| ts < cutoff)
@@ -138,9 +139,10 @@ fn scan_cursor_sessions(
     };
 
     let transcript_paths = collect_agent_transcript_paths();
+    let lookup = ComposerLookup::load(&conn);
     let mut sessions = Vec::new();
     for composer_id in discover_composer_ids(&conn)? {
-        let meta = load_composer_meta(&conn, &composer_id);
+        let meta = load_composer_meta(&conn, &composer_id, &lookup);
         if let Some(cutoff) = since_ts {
             let updated_at = meta.last_updated_at.or(meta.created_at).unwrap_or(0);
             if updated_at < cutoff {
@@ -433,31 +435,59 @@ fn collect_composer_ids_from_workspace_data(value: &Value, ids: &mut BTreeSet<St
     }
 }
 
-fn load_composer_meta(conn: &Connection, composer_id: &str) -> ComposerMeta {
-    let mut meta = ComposerMeta {
+/// `composer.composerHeaders` is one document describing every composer, and
+/// the agent cwd map is a second full-database read. Both were rebuilt once per
+/// composer id, which made metadata lookup quadratic in the number of sessions.
+/// Building them once per scan is what keeps the Cursor scan linear.
+struct ComposerLookup {
+    headers: HashMap<String, ComposerMeta>,
+    agent_cwd: HashMap<String, String>,
+}
+
+impl ComposerLookup {
+    fn load(conn: &Connection) -> Self {
+        let mut headers = HashMap::new();
+        if let Some(raw) = read_item_value(conn, "composer.composerHeaders")
+            && let Ok(value) = serde_json::from_str::<Value>(&raw)
+            && let Some(items) = value.get("allComposers").and_then(|value| value.as_array())
+        {
+            for item in items {
+                let Some(composer_id) = item.get("composerId").and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                headers.insert(
+                    composer_id.to_string(),
+                    ComposerMeta {
+                        name: item.get("name").and_then(|value| value.as_str()).map(str::to_string),
+                        unified_mode: item
+                            .get("unifiedMode")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        directory: workspace_path_from_identifier(item.get("workspaceIdentifier")),
+                        created_at: json_i64(item.get("createdAt")),
+                        last_updated_at: json_i64(item.get("lastUpdatedAt")),
+                    },
+                );
+            }
+        }
+
+        Self { headers, agent_cwd: build_agent_cwd_map(resolve_global_state_db_path().as_deref()) }
+    }
+}
+
+fn load_composer_meta(
+    conn: &Connection,
+    composer_id: &str,
+    lookup: &ComposerLookup,
+) -> ComposerMeta {
+    let mut meta = lookup.headers.get(composer_id).cloned().unwrap_or(ComposerMeta {
         name: None,
         unified_mode: None,
         directory: None,
         created_at: None,
         last_updated_at: None,
-    };
-
-    if let Some(raw) = read_item_value(conn, "composer.composerHeaders")
-        && let Ok(value) = serde_json::from_str::<Value>(&raw)
-        && let Some(items) = value.get("allComposers").and_then(|value| value.as_array())
-    {
-        for item in items {
-            if item.get("composerId").and_then(|value| value.as_str()) == Some(composer_id) {
-                meta.name = item.get("name").and_then(|value| value.as_str()).map(str::to_string);
-                meta.unified_mode =
-                    item.get("unifiedMode").and_then(|value| value.as_str()).map(str::to_string);
-                meta.created_at = json_i64(item.get("createdAt"));
-                meta.last_updated_at = json_i64(item.get("lastUpdatedAt"));
-                meta.directory = workspace_path_from_identifier(item.get("workspaceIdentifier"));
-                break;
-            }
-        }
-    }
+    });
 
     if let Some(raw) = read_disk_kv(conn, &format!("composerData:{composer_id}"))
         && let Ok(data) = serde_json::from_str::<Value>(&raw)
@@ -479,8 +509,7 @@ fn load_composer_meta(conn: &Connection, composer_id: &str) -> ComposerMeta {
     }
 
     if meta.directory.is_none()
-        && let Some(path) =
-            build_agent_cwd_map(resolve_global_state_db_path().as_deref()).get(composer_id)
+        && let Some(path) = lookup.agent_cwd.get(composer_id)
     {
         meta.directory = Some(path.clone());
     }
@@ -839,8 +868,15 @@ fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<O
         return Ok(None);
     }
 
+    // Agent transcripts carry no token accounting, but the sync state still has
+    // to record that this session was processed at the current usage parser
+    // version. Without the record, `usage_state_is_current` sees no state at
+    // all, never becomes true, and the session is re-parsed on every sync
+    // forever — which is what made Cursor re-materialise hundreds of sessions
+    // per run.
     let mut session =
-        RawSession::search_only(String::new(), None, 0, None, Some("agent".to_string()), messages);
+        RawSession::search_only(String::new(), None, 0, None, Some("agent".to_string()), messages)
+            .with_usage(Vec::new(), USAGE_PARSER_VERSION);
     if include_events {
         session = session.with_events(session_events, EVENT_PARSER_VERSION);
     }
@@ -1261,7 +1297,7 @@ mod tests {
         let composer_id = uuid::Uuid::new_v4().to_string();
         let bubble_id = uuid::Uuid::new_v4().to_string();
         let conn = seed_global_db(&root, &composer_id, &bubble_id);
-        let meta = load_composer_meta(&conn, &composer_id);
+        let meta = load_composer_meta(&conn, &composer_id, &ComposerLookup::load(&conn));
         let parsed = parse_composer_session(&conn, &composer_id, &meta, false).unwrap().unwrap();
         assert_eq!(parsed.messages.len(), 1);
         assert_eq!(parsed.messages[0].content, "hello cursor");
@@ -1311,7 +1347,7 @@ mod tests {
         )
         .unwrap();
 
-        let meta = load_composer_meta(&conn, &composer_id);
+        let meta = load_composer_meta(&conn, &composer_id, &ComposerLookup::load(&conn));
         let parsed = parse_composer_session(&conn, &composer_id, &meta, false).unwrap().unwrap();
         assert_eq!(parsed.usage_events.len(), 1);
         assert_eq!(parsed.usage_events[0].token_source, TokenSource::Observed);
@@ -1357,7 +1393,7 @@ mod tests {
         )
         .unwrap();
 
-        let meta = load_composer_meta(&conn, &composer_id);
+        let meta = load_composer_meta(&conn, &composer_id, &ComposerLookup::load(&conn));
         let parsed = parse_composer_session(&conn, &composer_id, &meta, true).unwrap().unwrap();
         assert_eq!(parsed.events.len(), 2);
         assert_eq!(parsed.events[0].kind, "search");
@@ -1402,6 +1438,12 @@ mod tests {
         assert_eq!(raw.messages.len(), 2);
         assert_eq!(raw.messages[0].content, "hello");
         assert!(raw.messages[1].content.contains("[tool_use:Glob]"));
+        // Agent transcripts carry no token accounting, but the version must
+        // still be declared: without it no usage state row is written, so the
+        // incremental scan never marks the session current and reparses it on
+        // every sync.
+        assert_eq!(raw.usage_parser_version, Some(USAGE_PARSER_VERSION));
+        assert!(raw.usage_events.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
