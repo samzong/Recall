@@ -1,8 +1,22 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  # Called by release-please once it has created the release, and manually
+  # available so a failed asset upload can be retried without re-tagging.
+  # It deliberately does not listen for tag pushes: whether such an event
+  # reaches Actions depends on which token created the tag.
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to build and attach binaries to
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and attach binaries to
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -31,6 +45,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -64,7 +80,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          ref: ${{ inputs.tag }}
       - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
@@ -75,16 +91,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          for attempt in 1 2 3 4 5; do
-            if gh release view "$tag" >/dev/null 2>&1; then
-              break
-            fi
-            echo "release $tag not visible yet (attempt $attempt), waiting"
-            sleep 10
-          done
+          tag="${{ inputs.tag }}"
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag was never created; refusing to guess release notes" >&2
+            echo "release $tag does not exist; nothing to attach binaries to" >&2
             exit 1
           fi
           gh release upload "$tag" --clobber recall-*.tar.gz recall-*.zip
