@@ -35,7 +35,7 @@ against. Build a single extension with `cargo build -p recall-<name>`.
 
 Core releases run through release-please: every merge to `main` updates a
 release PR that carries the next version, the `CHANGELOG.md` entries derived
-from the conventional commits, and the `Cargo.toml`/`Cargo.lock` bump. Merging
+from the conventional commits, and the root `Cargo.toml` bump. It deliberately does not use the `rust` release type: that rewrites every workspace member to the released version, which would republish the independently versioned extensions. `Cargo.lock` is therefore not updated by the release PR and self-heals on the next build. Merging
 that PR is what cuts the release — it creates the `v*` tag and the GitHub
 release, and then calls `release.yml` to build and attach the binaries.
 `release.yml` is not triggered by the tag push, because whether such an event
