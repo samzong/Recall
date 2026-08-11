@@ -1,0 +1,41 @@
+# git-cliff renders the changelog entry for a release. The version is an input,
+# not something it derives: `make release-patch|minor|major` decides the bump
+# and passes the resulting tag in. Output matches the format already in
+# CHANGELOG.md so back-filled and new entries stay consistent.
+
+[changelog]
+header = ""
+body = """
+{% if version %}
+## [{{ version | trim_start_matches(pat="v") }}](https://github.com/samzong/Recall/compare/{{ previous.version }}...{{ version }}) ({{ timestamp | date(format="%Y-%m-%d") }})
+{% for group, commits in commits | group_by(attribute="group") %}
+
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+* {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message }}{% endfor %}
+{% endfor %}
+{% endif %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+protect_breaking_commits = true
+commit_preprocessors = [
+  { pattern = '\(#(\d+)\)', replace = "([#${1}](https://github.com/samzong/Recall/issues/${1}))" },
+]
+commit_parsers = [
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^Merge ", skip = true },
+  { message = "^[a-z]+(\\(.+\\))?!:", group = "<!-- 0 -->⚠ BREAKING CHANGES" },
+  { message = "^feat", group = "<!-- 1 -->Features" },
+  { message = "^fix", group = "<!-- 2 -->Fixes" },
+  { message = "^perf", group = "<!-- 3 -->Performance" },
+  { message = "^refactor", group = "<!-- 4 -->Refactors" },
+  { message = "^docs", group = "<!-- 5 -->Documentation" },
+  { message = "^chore|^ci|^build|^test", skip = true },
+]
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+sort_commits = "oldest"

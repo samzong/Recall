@@ -1,0 +1,35 @@
+#!/bin/sh
+# Writes the changelog entry for the version being released. cargo-release runs
+# this as its pre-release hook, so the entry lands in the release commit and is
+# part of the tag describing it.
+#
+# The entry is inserted under the title rather than regenerating the file:
+# everything already in CHANGELOG.md is kept verbatim, including hand-written
+# upgrade notes and the back-filled history.
+set -eu
+
+version="${1:?usage: regenerate-changelog <version>}"
+
+if ! command -v git-cliff >/dev/null 2>&1; then
+	echo "regenerate-changelog: git-cliff is not installed." >&2
+	echo "  brew install git-cliff" >&2
+	exit 1
+fi
+
+title="$(head -n 1 CHANGELOG.md)"
+case "$title" in
+"# Changelog") ;;
+*)
+	echo "regenerate-changelog: CHANGELOG.md must start with '# Changelog', found: $title" >&2
+	exit 1
+	;;
+esac
+
+entry="$(git-cliff --unreleased --tag "v${version}")"
+{
+	printf '%s\n' "$title"
+	printf '%s\n' "$entry"
+	tail -n +2 CHANGELOG.md
+} >CHANGELOG.md.tmp
+mv CHANGELOG.md.tmp CHANGELOG.md
+echo "regenerate-changelog: CHANGELOG.md updated for v${version}"

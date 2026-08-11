@@ -33,24 +33,19 @@ no CI-only logic. The gate uses `--workspace` and `--features bench`, so it
 covers extension crates and the `bench_api` shim that `benches/` compiles
 against. Build a single extension with `cargo build -p recall-<name>`.
 
-Core releases run through release-please: every merge to `main` updates a
-release PR that carries the next version, the `CHANGELOG.md` entries derived
-from the conventional commits, and the root `Cargo.toml` bump. It deliberately does not use the `rust` release type: that rewrites every workspace member to the released version, which would republish the independently versioned extensions. `Cargo.lock` is therefore not updated by the release PR and self-heals on the next build. Merging
-that PR is what cuts the release — it creates the `v*` tag and the GitHub
-release, and then calls `release.yml` to build and attach the binaries.
-`release.yml` is not triggered by the tag push, because whether such an event
-reaches Actions depends on the token that created the tag; it is callable and
-manually dispatchable with a tag input instead. The action authenticates with
-the `RELEASE_PLEASE_TOKEN` PAT so the release PR opens with CI running on it. Nothing is
-released from a developer machine, and the release notes can be edited in the
-release PR before they are published, which is where an upgrade note for a
-breaking change belongs. Extensions keep their own independent flow: bumping an
-extension's package version in a PR is the release intent — after merge, a
-workflow creates the `recall-<name>-v<version>` tag, builds binaries, and
-regenerates the catalog.
+Core releases use cargo-release: `make release-patch` is a dry run; add
+`EXECUTE=1` to bump, commit, tag, and push. The bump is chosen by whoever cuts
+the release, not derived from the commit types. A pre-release hook prepends the
+changelog entry for that version with git-cliff, so `CHANGELOG.md` is part of
+the release commit and of the tag it describes, and the GitHub release notes
+are read back out of it. Existing changelog content is never rewritten, so
+hand-written upgrade notes survive. The `v*` tag triggers the binary build.
+Extensions release independently: bumping an extension's package version in a
+PR is the release intent — after merge, a workflow creates the
+`recall-<name>-v<version>` tag, builds binaries, and regenerates the catalog.
 
 One-time setup: `git config core.hooksPath .githooks` enables the DCO signoff
-hook.
+hook, and `brew install git-cliff` is required to cut a release.
 
 ## Architecture
 

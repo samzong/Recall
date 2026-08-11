@@ -1,16 +1,8 @@
 name: Release
 
 on:
-  # Called by release-please once it has created the release, and manually
-  # available so a failed asset upload can be retried without re-tagging.
-  # It deliberately does not listen for tag pushes: whether such an event
-  # reaches Actions depends on which token created the tag.
-  workflow_call:
-    inputs:
-      tag:
-        description: Release tag to build and attach binaries to
-        required: true
-        type: string
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -46,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -80,20 +72,30 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
 
       # release-please already created the tag and the GitHub release with its
       # changelog entry; this job only attaches the built binaries to it.
-      - name: Attach binaries to the release
+      - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${{ inputs.tag }}"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag does not exist; nothing to attach binaries to" >&2
-            exit 1
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          # The tag already carries its changelog entry, written into the
+          # release commit by the pre-release hook.
+          awk -v version="$version" '
+            $0 ~ "^## \\[" version "\\]" { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ -s release-notes.md ]; then
+            notes_args=(--notes-file release-notes.md)
+          else
+            notes_args=(--generate-notes)
           fi
-          gh release upload "$tag" --clobber recall-*.tar.gz recall-*.zip
+          gh release create "$tag" --title "$tag" "${notes_args[@]}" \
+            recall-*.tar.gz recall-*.zip
