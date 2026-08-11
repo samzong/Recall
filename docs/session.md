@@ -87,7 +87,10 @@ Options:
 
 - `--query <text>`: run the same hybrid search path as `recall search`.
 - `--source <source>`: source id or label, matching existing source filters.
-- `--project <path>`: project directory boundary, including child paths.
+- `--project <selector>`: scope selector. A path is a directory boundary
+  including child paths; `owner/repo` or a remote URL is a repository identity
+  spanning every worktree; `all` is every project. Without this flag the scope
+  is derived from the current directory (see Project Scope).
 - `--time <today|7d|week|30d|month|all>`: time window, default `all`.
 - `--thread-role <primary|subagent|unknown>`: filter by topology role. `unknown`
   selects sessions the source could not classify.
@@ -408,6 +411,32 @@ Grok retains its current skip-and-prune behavior; enabling classified Grok
 ingestion is a separate search/TUI visibility review before the path is turned
 on.
 
+## Project Scope
+
+Commands that operate on a set of sessions — `recall search`, `recall session
+list`, `recall export` — resolve their scope in this order:
+
+1. explicit `--project <selector>`;
+2. otherwise the current directory: a Git checkout with a resolvable `origin`
+   means that repository identity (so sibling worktrees are included), a Git
+   checkout without one means the top-level directory, and anything else means
+   every project.
+
+`recall sync` and `recall session list --sync` use the same rule, and a
+`--sync` listing always syncs exactly the scope it then shows.
+
+An inferred non-global scope is reported on stderr, and every structured
+response carries `filters.effective_scope` with `kind`
+(`repository|directory|global`) and `value`. Pass `--project all` for the
+explicit global scope; `--repo` is deprecated in favour of `--project`.
+
+A scoped sync never writes, refreshes, or deletes a session outside its scope.
+Two maintenance actions are therefore global-only and run on
+`recall sync --project all` (or the background worker started by the TUI):
+pruning sessions whose source transcript disappeared, and backfilling repo
+identity for sessions indexed before it was resolvable. Deleting sessions that
+match `excluded_paths` still runs, restricted to the current scope.
+
 ## Backward Compatibility
 
 - Existing commands keep working: `recall search`, `recall export`,
@@ -415,9 +444,14 @@ on.
   unchanged.
 - Existing `recall export` remains the bulk export command.
 - Existing TUI shortcuts keep using the same internal session operations.
-- Export record schema is `v5`: `session.topology` is additive, so `protocol_version`
-  stays `1`. Import accepts `v2`-`v5`; pre-topology records default to
-  `thread_role = null` with no parent links, and `v5` round-trips topology losslessly.
+- Export record schema is `v5`: `session.topology` is additive and does not
+  affect `protocol_version`. Import accepts `v2`-`v5`; pre-topology records
+  default to `thread_role = null` with no parent links, and `v5` round-trips
+  topology losslessly.
+- `protocol_version` is `2`: the default scope of `recall search`,
+  `recall session list`, and `recall export` now comes from the current
+  directory. Scripts and extensions that relied on the flagless global scope
+  must pass `--project all`.
 
 ## Implementation Notes
 

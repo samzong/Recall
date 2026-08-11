@@ -4,7 +4,8 @@ use rusqlite::OptionalExtension;
 
 use super::project_store::apply_scope_filters;
 use super::store::Store;
-use crate::db::search::{RepoFilter, TimeRange};
+use crate::db::search::TimeRange;
+use crate::project_scope::ProjectScope;
 use crate::types::{BackgroundJobStatus, SemanticProgress, SemanticSessionJob};
 use crate::utils::f32_slice_to_bytes;
 
@@ -203,15 +204,14 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
     ) -> Result<SemanticProgress> {
-        self.semantic_progress_for_search_scope(sources, time_range, None, None)
+        self.semantic_progress_for_search_scope(sources, time_range, &ProjectScope::Global)
     }
 
     pub(crate) fn semantic_progress_for_search_scope(
         &self,
         sources: Option<&[String]>,
         time_range: TimeRange,
-        directory: Option<&str>,
-        repo: Option<&RepoFilter>,
+        scope: &ProjectScope,
     ) -> Result<SemanticProgress> {
         let mut sql = String::from(
             "SELECT
@@ -226,15 +226,7 @@ impl Store {
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
-        apply_scope_filters(
-            &mut sql,
-            &mut params,
-            &mut param_idx,
-            sources,
-            time_range,
-            directory,
-            repo,
-        );
+        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, scope);
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
 
@@ -263,8 +255,7 @@ impl Store {
             &mut current_param_idx,
             sources,
             time_range,
-            directory,
-            repo,
+            scope,
         );
         current_sql.push_str(" ORDER BY COALESCE(s.updated_at, s.started_at) DESC LIMIT 1");
         let current_param_refs: Vec<&dyn rusqlite::types::ToSql> =

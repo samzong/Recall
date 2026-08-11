@@ -193,6 +193,7 @@ Options:
 - `--personal`: reflect across projects for the selected time/source scope.
 - `--project <path>`: project directory boundary, including child paths.
 - `--repo <identity>`: repository identity such as `owner/repo` or a remote URL.
+  Cannot be combined with `--project`.
 - `--time <today|7d|week|30d|month|all>`: time window.
 - `--source <source>`: optional source filter. Repeated values mean a
   mixed-source reflection. The current implementation accepts one source; repeated

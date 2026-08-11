@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::Store;
 use crate::embedding::EmbeddingProvider;
+use crate::project_scope::ProjectScope;
 use crate::semantic::build_embedding_text;
 use crate::types::SearchResult;
 use crate::utils::f32_slice_to_bytes;
@@ -175,8 +176,7 @@ pub(crate) fn run_search(query: &str) -> Result<()> {
     let filters = SearchFilters {
         sources: None,
         time_range: TimeRange::All,
-        directory: None,
-        repo: None,
+        scope: ProjectScope::Global,
         thread_role: None,
     };
 
@@ -319,8 +319,7 @@ where
     let filters = SearchFilters {
         sources: None,
         time_range: TimeRange::All,
-        directory: None,
-        repo: None,
+        scope: ProjectScope::Global,
         thread_role: None,
     };
     let mut report = EvalReport { total: entries.len(), ..Default::default() };

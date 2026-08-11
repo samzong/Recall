@@ -6,6 +6,7 @@ use crate::db::schema;
 use crate::db::search::{RepoFilter, SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::Store;
 use crate::export::{ExportIncludes, ExportOptions, write_jsonl};
+use crate::project_scope::{ProjectScope, SessionScopeFields};
 use crate::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource};
 use crate::usage::{UsageFilters, build_usage_report};
 
@@ -114,8 +115,7 @@ fn no_filters() -> SearchFilters {
     SearchFilters {
         sources: None,
         time_range: TimeRange::All,
-        directory: None,
-        repo: None,
+        scope: ProjectScope::Global,
         thread_role: None,
     }
 }
@@ -314,8 +314,7 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
         session_ids: Vec::new(),
         sources: None,
         time_range: TimeRange::All,
-        project: None,
-        repo: None,
+        scope: ProjectScope::Global,
         thread_role: None,
         limit: Some(10),
         includes: ExportIncludes::full(),
@@ -381,8 +380,7 @@ fn export_jsonl_applies_include_projection() {
         session_ids: Vec::new(),
         sources: None,
         time_range: TimeRange::All,
-        project: None,
-        repo: None,
+        scope: ProjectScope::Global,
         thread_role: None,
         limit: None,
         includes: ExportIncludes { messages: true, usage: false, events: false },
@@ -420,8 +418,7 @@ fn export_jsonl_can_select_sessions_by_id() {
         session_ids: vec!["s3".to_string(), "s1".to_string()],
         sources: None,
         time_range: TimeRange::All,
-        project: None,
-        repo: None,
+        scope: ProjectScope::Global,
         thread_role: None,
         limit: None,
         includes: ExportIncludes::full(),
@@ -468,8 +465,7 @@ fn export_jsonl_applies_source_time_project_and_limit_filters() {
         session_ids: Vec::new(),
         sources: Some(vec!["codex".to_string()]),
         time_range: TimeRange::Month,
-        project: Some("/tmp/project".to_string()),
-        repo: None,
+        scope: ProjectScope::Directory("/tmp/project".to_string()),
         thread_role: None,
         limit: Some(1),
         includes: ExportIncludes::full(),
@@ -605,8 +601,7 @@ fn search_with_source_filter() {
     let filters = SearchFilters {
         sources: Some(vec!["claude-code".to_string()]),
         time_range: TimeRange::All,
-        directory: None,
-        repo: None,
+        scope: ProjectScope::Global,
         thread_role: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
@@ -673,8 +668,7 @@ fn search_with_directory_filter_respects_project_boundary() {
     let filters = SearchFilters {
         sources: None,
         time_range: TimeRange::All,
-        directory: Some("/tmp/project".to_string()),
-        repo: None,
+        scope: ProjectScope::Directory("/tmp/project".to_string()),
         thread_role: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
@@ -696,7 +690,12 @@ fn recent_sessions_with_directory_filter_respects_project_boundary() {
     store.insert_session(&sibling).unwrap();
 
     let sessions = store
-        .list_recent_sessions_for_search_scope(None, TimeRange::All, Some("/tmp/project"), None, 10)
+        .list_recent_sessions_for_search_scope(
+            None,
+            TimeRange::All,
+            &ProjectScope::Directory("/tmp/project".to_string()),
+            10,
+        )
         .unwrap();
 
     assert_eq!(sessions.len(), 1);
@@ -731,8 +730,10 @@ fn search_with_repo_filter_matches_sibling_worktrees() {
     let filters = SearchFilters {
         sources: None,
         time_range: TimeRange::All,
-        directory: None,
-        repo: Some(RepoFilter::Slug("samzong/Recall".to_string())),
+        scope: ProjectScope::Repository {
+            filter: RepoFilter::Slug("samzong/Recall".to_string()),
+            local_root: None,
+        },
         thread_role: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
@@ -761,8 +762,10 @@ fn export_jsonl_applies_repo_filter() {
         session_ids: Vec::new(),
         sources: None,
         time_range: TimeRange::All,
-        project: None,
-        repo: Some(RepoFilter::Slug("samzong/Recall".to_string())),
+        scope: ProjectScope::Repository {
+            filter: RepoFilter::Slug("samzong/Recall".to_string()),
+            local_root: None,
+        },
         thread_role: None,
         limit: None,
         includes: ExportIncludes::full(),
@@ -803,11 +806,146 @@ fn project_filter_prefers_indexed_relative_directory() {
     session.directory = Some("samzong/Recall".to_string());
     store.insert_session(&session).unwrap();
 
-    let (directory, repo) =
-        store.resolve_project_repo_filters(Some("samzong/Recall"), None).unwrap();
+    let scope = store.resolve_scope(Some("samzong/Recall"), None).unwrap().scope;
 
-    assert_eq!(directory.as_deref(), Some("samzong/Recall"));
-    assert_eq!(repo, None);
+    assert_eq!(scope, ProjectScope::Directory("samzong/Recall".to_string()));
+}
+
+#[test]
+fn repository_scope_reaches_local_checkout_without_repo_identity() {
+    let store = setup();
+    let mut indexed = make_session("s1", "codex", "raw1", "Backfilled");
+    indexed.directory = Some("/repo/root".to_string());
+    indexed.repo_remote = Some("github.com/samzong/Recall".to_string());
+    let mut not_backfilled = make_session("s2", "codex", "raw2", "Missing identity");
+    not_backfilled.directory = Some("/repo/root/nested".to_string());
+    let mut other = make_session("s3", "codex", "raw3", "Other repo");
+    other.directory = Some("/elsewhere".to_string());
+    for session in [&indexed, &not_backfilled, &other] {
+        store.insert_session(session).unwrap();
+    }
+
+    let scope = ProjectScope::Repository {
+        filter: RepoFilter::Remote("github.com/samzong/Recall".to_string()),
+        local_root: Some("/repo/root".to_string()),
+    };
+    let mut ids = store
+        .list_recent_sessions_for_search_scope(None, TimeRange::All, &scope, 10)
+        .unwrap()
+        .into_iter()
+        .map(|session| session.source_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+
+    assert_eq!(ids, vec!["raw1".to_string(), "raw2".to_string()]);
+}
+
+/// The write path decides scope membership in Rust while queries decide it in
+/// SQL. Divergence would let sync persist sessions that search then hides, so
+/// the two must agree on every fixture.
+#[test]
+fn scope_predicate_matches_sql_and_rust_paths() {
+    let store = setup();
+    let fixtures = [
+        ("raw1", Some("/repo/root"), Some("github.com/samzong/Recall"), Some("samzong/Recall")),
+        (
+            "raw2",
+            Some("/repo/root/nested"),
+            Some("github.com/samzong/Recall"),
+            Some("samzong/Recall"),
+        ),
+        ("raw3", Some("/repo/worktree"), Some("github.com/samzong/Recall"), Some("samzong/Recall")),
+        ("raw4", Some("/repo/rootless"), None, None),
+        ("raw5", Some("/elsewhere"), Some("github.com/other/Repo"), Some("other/Repo")),
+        ("raw6", None, None, None),
+    ];
+    for (index, (source_id, directory, remote, slug)) in fixtures.iter().enumerate() {
+        let mut session = make_session(&format!("s{index}"), "codex", source_id, "Fixture");
+        session.directory = directory.map(str::to_string);
+        session.repo_remote = remote.map(str::to_string);
+        session.repo_slug = slug.map(str::to_string);
+        session.repo_name = slug.map(|slug| slug.rsplit('/').next().unwrap().to_string());
+        store.insert_session(&session).unwrap();
+    }
+
+    let scopes = [
+        ProjectScope::Global,
+        ProjectScope::Directory("/repo/root".to_string()),
+        ProjectScope::Directory("/repo/root/".to_string()),
+        ProjectScope::Directory("/repo".to_string()),
+        ProjectScope::Repository {
+            filter: RepoFilter::Remote("github.com/samzong/Recall".to_string()),
+            local_root: None,
+        },
+        ProjectScope::Repository {
+            filter: RepoFilter::Remote("github.com/samzong/Recall".to_string()),
+            local_root: Some("/repo/rootless".to_string()),
+        },
+        ProjectScope::Repository {
+            filter: RepoFilter::Slug("samzong/Recall".to_string()),
+            local_root: None,
+        },
+    ];
+
+    for scope in scopes {
+        let mut sql_ids = store
+            .list_recent_sessions_for_search_scope(None, TimeRange::All, &scope, 100)
+            .unwrap()
+            .into_iter()
+            .map(|session| session.source_id)
+            .collect::<Vec<_>>();
+        sql_ids.sort();
+
+        let mut rust_ids = fixtures
+            .iter()
+            .filter(|(_, directory, remote, slug)| {
+                scope.matches(SessionScopeFields {
+                    directory: *directory,
+                    repo_remote: *remote,
+                    repo_slug: *slug,
+                    repo_name: slug.map(|slug| slug.rsplit('/').next().unwrap()),
+                })
+            })
+            .map(|(source_id, ..)| source_id.to_string())
+            .collect::<Vec<_>>();
+        rust_ids.sort();
+
+        assert_eq!(sql_ids, rust_ids, "scope {scope:?} disagrees between SQL and Rust");
+    }
+}
+
+#[test]
+fn project_filter_all_selects_global_scope() {
+    let store = setup();
+    let mut session = make_session("s1", "codex", "raw1", "Indexed");
+    session.repo_slug = Some("samzong/Recall".to_string());
+    session.repo_name = Some("Recall".to_string());
+    store.insert_session(&session).unwrap();
+
+    assert_eq!(store.resolve_scope(Some("all"), None).unwrap().scope, ProjectScope::Global);
+}
+
+#[test]
+fn project_filter_reports_unknown_name_instead_of_matching_nothing() {
+    let store = setup();
+    store.insert_session(&make_session("s1", "codex", "raw1", "Indexed")).unwrap();
+
+    let err = store.resolve_scope(Some("Unindexed"), None).unwrap_err().to_string();
+
+    assert!(err.contains("no indexed project matches"), "{err}");
+}
+
+#[test]
+fn repo_name_filter_keeps_working_without_indexed_slug() {
+    let store = setup();
+    let mut session = make_session("s1", "codex", "raw1", "Imported");
+    session.repo_name = Some("Recall".to_string());
+    store.insert_session(&session).unwrap();
+
+    assert_eq!(
+        store.resolve_repo_filter("Recall").unwrap(),
+        RepoFilter::Name("Recall".to_string())
+    );
 }
 
 #[test]
@@ -1404,8 +1542,7 @@ fn hybrid_search_filters_by_thread_role_in_sql() {
     let filter = |thread_role| SearchFilters {
         sources: None,
         time_range: TimeRange::All,
-        directory: None,
-        repo: None,
+        scope: ProjectScope::Global,
         thread_role,
     };
     let source_ids = |results: Vec<crate::types::SearchResult>| {

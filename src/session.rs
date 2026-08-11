@@ -7,6 +7,7 @@ use crate::db::search::{SearchEngine, SearchFilters, ThreadRoleFilter, TimeRange
 use crate::db::store::{SessionListSort, Store};
 use crate::export::{ExportIncludes, ExportOptions};
 use crate::handoff;
+use crate::project_scope::ProjectScope;
 use crate::query::{parse_time_range, query_embedding, resolve_source_filter};
 use crate::semantic;
 use crate::session_action::{self, SessionAction};
@@ -327,6 +328,11 @@ pub(crate) fn run_session_list(
     let resolved_source = resolve_source_filter(source_filter, &sources)?;
     let time_range = parse_time_range(time_filter);
 
+    let store = Store::open()?;
+    let scope = store.resolve_scope(project_filter, repo_filter)?.announce();
+
+    // The sync and the listing must agree on the scope, or `--sync` would
+    // refresh a different set of sessions than the one it then shows.
     if sync {
         run_sync_job_inner(SyncRunOptions {
             force: false,
@@ -335,14 +341,11 @@ pub(crate) fn run_session_list(
             usage_only: false,
             backfill_events: false,
             sources: resolved_source.clone(),
+            scope: scope.clone(),
         })?;
         semantic::ensure_background_worker(false)?;
     }
 
-    let store = Store::open()?;
-    let (directory, repo) = store.resolve_project_repo_filters(project_filter, repo_filter)?;
-    let effective_repo_filter = repo_filter
-        .or_else(|| if repo.is_some() && directory.is_none() { project_filter } else { None });
     let effective_limit = if all { None } else { Some(limit) };
     let rows: Vec<SessionListRow> = if let Some(query) = query.filter(|q| !q.trim().is_empty()) {
         let engine = SearchEngine::new(&store.conn);
@@ -350,8 +353,7 @@ pub(crate) fn run_session_list(
         let filters = SearchFilters {
             sources: resolved_source.clone(),
             time_range,
-            directory: directory.clone(),
-            repo: repo.clone(),
+            scope: scope.clone(),
             thread_role,
         };
         let search_limit = effective_limit.unwrap_or(10_000).saturating_add(offset).max(1);
@@ -377,8 +379,7 @@ pub(crate) fn run_session_list(
             .list_indexed_sessions(
                 resolved_source.as_deref(),
                 time_range,
-                directory.as_deref(),
-                repo.as_ref(),
+                &scope,
                 thread_role,
                 effective_limit,
                 offset,
@@ -399,7 +400,8 @@ pub(crate) fn run_session_list(
             source_filter,
             time_filter,
             project_filter,
-            effective_repo_filter,
+            repo_filter,
+            &scope,
             thread_role,
             limit,
             offset,
@@ -505,8 +507,7 @@ fn cmd_session_export(
                 session_ids: sessions.iter().map(|session| session.id.clone()).collect(),
                 sources: None,
                 time_range: TimeRange::All,
-                project: None,
-                repo: None,
+                scope: ProjectScope::Global,
                 thread_role: None,
                 limit: None,
                 includes: crate::export::parse_export_includes(include)?,
@@ -817,6 +818,7 @@ fn print_session_list_json(
     time: Option<&str>,
     project: Option<&str>,
     repo: Option<&str>,
+    scope: &ProjectScope,
     thread_role: Option<ThreadRoleFilter>,
     limit: usize,
     offset: usize,
@@ -835,6 +837,10 @@ fn print_session_list_json(
                 "source": source,
                 "project": project,
                 "repo": repo,
+                "effective_scope": {
+                    "kind": scope.kind(),
+                    "value": scope.value()
+                },
                 "time": time.unwrap_or("all"),
                 "thread_role": thread_role.map(|role| role.as_str()),
                 "limit": if all { serde_json::Value::Null } else { serde_json::json!(limit) },

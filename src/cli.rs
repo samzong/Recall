@@ -45,6 +45,11 @@ enum Commands {
         verbose: bool,
         #[arg(long, help = "Sync only this source (id or label, e.g. cursor or CUR)")]
         source: Option<String>,
+        #[arg(
+            long,
+            help = "Scope selector: a path, owner/repo, a remote URL, or all; defaults to the current directory's project"
+        )]
+        project: Option<String>,
     },
     #[command(about = "Show indexed source and background job status")]
     Info {
@@ -195,8 +200,8 @@ pub(crate) fn run() -> Result<()> {
 
     match cli.command {
         Some(Commands::Info { format }) => crate::info::run(format)?,
-        Some(Commands::Sync { force, verbose, source }) => {
-            crate::sync::run_cli(force, verbose, source.as_deref())?
+        Some(Commands::Sync { force, verbose, source, project }) => {
+            crate::sync::run_cli(force, verbose, source.as_deref(), project.as_deref())?
         }
         Some(Commands::BackgroundWorker { sync_first }) => {
             crate::sync::run_background_worker(sync_first)?

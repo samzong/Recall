@@ -19,6 +19,7 @@ use crate::adapters::{claude_code, codex};
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::{SessionTopologyWrite, Store};
 use crate::export::{ExportIncludes, ExportOptions};
+use crate::project_scope::ProjectScope;
 use crate::share::meta::SessionDisplayMeta;
 use crate::share::render;
 use crate::types::{Message, Role, Session, UsageEventRecord};
@@ -513,8 +514,7 @@ impl SearchIndex {
         SearchFilters {
             sources: None,
             time_range: TimeRange::All,
-            directory: None,
-            repo: None,
+            scope: ProjectScope::Global,
             thread_role: None,
         }
     }

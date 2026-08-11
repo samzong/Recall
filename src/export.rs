@@ -4,8 +4,9 @@ use anyhow::{Result, anyhow};
 use serde::Serialize;
 
 use crate::adapters;
-use crate::db::search::{RepoFilter, ThreadRoleFilter, TimeRange};
+use crate::db::search::{ThreadRoleFilter, TimeRange};
 use crate::db::store::Store;
+use crate::project_scope::ProjectScope;
 use crate::query::{parse_time_range, resolve_source_filter};
 use crate::types::{
     Message, Role, Session, SessionEventRecord, SessionTopology, SessionUsageEventRecord,
@@ -31,8 +32,7 @@ pub(crate) struct ExportOptions {
     pub(crate) session_ids: Vec<String>,
     pub(crate) sources: Option<Vec<String>>,
     pub(crate) time_range: TimeRange,
-    pub(crate) project: Option<String>,
-    pub(crate) repo: Option<RepoFilter>,
+    pub(crate) scope: ProjectScope,
     pub(crate) thread_role: Option<ThreadRoleFilter>,
     pub(crate) limit: Option<usize>,
     pub(crate) includes: ExportIncludes,
@@ -49,13 +49,12 @@ pub(crate) fn run_cli(
 ) -> Result<()> {
     let store = Store::open()?;
     let sources = adapters::source_labels();
-    let (directory, repo) = store.resolve_project_repo_filters(project_filter, repo_filter)?;
+    let scope = store.resolve_scope(project_filter, repo_filter)?.announce();
     let options = ExportOptions {
         session_ids: Vec::new(),
         sources: resolve_source_filter(source_filter, &sources)?,
         time_range: parse_time_range(time_filter),
-        project: directory,
-        repo,
+        scope,
         thread_role,
         limit: if limit == 0 { None } else { Some(limit) },
         includes: parse_export_includes(include_filter)?,
@@ -180,8 +179,7 @@ pub(crate) fn write_jsonl<W: Write>(
         store.list_export_sessions(
             options.sources.as_deref(),
             options.time_range,
-            options.project.as_deref(),
-            options.repo.as_ref(),
+            &options.scope,
             options.thread_role,
             options.limit,
         )?

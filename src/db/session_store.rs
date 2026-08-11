@@ -10,7 +10,8 @@ use super::store::{
     MetadataSessionStateMeta, SESSION_COLUMNS, SessionListSort, SessionTopologyWrite, Store,
     session_from_row,
 };
-use crate::db::search::{RepoFilter, ThreadRoleFilter, TimeRange};
+use crate::db::search::{ThreadRoleFilter, TimeRange};
+use crate::project_scope::ProjectScope;
 use crate::types::{
     Message, ParentLink, RawSessionEvent, RawUsageEvent, Role, Session, SessionTopology, ThreadRole,
 };
@@ -448,15 +449,14 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
     ) -> Result<(u64, u64)> {
-        self.stats_for_search_scope(sources, time_range, None, None)
+        self.stats_for_search_scope(sources, time_range, &ProjectScope::Global)
     }
 
     pub(crate) fn stats_for_search_scope(
         &self,
         sources: Option<&[String]>,
         time_range: TimeRange,
-        directory: Option<&str>,
-        repo: Option<&RepoFilter>,
+        scope: &ProjectScope,
     ) -> Result<(u64, u64)> {
         let mut session_sql = String::from("SELECT COUNT(*) FROM sessions s WHERE 1=1");
         let mut session_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -467,8 +467,7 @@ impl Store {
             &mut session_param_idx,
             sources,
             time_range,
-            directory,
-            repo,
+            scope,
         );
         let session_param_refs: Vec<&dyn rusqlite::types::ToSql> =
             session_params.iter().map(|p| p.as_ref()).collect();
@@ -489,8 +488,7 @@ impl Store {
             &mut message_param_idx,
             sources,
             time_range,
-            directory,
-            repo,
+            scope,
         );
         let message_param_refs: Vec<&dyn rusqlite::types::ToSql> =
             message_params.iter().map(|p| p.as_ref()).collect();
@@ -501,15 +499,19 @@ impl Store {
 
     #[cfg(test)]
     pub(crate) fn list_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
-        self.list_recent_sessions_for_search_scope(None, TimeRange::All, None, None, limit)
+        self.list_recent_sessions_for_search_scope(
+            None,
+            TimeRange::All,
+            &ProjectScope::Global,
+            limit,
+        )
     }
 
     pub(crate) fn list_recent_sessions_for_search_scope(
         &self,
         sources: Option<&[String]>,
         time_range: TimeRange,
-        directory: Option<&str>,
-        repo: Option<&RepoFilter>,
+        scope: &ProjectScope,
         limit: usize,
     ) -> Result<Vec<Session>> {
         let mut sql = format!(
@@ -519,15 +521,7 @@ impl Store {
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
-        apply_scope_filters(
-            &mut sql,
-            &mut params,
-            &mut param_idx,
-            sources,
-            time_range,
-            directory,
-            repo,
-        );
+        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, scope);
         sql.push_str(&format!(
             " ORDER BY COALESCE(updated_at, started_at) DESC, started_at DESC, source ASC, source_id ASC LIMIT ?{param_idx}"
         ));
@@ -587,8 +581,7 @@ impl Store {
         &self,
         sources: Option<&[String]>,
         time_range: TimeRange,
-        directory: Option<&str>,
-        repo: Option<&RepoFilter>,
+        scope: &ProjectScope,
         thread_role: Option<ThreadRoleFilter>,
         limit: Option<usize>,
         offset: usize,
@@ -601,15 +594,7 @@ impl Store {
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
-        apply_scope_filters(
-            &mut sql,
-            &mut params,
-            &mut param_idx,
-            sources,
-            time_range,
-            directory,
-            repo,
-        );
+        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, scope);
         if let Some(thread_role) = thread_role {
             sql.push_str(thread_role.sql_predicate());
         }
@@ -644,16 +629,14 @@ impl Store {
         &self,
         sources: Option<&[String]>,
         time_range: TimeRange,
-        directory: Option<&str>,
-        repo: Option<&RepoFilter>,
+        scope: &ProjectScope,
         thread_role: Option<ThreadRoleFilter>,
         limit: Option<usize>,
     ) -> Result<Vec<Session>> {
         self.list_indexed_sessions(
             sources,
             time_range,
-            directory,
-            repo,
+            scope,
             thread_role,
             limit,
             0,
@@ -1114,8 +1097,7 @@ mod topology_tests {
                 .list_indexed_sessions(
                     None,
                     TimeRange::All,
-                    None,
-                    None,
+                    &ProjectScope::Global,
                     Some(filter),
                     None,
                     0,
@@ -1177,7 +1159,7 @@ mod topology_tests {
         );
 
         let mut ids = store
-            .list_recent_sessions_for_search_scope(None, TimeRange::All, None, None, 100)
+            .list_recent_sessions_for_search_scope(None, TimeRange::All, &ProjectScope::Global, 100)
             .unwrap()
             .into_iter()
             .map(|s| s.source_id)
@@ -1227,7 +1209,12 @@ mod topology_tests {
         // Under Today, the parent (3 days ago) is filtered out; the child must
         // stay visible because its picker is unreachable without the parent.
         let ids: Vec<String> = store
-            .list_recent_sessions_for_search_scope(None, TimeRange::Today, None, None, 100)
+            .list_recent_sessions_for_search_scope(
+                None,
+                TimeRange::Today,
+                &ProjectScope::Global,
+                100,
+            )
             .unwrap()
             .into_iter()
             .map(|s| s.source_id)

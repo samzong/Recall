@@ -295,6 +295,23 @@ mod tests {
     }
 
     #[test]
+    fn render_filter_bar_always_shows_active_project_scope() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+
+        app.scope = crate::project_scope::ProjectScope::Repository {
+            filter: crate::db::search::RepoFilter::Remote("github.com/samzong/Recall".to_string()),
+            local_root: None,
+        };
+        assert!(render_to_text(&app, 80, 10).contains("samzong/Recall"));
+
+        app.scope = crate::project_scope::ProjectScope::Global;
+        assert!(render_to_text(&app, 80, 10).contains("All projects"));
+    }
+
+    #[test]
     fn render_viewing_shows_subagent_hint_and_picker() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();

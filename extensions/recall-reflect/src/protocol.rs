@@ -52,15 +52,13 @@ impl RecallClient {
         Self { bin }
     }
 
-    pub fn sync(&self, source: Option<&str>) -> Result<()> {
-        let mut args = vec!["sync".to_string()];
-        if let Some(source) = source {
-            args.push("--source".to_string());
-            args.push(source.to_string());
-        }
+    pub fn sync(&self, args: &ReflectArgs) -> Result<()> {
+        let mut command_args =
+            vec!["sync".to_string(), "--project".to_string(), scope_selector(args).to_string()];
+        push_optional_arg(&mut command_args, "--source", args.source.as_deref());
 
-        let output = self.run(&args)?;
-        ensure_success("sync", &args, output).map(|_| ())
+        let output = self.run(&command_args)?;
+        ensure_success("sync", &command_args, output).map(|_| ())
     }
 
     pub fn export_sessions(&self, args: &ReflectArgs) -> Result<Vec<SourceSession>> {
@@ -71,8 +69,8 @@ impl RecallClient {
             "--include".to_string(),
             "metadata,messages".to_string(),
         ];
-        push_optional_arg(&mut command_args, "--project", args.project.as_deref());
-        push_optional_arg(&mut command_args, "--repo", args.repo.as_deref());
+        command_args.push("--project".to_string());
+        command_args.push(scope_selector(args).to_string());
         push_optional_arg(&mut command_args, "--source", args.source.as_deref());
         push_optional_arg(&mut command_args, "--time", args.time.as_deref());
 
@@ -86,6 +84,14 @@ impl RecallClient {
             format!("failed to spawn Recall command `{}`", command_label(&self.bin, args))
         })
     }
+}
+
+/// Recall infers a project scope from the current directory when no selector
+/// is given, so reflect always passes one — and passes the same one to sync and
+/// export, or it would refresh a different set of sessions than it reports on.
+/// `all` is the explicit global scope that personal reflection needs.
+fn scope_selector(args: &ReflectArgs) -> &str {
+    args.project.as_deref().or(args.repo.as_deref()).unwrap_or("all")
 }
 
 fn push_optional_arg(args: &mut Vec<String>, flag: &str, value: Option<&str>) {

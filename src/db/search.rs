@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use chrono::{Local, TimeZone};
 use rusqlite::Connection;
 
+use crate::db::project_store::apply_project_scope;
 use crate::db::store::{SESSION_COLUMNS, session_from_row};
+use crate::project_scope::ProjectScope;
 use crate::types::{MatchSource, SearchResult, Session};
 use crate::utils::f32_slice_to_bytes;
 
@@ -15,8 +17,7 @@ pub(crate) struct SearchEngine<'a> {
 pub(crate) struct SearchFilters {
     pub(crate) sources: Option<Vec<String>>,
     pub(crate) time_range: TimeRange,
-    pub(crate) directory: Option<String>,
-    pub(crate) repo: Option<RepoFilter>,
+    pub(crate) scope: ProjectScope,
     pub(crate) thread_role: Option<ThreadRoleFilter>,
 }
 
@@ -265,29 +266,10 @@ fn apply_filters(
         params.push(Box::new(min_ts));
         *param_idx += 1;
     }
-    if let Some(ref dir) = filters.directory {
-        sql.push_str(&format!(
-            " AND (s.directory = ?{} OR s.directory LIKE ?{})",
-            *param_idx,
-            *param_idx + 1
-        ));
-        params.push(Box::new(dir.clone()));
-        params.push(Box::new(directory_child_pattern(dir)));
-        *param_idx += 2;
-    }
-    if let Some(ref repo) = filters.repo {
-        let (column, value) = repo.column_and_value();
-        sql.push_str(&format!(" AND s.{column} = ?{}", *param_idx));
-        params.push(Box::new(value.to_string()));
-        *param_idx += 1;
-    }
+    apply_project_scope(sql, params, param_idx, &filters.scope);
     if let Some(thread_role) = filters.thread_role {
         sql.push_str(thread_role.sql_predicate());
     }
-}
-
-fn directory_child_pattern(dir: &str) -> String {
-    if dir.ends_with('/') { format!("{dir}%") } else { format!("{dir}/%") }
 }
 
 fn rrf_merge(fts_hits: &[Hit], vec_hits: &[Hit], k: u32) -> Vec<(String, f64, MatchSource)> {

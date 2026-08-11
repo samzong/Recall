@@ -44,11 +44,10 @@ pub(crate) fn run_search(
     let sources = adapters::source_labels();
     let resolved_source = resolve_source_filter(source_filter, &sources)?;
     let time_range = parse_time_range(time_filter);
-    let (directory, repo) = store.resolve_project_repo_filters(project_filter, repo_filter)?;
+    let scope = store.resolve_scope(project_filter, repo_filter)?.announce();
     let embedding = query_embedding(&store, query, |message| println!("{message}"))?;
 
-    let filters =
-        SearchFilters { sources: resolved_source, time_range, directory, repo, thread_role: None };
+    let filters = SearchFilters { sources: resolved_source, time_range, scope, thread_role: None };
 
     let results = engine.hybrid_search(query, embedding.as_deref(), &filters, 20, 3)?;
 

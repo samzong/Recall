@@ -99,6 +99,7 @@ Extensions consume Recall through the CLI:
 
 ```bash
 recall info --format json
+recall session list --project all --format json
 recall session list --project /repo --format json
 recall session list --query "query" --project /repo --format json
 recall search "query" --project /repo --format json
@@ -123,8 +124,18 @@ Core support in v0.1:
   that need transcript data must pass `--messages` or
   `--include metadata,messages,usage,events`.
 - every session record carries `session.topology` (`thread_role` plus portable
-  `parents[]`); it is additive over schema v4, so `protocol_version` stays `1`.
-  Import accepts records from schema v2 through v5.
+  `parents[]`); it is additive over schema v4 and does not affect
+  `protocol_version`. Import accepts records from schema v2 through v5.
+
+`protocol_version` is `2`. Version 2 changed the default scope: a command
+without `--project` now resolves its scope from the current directory instead
+of covering every project. Extensions must pass an explicit selector — use
+`--project all` for the previous global behaviour — because the caller's
+working directory would otherwise narrow the result set. `--project` also
+accepts a repository identity (`owner/repo` or a remote URL), so the separate
+`--repo` flag is deprecated. Structured responses carry
+`filters.effective_scope`. `recall sync` follows the same rule, so an extension
+that needs a full sync must pass `recall sync --project all`.
 
 Transcript-only extensions should use `--include metadata,messages` instead of
 reading usage or event records they do not need.

@@ -9,6 +9,7 @@ use crate::db::store::{
     EventSessionStateMeta, MetadataSessionStateMeta, SessionPath, SessionTopologyWrite, Store,
     UsageSessionStateMeta,
 };
+use crate::project_scope::{ProjectScope, SessionScopeFields};
 use crate::query::resolve_source_filter;
 use crate::repo_identity::{RepoIdentity, RepoIdentityCache};
 use crate::semantic;
@@ -23,11 +24,21 @@ pub(crate) struct SyncRunOptions {
     pub(crate) usage_only: bool,
     pub(crate) backfill_events: bool,
     pub(crate) sources: Option<Vec<String>>,
+    /// System jobs must pass `Global` explicitly: the background worker is a
+    /// child process that inherits the caller's directory, so an inferred
+    /// scope would silently shrink global maintenance.
+    pub(crate) scope: ProjectScope,
 }
 
-pub(crate) fn run_cli(force: bool, verbose: bool, source_filter: Option<&str>) -> Result<()> {
+pub(crate) fn run_cli(
+    force: bool,
+    verbose: bool,
+    source_filter: Option<&str>,
+    project_filter: Option<&str>,
+) -> Result<()> {
     let labels = adapters::source_labels();
     let sources = resolve_source_filter(source_filter, &labels)?;
+    let scope = Store::open()?.resolve_scope(project_filter, None)?.announce();
     run_sync_job_inner(SyncRunOptions {
         force,
         verbose,
@@ -35,13 +46,10 @@ pub(crate) fn run_cli(force: bool, verbose: bool, source_filter: Option<&str>) -
         usage_only: false,
         backfill_events: false,
         sources,
+        scope,
     })?;
     semantic::ensure_background_worker(false)?;
     Ok(())
-}
-
-pub(crate) fn run_sync_job(force: bool, verbose: bool) -> Result<()> {
-    run_cli(force, verbose, None)
 }
 
 pub(crate) fn run_usage_sync_job() -> Result<()> {
@@ -52,6 +60,7 @@ pub(crate) fn run_usage_sync_job() -> Result<()> {
         usage_only: true,
         backfill_events: false,
         sources: None,
+        scope: ProjectScope::Global,
     })
 }
 
@@ -63,11 +72,22 @@ pub(crate) fn run_dashboard_sync_job() -> Result<()> {
         usage_only: true,
         backfill_events: true,
         sources: None,
+        scope: ProjectScope::Global,
     })
 }
 
 pub(crate) fn run_background_worker(sync_first: bool) -> Result<()> {
-    semantic::run_background_worker(sync_first, || run_sync_job(false, false))
+    semantic::run_background_worker(sync_first, || {
+        run_sync_job_inner(SyncRunOptions {
+            force: false,
+            verbose: false,
+            emit: false,
+            usage_only: false,
+            backfill_events: false,
+            sources: None,
+            scope: ProjectScope::Global,
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +113,7 @@ struct SyncStats {
     skipped: u32,
     filtered_out: u32,
     excluded_out: u32,
+    out_of_scope: u32,
 }
 
 impl SyncStats {
@@ -242,6 +263,7 @@ impl SyncJob {
                 &self.store,
                 source_id,
                 matcher,
+                &self.options.scope,
                 &mut purged_excluded_ids,
             )?;
             self.stats.excluded_out += n;
@@ -272,7 +294,11 @@ impl SyncJob {
         if self.options.verbose {
             println!("Scanning {label}...");
         }
-        if let Err(e) = adapter.prune(&self.store)
+        // Prune deletes every row whose source file disappeared, which a
+        // scoped run must not do outside its scope. Adapters cannot prune by
+        // scope, so a scoped sync leaves it to global runs.
+        if matches!(self.options.scope, ProjectScope::Global)
+            && let Err(e) = adapter.prune(&self.store)
             && self.options.emit
         {
             eprintln!("Error pruning {label}: {e}");
@@ -315,6 +341,7 @@ impl SyncJob {
                 &self.store,
                 source_id,
                 matcher,
+                &self.options.scope,
                 purged_excluded_ids,
             )?;
             self.stats.excluded_out += n;
@@ -328,8 +355,13 @@ impl SyncJob {
     fn load_existing_state(&mut self, source_id: &str) -> Result<ExistingState> {
         let meta = self.store.session_meta_map(source_id)?;
         let mut paths = HashMap::new();
+        // Backfilling identity for every session of a source is global
+        // maintenance; a scoped run only writes identity for the sessions it
+        // actually processes.
+        let backfill_identity = matches!(self.options.scope, ProjectScope::Global);
         for mut path in self.store.session_paths_for_source(source_id)? {
-            if path.directory.is_some()
+            if backfill_identity
+                && path.directory.is_some()
                 && (path.repo_remote.is_none()
                     || path.repo_slug.is_none()
                     || path.repo_name.is_none())
@@ -376,6 +408,18 @@ impl SyncJob {
 
         let raw_source_id = raw.source_id.clone();
 
+        // Runs before every write and delete below, so a scoped sync can never
+        // touch a session outside its scope.
+        let repo_identity = self.repo_cache.resolve(raw.directory.as_deref());
+        if !self
+            .options
+            .scope
+            .matches(SessionScopeFields::new(raw.directory.as_deref(), repo_identity.as_ref()))
+        {
+            self.stats.out_of_scope += 1;
+            return Ok(());
+        }
+
         if let Some(matcher) = &self.path_excluder
             && paths_match_excluded(
                 raw.directory.as_deref(),
@@ -392,7 +436,6 @@ impl SyncJob {
             return Ok(());
         }
 
-        let repo_identity = self.repo_cache.resolve(raw.directory.as_deref());
         let existing_repo_fields = existing.paths.get(&raw_source_id).filter(|old| {
             repo_identity.is_none() && old.directory.as_deref() == raw.directory.as_deref()
         });
@@ -645,6 +688,7 @@ impl SyncJob {
             skipped,
             filtered_out,
             excluded_out,
+            out_of_scope,
         } = self.stats;
         let touched = self.stats.touched();
 
@@ -661,6 +705,9 @@ impl SyncJob {
             }
             if filtered_out > 0 {
                 print!(", {filtered_out} outside configured time scope");
+            }
+            if out_of_scope > 0 {
+                print!(", {out_of_scope} outside project scope");
             }
             if excluded_out > 0 {
                 print!(", {excluded_out} excluded by excluded_paths");
@@ -769,10 +816,19 @@ fn delete_excluded_sessions_for_source(
     store: &Store,
     source_id: &str,
     matcher: &globset::GlobSet,
+    scope: &ProjectScope,
     deleted: &mut HashSet<String>,
 ) -> Result<u32> {
     let mut count = 0;
     for path in store.session_paths_for_source(source_id)? {
+        if !scope.matches(SessionScopeFields {
+            directory: path.directory.as_deref(),
+            repo_remote: path.repo_remote.as_deref(),
+            repo_slug: path.repo_slug.as_deref(),
+            repo_name: path.repo_name.as_deref(),
+        }) {
+            continue;
+        }
         if paths_match_excluded(
             path.directory.as_deref(),
             path.source_file_path.as_deref(),
@@ -812,6 +868,7 @@ mod tests {
         schema,
         store::{SessionPath, Store},
     };
+    use crate::project_scope::ProjectScope;
     use crate::types::{Role, Session};
 
     use super::{
@@ -998,6 +1055,116 @@ mod tests {
         assert!(raw_session_metadata_changed(&raw_with_path, None, &missing));
     }
 
+    struct TwoProjectAdapter;
+
+    impl SourceAdapter for TwoProjectAdapter {
+        fn id(&self) -> &str {
+            "test"
+        }
+
+        fn label(&self) -> &str {
+            "Test"
+        }
+
+        fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
+            let message = |content: &str| RawMessage {
+                role: Role::User,
+                content: content.to_string(),
+                timestamp: Some(1_000),
+            };
+            Ok(vec![
+                RawSession::search_only(
+                    "inside",
+                    Some("/repo/root/nested".to_string()),
+                    1_000,
+                    Some(2_000),
+                    None,
+                    vec![message("inside")],
+                ),
+                RawSession::search_only(
+                    "outside",
+                    Some("/elsewhere".to_string()),
+                    1_000,
+                    Some(2_000),
+                    None,
+                    vec![message("outside")],
+                ),
+            ])
+        }
+
+        fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
+            None
+        }
+    }
+
+    fn scoped_job(scope: ProjectScope) -> (SyncJob, Vec<Box<dyn SourceAdapter>>) {
+        schema::register_sqlite_vec();
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(TwoProjectAdapter)];
+        let job = SyncJob::new(
+            SyncRunOptions {
+                force: false,
+                verbose: false,
+                emit: false,
+                usage_only: false,
+                backfill_events: false,
+                sources: None,
+                scope,
+            },
+            Store::open_in_memory().unwrap(),
+            AppConfig::default(),
+            &adapters,
+        )
+        .unwrap();
+        (job, adapters)
+    }
+
+    fn synced_source_ids(job: &SyncJob) -> Vec<String> {
+        let mut ids = job
+            .store
+            .session_paths_for_source("test")
+            .unwrap()
+            .into_iter()
+            .map(|path| path.source_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn scoped_sync_writes_only_sessions_inside_the_scope() {
+        let (mut job, adapters) = scoped_job(ProjectScope::Directory("/repo/root".to_string()));
+
+        job.run(&adapters).unwrap();
+
+        assert_eq!(synced_source_ids(&job), vec!["inside".to_string()]);
+        assert_eq!(job.stats.out_of_scope, 1);
+    }
+
+    #[test]
+    fn scoped_sync_leaves_sessions_outside_the_scope_untouched() {
+        let (mut job, adapters) = scoped_job(ProjectScope::Directory("/repo/root".to_string()));
+        let mut existing = session("s-outside", "test", "outside");
+        existing.directory = Some("/elsewhere".to_string());
+        existing.message_count = 7;
+        job.store.insert_session(&existing).unwrap();
+
+        job.run(&adapters).unwrap();
+
+        assert_eq!(job.store.session_meta("test", "outside").unwrap(), Some((Some(1), 7)));
+    }
+
+    #[test]
+    fn repository_scope_falls_back_to_local_root_when_identity_is_unknown() {
+        let (mut job, adapters) = scoped_job(ProjectScope::Repository {
+            filter: crate::db::search::RepoFilter::Remote("github.com/samzong/Recall".to_string()),
+            local_root: Some("/repo/root".to_string()),
+        });
+
+        job.run(&adapters).unwrap();
+
+        assert_eq!(synced_source_ids(&job), vec!["inside".to_string()]);
+    }
+
     #[test]
     fn sync_job_refreshes_changed_session_through_adapter_seam() {
         schema::register_sqlite_vec();
@@ -1011,6 +1178,7 @@ mod tests {
                 usage_only: false,
                 backfill_events: false,
                 sources: None,
+                scope: ProjectScope::Global,
             },
             Store::open_in_memory().unwrap(),
             AppConfig::default(),
@@ -1052,9 +1220,14 @@ mod tests {
             .unwrap();
 
         let mut deleted = HashSet::new();
-        let count =
-            delete_excluded_sessions_for_source(&store, "claude-code", &matcher, &mut deleted)
-                .unwrap();
+        let count = delete_excluded_sessions_for_source(
+            &store,
+            "claude-code",
+            &matcher,
+            &ProjectScope::Global,
+            &mut deleted,
+        )
+        .unwrap();
 
         assert_eq!(count, 1);
         assert!(deleted.contains("s1"));

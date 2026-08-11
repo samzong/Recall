@@ -58,7 +58,7 @@ fn main() -> Result<()> {
 
     let client = RecallClient::from_env();
     if cli.sync {
-        client.sync(args.source.as_deref())?;
+        client.sync(&args)?;
     }
 
     let filters = args.filters();
@@ -84,6 +84,9 @@ fn apply_default_scope(args: &mut ReflectArgs) -> Result<()> {
         return Ok(());
     }
 
+    if args.project.is_some() && args.repo.is_some() {
+        bail!("--project cannot be combined with --repo");
+    }
     if args.project.is_some() || args.repo.is_some() {
         return Ok(());
     }

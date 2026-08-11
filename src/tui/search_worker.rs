@@ -165,8 +165,7 @@ fn recent_sessions(store: &Store, request: &SearchRequest) -> anyhow::Result<Vec
     let recent = store.list_recent_sessions_for_search_scope(
         request.filters.sources.as_deref(),
         request.filters.time_range,
-        request.filters.directory.as_deref(),
-        request.filters.repo.as_ref(),
+        &request.filters.scope,
         SEARCH_LIMIT,
     )?;
     Ok(recent

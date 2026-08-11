@@ -322,6 +322,7 @@ mod tests {
     use crate::db::schema;
     use crate::db::search::TimeRange;
     use crate::export::{ExportIncludes, ExportOptions, write_jsonl};
+    use crate::project_scope::ProjectScope;
     use crate::types::{ParentRelation, ThreadRole};
 
     fn setup() -> Store {
@@ -448,8 +449,7 @@ mod tests {
             session_ids: Vec::new(),
             sources: None,
             time_range: TimeRange::All,
-            project: None,
-            repo: None,
+            scope: ProjectScope::Global,
             thread_role: None,
             limit: None,
             includes: ExportIncludes::full(),

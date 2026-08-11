@@ -407,15 +407,12 @@ pub(super) fn render_settings(f: &mut Frame, app: &App) {
             if app.settings_selected == 0 { selected_style } else { normal_style },
         ),
     ]));
-    let prefix = if app.config.default_current_repo_scope { "[x]" } else { "[ ]" };
-    let style = if app.settings_selected == 1 { selected_style } else { normal_style };
-    lines.push(Line::from(Span::styled(format!(" {prefix} Default Current Repo"), style)));
     lines.push(Line::from(""));
 
     for (index, (source_id, label)) in app.all_sources.iter().enumerate() {
         let enabled = app.config.is_source_enabled(source_id);
         let prefix = if enabled { "[x]" } else { "[ ]" };
-        let style = if app.settings_selected == index + 2 { selected_style } else { normal_style };
+        let style = if app.settings_selected == index + 1 { selected_style } else { normal_style };
         lines.push(Line::from(Span::styled(format!(" {prefix} {label} ({source_id})"), style)));
     }
 

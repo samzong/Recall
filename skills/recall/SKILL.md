@@ -32,19 +32,30 @@ Treat "share" and "update/refresh share link" as the same action: sync the lates
 
 ## Project Scope Defaults
 
-Treat "current project", "this repo", and similar wording as a repository identity request, not necessarily the current filesystem path. `recall --project` filters by exact session directory plus child paths only; it does not understand repo names, remotes, symlinks, or gmc worktrees.
+`--project` is the single scope selector and Recall resolves repo identity
+itself, so no manual repo-identity reconstruction is needed.
+
+- A path scopes to that directory and its children only. Use it for "just this
+  worktree" or a subdirectory of a monorepo.
+- `owner/repo` or a remote URL scopes to the repository identity, spanning every
+  worktree of that repo.
+- `all` scopes to every project.
+- Without `--project`, Recall derives the scope from the current directory: a
+  checkout with a resolvable `origin` means that repository, a checkout without
+  one means its top-level directory, anything else means every project.
 
 Default scoping rules:
 
-- If the user explicitly says global, all projects, or no project filter, do not scope by project.
-- If the user gives an exact path, use that path with `--project`.
-- If the request is about the current checkout only, use `git rev-parse --show-toplevel` with `--project`.
-- If the request is about the current project/repo and may include other worktrees, derive repo identity first:
-  - `git rev-parse --show-toplevel`
-  - `git remote get-url origin`
-  - repo slug such as `owner/repo` and repo name such as `repo`
-- For repo-identity lookups, do not rely on `--project <current path>` alone. List a bounded recent candidate set with source/time filters, parse JSON structurally, and keep sessions whose project directory belongs to the same repo identity. Prefer matching candidates by running `git -C <session.project> remote get-url origin` when that directory still exists; fall back to exact repo-name basename matches only when the directory is unavailable.
-- When reporting results from repo-identity filtering, say which project directories were included so path/worktree ambiguity is visible.
+- If the user explicitly says global, all projects, or no project filter, pass
+  `--project all` rather than omitting the flag.
+- If the user gives an exact path, pass that path.
+- If the request is about the current checkout only, pass
+  `git rev-parse --show-toplevel`.
+- If the request is about the current project and may include other worktrees,
+  omit `--project` when the command runs inside that checkout, or pass the
+  `owner/repo` slug explicitly.
+- Every structured response carries `filters.effective_scope`; report which
+  scope was used so path/worktree ambiguity stays visible.
 
 ## Latest/Find Session Lookup
 
@@ -55,11 +66,11 @@ Use this workflow for one-shot requests such as "latest Grok session for this pr
    ```bash
    recall session list --project /absolute/project/path --source <source> --limit 20 --sort updated --sync --format json
    ```
-3. If repo identity scope is intended, especially in gmc or alternate worktrees, use a bounded unscoped candidate list and filter structurally by repo identity:
+3. If repo identity scope is intended, especially in gmc or alternate worktrees, pass the identity directly:
    ```bash
-   recall session list --source <source> --limit 100 --sort updated --sync --format json
+   recall session list --project owner/repo --source <source> --limit 20 --sort updated --sync --format json
    ```
-   Increase the limit or add `--time 30d` only when needed. Do not pick the first global result without checking the session's `project`.
+   Running inside the checkout without `--project` resolves to the same scope. Check the selected session's `project` before acting on it.
 4. For a named or older session, add `--query "<keywords>"` and/or `--time 7d`, but keep the same project-scope rules.
 5. Show the selected session with:
    ```bash
@@ -170,8 +181,8 @@ If the user asks for "deep", "full", "comprehensive", or "analyze history", use 
 ## Workflow
 
 1. Identify the project scope and analysis mode.
-   - Apply Project Scope Defaults before choosing `--project`; repo identity may span multiple worktree paths.
-   - `--project` matches that directory and child paths; it does not match sibling prefixes.
+   - Apply Project Scope Defaults before choosing `--project`.
+   - A path matches that directory and child paths only; an `owner/repo` identity spans every worktree.
    - Ask at most one scoping question for broad requests.
    - State the default analysis mode when proceeding without a question.
 

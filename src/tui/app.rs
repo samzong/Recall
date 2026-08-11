@@ -1,6 +1,3 @@
-use std::path::Path;
-#[cfg(test)]
-use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -12,7 +9,7 @@ use crate::config::AppConfig;
 use crate::db::search::{RepoFilter, SearchFilters, TimeRange};
 use crate::db::store::{ProjectDirectory, Store};
 use crate::handoff;
-use crate::repo_identity::RepoIdentityCache;
+use crate::project_scope::ProjectScope;
 use crate::session_action;
 use crate::skill_audit::{self, SkillAuditFilters, SkillAuditReport};
 use crate::transcript;
@@ -156,8 +153,7 @@ pub(crate) struct App {
     pub(crate) filter_focus: FilterFocus,
     pub(crate) filters_dirty: bool,
     pub(crate) draft_source_filter_selection: Vec<String>,
-    pub(crate) draft_project_filter: Option<String>,
-    pub(crate) draft_repo_filter: Option<RepoFilter>,
+    pub(crate) draft_scope: ProjectScope,
     pub(crate) draft_time_filter: TimeRange,
     pub(crate) draft_sort_order: SortOrder,
     pub(crate) should_quit: bool,
@@ -193,8 +189,7 @@ pub(crate) struct App {
     pub(crate) source_picker_selection: Vec<String>,
     pub(crate) filters_editing_source: bool,
     pub(crate) project_directories: Vec<ProjectDirectory>,
-    pub(crate) project_filter: Option<String>,
-    pub(crate) repo_filter: Option<RepoFilter>,
+    pub(crate) scope: ProjectScope,
     pub(crate) project_picker: PickerState,
     pub(crate) project_picker_selection: Option<String>,
     pub(crate) filters_editing_project: bool,
@@ -221,7 +216,7 @@ impl App {
         let (total_sessions, total_messages) = store.stats().unwrap_or((0, 0));
         let semantic_progress = store.semantic_progress().unwrap_or_default();
         let background_status = store.background_job_status("pipeline").unwrap_or_default();
-        let repo_filter = default_repo_filter(&config);
+        let scope = crate::project_scope::auto_scope();
 
         let mut app = Self {
             terminal_area: Rect::new(0, 0, 80, 24),
@@ -252,8 +247,7 @@ impl App {
             filter_focus: FilterFocus::Source,
             filters_dirty: false,
             draft_source_filter_selection: Vec::new(),
-            draft_project_filter: None,
-            draft_repo_filter: None,
+            draft_scope: scope.clone(),
             draft_time_filter: TimeRange::All,
             draft_sort_order: SortOrder::Newest,
             should_quit: false,
@@ -289,8 +283,7 @@ impl App {
             source_picker_selection: Vec::new(),
             filters_editing_source: false,
             project_directories: store.list_project_directories().unwrap_or_default(),
-            project_filter: None,
-            repo_filter,
+            scope,
             project_picker: PickerState::default(),
             project_picker_selection: None,
             filters_editing_project: false,
@@ -402,19 +395,11 @@ impl App {
     }
 
     pub(crate) fn project_filter_label(&self) -> String {
-        self.project_filter
-            .as_deref()
-            .map(short_project_label)
-            .or_else(|| self.repo_filter.as_ref().map(repo_filter_label))
-            .unwrap_or_else(|| "All projects".to_string())
+        scope_label(&self.scope)
     }
 
     pub(crate) fn draft_project_filter_label(&self) -> String {
-        self.draft_project_filter
-            .as_deref()
-            .map(short_project_label)
-            .or_else(|| self.draft_repo_filter.as_ref().map(repo_filter_label))
-            .unwrap_or_else(|| "All projects".to_string())
+        scope_label(&self.draft_scope)
     }
 
     pub(crate) fn source_label_for<'a>(&'a self, source_id: &'a str) -> &'a str {
@@ -431,8 +416,7 @@ impl App {
             .list_recent_sessions_for_search_scope(
                 source_ids.as_deref(),
                 self.time_filter,
-                self.project_filter.as_deref(),
-                self.repo_filter.as_ref(),
+                &self.scope,
                 200,
             )
             .unwrap_or_default();
@@ -1635,8 +1619,7 @@ impl App {
         self.mode = AppMode::Search;
         if self.filters_dirty {
             self.source_filter_selection = self.draft_source_filter_selection.clone();
-            self.project_filter = self.draft_project_filter.clone();
-            self.repo_filter = self.draft_repo_filter.clone();
+            self.scope = self.draft_scope.clone();
             self.time_filter = self.draft_time_filter;
             self.sort_order = self.draft_sort_order;
             self.filters_dirty = false;
@@ -1736,8 +1719,7 @@ impl App {
         self.filters_editing_source = false;
         self.filters_editing_project = false;
         self.draft_source_filter_selection = self.source_filter_selection.clone();
-        self.draft_project_filter = self.project_filter.clone();
-        self.draft_repo_filter = self.repo_filter.clone();
+        self.draft_scope = self.scope.clone();
         self.draft_time_filter = self.time_filter;
         self.draft_sort_order = self.sort_order;
         self.filters_dirty = false;
@@ -1816,8 +1798,11 @@ impl App {
         self.filters_editing_source = false;
         self.filters_editing_project = true;
         self.project_picker.reset();
-        self.project_picker_selection = self.draft_project_filter.clone();
-        if let Some(selected_project) = self.draft_project_filter.as_ref() {
+        self.project_picker_selection = match &self.draft_scope {
+            ProjectScope::Directory(directory) => Some(directory.clone()),
+            ProjectScope::Global | ProjectScope::Repository { .. } => None,
+        };
+        if let Some(selected_project) = self.project_picker_selection.clone().as_ref() {
             self.project_picker.selected = self
                 .project_picker_rows()
                 .iter()
@@ -1840,31 +1825,27 @@ impl App {
     }
 
     fn apply_project_picker(&mut self) {
-        let previous_project = self.draft_project_filter.clone();
-        let previous_repo = self.draft_repo_filter.clone();
+        let previous_scope = self.draft_scope.clone();
         self.commit_project_picker_filter();
         self.close_project_picker();
         self.mode = AppMode::Filters;
-        if self.draft_project_filter != previous_project || self.draft_repo_filter != previous_repo
-        {
+        if self.draft_scope != previous_scope {
             self.mark_filters_dirty();
         }
     }
 
     fn commit_project_picker_filter(&mut self) {
         if self.project_picker.dirty {
-            self.draft_project_filter = self.project_picker_selection.clone();
-            self.draft_repo_filter = None;
+            self.draft_scope = match self.project_picker_selection.clone() {
+                Some(directory) => ProjectScope::Directory(directory),
+                None => ProjectScope::Global,
+            };
         } else if let Some(row) = self.project_picker_rows().get(self.project_picker.selected) {
             match *row {
-                ProjectPickerRow::All => {
-                    self.draft_project_filter = None;
-                    self.draft_repo_filter = None;
-                }
+                ProjectPickerRow::All => self.draft_scope = ProjectScope::Global,
                 ProjectPickerRow::Project(index) => {
                     if let Some(project) = self.project_directories.get(index) {
-                        self.draft_project_filter = Some(project.directory.clone());
-                        self.draft_repo_filter = None;
+                        self.draft_scope = ProjectScope::Directory(project.directory.clone());
                     }
                 }
             }
@@ -1959,13 +1940,11 @@ impl App {
 
     fn clear_filters(&mut self) {
         let was_filtered = !self.draft_source_filter_selection.is_empty()
-            || self.draft_project_filter.is_some()
-            || self.draft_repo_filter.is_some()
+            || self.draft_scope != ProjectScope::Global
             || self.draft_time_filter != TimeRange::All
             || self.draft_sort_order != SortOrder::Newest;
         self.draft_source_filter_selection.clear();
-        self.draft_project_filter = None;
-        self.draft_repo_filter = None;
+        self.draft_scope = ProjectScope::Global;
         self.draft_time_filter = TimeRange::All;
         self.draft_sort_order = SortOrder::Newest;
         self.filter_focus = FilterFocus::Source;
@@ -2128,8 +2107,7 @@ impl App {
         SearchFilters {
             sources: self.source_filter_ids(),
             time_range: self.time_filter,
-            directory: self.project_filter.clone(),
-            repo: self.repo_filter.clone(),
+            scope: self.scope.clone(),
             thread_role: None,
         }
     }
@@ -2168,11 +2146,11 @@ impl App {
     }
 
     fn update_scope_metrics(&mut self, store: &Store) {
+        let scope = self.scope.clone();
         if let Ok((sessions, messages)) = store.stats_for_search_scope(
             self.source_filter_ids().as_deref(),
             self.time_filter,
-            self.project_filter.as_deref(),
-            self.repo_filter.as_ref(),
+            &scope,
         ) {
             self.total_sessions = sessions;
             self.total_messages = messages;
@@ -2180,8 +2158,7 @@ impl App {
         if let Ok(progress) = store.semantic_progress_for_search_scope(
             self.source_filter_ids().as_deref(),
             self.time_filter,
-            self.project_filter.as_deref(),
-            self.repo_filter.as_ref(),
+            &scope,
         ) {
             self.semantic_progress = progress;
         }
@@ -2252,13 +2229,11 @@ impl App {
 
     fn reset_search_defaults(&mut self) {
         self.source_filter_selection.clear();
-        self.project_filter = None;
-        self.repo_filter = default_repo_filter(&self.config);
+        self.scope = crate::project_scope::auto_scope();
         self.time_filter = self.config.sync_window.to_time_range();
         self.sort_order = SortOrder::Newest;
         self.draft_source_filter_selection = self.source_filter_selection.clone();
-        self.draft_project_filter = self.project_filter.clone();
-        self.draft_repo_filter = self.repo_filter.clone();
+        self.draft_scope = self.scope.clone();
         self.draft_time_filter = self.time_filter;
         self.draft_sort_order = self.sort_order;
         self.filters_dirty = false;
@@ -2383,15 +2358,13 @@ impl App {
     }
 
     fn settings_row_count(&self) -> usize {
-        2 + self.all_sources.len()
+        1 + self.all_sources.len()
     }
 
     fn update_setting(&mut self, store: &Store) {
         if self.settings_selected == 0 {
             self.config.sync_window = self.config.sync_window.next();
-        } else if self.settings_selected == 1 {
-            self.config.default_current_repo_scope = !self.config.default_current_repo_scope;
-        } else if let Some((source_id, _)) = self.all_sources.get(self.settings_selected - 2) {
+        } else if let Some((source_id, _)) = self.all_sources.get(self.settings_selected - 1) {
             if self.config.is_source_enabled(source_id) {
                 let enabled_count =
                     self.all_sources.len().saturating_sub(self.config.disabled_sources.len());
@@ -2755,18 +2728,12 @@ fn project_matches_query(path: &str, query: &str) -> bool {
     query.split_whitespace().all(|part| path.contains(part))
 }
 
-fn default_repo_filter(config: &AppConfig) -> Option<RepoFilter> {
-    if !config.default_current_repo_scope {
-        return None;
+fn scope_label(scope: &ProjectScope) -> String {
+    match scope {
+        ProjectScope::Global => "All projects".to_string(),
+        ProjectScope::Directory(directory) => short_project_label(directory),
+        ProjectScope::Repository { filter, .. } => repo_filter_label(filter),
     }
-    let cwd = std::env::current_dir().ok()?;
-    repo_filter_for_dir(&cwd)
-}
-
-fn repo_filter_for_dir(dir: &Path) -> Option<RepoFilter> {
-    let mut cache = RepoIdentityCache::default();
-    let identity = cache.resolve(dir.to_str())?;
-    Some(RepoFilter::Remote(identity.remote))
 }
 
 fn repo_filter_label(repo: &RepoFilter) -> String {
@@ -2817,14 +2784,12 @@ mod tests {
             config: AppConfig::default(),
             source_filter_selection: Vec::new(),
             project_directories: Vec::new(),
-            project_filter: None,
-            repo_filter: None,
+            scope: ProjectScope::Global,
             time_filter: TimeRange::All,
             filter_focus: FilterFocus::Source,
             filters_dirty: false,
             draft_source_filter_selection: Vec::new(),
-            draft_project_filter: None,
-            draft_repo_filter: None,
+            draft_scope: ProjectScope::Global,
             draft_time_filter: TimeRange::All,
             draft_sort_order: SortOrder::Newest,
             should_quit: false,
@@ -3616,33 +3581,26 @@ mod tests {
     }
 
     #[test]
-    fn repo_filter_for_dir_resolves_remote_repo() {
-        let root =
-            std::env::temp_dir().join(format!("recall-repo-filter-{}", uuid::Uuid::new_v4()));
-        let nested = root.join("a").join("b");
-        std::fs::create_dir_all(&nested).unwrap();
-        Command::new("git").arg("init").current_dir(&root).output().unwrap();
-        Command::new("git")
-            .args(["remote", "add", "origin", "git@github.com:samzong/Recall.git"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-
-        let resolved = repo_filter_for_dir(&nested);
-
-        assert_eq!(resolved, Some(RepoFilter::Remote("github.com/samzong/Recall".to_string())));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn search_filters_include_repo_filter() {
+    fn search_filters_use_repo_scope() {
         let mut app = app_with_sources();
-        app.repo_filter = Some(RepoFilter::Remote("github.com/samzong/Recall".to_string()));
+        app.scope = ProjectScope::Repository {
+            filter: RepoFilter::Remote("github.com/samzong/Recall".to_string()),
+            local_root: None,
+        };
 
         let filters = app.search_filters();
 
-        assert_eq!(filters.directory, None);
-        assert_eq!(filters.repo, app.repo_filter);
+        assert_eq!(filters.scope, app.scope);
+    }
+
+    #[test]
+    fn search_filters_use_directory_scope_when_project_selected() {
+        let mut app = app_with_sources();
+        app.scope = ProjectScope::Directory("/tmp/project".to_string());
+
+        let filters = app.search_filters();
+
+        assert_eq!(filters.scope, ProjectScope::Directory("/tmp/project".to_string()));
     }
 
     #[test]
@@ -3659,7 +3617,7 @@ mod tests {
 
         assert_eq!(app.project_picker_selection, Some("/Users/x/git/samzong/Recall".to_string()));
         assert!(app.project_picker.dirty);
-        assert_eq!(app.project_filter, None);
+        assert_eq!(app.scope, ProjectScope::Global);
     }
 
     #[test]
@@ -3867,8 +3825,11 @@ mod tests {
 
         assert!(matches!(app.mode, AppMode::Filters));
         assert!(!app.filters_editing_project);
-        assert_eq!(app.project_filter, None);
-        assert_eq!(app.draft_project_filter, Some("/Users/x/git/samzong/Recall".to_string()));
+        assert_eq!(app.scope, ProjectScope::Global);
+        assert_eq!(
+            app.draft_scope,
+            ProjectScope::Directory("/Users/x/git/samzong/Recall".to_string())
+        );
         assert!(app.filters_dirty);
         assert!(!app.search_pending);
     }

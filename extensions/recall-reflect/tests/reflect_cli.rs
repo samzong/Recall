@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const JSONL_FIXTURE: &str = r#"{"schema_version":4,"record_type":"session","session":{"id":"s1","source":"codex","source_id":"source-s1","title":"Codex session","directory":"/tmp/repo","repo_remote":"git@example.com:owner/repo.git","repo_slug":"owner/repo","repo_name":"repo","started_at":1000,"updated_at":1200,"message_count":2,"entrypoint":null,"custom_title":null,"summary":null,"duration_minutes":null,"source_file_path":null},"messages":[{"seq":0,"role":"user","timestamp":1000,"content":"please keep scope small"},{"seq":1,"role":"assistant","timestamp":1100,"content":"I will keep it focused"}],"usage_events":[],"events":[]}
@@ -16,18 +17,7 @@ fn reflect_cli_reads_export_jsonl_from_recall_bin() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_recall-reflect"))
         .env("RECALL_BIN", fake.script_path())
-        .args([
-            "--project",
-            "/tmp/repo",
-            "--repo",
-            "owner/repo",
-            "--source",
-            "codex",
-            "--time",
-            "week",
-            "--format",
-            "json",
-        ])
+        .args(["--repo", "owner/repo", "--source", "codex", "--time", "week", "--format", "json"])
         .output()
         .unwrap();
 
@@ -38,7 +28,7 @@ fn reflect_cli_reads_export_jsonl_from_recall_bin() {
     assert_eq!(json["summary"]["sessions"], 1);
     assert_eq!(json["summary"]["timeline_moments"], 2);
     assert_eq!(json["scope"]["kind"], "project");
-    assert_eq!(json["scope"]["project"], "/tmp/repo");
+    assert_eq!(json["scope"]["project"], serde_json::Value::Null);
     assert_eq!(json["scope"]["repo"], "owner/repo");
     assert_eq!(json["scope"]["time_range"], "week");
     assert_eq!(json["scope"]["sources"][0], "codex");
@@ -47,7 +37,7 @@ fn reflect_cli_reads_export_jsonl_from_recall_bin() {
     assert_eq!(
         calls,
         [
-            "export --limit 0 --include metadata,messages --project /tmp/repo --repo owner/repo --source codex --time week"
+            "export --limit 0 --include metadata,messages --project owner/repo --source codex --time week"
         ]
     );
 }
@@ -77,7 +67,7 @@ fn reflect_cli_json_exposes_broader_signals() {
     assert!(json["task_shapes"].as_array().unwrap().len() >= 2);
 
     let calls = fake.calls();
-    assert_eq!(calls, ["export --limit 0 --include metadata,messages --time 30d"]);
+    assert_eq!(calls, ["export --limit 0 --include metadata,messages --project all --time 30d"]);
 }
 
 #[test]
@@ -102,8 +92,8 @@ fn reflect_cli_syncs_selected_source_before_export() {
     assert_eq!(
         calls,
         [
-            "sync --source opencode",
-            &format!(
+            format!("sync --project {} --source opencode", repo.path().display()),
+            format!(
                 "export --limit 0 --include metadata,messages --project {} --source opencode",
                 repo.path().display()
             )
@@ -167,7 +157,7 @@ fn reflect_cli_defaults_to_personal_scope_outside_git_worktree() {
     assert_eq!(json["scope"]["time_range"], "30d");
 
     let calls = fake.calls();
-    assert_eq!(calls, ["export --limit 0 --include metadata,messages --time 30d"]);
+    assert_eq!(calls, ["export --limit 0 --include metadata,messages --project all --time 30d"]);
 }
 
 #[test]
@@ -192,7 +182,7 @@ fn reflect_cli_personal_overrides_git_root_scope() {
     assert_eq!(json["scope"]["time_range"], "7d");
 
     let calls = fake.calls();
-    assert_eq!(calls, ["export --limit 0 --include metadata,messages --time 7d"]);
+    assert_eq!(calls, ["export --limit 0 --include metadata,messages --project all --time 7d"]);
 }
 
 #[test]
@@ -244,6 +234,9 @@ impl TempDir {
     fn new(prefix: &str) -> Self {
         let path = unique_temp_dir(prefix);
         fs::create_dir_all(&path).unwrap();
+        // macOS resolves TMPDIR through /private, and git reports the resolved
+        // path, so tests must compare against the canonical form.
+        let path = fs::canonicalize(&path).unwrap_or(path);
         Self { path }
     }
 
@@ -317,8 +310,12 @@ impl Drop for FakeRecall {
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
+    // Clock resolution alone collides when tests start in the same tick, which
+    // makes parallel runs share a capture file.
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{seq}", std::process::id()))
 }
 
 fn init_git_repo(path: &Path) {

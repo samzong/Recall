@@ -19,10 +19,11 @@ brew install samzong/tap/recall
 ## Usage
 
 ```bash
-recall sync          # incremental sync (safe to run anytime)
+recall sync          # incremental sync of the current project (safe to run anytime)
+recall sync --project all  # sync every project and run index-wide maintenance
 recall               # launch TUI
 recall usage         # usage dashboard
-recall export > recall-export.jsonl # export all session
+recall export --project all > recall-export.jsonl # export all sessions
 recall import recall-export.jsonl --dry-run  # preview an import
 recall session list  # list sessions for agents/scripts
 recall session share --id <session-id> --format json  # publish one selected session

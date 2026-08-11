@@ -8,7 +8,12 @@ description: Recall command reference
 ```bash
 recall sync
 recall sync --force
+recall sync --project all
 ```
+
+Inside a Git checkout `recall sync` syncs that project only. `--project all`
+syncs every project and is what runs index-wide maintenance such as pruning
+sessions whose transcripts were deleted.
 
 ## Search
 
@@ -16,7 +21,13 @@ recall sync --force
 recall
 recall search "query"
 recall search "query" --project /path/to/repo
+recall search "query" --project owner/repo
+recall search "query" --project all
 ```
+
+Run inside a Git checkout and the scope defaults to that project, including its
+other worktrees. `--project` takes a path (that directory and its children), a
+repository identity (`owner/repo` or a remote URL), or `all` for every project.
 
 ## Usage
 

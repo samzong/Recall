@@ -62,8 +62,6 @@ pub(crate) struct AppConfig {
     legacy_enabled_sources: Vec<String>,
     #[serde(default)]
     pub(crate) sync_window: SyncWindow,
-    #[serde(default)]
-    pub(crate) default_current_repo_scope: bool,
     /// Glob patterns matched against each session's `directory` (cwd) field.
     /// Sessions whose cwd matches ANY glob are dropped at sync time — they
     /// never enter the FTS or vector index. Edit via the config file.
