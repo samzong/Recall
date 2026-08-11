@@ -29,8 +29,9 @@ cargo test integration::eval_harness  # eval harness
 ```
 
 `make check` must pass before push. CI runs exactly the same command — there is
-no CI-only logic. The gate uses `--workspace`, so it covers extension crates
-too. Build a single extension with `cargo build -p recall-<name>`.
+no CI-only logic. The gate uses `--workspace` and `--features bench`, so it
+covers extension crates and the `bench_api` shim that `benches/` compiles
+against. Build a single extension with `cargo build -p recall-<name>`.
 
 Core releases use cargo-release: `make release-patch` is a dry run; add
 `EXECUTE=1` to bump, commit, tag, and push. The `v*` tag triggers the GitHub

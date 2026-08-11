@@ -25,7 +25,7 @@ check: ## Full quality gate — format, lint, test
 	@printf '\n$(BOLD)[1/3] Checking format$(RESET)\n'
 	$(CARGO) fmt --all -- --check
 	@printf '\n$(BOLD)[2/3] Running clippy$(RESET)\n'
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --features bench -- -D warnings
 	@printf '\n$(BOLD)[3/3] Running tests$(RESET)\n'
 	$(CARGO) test --workspace
 	@printf '\n$(GREEN)  ✓ All checks passed$(RESET)\n\n'
@@ -34,7 +34,7 @@ test: ## Run tests
 	$(CARGO) test --workspace
 
 lint: ## Run clippy
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --features bench -- -D warnings
 
 fmt: ## Format code
 	$(CARGO) fmt --all
