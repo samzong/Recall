@@ -23,10 +23,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # A benchmark comparison is only meaningful when the measurement
+      # instrument is identical on both sides, so everything that shapes the
+      # generated code or the measurement is pinned to an exact revision. CI's
+      # correctness workflow deliberately keeps tracking current stable; this
+      # one must not, or a toolchain release would show up as a performance
+      # change. Bump these deliberately, on their own commit.
       - name: Setup rust toolchain, cache and cargo-codspeed binary
-        uses: moonrepo/setup-rust@v1
+        uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3 # v1.3.0
         with:
-          channel: stable
+          channel: "1.97.1"
           cache-target: release
           bins: cargo-codspeed
 
@@ -34,7 +40,7 @@ jobs:
         run: cargo codspeed build --features bench
 
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v5
+        uses: CodSpeedHQ/action@0ca9cbbf4623b599a6c3ed4fc8a922942705d9f1 # v5.0.2
         with:
           mode: simulation
           run: cargo codspeed run
