@@ -19,16 +19,20 @@ release: ## Release build (LTO + strip)
 
 # ── Quality ──────────────────────────────────────────────────────────────────
 
-.PHONY: check test lint fmt
+.PHONY: check audit test lint fmt
 
-check: ## Full quality gate — format, lint, test
-	@printf '\n$(BOLD)[1/3] Checking format$(RESET)\n'
+check: audit ## Full quality gate — dependency audit, format, lint, test
+	@printf '\n$(BOLD)[2/4] Checking format$(RESET)\n'
 	$(CARGO) fmt --all -- --check
-	@printf '\n$(BOLD)[2/3] Running clippy$(RESET)\n'
+	@printf '\n$(BOLD)[3/4] Running clippy$(RESET)\n'
 	$(CARGO) clippy --workspace --all-targets --features bench -- -D warnings
-	@printf '\n$(BOLD)[3/3] Running tests$(RESET)\n'
+	@printf '\n$(BOLD)[4/4] Running tests$(RESET)\n'
 	$(CARGO) test --workspace
 	@printf '\n$(GREEN)  ✓ All checks passed$(RESET)\n\n'
+
+audit: ## Check locked Rust dependencies for known vulnerabilities
+	@printf '\n$(BOLD)[1/4] Auditing dependencies$(RESET)\n'
+	$(CARGO) audit --file Cargo.lock
 
 test: ## Run tests
 	$(CARGO) test --workspace

@@ -17,7 +17,7 @@ published to crates.io — these are application binaries, not library crates.
 ## Commands
 
 ```bash
-make check                            # full gate: fmt --check → clippy -D warnings → test
+make check                            # full gate: audit → fmt --check → clippy -D warnings → test
 make build                            # debug build
 make run                              # launch TUI
 make sync                             # cargo run -- sync (FORCE=1 reprocesses all)
@@ -45,7 +45,8 @@ PR is the release intent — after merge, a workflow creates the
 `recall-<name>-v<version>` tag, builds binaries, and regenerates the catalog.
 
 One-time setup: `git config core.hooksPath .githooks` enables the DCO signoff
-hook, and `brew install git-cliff` is required to cut a release.
+hook. Install `cargo-audit 0.22.2` for `make check`; `brew install git-cliff`
+is also required to cut a release.
 
 ## Architecture
 

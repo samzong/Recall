@@ -233,6 +233,7 @@ current application release boundary, not a package metadata bug.
 
 ```bash
 cargo install cargo-release
+cargo install cargo-audit --locked --version 0.22.2
 git config core.hooksPath .githooks   # enables auto DCO signoff
 ```
 
