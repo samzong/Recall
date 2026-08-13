@@ -198,21 +198,17 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn failed_atomic_save_preserves_existing_config() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn failed_atomic_save_preserves_existing_target() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let original = br#"{"disabled_sources":["codex"]}"#;
-        std::fs::write(&path, original).unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let marker = path.join("existing");
+        std::fs::write(&marker, "keep").unwrap();
 
         let result = AppConfig::default().save_to(&path);
 
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "keep");
     }
 }

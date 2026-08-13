@@ -2364,8 +2364,7 @@ impl App {
             self.config.sync_window = self.config.sync_window.next();
         } else if let Some((source_id, _)) = self.all_sources.get(self.settings_selected - 1) {
             if self.config.is_source_enabled(source_id) {
-                let enabled_count =
-                    self.all_sources.len().saturating_sub(self.config.disabled_sources.len());
+                let enabled_count = self.enabled_sources().len();
                 if enabled_count <= 1 {
                     self.status_message = Some("At least one source must stay enabled".to_string());
                     return;
@@ -3645,11 +3644,12 @@ mod tests {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let mut config = AppConfig::default();
-        config.disabled_sources = vec!["codex".to_string(), "cline".to_string()];
+        config.disabled_sources = vec!["cline".to_string()];
 
-        let app = App::new(&store, vec![source("codex", "Codex")], config);
+        let app = App::new(&store, vec![source("codex", "Codex"), source("grok", "Grok")], config);
 
-        assert_eq!(app.config.disabled_sources, vec!["codex".to_string(), "cline".to_string()]);
+        assert_eq!(app.config.disabled_sources, vec!["cline".to_string()]);
+        assert_eq!(app.enabled_sources().len(), 2);
     }
 
     #[test]
