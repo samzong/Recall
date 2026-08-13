@@ -4,6 +4,7 @@ pub(crate) mod cline;
 pub(crate) mod codex;
 pub(crate) mod copilot;
 pub(crate) mod cursor;
+pub(crate) mod deepseek_harness;
 pub(crate) mod events;
 pub(crate) mod file_scan;
 pub(crate) mod gemini;
@@ -198,6 +199,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(copilot::CopilotAdapter),
         Box::new(cursor::CursorAdapter),
         Box::new(cline::ClineAdapter),
+        Box::new(deepseek_harness::DeepSeekHarnessAdapter),
     ]
 }
 

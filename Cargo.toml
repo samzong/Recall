@@ -41,6 +41,7 @@ unicode-width = "0.2"
 fs2 = "0.4"
 pulldown-cmark = "0.13"
 zip = { version = "7", default-features = false, features = ["deflate"] }
+zstd = { version = "0.13", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10", features = ["metal"] }
