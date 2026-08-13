@@ -163,6 +163,7 @@ fn parse_antigravity_session_for_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
 ) -> anyhow::Result<Option<RawSession>> {
+    let source_file_path = entry.stat_target.to_str().map(str::to_string);
     let mut raw = match parse_antigravity_transcript(&entry.stat_target, &entry.session_id) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
@@ -173,6 +174,7 @@ fn parse_antigravity_session_for_entry(
     };
     raw.directory = entry.directory;
     raw.updated_at = Some(mtime_ms);
+    raw.source_file_path = source_file_path;
     Ok(Some(raw))
 }
 
@@ -376,6 +378,10 @@ mod tests {
         );
         let mtime = file_scan::stat_mtime_ms(&transcript).unwrap();
         let store = setup_store();
+
+        let fresh = scan_for_sync_impl(&root, &store, None).unwrap();
+        assert_eq!(fresh.sessions[0].source_file_path.as_deref(), transcript.to_str());
+
         store.insert_session(&make_existing_session(conversation_id, mtime, 1)).unwrap();
 
         let result = scan_for_sync_impl(&root, &store, None).unwrap();

@@ -166,6 +166,7 @@ fn parse_gemini_session_value(
 
     let mut session =
         RawSession::search_only(session_id, None, started_at, updated_at, None, messages);
+    session.source_file_path = source_path;
     if !usage_events.is_empty() {
         session = session.with_usage(usage_events, USAGE_PARSER_VERSION);
     }
@@ -283,5 +284,20 @@ mod tests {
         assert_eq!(event.cache_read_tokens, 30);
         assert_eq!(event.reasoning_tokens, 5);
         assert_eq!(event.token_source, crate::types::TokenSource::Observed);
+    }
+
+    #[test]
+    fn parse_gemini_session_file_sets_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(
+            &path,
+            r#"{"sessionId":"abc-123","messages":[{"type":"user","content":"hello"}]}"#,
+        )
+        .unwrap();
+
+        let session = parse_gemini_session_file(&path).unwrap().unwrap();
+
+        assert_eq!(session.source_file_path.as_deref(), path.to_str());
     }
 }

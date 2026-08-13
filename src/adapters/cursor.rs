@@ -95,6 +95,20 @@ impl SourceAdapter for CursorAdapter {
 
         for composer_id in composer_ids {
             let meta = load_composer_meta(&conn, &composer_id, &lookup);
+            if existing.contains_key(&composer_id)
+                && let Some(path) = transcript_paths
+                    .get(&composer_id)
+                    .and_then(|transcript| transcript.path.to_str())
+            {
+                store.update_session_fields(
+                    self.id(),
+                    &composer_id,
+                    None,
+                    None,
+                    None,
+                    Some(path),
+                )?;
+            }
             let updated_at = meta.last_updated_at.or(meta.created_at);
             if let Some(cutoff) = since_ts
                 && updated_at.is_some_and(|ts| ts < cutoff)
@@ -239,6 +253,10 @@ fn build_raw_session(
     if include_events {
         session = session.with_events(parsed.events, EVENT_PARSER_VERSION);
     }
+    session.source_file_path = transcript_paths
+        .get(composer_id)
+        .and_then(|transcript| transcript.path.to_str())
+        .map(str::to_string);
     Ok(Some(session))
 }
 
@@ -877,6 +895,7 @@ fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<O
     let mut session =
         RawSession::search_only(String::new(), None, 0, None, Some("agent".to_string()), messages)
             .with_usage(Vec::new(), USAGE_PARSER_VERSION);
+    session.source_file_path = Some(source_path);
     if include_events {
         session = session.with_events(session_events, EVENT_PARSER_VERSION);
     }
@@ -1311,6 +1330,31 @@ mod tests {
     }
 
     #[test]
+    fn build_raw_session_attaches_matching_transcript_path() {
+        let root = temp_root("composer-path");
+        let composer_id = uuid::Uuid::new_v4().to_string();
+        let bubble_id = uuid::Uuid::new_v4().to_string();
+        let transcript_path = root.join(format!("{composer_id}.jsonl"));
+        let conn = seed_global_db(&root, &composer_id, &bubble_id);
+        let meta = load_composer_meta(&conn, &composer_id, &ComposerLookup::load(&conn));
+        let transcript_paths = HashMap::from([(
+            composer_id.clone(),
+            AgentTranscriptPath {
+                session_id: composer_id.clone(),
+                path: transcript_path.clone(),
+                directory: None,
+            },
+        )]);
+
+        let raw = build_raw_session(&conn, &composer_id, &meta, &transcript_paths, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(raw.source_file_path.as_deref(), transcript_path.to_str());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn parse_composer_session_prefers_bubble_usage_over_context_breakdown() {
         let root = temp_root("bubble-usage");
         let composer_id = uuid::Uuid::new_v4().to_string();
@@ -1444,6 +1488,7 @@ mod tests {
         // every sync.
         assert_eq!(raw.usage_parser_version, Some(USAGE_PARSER_VERSION));
         assert!(raw.usage_events.is_empty());
+        assert_eq!(raw.source_file_path.as_deref(), jsonl_path.to_str());
         let _ = fs::remove_dir_all(root);
     }
 

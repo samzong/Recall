@@ -261,6 +261,7 @@ fn parse_pi_session_file(
     entry: FileScanEntry,
     mtime_ms: i64,
 ) -> anyhow::Result<Option<RawSession>> {
+    let source_file_path = entry.stat_target.to_str().map(str::to_string);
     let parsed = match parse_pi_session(&entry.stat_target, mtime_ms) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -304,7 +305,7 @@ fn parse_pi_session_file(
         usage_parser_version: Some(USAGE_PARSER_VERSION),
         events: Vec::new(),
         event_parser_version: None,
-        source_file_path: None,
+        source_file_path,
         custom_title: None,
         summary: None,
         duration_minutes: None,
@@ -838,6 +839,7 @@ mod tests {
         assert_eq!(raw.directory.as_deref(), Some("/tmp/pi-project"));
         assert_eq!(raw.started_at, 1_000);
         assert_eq!(raw.updated_at, Some(mtime));
+        assert_eq!(raw.source_file_path.as_deref(), path.to_str());
         assert_eq!(raw.messages.len(), 3);
         assert_eq!(raw.messages[0].role, Role::User);
         assert_eq!(raw.messages[0].content, "hello pi");

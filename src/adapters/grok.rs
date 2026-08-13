@@ -298,6 +298,7 @@ fn parse_grok_session_for_entry(
     .with_usage(usage_events, USAGE_PARSER_VERSION);
 
     session.updated_at = Some(mtime_ms);
+    session.source_file_path = source_path;
     Ok(Some(session))
 }
 
@@ -881,6 +882,7 @@ mod tests {
         let session = parse_grok_session_for_entry(&entry, mtime).unwrap().unwrap();
 
         assert_eq!(session.usage_parser_version, Some(USAGE_PARSER_VERSION));
+        assert_eq!(session.source_file_path.as_deref(), updates_path.to_str());
         assert_eq!(session.usage_events.len(), 1);
         assert_eq!(session.usage_events[0].model, "grok-composer-2.5-fast");
         assert_eq!(session.usage_events[0].source_path.as_deref(), updates_path.to_str());

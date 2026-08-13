@@ -174,6 +174,7 @@ fn parse_codex_session_for_entry(
     mtime_ms: i64,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
+    let source_file_path = entry.stat_target.to_str().map(str::to_string);
     let mut raw = match parse_codex_session_with_options(&entry.stat_target, include_events) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
@@ -184,6 +185,7 @@ fn parse_codex_session_for_entry(
     };
     raw.source_id = entry.session_id;
     raw.updated_at = Some(mtime_ms);
+    raw.source_file_path = source_file_path;
     Ok(Some(raw))
 }
 
@@ -1836,13 +1838,14 @@ mod tests {
         let root = temp_codex_root("new");
         let sessions_dir = root.join("archived_sessions");
         let uuid = "019a4c01-e8f4-7270-bdab-7f19273b237e";
-        write_codex_rollout(&sessions_dir, uuid, "fresh");
+        let path = write_codex_rollout(&sessions_dir, uuid, "fresh");
 
         let store = setup_store();
 
         let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
+        assert_eq!(result.sessions[0].source_file_path.as_deref(), path.to_str());
         assert_eq!(result.stats.skipped_sessions, 0);
 
         let _ = fs::remove_dir_all(&root);

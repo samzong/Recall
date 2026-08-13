@@ -129,15 +129,18 @@ fn parse_cline_task(entry: FileScanEntry, mtime_ms: i64) -> anyhow::Result<Optio
     }
 
     let directory = extract_directory(&entry.stat_target);
+    let source_file_path = entry.stat_target.to_str().map(str::to_string);
 
-    Ok(Some(RawSession::search_only(
+    let mut raw = RawSession::search_only(
         entry.session_id,
         directory,
         started_at,
         Some(mtime_ms),
         None,
         messages,
-    )))
+    );
+    raw.source_file_path = source_file_path;
+    Ok(Some(raw))
 }
 
 fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
@@ -495,6 +498,7 @@ mod tests {
         assert_eq!(raw.source_id, "1765706891317");
         assert_eq!(raw.started_at, 1765706891317);
         assert_eq!(raw.updated_at, Some(mtime));
+        assert_eq!(raw.source_file_path.as_deref(), path.to_str());
         assert_eq!(raw.messages.len(), 1);
 
         let _ = fs::remove_dir_all(&root);

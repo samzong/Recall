@@ -157,6 +157,7 @@ fn parse_copilot_session_for_entry(
     mtime_ms: i64,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
+    let source_file_path = entry.stat_target.to_str().map(str::to_string);
     let file = match fs::File::open(&entry.stat_target) {
         Ok(f) => f,
         Err(e) => {
@@ -181,6 +182,7 @@ fn parse_copilot_session_for_entry(
     };
     raw.source_id = entry.session_id;
     raw.updated_at = Some(mtime_ms);
+    raw.source_file_path = source_file_path;
     Ok(Some(raw))
 }
 
@@ -597,13 +599,14 @@ mod tests {
         let root = temp_copilot_root("new");
         let sessions_dir = root.join("session-state");
         let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
-        write_copilot_session(&sessions_dir, "dir-1", uuid, "fresh");
+        let events_path = write_copilot_session(&sessions_dir, "dir-1", uuid, "fresh");
 
         let store = setup_store();
 
         let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
+        assert_eq!(result.sessions[0].source_file_path.as_deref(), events_path.to_str());
         assert_eq!(result.stats.skipped_sessions, 0);
 
         let _ = fs::remove_dir_all(&root);
