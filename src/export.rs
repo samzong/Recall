@@ -196,7 +196,12 @@ pub(crate) fn write_jsonl<W: Write>(
         sessions
     };
 
-    let (records, mut spool) = collect_session_records(store, sessions, options.includes)?;
+    let (records, mut spool) = collect_session_records(
+        store,
+        sessions,
+        options.includes,
+        !options.session_ids.is_empty(),
+    )?;
     if let Some(spool) = spool.as_mut() {
         spool.flush()?;
     }
@@ -233,11 +238,13 @@ fn collect_session_records(
     store: &Store,
     sessions: Vec<Session>,
     includes: ExportIncludes,
+    force_spool: bool,
 ) -> Result<(Vec<ExportSessionRecord>, Option<BufWriter<std::fs::File>>)> {
     let page_count: usize = store.conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
     let page_size: usize = store.conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
     let mut records = Vec::new();
-    let mut spool = (page_count.saturating_mul(page_size) > EXPORT_IN_MEMORY_DB_LIMIT)
+    let mut spool = (force_spool
+        || page_count.saturating_mul(page_size) > EXPORT_IN_MEMORY_DB_LIMIT)
         .then(|| tempfile::tempfile().map(BufWriter::new))
         .transpose()?;
     for session in sessions {

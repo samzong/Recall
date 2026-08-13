@@ -510,7 +510,7 @@ fn export_jsonl_can_select_sessions_by_id() {
     }
 
     let options = ExportOptions {
-        session_ids: vec!["s3".to_string(), "s1".to_string()],
+        session_ids: vec!["s3".to_string(), "s1".to_string(), "s3".to_string()],
         sources: None,
         time_range: TimeRange::All,
         scope: ProjectScope::Global,
@@ -523,11 +523,13 @@ fn export_jsonl_can_select_sessions_by_id() {
 
     let text = String::from_utf8(out).unwrap();
     let lines: Vec<_> = text.lines().collect();
-    assert_eq!(lines.len(), 2);
+    assert_eq!(lines.len(), 3);
     let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let third: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
     assert_eq!(first["session"]["id"], "s3");
     assert_eq!(second["session"]["id"], "s1");
+    assert_eq!(third["session"]["id"], "s3");
 }
 
 #[test]
