@@ -95,20 +95,6 @@ impl SourceAdapter for CursorAdapter {
 
         for composer_id in composer_ids {
             let meta = load_composer_meta(&conn, &composer_id, &lookup);
-            if existing.contains_key(&composer_id)
-                && let Some(path) = transcript_paths
-                    .get(&composer_id)
-                    .and_then(|transcript| transcript.path.to_str())
-            {
-                store.update_session_fields(
-                    self.id(),
-                    &composer_id,
-                    None,
-                    None,
-                    None,
-                    Some(path),
-                )?;
-            }
             let updated_at = meta.last_updated_at.or(meta.created_at);
             if let Some(cutoff) = since_ts
                 && updated_at.is_some_and(|ts| ts < cutoff)
