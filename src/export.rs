@@ -175,6 +175,7 @@ pub(crate) fn write_jsonl<W: Write>(
     options: &ExportOptions,
     mut writer: W,
 ) -> Result<()> {
+    let snapshot = store.conn.unchecked_transaction()?;
     let sessions = if options.session_ids.is_empty() {
         store.list_export_sessions(
             options.sources.as_deref(),
@@ -194,7 +195,9 @@ pub(crate) fn write_jsonl<W: Write>(
         sessions
     };
 
-    write_jsonl_for_sessions(store, sessions, options.includes, &mut writer)
+    write_jsonl_for_sessions(store, sessions, options.includes, &mut writer)?;
+    snapshot.commit()?;
+    Ok(())
 }
 
 pub(crate) fn session_record_value(

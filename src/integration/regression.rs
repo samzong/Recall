@@ -359,6 +359,83 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
 }
 
 #[test]
+fn export_jsonl_reads_every_record_from_one_snapshot() {
+    struct VersionSwitchWriter {
+        output: Vec<u8>,
+        writer: rusqlite::Connection,
+        switched: bool,
+    }
+
+    impl std::io::Write for VersionSwitchWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            if !self.switched && buf == b"\n" {
+                self.writer
+                    .execute_batch(
+                        "BEGIN IMMEDIATE;
+                         UPDATE sessions SET title = 'version-b' WHERE id = 's2';
+                         UPDATE messages SET content = 'version-b' WHERE session_id = 's2';
+                         COMMIT;",
+                    )
+                    .map_err(std::io::Error::other)?;
+                self.switched = true;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    schema::register_sqlite_vec();
+    let root = tempfile::tempdir().unwrap();
+    let db_path = root.path().join("recall.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA busy_timeout=5000;
+         PRAGMA foreign_keys=ON;",
+    )
+    .unwrap();
+    schema::init(&conn).unwrap();
+    let store = Store { conn };
+
+    let mut first = make_session("s1", "codex", "raw1", "version-a");
+    first.started_at = 2;
+    let mut second = make_session("s2", "codex", "raw2", "version-a");
+    second.started_at = 1;
+    for session in [&first, &second] {
+        store.insert_session(session).unwrap();
+        store.insert_messages(&[make_message(&session.id, Role::User, "version-a", 0)]).unwrap();
+    }
+
+    let writer_conn = rusqlite::Connection::open(&db_path).unwrap();
+    writer_conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;").unwrap();
+    let mut writer =
+        VersionSwitchWriter { output: Vec::new(), writer: writer_conn, switched: false };
+    let options = ExportOptions {
+        session_ids: Vec::new(),
+        sources: None,
+        time_range: TimeRange::All,
+        scope: ProjectScope::Global,
+        thread_role: None,
+        limit: None,
+        includes: ExportIncludes { messages: true, usage: false, events: false },
+    };
+
+    write_jsonl(&store, &options, &mut writer).unwrap();
+
+    let records = String::from_utf8(std::mem::take(&mut writer.output))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records[1]["session"]["title"], "version-a");
+    assert_eq!(records[1]["messages"][0]["content"], "version-a");
+}
+
+#[test]
 fn export_jsonl_applies_include_projection() {
     let store = setup();
     let session = make_session("s1", "codex", "raw1", "Projected export");
