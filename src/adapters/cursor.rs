@@ -82,52 +82,77 @@ impl SourceAdapter for CursorAdapter {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
         };
 
-        let existing = store.session_meta_map(self.id())?;
-        let usage_state = store.usage_state_meta_map(self.id())?;
-        let event_state =
-            if include_events { store.event_state_meta_map(self.id())? } else { HashMap::new() };
-        let global_mtime = global_db_mtime();
-        let lookup = ComposerLookup::load(&conn);
-        let composer_ids = discover_composer_ids(&conn)?;
         let transcript_paths = collect_agent_transcript_paths();
-        let mut sessions = Vec::new();
-        let mut stats = SyncScanStats::default();
+        Ok(Some(scan_for_sync_conn(&conn, store, since_ts, include_events, &transcript_paths)?))
+    }
+}
 
-        for composer_id in composer_ids {
-            let meta = load_composer_meta(&conn, &composer_id, &lookup);
-            let updated_at = meta.last_updated_at.or(meta.created_at);
-            if let Some(cutoff) = since_ts
-                && updated_at.is_some_and(|ts| ts < cutoff)
-            {
-                stats.filtered_sessions += 1;
-                continue;
-            }
+fn scan_for_sync_conn(
+    conn: &Connection,
+    store: &Store,
+    since_ts: Option<i64>,
+    include_events: bool,
+    transcript_paths: &HashMap<String, AgentTranscriptPath>,
+) -> anyhow::Result<SyncScanResult> {
+    let existing = store.session_meta_map("cursor")?;
+    let existing_paths = store
+        .session_paths_for_source("cursor")?
+        .into_iter()
+        .map(|path| (path.source_id, path.source_file_path))
+        .collect::<HashMap<_, _>>();
+    let usage_state = store.usage_state_meta_map("cursor")?;
+    let event_state =
+        if include_events { store.event_state_meta_map("cursor")? } else { HashMap::new() };
+    let global_mtime = global_db_mtime();
+    let lookup = ComposerLookup::load(conn);
+    let composer_ids = discover_composer_ids(conn)?;
+    let mut sessions = Vec::new();
+    let mut stats = SyncScanStats::default();
 
-            let source_updated_at = updated_at.or(global_mtime);
-            if let Some((old_updated_at, _)) = existing.get(&composer_id)
-                && *old_updated_at == source_updated_at
-                && crate::adapters::sync_state::session_state_is_current(
-                    USAGE_PARSER_VERSION,
-                    EVENT_PARSER_VERSION,
-                    usage_state.get(&composer_id).copied(),
-                    event_state.get(&composer_id).copied(),
-                    source_updated_at,
-                    include_events,
-                )
-            {
-                stats.skipped_sessions += 1;
-                continue;
-            }
-
-            if let Some(raw) =
-                build_raw_session(&conn, &composer_id, &meta, &transcript_paths, include_events)?
-            {
-                sessions.push(raw);
-            }
+    for composer_id in composer_ids {
+        let meta = load_composer_meta(conn, &composer_id, &lookup);
+        let source_path_changed = existing.contains_key(&composer_id)
+            && transcript_paths
+                .get(&composer_id)
+                .and_then(|transcript| transcript.path.to_str())
+                .is_some_and(|path| {
+                    existing_paths.get(&composer_id).and_then(|stored| stored.as_deref())
+                        != Some(path)
+                });
+        let updated_at = meta.last_updated_at.or(meta.created_at);
+        if let Some(cutoff) = since_ts
+            && updated_at.is_some_and(|ts| ts < cutoff)
+            && !source_path_changed
+        {
+            stats.filtered_sessions += 1;
+            continue;
         }
 
-        Ok(Some(SyncScanResult { sessions, stats }))
+        let source_updated_at = updated_at.or(global_mtime);
+        if let Some((old_updated_at, _)) = existing.get(&composer_id)
+            && *old_updated_at == source_updated_at
+            && crate::adapters::sync_state::session_state_is_current(
+                USAGE_PARSER_VERSION,
+                EVENT_PARSER_VERSION,
+                usage_state.get(&composer_id).copied(),
+                event_state.get(&composer_id).copied(),
+                source_updated_at,
+                include_events,
+            )
+            && !source_path_changed
+        {
+            stats.skipped_sessions += 1;
+            continue;
+        }
+
+        if let Some(raw) =
+            build_raw_session(conn, &composer_id, &meta, transcript_paths, include_events)?
+        {
+            sessions.push(raw);
+        }
     }
+
+    Ok(SyncScanResult { sessions, stats })
 }
 
 fn scan_cursor_sessions(
@@ -1178,7 +1203,8 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
-    use crate::types::TokenSource;
+    use crate::db::schema;
+    use crate::types::{Session, TokenSource};
 
     fn temp_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1337,6 +1363,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(raw.source_file_path.as_deref(), transcript_path.to_str());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incremental_scan_returns_current_session_when_transcript_path_needs_backfill() {
+        schema::register_sqlite_vec();
+        let root = temp_root("path-backfill");
+        let composer_id = uuid::Uuid::new_v4().to_string();
+        let bubble_id = uuid::Uuid::new_v4().to_string();
+        let transcript_path = root.join(format!("{composer_id}.jsonl"));
+        let conn = seed_global_db(&root, &composer_id, &bubble_id);
+        let store = Store::open_in_memory().unwrap();
+        let source_updated_at = 1_700_000_100_000_i64;
+        store
+            .insert_session(&Session {
+                id: uuid::Uuid::new_v4().to_string(),
+                source: "cursor".to_string(),
+                source_id: composer_id.clone(),
+                title: "Usage review".to_string(),
+                directory: Some("/Users/x/project".to_string()),
+                repo_remote: None,
+                repo_slug: None,
+                repo_name: None,
+                started_at: 1_700_000_000_000,
+                updated_at: Some(source_updated_at),
+                message_count: 1,
+                entrypoint: Some("chat".to_string()),
+                custom_title: None,
+                summary: None,
+                duration_minutes: None,
+                source_file_path: None,
+                is_import: false,
+            })
+            .unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "cursor",
+                &composer_id,
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(source_updated_at),
+            )
+            .unwrap();
+        let transcript_paths = HashMap::from([(
+            composer_id.clone(),
+            AgentTranscriptPath {
+                session_id: composer_id,
+                path: transcript_path.clone(),
+                directory: None,
+            },
+        )]);
+
+        let result = scan_for_sync_conn(
+            &conn,
+            &store,
+            Some(source_updated_at + 1),
+            false,
+            &transcript_paths,
+        )
+        .unwrap();
+
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].source_file_path.as_deref(), transcript_path.to_str());
+        assert_eq!(store.session_paths_for_source("cursor").unwrap()[0].source_file_path, None);
         let _ = fs::remove_dir_all(root);
     }
 
