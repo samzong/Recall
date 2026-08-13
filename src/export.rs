@@ -195,8 +195,12 @@ pub(crate) fn write_jsonl<W: Write>(
         sessions
     };
 
-    write_jsonl_for_sessions(store, sessions, options.includes, &mut writer)?;
+    let records = collect_session_records(store, sessions, options.includes)?;
     snapshot.commit()?;
+    for record in records {
+        serde_json::to_writer(&mut writer, &record)?;
+        writer.write_all(b"\n")?;
+    }
     Ok(())
 }
 
@@ -216,12 +220,12 @@ pub(crate) fn session_record_value(
     ))?)
 }
 
-fn write_jsonl_for_sessions<W: Write>(
+fn collect_session_records(
     store: &Store,
     sessions: Vec<Session>,
     includes: ExportIncludes,
-    mut writer: W,
-) -> Result<()> {
+) -> Result<Vec<ExportSessionRecord>> {
+    let mut records = Vec::with_capacity(sessions.len());
     for session in sessions {
         let topology = store.session_topology(&session.id)?;
         let messages =
@@ -236,12 +240,9 @@ fn write_jsonl_for_sessions<W: Write>(
         } else {
             Vec::new()
         };
-        let record = build_session_record(session, topology, messages, usage_events, events);
-        serde_json::to_writer(&mut writer, &record)?;
-        writer.write_all(b"\n")?;
+        records.push(build_session_record(session, topology, messages, usage_events, events));
     }
-
-    Ok(())
+    Ok(records)
 }
 
 fn build_session_record(

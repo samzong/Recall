@@ -364,12 +364,13 @@ fn export_jsonl_reads_every_record_from_one_snapshot() {
         output: Vec<u8>,
         writer: rusqlite::Connection,
         switched: bool,
+        checkpoint_busy: Option<i64>,
     }
 
     impl std::io::Write for VersionSwitchWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.output.extend_from_slice(buf);
-            if !self.switched && buf == b"\n" {
+            if !self.switched && buf.contains(&b'\n') {
                 self.writer
                     .execute_batch(
                         "BEGIN IMMEDIATE;
@@ -378,6 +379,11 @@ fn export_jsonl_reads_every_record_from_one_snapshot() {
                          COMMIT;",
                     )
                     .map_err(std::io::Error::other)?;
+                self.checkpoint_busy = Some(
+                    self.writer
+                        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+                        .map_err(std::io::Error::other)?,
+                );
                 self.switched = true;
             }
             Ok(buf.len())
@@ -411,9 +417,13 @@ fn export_jsonl_reads_every_record_from_one_snapshot() {
     }
 
     let writer_conn = rusqlite::Connection::open(&db_path).unwrap();
-    writer_conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;").unwrap();
-    let mut writer =
-        VersionSwitchWriter { output: Vec::new(), writer: writer_conn, switched: false };
+    writer_conn.execute_batch("PRAGMA busy_timeout=0; PRAGMA foreign_keys=ON;").unwrap();
+    let mut writer = VersionSwitchWriter {
+        output: Vec::new(),
+        writer: writer_conn,
+        switched: false,
+        checkpoint_busy: None,
+    };
     let options = ExportOptions {
         session_ids: Vec::new(),
         sources: None,
@@ -431,6 +441,7 @@ fn export_jsonl_reads_every_record_from_one_snapshot() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
+    assert_eq!(writer.checkpoint_busy, Some(0));
     assert_eq!(records[1]["session"]["title"], "version-a");
     assert_eq!(records[1]["messages"][0]["content"], "version-a");
 }
