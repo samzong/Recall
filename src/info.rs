@@ -23,7 +23,7 @@ struct SourceSummary {
 pub(crate) fn run(format: InfoFormat) -> Result<()> {
     let all = adapters::all_adapters();
     let labels = adapters::source_labels();
-    let mut config = AppConfig::load_or_default();
+    let mut config = AppConfig::load()?;
     config.normalize_sources(&labels);
     let store = Store::open()?;
     let progress = store.semantic_progress().unwrap_or_default();

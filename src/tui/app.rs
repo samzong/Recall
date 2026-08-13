@@ -209,10 +209,8 @@ impl App {
     pub(crate) fn new(
         store: &Store,
         all_sources: Vec<(String, String)>,
-        mut config: AppConfig,
+        config: AppConfig,
     ) -> Self {
-        config.normalize_sources(&all_sources);
-
         let (total_sessions, total_messages) = store.stats().unwrap_or((0, 0));
         let semantic_progress = store.semantic_progress().unwrap_or_default();
         let background_status = store.background_job_status("pipeline").unwrap_or_default();
@@ -3640,6 +3638,18 @@ mod tests {
         let app = App::new(&store, vec![source("codex", "Codex")], AppConfig::default());
 
         assert_eq!(app.sort_order, SortOrder::Newest);
+    }
+
+    #[test]
+    fn app_preserves_disabled_sources_outside_visible_subset() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut config = AppConfig::default();
+        config.disabled_sources = vec!["codex".to_string(), "cline".to_string()];
+
+        let app = App::new(&store, vec![source("codex", "Codex")], config);
+
+        assert_eq!(app.config.disabled_sources, vec!["codex".to_string(), "cline".to_string()]);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use anyhow::Result;
 use crate::config::AppConfig;
 
 pub(crate) fn run(project_name: Option<String>, publish_dir: Option<PathBuf>) -> Result<()> {
-    let mut config = AppConfig::load_or_default();
+    let mut config = AppConfig::load()?;
     let existing = config.share.clone();
     if let Some(ref share) = existing {
         println!("Share already initialized");

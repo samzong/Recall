@@ -1523,14 +1523,14 @@ fn config_disables_persist_across_reloads() {
 }
 
 #[test]
-fn config_drops_obsolete_disabled_entries() {
+fn config_drops_obsolete_disabled_entries_without_reenabling_known_sources() {
     let mut config = AppConfig::default();
     config.disabled_sources = vec!["ghost-adapter".to_string(), "claude-code".to_string()];
     let known = vec![("claude-code".to_string(), "CC".to_string())];
     config.normalize_sources(&known);
 
     assert!(!config.disabled_sources.iter().any(|id| id == "ghost-adapter"));
-    assert!(config.is_source_enabled("claude-code"), "cleared to avoid zero-source state");
+    assert!(!config.is_source_enabled("claude-code"), "explicit all-disabled state must survive");
 }
 
 #[test]

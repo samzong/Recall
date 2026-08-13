@@ -558,7 +558,7 @@ fn cmd_session_share(
     let session = resolve_session_ref(&store, &sources, id, source_filter, source_id)?;
     let messages = store.get_messages(&session.id)?;
     let usage_events = store.list_usage_events_for_session(&session.id)?;
-    let config = AppConfig::load_or_default();
+    let config = AppConfig::load()?;
     let tldr_markdown = tldr_file.and_then(read_tldr_file);
     let render_options = crate::share::ShareRenderOptions { tldr_markdown };
     let preview = crate::share::preview_session_with_options(

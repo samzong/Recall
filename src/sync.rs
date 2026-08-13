@@ -197,8 +197,8 @@ impl ExistingState {
 
 pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
     let available_adapters = adapters::all_adapters();
-    SyncJob::new(options, Store::open()?, AppConfig::load_or_default(), &available_adapters)?
-        .run(&available_adapters)
+    let config = AppConfig::load()?;
+    SyncJob::new(options, Store::open()?, config, &available_adapters)?.run(&available_adapters)
 }
 
 struct SyncJob {

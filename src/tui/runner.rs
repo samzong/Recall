@@ -25,15 +25,18 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
     use crate::tui::ui;
 
     let usage_mode = usage_start.is_some();
+    let known_sources = adapters::source_labels();
+    let sources = if usage_start.is_some() {
+        adapters::dashboard_source_labels()
+    } else {
+        known_sources.clone()
+    };
+    let mut config = AppConfig::load()?;
+    config.normalize_sources(&known_sources);
     let store = Store::open()?;
     if !cfg!(debug_assertions) {
         semantic::ensure_background_worker(true)?;
     }
-    let sources = if usage_start.is_some() {
-        adapters::dashboard_source_labels()
-    } else {
-        adapters::source_labels()
-    };
 
     struct TerminalGuard;
     impl Drop for TerminalGuard {
@@ -51,9 +54,6 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-
-    let mut config = AppConfig::load_or_default();
-    config.normalize_sources(&sources);
 
     let mut app = App::new(&store, sources, config);
     if cfg!(debug_assertions) {

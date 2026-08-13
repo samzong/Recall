@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -88,25 +89,46 @@ pub(crate) struct ShareConfig {
 impl AppConfig {
     pub(crate) fn load() -> Result<Self> {
         let path = config_path()?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-
-        let content = std::fs::read_to_string(path)?;
-        let config: Self = serde_json::from_str(&content)?;
-        Ok(config)
+        Self::load_from(&path)
     }
 
-    pub(crate) fn load_or_default() -> Self {
-        Self::load().unwrap_or_default()
+    fn load_from(path: &Path) -> Result<Self> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse {}", path.display()))
     }
 
     pub(crate) fn save(&self) -> Result<()> {
         let path = config_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        self.save_to(&path)
+    }
+
+    fn save_to(&self, path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("config path has no parent: {}", path.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+
+        let content = serde_json::to_vec_pretty(self)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+        temp.write_all(&content)
+            .with_context(|| format!("failed to write temporary config in {}", parent.display()))?;
+        temp.as_file()
+            .sync_all()
+            .with_context(|| format!("failed to sync temporary config in {}", parent.display()))?;
+        temp.persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
 
@@ -116,11 +138,6 @@ impl AppConfig {
         self.disabled_sources.retain(|id| known_sources.iter().any(|(known, _)| known == id));
         self.disabled_sources.sort();
         self.disabled_sources.dedup();
-
-        let enabled_count = known_sources.len().saturating_sub(self.disabled_sources.len());
-        if enabled_count == 0 {
-            self.disabled_sources.clear();
-        }
     }
 
     pub(crate) fn is_source_enabled(&self, source_id: &str) -> bool {
@@ -149,4 +166,53 @@ pub(crate) fn config_path() -> Result<PathBuf> {
     let dir =
         dirs::config_dir().ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
     Ok(dir.join("recall").join("config.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_invalid_config_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ invalid json").unwrap();
+
+        let error = AppConfig::load_from(&path).unwrap_err();
+
+        assert!(error.to_string().contains("failed to parse"), "{error:#}");
+    }
+
+    #[test]
+    fn atomic_save_replaces_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut config = AppConfig::default();
+        config.disabled_sources.push("codex".to_string());
+
+        config.save_to(&path).unwrap();
+
+        let reloaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(reloaded.disabled_sources, vec!["codex"]);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_atomic_save_preserves_existing_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let original = br#"{"disabled_sources":["codex"]}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = AppConfig::default().save_to(&path);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
 }
