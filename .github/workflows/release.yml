@@ -15,9 +15,49 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  RELEASE_REF: refs/tags/${{ inputs.tag || github.ref_name }}
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Validate release tag
+        id: release
+        shell: bash
+        run: |
+          set -eu
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$version" ] || [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "::error::release tag $RELEASE_TAG does not match Cargo.toml version ${version:-missing}"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" ]; then
+            echo "::error::checked out commit does not match release tag $RELEASE_TAG"
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/ort.pyke.io
+          key: ort-${{ hashFiles('Cargo.lock') }}
+      - run: make check
+
   build:
+    needs: check
     strategy:
       matrix:
         include:
@@ -38,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ needs.check.outputs.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -67,12 +107,21 @@ jobs:
           path: ${{ matrix.artifact }}.*
 
   release:
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ env.RELEASE_REF }}
+      - name: Verify release commit
+        shell: bash
+        env:
+          VALIDATED_SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$VALIDATED_SHA" ]; then
+            echo "::error::release tag moved after validation"
+            exit 1
+          fi
       - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
@@ -83,7 +132,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="$RELEASE_TAG"
           version="${tag#v}"
           # The tag already carries its changelog entry, written into the
           # release commit by the pre-release hook.
