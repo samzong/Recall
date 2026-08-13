@@ -415,6 +415,12 @@ fn export_jsonl_reads_every_record_from_one_snapshot() {
         store.insert_session(session).unwrap();
         store.insert_messages(&[make_message(&session.id, Role::User, "version-a", 0)]).unwrap();
     }
+    let mut third = make_session("s3", "codex", "raw3", "large");
+    third.started_at = 0;
+    store.insert_session(&third).unwrap();
+    let large_message = "x".repeat(9 * 1024 * 1024);
+    store.insert_messages(&[make_message(&third.id, Role::User, &large_message, 0)]).unwrap();
+    drop(large_message);
 
     let writer_conn = rusqlite::Connection::open(&db_path).unwrap();
     writer_conn.execute_batch("PRAGMA busy_timeout=0; PRAGMA foreign_keys=ON;").unwrap();
@@ -444,6 +450,7 @@ fn export_jsonl_reads_every_record_from_one_snapshot() {
     assert_eq!(writer.checkpoint_busy, Some(0));
     assert_eq!(records[1]["session"]["title"], "version-a");
     assert_eq!(records[1]["messages"][0]["content"], "version-a");
+    assert_eq!(records[2]["messages"][0]["content"].as_str().unwrap().len(), 9 * 1024 * 1024);
 }
 
 #[test]
