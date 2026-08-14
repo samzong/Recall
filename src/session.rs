@@ -513,9 +513,7 @@ fn cmd_session_export(
                 includes: crate::export::parse_export_includes(include)?,
             };
             if let Some(path) = output {
-                ensure_parent_dir(&path)?;
-                let file = fs::File::create(&path)?;
-                crate::export::write_jsonl(&store, &options, file)?;
+                write_jsonl_file(&store, &options, &path)?;
             } else {
                 let stdout = std::io::stdout();
                 let handle = stdout.lock();
@@ -984,6 +982,19 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_jsonl_file(store: &Store, options: &ExportOptions, path: &Path) -> Result<()> {
+    ensure_parent_dir(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    crate::export::write_jsonl(store, options, temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 fn read_tldr_file(path: &Path) -> Option<String> {
     match fs::read_to_string(path) {
         Ok(content) => {
@@ -1036,5 +1047,31 @@ mod tests {
         assert_eq!(read_tldr_file(&path), None);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn jsonl_file_export_replaces_target_only_after_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.jsonl");
+        fs::write(&path, "keep").unwrap();
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut options = ExportOptions {
+            session_ids: vec!["missing".to_string()],
+            sources: None,
+            time_range: TimeRange::All,
+            scope: ProjectScope::Global,
+            thread_role: None,
+            limit: None,
+            includes: ExportIncludes::full(),
+        };
+
+        assert!(write_jsonl_file(&store, &options, &path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "keep");
+
+        options.session_ids.clear();
+        write_jsonl_file(&store, &options, &path).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
