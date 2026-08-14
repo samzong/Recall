@@ -66,10 +66,18 @@ fn run_worker(request_rx: Receiver<UsageRequest>, response_tx: Sender<UsageRespo
         }
     };
 
+    let mut sync_pending = false;
     while let Ok(mut request) = request_rx.recv() {
         while let Ok(next) = request_rx.try_recv() {
             let sync = request.sync || next.sync;
             request = UsageRequest { sync, ..next };
+        }
+
+        if let Err(error) = run_sync(&mut sync_pending, request.sync, run_dashboard_sync_job) {
+            if response_tx.send(failed_response(request, error)).is_err() {
+                return;
+            }
+            continue;
         }
 
         let response = run_request(&store, request);
@@ -79,13 +87,20 @@ fn run_worker(request_rx: Receiver<UsageRequest>, response_tx: Sender<UsageRespo
     }
 }
 
-fn run_request(store: &Store, request: UsageRequest) -> UsageResponse {
-    if request.sync
-        && let Err(error) = run_dashboard_sync_job()
-    {
-        return failed_response(request, format!("Sync failed: {error}"));
+fn run_sync(
+    pending: &mut bool,
+    requested: bool,
+    sync: impl FnOnce() -> anyhow::Result<()>,
+) -> Result<(), String> {
+    *pending |= requested;
+    if *pending {
+        sync().map_err(|error| format!("Sync failed: {error}"))?;
+        *pending = false;
     }
+    Ok(())
+}
 
+fn run_request(store: &Store, request: UsageRequest) -> UsageResponse {
     let (current_report, all_time_report) =
         build_usage_reports(&request, |filters| usage::build_usage_report(store, filters));
     let skill_filters =
@@ -184,6 +199,16 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(worker.try_recv().is_none());
         release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn failed_initial_sync_is_retried_by_the_next_request() {
+        let mut pending = false;
+
+        assert!(run_sync(&mut pending, true, || anyhow::bail!("offline")).is_err());
+        assert!(pending);
+        assert!(run_sync(&mut pending, false, || Ok(())).is_ok());
+        assert!(!pending);
     }
 
     #[test]
