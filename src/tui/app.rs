@@ -1206,7 +1206,7 @@ impl App {
                 self.reset_usage_dashboard();
                 self.request_usage_refresh();
             }
-            KeyCode::Enter if self.usage_tab == UsageTab::Skills => {
+            KeyCode::Enter if self.usage_tab == UsageTab::Skills && !self.usage_is_loading() => {
                 self.open_skill_sessions(store);
             }
             KeyCode::Up | KeyCode::Char('k') => self.handle_scroll_up(store),
@@ -3919,5 +3919,37 @@ mod tests {
         assert!(app.usage_error.is_none());
         assert!(app.skill_audit_error.is_none());
         assert_eq!(app.usage_time_filter, TimeRange::Month);
+    }
+
+    #[test]
+    fn skill_drill_down_is_disabled_while_usage_is_loading() {
+        use crate::skill_audit::{SkillAuditSummary, SkillTier, SkillUsageEntry};
+
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.mode = AppMode::Usage;
+        app.usage_tab = UsageTab::Skills;
+        app.usage_in_flight = true;
+        app.skill_audit_report = Some(SkillAuditReport {
+            summary: SkillAuditSummary { installed: 1, core: 0, occasional: 1, dormant: 0 },
+            core: Vec::new(),
+            occasional: vec![SkillUsageEntry {
+                id: "stale-skill".to_string(),
+                tier: SkillTier::Occasional,
+                invocations: 1,
+                last_used: None,
+                signals: Vec::new(),
+                install_path: None,
+                session_ids: vec!["stale-session".to_string()],
+            }],
+            dormant: Vec::new(),
+            coverage_note: None,
+        });
+
+        app.handle_usage_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &store);
+
+        assert!(matches!(app.mode, AppMode::Usage));
+        assert!(app.status_message.is_none());
     }
 }
