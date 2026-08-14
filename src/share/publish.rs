@@ -17,6 +17,7 @@ const PROVIDER_CLOUDFLARE_PAGES: &str = "cloudflare-pages";
 const PAGES_PROJECT_NAME_FIELD: &str = "Project Name";
 const PAGES_PROJECT_DOMAINS_FIELD: &str = "Project Domains";
 const MAX_PAGES_ASSET_BYTES: usize = 25 * 1024 * 1024;
+const PUBLISH_DIR_MARKER: &str = ".recall-share";
 
 #[derive(Debug, Clone)]
 pub(crate) struct SharePreview {
@@ -237,6 +238,18 @@ fn configured_project_domain(share: &ShareConfig) -> Result<String> {
 fn init_publish_dir(publish_dir: &Path) -> Result<()> {
     fs::create_dir_all(publish_dir)
         .with_context(|| format!("failed to create {}", publish_dir.display()))?;
+    let marker = publish_dir.join(PUBLISH_DIR_MARKER);
+    if !marker.is_file() {
+        let mut entries = fs::read_dir(publish_dir)
+            .with_context(|| format!("failed to read {}", publish_dir.display()))?;
+        if entries.next().transpose()?.is_some() {
+            bail!(
+                "publish directory {} is not managed by Recall; choose an empty directory",
+                publish_dir.display()
+            );
+        }
+        fs::write(&marker, "Recall-managed share directory\n")?;
+    }
     fs::write(publish_dir.join("_headers"), HEADERS)?;
     fs::write(publish_dir.join("robots.txt"), ROBOTS)?;
     Ok(())
@@ -427,6 +440,23 @@ mod tests {
     #[test]
     fn share_id_sanitizes_path_chars() {
         assert_eq!(share_id_for_session(&session("foo/bar baz")), "foo-bar-baz");
+    }
+
+    #[test]
+    fn publish_dir_rejects_unmanaged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("canary-secret"), "do not publish").unwrap();
+
+        let error = init_publish_dir(dir.path()).unwrap_err();
+
+        assert!(error.to_string().contains("not managed by Recall"));
+        assert!(!dir.path().join("_headers").exists());
+        assert!(!dir.path().join("robots.txt").exists());
+
+        let managed = tempfile::tempdir().unwrap();
+        init_publish_dir(managed.path()).unwrap();
+        assert!(managed.path().join(PUBLISH_DIR_MARKER).is_file());
+        init_publish_dir(managed.path()).unwrap();
     }
 
     fn session(source_id: &str) -> Session {
