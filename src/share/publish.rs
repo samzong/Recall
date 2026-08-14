@@ -249,7 +249,7 @@ fn init_publish_dir(publish_dir: &Path) -> Result<()> {
     let marker = publish_dir.join(PUBLISH_DIR_MARKER);
     let managed =
         fs::read_to_string(&marker).is_ok_and(|contents| contents == PUBLISH_DIR_MARKER_CONTENT);
-    if !managed && publish_dir_is_unmanaged(publish_dir)? {
+    if publish_dir_is_unmanaged(publish_dir, managed)? {
         bail!(
             "publish directory {} is not managed by Recall; choose an empty directory",
             publish_dir.display()
@@ -263,7 +263,7 @@ fn init_publish_dir(publish_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn publish_dir_is_unmanaged(publish_dir: &Path) -> Result<bool> {
+fn publish_dir_is_unmanaged(publish_dir: &Path, managed: bool) -> Result<bool> {
     let mut has_entries = false;
     let mut has_headers = false;
     let mut has_robots = false;
@@ -274,6 +274,7 @@ fn publish_dir_is_unmanaged(publish_dir: &Path) -> Result<bool> {
         }
         has_entries = true;
         match entry.file_name().to_str() {
+            Some(PUBLISH_DIR_MARKER) if managed => {}
             Some("_headers") => {
                 let contents = fs::read_to_string(entry.path())?;
                 if contents != HEADERS && contents != LEGACY_HEADERS {
@@ -299,7 +300,7 @@ fn publish_dir_is_unmanaged(publish_dir: &Path) -> Result<bool> {
             _ => return Ok(true),
         }
     }
-    Ok(has_entries && !(has_headers && has_robots))
+    Ok(!managed && has_entries && !(has_headers && has_robots))
 }
 
 fn ensure_wrangler_available() -> Result<()> {
@@ -508,6 +509,8 @@ mod tests {
         init_publish_dir(managed.path()).unwrap();
         assert!(managed.path().join(PUBLISH_DIR_MARKER).is_file());
         init_publish_dir(managed.path()).unwrap();
+        fs::write(managed.path().join("later-canary"), "do not publish").unwrap();
+        assert!(init_publish_dir(managed.path()).is_err());
 
         let legacy = tempfile::tempdir().unwrap();
         fs::write(legacy.path().join("_headers"), HEADERS).unwrap();
@@ -521,6 +524,7 @@ mod tests {
         .unwrap();
         init_publish_dir(legacy.path()).unwrap();
         assert!(legacy.path().join(PUBLISH_DIR_MARKER).is_file());
+        init_publish_dir(legacy.path()).unwrap();
     }
 
     fn session(source_id: &str) -> Session {
