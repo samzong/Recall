@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 
 use crate::adapters;
 use crate::config::AppConfig;
+use crate::db::session_store::IndexedSourceStats;
 use crate::db::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -29,29 +32,9 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
     let progress = store.semantic_progress().unwrap_or_default();
     let worker = store.background_job_status("pipeline").unwrap_or_default();
 
-    let mut rows = Vec::new();
-    let mut grand_sessions = 0u64;
-    let mut grand_messages = 0u64;
-
-    for (id, label) in &labels {
-        let stats = source_stats.get(id);
-        let sessions = stats.map_or(0, |stats| stats.sessions);
-        let messages = stats.map_or(0, |stats| stats.messages);
-        grand_sessions += sessions;
-        grand_messages += messages;
-
-        rows.push(SourceSummary {
-            label: label.clone(),
-            id: id.clone(),
-            sessions,
-            messages,
-            range: format_date_range(
-                stats.and_then(|stats| stats.oldest_started_at),
-                stats.and_then(|stats| stats.newest_started_at),
-            ),
-            error: None,
-        });
-    }
+    let rows = source_summaries(&labels, &source_stats);
+    let grand_sessions = rows.iter().map(|row| row.sessions).sum::<u64>();
+    let grand_messages = rows.iter().map(|row| row.messages).sum::<u64>();
 
     if matches!(format, InfoFormat::Json) {
         println!(
@@ -171,6 +154,38 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
     Ok(())
 }
 
+fn source_summaries(
+    labels: &[(String, String)],
+    source_stats: &HashMap<String, IndexedSourceStats>,
+) -> Vec<SourceSummary> {
+    let mut sources = labels.to_vec();
+    let mut unknown_sources = source_stats
+        .keys()
+        .filter(|source| !labels.iter().any(|(id, _)| id == *source))
+        .cloned()
+        .collect::<Vec<_>>();
+    unknown_sources.sort();
+    sources.extend(unknown_sources.into_iter().map(|id| (id.clone(), id)));
+
+    sources
+        .into_iter()
+        .map(|(id, label)| {
+            let stats = source_stats.get(&id);
+            SourceSummary {
+                label,
+                sessions: stats.map_or(0, |stats| stats.sessions),
+                messages: stats.map_or(0, |stats| stats.messages),
+                range: format_date_range(
+                    stats.and_then(|stats| stats.oldest_started_at),
+                    stats.and_then(|stats| stats.newest_started_at),
+                ),
+                id,
+                error: None,
+            }
+        })
+        .collect()
+}
+
 fn format_date_range(oldest: Option<i64>, newest: Option<i64>) -> String {
     if oldest.is_none() && newest.is_none() {
         return "-".to_string();
@@ -186,4 +201,47 @@ fn format_date_range(oldest: Option<i64>, newest: Option<i64>) -> String {
         .unwrap_or_else(|| "-".to_string());
 
     format!("{oldest} -> {newest}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::db::session_store::IndexedSourceStats;
+
+    #[test]
+    fn source_summaries_include_unregistered_indexed_sources() {
+        let labels = vec![("codex".to_string(), "CDX".to_string())];
+        let stats = HashMap::from([
+            (
+                "codex".to_string(),
+                IndexedSourceStats {
+                    sessions: 1,
+                    messages: 2,
+                    oldest_started_at: Some(10),
+                    newest_started_at: Some(20),
+                },
+            ),
+            (
+                "future-agent".to_string(),
+                IndexedSourceStats {
+                    sessions: 3,
+                    messages: 4,
+                    oldest_started_at: Some(30),
+                    newest_started_at: Some(40),
+                },
+            ),
+        ]);
+
+        let rows = source_summaries(&labels, &stats);
+
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["codex", "future-agent"]
+        );
+        assert_eq!(rows[1].label, "future-agent");
+        assert_eq!(rows[1].sessions, 3);
+        assert_eq!(rows[1].messages, 4);
+    }
 }
