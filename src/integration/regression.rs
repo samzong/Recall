@@ -680,6 +680,178 @@ fn hybrid_search_fts_only_without_embedding() {
     assert_eq!(results.len(), 1);
 }
 
+fn seed_semantic_boundary_sessions(store: &Store, count: usize) {
+    store
+        .conn
+        .execute_batch(&format!(
+            "WITH RECURSIVE seq(n) AS (
+                 SELECT 0
+                 UNION ALL
+                 SELECT n + 1 FROM seq WHERE n + 1 < {count}
+             )
+             INSERT INTO sessions (id, source, source_id, title, started_at, message_count)
+             SELECT printf('semantic-%05d', n), 'test', printf('raw-%05d', n),
+                    printf('Semantic session %05d', n), n, 1
+             FROM seq;
+             INSERT INTO messages (session_id, role, content, timestamp, seq)
+             SELECT id, 'user', 'semanticboundary ' || id, started_at, 0
+             FROM sessions
+             WHERE source = 'test';"
+        ))
+        .unwrap();
+}
+
+fn add_semantic_boundary_embedding(store: &Store) -> Vec<f32> {
+    let message_id: i64 = store
+        .conn
+        .query_row("SELECT id FROM messages ORDER BY id LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    let embedding = vec![0.1f32; 384];
+    store.upsert_embeddings(&[(message_id, &embedding)]).unwrap();
+    embedding
+}
+
+fn seed_semantic_page_fixture(store: &Store) -> Vec<f32> {
+    for index in 0..6 {
+        let id = format!("semantic-fts-{index:02}");
+        let session = make_session(&id, "test", &format!("raw-fts-{index:02}"), "Semantic FTS");
+        store.insert_session(&session).unwrap();
+        store.insert_messages(&[make_message(&id, Role::User, "semanticstable", 0)]).unwrap();
+    }
+
+    let mut filler =
+        make_session("semantic-vec-fill", "test", "raw-vec-fill", "Semantic vector filler");
+    filler.message_count = 30;
+    store.insert_session(&filler).unwrap();
+    let filler_messages = (0..30)
+        .map(|seq| make_message("semantic-vec-fill", Role::User, "semantic filler", seq))
+        .collect::<Vec<_>>();
+    store.insert_messages(&filler_messages).unwrap();
+
+    let mut stmt = store
+        .conn
+        .prepare("SELECT id FROM messages WHERE session_id = 'semantic-vec-fill' ORDER BY seq")
+        .unwrap();
+    let mut message_ids = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    message_ids.push(
+        store
+            .conn
+            .query_row("SELECT id FROM messages WHERE session_id = 'semantic-fts-04'", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+    );
+
+    let vectors = (1..=message_ids.len())
+        .map(|rank| {
+            let mut vector = vec![0.0f32; 384];
+            vector[0] = rank as f32 / 1_000.0;
+            vector
+        })
+        .collect::<Vec<_>>();
+    let embeddings = message_ids
+        .iter()
+        .zip(&vectors)
+        .map(|(&message_id, vector)| (message_id, vector.as_slice()))
+        .collect::<Vec<_>>();
+    store.upsert_embeddings(&embeddings).unwrap();
+
+    vec![0.0f32; 384]
+}
+
+#[test]
+fn semantic_query_crosses_sqlite_vec_boundary() {
+    let store = setup();
+    seed_semantic_boundary_sessions(&store, 300);
+    let embedding = add_semantic_boundary_embedding(&store);
+    let engine = SearchEngine::new(&store.conn);
+
+    let results =
+        engine.hybrid_search("semanticboundary", Some(&embedding), &no_filters(), 274, 3).unwrap();
+    assert_eq!(results.len(), 274);
+
+    let page = engine
+        .hybrid_search_page("semanticboundary", Some(&embedding), &no_filters(), Some(50), 224)
+        .unwrap();
+    assert_eq!(page.len(), 50);
+}
+
+#[test]
+fn semantic_adjacent_pages_follow_one_global_order() {
+    let store = setup();
+    let embedding = seed_semantic_page_fixture(&store);
+    let engine = SearchEngine::new(&store.conn);
+
+    let first_page = engine
+        .hybrid_search_page("semanticstable", Some(&embedding), &no_filters(), Some(2), 0)
+        .unwrap();
+    let second_page = engine
+        .hybrid_search_page("semanticstable", Some(&embedding), &no_filters(), Some(2), 2)
+        .unwrap();
+    let global = engine
+        .hybrid_search_page("semanticstable", Some(&embedding), &no_filters(), None, 0)
+        .unwrap();
+
+    let paged_ids = first_page
+        .iter()
+        .chain(&second_page)
+        .map(|result| result.session.id.as_str())
+        .collect::<Vec<_>>();
+    let global_prefix =
+        global.iter().take(4).map(|result| result.session.id.as_str()).collect::<Vec<_>>();
+
+    assert_eq!(global_prefix[0], "semantic-fts-04");
+    assert_eq!(paged_ids, global_prefix);
+}
+
+#[test]
+fn semantic_query_all_returns_complete_fts_set() {
+    let store = setup();
+    seed_semantic_boundary_sessions(&store, 10_001);
+    let engine = SearchEngine::new(&store.conn);
+
+    let text_results =
+        engine.hybrid_search_page("semanticboundary", None, &no_filters(), None, 0).unwrap();
+    assert_eq!(text_results.len(), 10_001);
+    assert!(text_results.iter().all(|result| {
+        result.snippet.as_deref().and_then(|snippet| snippet.strip_prefix("semanticboundary "))
+            == Some(result.session.id.as_str())
+    }));
+
+    let embedding = add_semantic_boundary_embedding(&store);
+    let semantic_results = engine
+        .hybrid_search_page("semanticboundary", Some(&embedding), &no_filters(), None, 0)
+        .unwrap();
+    assert_eq!(semantic_results.len(), 10_001);
+}
+
+#[test]
+fn semantic_search_arithmetic_is_saturating() {
+    let store = setup();
+    let engine = SearchEngine::new(&store.conn);
+    let embedding = vec![0.1f32; 384];
+
+    let direct = engine
+        .hybrid_search("semanticboundary", Some(&embedding), &no_filters(), usize::MAX, usize::MAX)
+        .unwrap();
+    assert!(direct.is_empty());
+
+    let page = engine
+        .hybrid_search_page(
+            "semanticboundary",
+            Some(&embedding),
+            &no_filters(),
+            Some(usize::MAX),
+            usize::MAX,
+        )
+        .unwrap();
+    assert!(page.is_empty());
+}
+
 #[test]
 fn search_with_source_filter() {
     let store = setup();

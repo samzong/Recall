@@ -356,13 +356,15 @@ pub(crate) fn run_session_list(
             scope: scope.clone(),
             thread_role,
         };
-        let search_limit = effective_limit.unwrap_or(10_000).saturating_add(offset).max(1);
-        let results =
-            engine.hybrid_search(query, embedding.as_deref(), &filters, search_limit, 3)?;
+        let results = engine.hybrid_search_page(
+            query,
+            embedding.as_deref(),
+            &filters,
+            effective_limit,
+            offset,
+        )?;
         results
             .into_iter()
-            .skip(offset)
-            .take(effective_limit.unwrap_or(usize::MAX))
             .map(|result| SessionListRow {
                 session: result.session,
                 match_source: Some(result.match_source),
@@ -849,7 +851,7 @@ fn print_session_list_json(
             "next_offset": if all || rows.len() < limit {
                 serde_json::Value::Null
             } else {
-                serde_json::json!(offset + rows.len())
+                serde_json::json!(offset.saturating_add(rows.len()))
             }
         }))?
     );

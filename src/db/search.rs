@@ -9,6 +9,8 @@ use crate::project_scope::ProjectScope;
 use crate::types::{MatchSource, SearchResult, Session};
 use crate::utils::f32_slice_to_bytes;
 
+const SQLITE_VEC_MAX_K: usize = 4096;
+
 pub(crate) struct SearchEngine<'a> {
     conn: &'a Connection,
 }
@@ -109,30 +111,57 @@ impl<'a> SearchEngine<'a> {
         limit: usize,
         fetch_multiplier: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let fetch_size = limit * fetch_multiplier;
-        let fts_hits = self.fts_search(query, filters, fetch_size)?;
+        let fetch_size = limit.saturating_mul(fetch_multiplier).max(1);
+        let fts_hits = self.fts_search(query, filters, Some(fetch_size))?;
         let vec_hits = match embedding {
-            Some(e) => self.vec_search(e, filters, fetch_size)?,
+            Some(embedding) => self.vec_search(embedding, filters, fetch_size.saturating_mul(5))?,
             None => vec![],
         };
+        self.search_results(fts_hits, vec_hits, 0, Some(limit))
+    }
+
+    pub(crate) fn hybrid_search_page(
+        &self,
+        query: &str,
+        embedding: Option<&[f32]>,
+        filters: &SearchFilters,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        if limit == Some(0) {
+            return Ok(vec![]);
+        }
+
+        let fts_hits = self.fts_search(query, filters, None)?;
+        let vec_hits = match embedding {
+            Some(embedding) => self.vec_search(embedding, filters, SQLITE_VEC_MAX_K)?,
+            None => vec![],
+        };
+        self.search_results(fts_hits, vec_hits, offset, limit)
+    }
+
+    fn search_results(
+        &self,
+        fts_hits: Vec<Hit>,
+        vec_hits: Vec<Hit>,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<SearchResult>> {
         let merged = rrf_merge(&fts_hits, &vec_hits, 10);
-
+        let snippets: HashMap<_, _> =
+            fts_hits.into_iter().map(|hit| (hit.session_id, hit.snippet)).collect();
+        let limit = limit.unwrap_or(usize::MAX);
         let session_ids: Vec<&str> =
-            merged.iter().take(limit).map(|(id, _, _)| id.as_str()).collect();
-
+            merged.iter().skip(offset).take(limit).map(|(id, _, _)| id.as_str()).collect();
         let sessions = self.load_sessions(&session_ids)?;
 
         let mut results = Vec::new();
-        for (session_id, _score, match_source) in merged.into_iter().take(limit) {
+        for (session_id, _score, match_source) in merged.into_iter().skip(offset).take(limit) {
             if let Some(session) = sessions.get(&session_id) {
-                let snippet = fts_hits
-                    .iter()
-                    .find(|h| h.session_id == session_id)
-                    .and_then(|h| h.snippet.clone());
+                let snippet = snippets.get(&session_id).cloned().flatten();
                 results.push(SearchResult { session: session.clone(), match_source, snippet });
             }
         }
-
         Ok(results)
     }
 
@@ -140,7 +169,7 @@ impl<'a> SearchEngine<'a> {
         &self,
         query: &str,
         filters: &SearchFilters,
-        limit: usize,
+        limit: Option<usize>,
     ) -> anyhow::Result<Vec<Hit>> {
         let escaped = fts5_escape(query);
         if escaped.is_empty() {
@@ -160,10 +189,14 @@ impl<'a> SearchEngine<'a> {
         let mut param_idx = 2;
         apply_filters(&mut sql, &mut params, &mut param_idx, filters);
 
-        sql.push_str(&format!(" GROUP BY m.session_id ORDER BY best_rank LIMIT {limit}"));
+        sql.push_str(" GROUP BY m.session_id ORDER BY best_rank, m.session_id");
+        if let Some(limit) = limit {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
+            params.iter().map(|param| param.as_ref()).collect();
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
@@ -181,10 +214,10 @@ impl<'a> SearchEngine<'a> {
         &self,
         embedding: &[f32],
         filters: &SearchFilters,
-        limit: usize,
+        requested_k: usize,
     ) -> anyhow::Result<Vec<Hit>> {
         let blob = f32_slice_to_bytes(embedding);
-        let fetch_k = (limit * 5) as i64;
+        let fetch_k = requested_k.clamp(1, SQLITE_VEC_MAX_K) as i64;
 
         let mut sql = String::from(
             "SELECT m.session_id, MIN(mv.distance) AS best_distance
@@ -200,10 +233,10 @@ impl<'a> SearchEngine<'a> {
         let mut param_idx = 3;
         apply_filters(&mut sql, &mut params, &mut param_idx, filters);
 
-        sql.push_str(" GROUP BY m.session_id ORDER BY best_distance");
+        sql.push_str(" GROUP BY m.session_id ORDER BY best_distance, m.session_id");
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
+            params.iter().map(|param| param.as_ref()).collect();
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
@@ -218,27 +251,25 @@ impl<'a> SearchEngine<'a> {
     }
 
     fn load_sessions(&self, ids: &[&str]) -> anyhow::Result<HashMap<String, Session>> {
+        const SESSION_LOAD_CHUNK_SIZE: usize = 900;
+
         let mut map = HashMap::new();
-        if ids.is_empty() {
-            return Ok(map);
-        }
+        for ids in ids.chunks(SESSION_LOAD_CHUNK_SIZE) {
+            let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT {SESSION_COLUMNS}
+                 FROM sessions WHERE id IN ({})",
+                placeholders.join(", ")
+            );
+            let params: Vec<&dyn rusqlite::types::ToSql> =
+                ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), session_from_row)?;
 
-        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
-        let sql = format!(
-            "SELECT {SESSION_COLUMNS}
-             FROM sessions WHERE id IN ({})",
-            placeholders.join(", ")
-        );
-
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params.as_slice(), session_from_row)?;
-
-        for row in rows {
-            let session = row?;
-            map.insert(session.id.clone(), session);
+            for row in rows {
+                let session = row?;
+                map.insert(session.id.clone(), session);
+            }
         }
         Ok(map)
     }
@@ -300,7 +331,7 @@ fn rrf_merge(fts_hits: &[Hit], vec_hits: &[Hit], k: u32) -> Vec<(String, f64, Ma
         })
         .collect();
 
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     results
 }
 
