@@ -5,8 +5,8 @@ use crate::config::AppConfig;
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
 use crate::semantic;
-use crate::sync::run_dashboard_sync_job;
 use crate::tui::search_worker::SearchWorker;
+use crate::tui::usage_worker::UsageWorker;
 
 pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Result<()> {
     use std::io;
@@ -61,6 +61,7 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
             Some("Debug builds do not start semantic indexing; run cargo run -- sync first".into());
     }
     let search_worker = SearchWorker::spawn();
+    let usage_worker = UsageWorker::spawn();
     if let Some((source_filter, time_filter)) = usage_start {
         app.source_filter_selection = source_filter.unwrap_or_default();
         if let Some(time_filter) = time_filter {
@@ -76,6 +77,9 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
         app.poll_share_publish();
         while let Some(response) = search_worker.try_recv() {
             app.apply_search_response(&store, response);
+        }
+        while let Some(response) = usage_worker.try_recv() {
+            app.apply_usage_response(response);
         }
         terminal.draw(|f| ui::render(f, &app))?;
 
@@ -97,21 +101,19 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
             break;
         }
 
-        if app.usage_refresh_is_due() {
-            if usage_sync_pending {
-                usage_sync_pending = false;
-                match run_dashboard_sync_job() {
-                    Ok(()) => app.refresh_usage(&store),
-                    Err(err) => app.fail_usage_refresh(err),
-                }
-            } else {
-                app.refresh_usage(&store);
+        if let Some(request) = app.take_usage_request(usage_sync_pending) {
+            usage_sync_pending = false;
+            if !usage_worker.refresh(request) {
+                app.fail_usage_refresh("Usage worker unavailable");
             }
         }
 
         app.try_search(&store, &search_worker);
         while let Some(response) = search_worker.try_recv() {
             app.apply_search_response(&store, response);
+        }
+        while let Some(response) = usage_worker.try_recv() {
+            app.apply_usage_response(response);
         }
 
         if app.should_quit {

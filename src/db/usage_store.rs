@@ -122,11 +122,13 @@ impl Store {
         Ok(true)
     }
 
-    pub(crate) fn list_usage_events(
+    pub(crate) fn fold_usage_events<T>(
         &self,
         sources: Option<&[String]>,
         time_range: TimeRange,
-    ) -> Result<Vec<UsageEventRecord>> {
+        mut state: T,
+        mut fold: impl FnMut(&mut T, UsageEventRecord),
+    ) -> Result<T> {
         let mut sql = String::from(
             "SELECT session_id, source, source_id, event_key, timestamp, model, provider,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
@@ -182,7 +184,10 @@ impl Store {
             })
         })?;
 
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        for row in rows {
+            fold(&mut state, row?);
+        }
+        Ok(state)
     }
 
     pub(crate) fn list_usage_events_for_session(

@@ -11,7 +11,7 @@ use crate::db::store::{ProjectDirectory, Store};
 use crate::handoff;
 use crate::project_scope::ProjectScope;
 use crate::session_action;
-use crate::skill_audit::{self, SkillAuditFilters, SkillAuditReport};
+use crate::skill_audit::SkillAuditReport;
 use crate::transcript;
 use crate::tui::layout::{
     MessagePane, SearchLayout, ViewingLayout, search_layout, vertical_scrollbar_position,
@@ -26,6 +26,7 @@ use crate::tui::share_state::{
 };
 use crate::tui::text_layout::wrap_visual_rows;
 use crate::tui::usage_state::UsageTab;
+use crate::tui::usage_worker::{UsageRequest, UsageResponse};
 use crate::tui::viewing_state::{
     SanitizedLine, ViewingFrame, ViewingLineage, ViewingParent, ViewingSessionSummary,
     build_viewing_caches,
@@ -33,7 +34,7 @@ use crate::tui::viewing_state::{
 use crate::types::{
     BackgroundJobStatus, MatchSource, Message, SearchResult, SemanticProgress, Session,
 };
-use crate::usage::{self, UsageFilters, UsageReport};
+use crate::usage::UsageReport;
 
 const USAGE_LOADING_MIN_MS: u128 = 75;
 const SEARCH_DEBOUNCE_MS: u64 = 250;
@@ -198,6 +199,9 @@ pub(crate) struct App {
     pub(crate) usage_error: Option<String>,
     pub(crate) usage_time_filter: TimeRange,
     pub(crate) usage_refresh_requested_at: Option<Instant>,
+    pub(crate) usage_in_flight: bool,
+    pub(crate) usage_request_id: u64,
+    pub(crate) active_usage_request_id: u64,
     pub(crate) usage_breakdown_scroll: u16,
     pub(crate) usage_tab: UsageTab,
     pub(crate) skill_audit_report: Option<SkillAuditReport>,
@@ -290,6 +294,9 @@ impl App {
             usage_error: None,
             usage_time_filter: TimeRange::All,
             usage_refresh_requested_at: None,
+            usage_in_flight: false,
+            usage_request_id: 0,
+            active_usage_request_id: 0,
             usage_breakdown_scroll: 0,
             usage_tab: UsageTab::Tokens,
             skill_audit_report: None,
@@ -1951,60 +1958,33 @@ impl App {
         }
     }
 
-    pub(crate) fn refresh_usage(&mut self, store: &Store) {
+    pub(crate) fn take_usage_request(&mut self, sync: bool) -> Option<UsageRequest> {
+        if !self.usage_refresh_is_due() {
+            return None;
+        }
+
         self.usage_refresh_requested_at = None;
-        self.usage_error = None;
-        self.skill_audit_error = None;
-        self.usage_breakdown_scroll = 0;
-        self.skill_audit_selected = 0;
-        let sources = self.source_filter_ids();
-        let current_filters =
-            UsageFilters { sources: sources.clone(), time_range: self.usage_time_filter };
-        match usage::build_usage_report(store, &current_filters) {
-            Ok(report) => {
-                self.usage_report = Some(report);
-            }
-            Err(err) => {
-                self.usage_report = None;
-                self.usage_error = Some(format!("Usage unavailable: {err}"));
-            }
-        }
-
-        let year_filters = UsageFilters { sources, time_range: TimeRange::All };
-        match usage::build_usage_report(store, &year_filters) {
-            Ok(report) => {
-                self.usage_year_report = Some(report);
-            }
-            Err(err) => {
-                self.usage_year_report = None;
-                if self.usage_error.is_none() {
-                    self.usage_error = Some(format!("Usage unavailable: {err}"));
-                }
-            }
-        }
-
-        let skill_filters = SkillAuditFilters {
+        self.usage_in_flight = true;
+        Some(UsageRequest {
+            id: self.active_usage_request_id,
             sources: self.source_filter_ids(),
             time_range: self.usage_time_filter,
-        };
-        match skill_audit::build_skill_audit_report(store, &skill_filters) {
-            Ok(report) => {
-                self.skill_audit_report = Some(report);
-            }
-            Err(err) => {
-                self.skill_audit_report = None;
-                self.skill_audit_error = Some(format!("Skill audit unavailable: {err}"));
-            }
-        }
+            sync,
+        })
     }
 
     pub(crate) fn request_usage_refresh(&mut self) {
         self.usage_error = None;
+        self.skill_audit_error = None;
+        self.usage_request_id = self.usage_request_id.saturating_add(1);
+        self.active_usage_request_id = self.usage_request_id;
         self.usage_refresh_requested_at = Some(Instant::now());
+        self.usage_breakdown_scroll = 0;
+        self.skill_audit_selected = 0;
     }
 
     pub(crate) fn usage_is_loading(&self) -> bool {
-        self.usage_refresh_requested_at.is_some()
+        self.usage_refresh_requested_at.is_some() || self.usage_in_flight
     }
 
     pub(crate) fn usage_refresh_is_due(&self) -> bool {
@@ -2015,11 +1995,48 @@ impl App {
 
     pub(crate) fn fail_usage_refresh(&mut self, error: impl std::fmt::Display) {
         self.usage_refresh_requested_at = None;
+        self.usage_in_flight = false;
         self.usage_report = None;
         self.usage_year_report = None;
         self.skill_audit_report = None;
         self.usage_error = Some(format!("Usage unavailable: {error}"));
         self.skill_audit_error = Some(format!("Skill audit unavailable: {error}"));
+    }
+
+    pub(crate) fn apply_usage_response(&mut self, response: UsageResponse) {
+        if response.id != self.active_usage_request_id
+            || response.sources != self.source_filter_ids()
+            || response.time_range != self.usage_time_filter
+        {
+            return;
+        }
+
+        self.usage_in_flight = false;
+        match response.current_report {
+            Ok(report) => self.usage_report = Some(report),
+            Err(error) => {
+                self.usage_report = None;
+                self.usage_error = Some(format!("Usage unavailable: {error}"));
+            }
+        }
+
+        match response.all_time_report {
+            Ok(report) => self.usage_year_report = Some(report),
+            Err(error) => {
+                self.usage_year_report = None;
+                if self.usage_error.is_none() {
+                    self.usage_error = Some(format!("Usage unavailable: {error}"));
+                }
+            }
+        }
+
+        match response.skill_audit_report {
+            Ok(report) => self.skill_audit_report = Some(report),
+            Err(error) => {
+                self.skill_audit_report = None;
+                self.skill_audit_error = Some(format!("Skill audit unavailable: {error}"));
+            }
+        }
     }
 
     pub(crate) fn try_search(&mut self, store: &Store, worker: &SearchWorker) {
@@ -2829,6 +2846,9 @@ mod tests {
             usage_error: None,
             usage_time_filter: TimeRange::All,
             usage_refresh_requested_at: None,
+            usage_in_flight: false,
+            usage_request_id: 0,
+            active_usage_request_id: 0,
             usage_breakdown_scroll: 0,
             usage_tab: UsageTab::Tokens,
             skill_audit_report: None,
@@ -3860,5 +3880,44 @@ mod tests {
         assert_eq!(app.draft_source_filter_selection, vec!["codex".to_string()]);
         assert!(app.filters_dirty);
         assert!(!app.search_pending);
+    }
+
+    #[test]
+    fn usage_refresh_yields_background_request() {
+        let mut app = app_with_sources();
+        app.request_usage_refresh();
+        app.usage_refresh_requested_at = Some(Instant::now() - Duration::from_millis(100));
+
+        let request = app.take_usage_request(false).expect("usage request");
+
+        assert_eq!(request.time_range, TimeRange::All);
+        assert!(!request.sync);
+        assert!(app.usage_is_loading());
+    }
+
+    #[test]
+    fn stale_usage_response_does_not_replace_latest_filter_state() {
+        use crate::tui::usage_worker::UsageResponse;
+
+        let mut app = app_with_sources();
+        app.source_filter_selection = vec!["codex".to_string()];
+        app.usage_time_filter = TimeRange::Month;
+        app.usage_request_id = 1;
+        app.active_usage_request_id = 1;
+        app.request_usage_refresh();
+
+        app.apply_usage_response(UsageResponse {
+            id: 1,
+            sources: Some(vec!["codex".to_string()]),
+            time_range: TimeRange::Month,
+            current_report: Err("stale current report".to_string()),
+            all_time_report: Err("stale all-time report".to_string()),
+            skill_audit_report: Err("stale skill audit".to_string()),
+        });
+
+        assert_eq!(app.active_usage_request_id, 2);
+        assert!(app.usage_error.is_none());
+        assert!(app.skill_audit_error.is_none());
+        assert_eq!(app.usage_time_filter, TimeRange::Month);
     }
 }

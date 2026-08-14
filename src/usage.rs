@@ -130,87 +130,21 @@ impl Accumulator {
     }
 }
 
-pub(crate) fn build_usage_report(store: &Store, filters: &UsageFilters) -> Result<UsageReport> {
-    let events = store.list_usage_events(filters.sources.as_deref(), filters.time_range)?;
-    Ok(aggregate_usage_events(&events))
+#[derive(Default)]
+struct UsageReportAccumulator {
+    total: Accumulator,
+    by_source: BTreeMap<String, Accumulator>,
+    by_model: BTreeMap<(String, String, String), Accumulator>,
+    daily: BTreeMap<String, Accumulator>,
+    weekly: BTreeMap<String, Accumulator>,
+    monthly: BTreeMap<String, Accumulator>,
+    token_source_events: BTreeMap<String, usize>,
+    codex_seen: HashSet<String>,
+    claude_seen: HashSet<String>,
 }
 
-pub(crate) fn aggregate_usage_events(events: &[UsageEventRecord]) -> UsageReport {
-    let events = dedupe_report_events(events);
-    let mut total = Accumulator::default();
-    let mut by_source: BTreeMap<String, Accumulator> = BTreeMap::new();
-    let mut by_model: BTreeMap<(String, String, String), Accumulator> = BTreeMap::new();
-    let mut daily: BTreeMap<String, Accumulator> = BTreeMap::new();
-    let mut weekly: BTreeMap<String, Accumulator> = BTreeMap::new();
-    let mut monthly: BTreeMap<String, Accumulator> = BTreeMap::new();
-    let mut token_source_events = BTreeMap::new();
-
-    for event in events {
-        total.add(event);
-        *token_source_events.entry(event.token_source.clone()).or_insert(0) += 1;
-
-        by_source.entry(event.source.clone()).or_default().add(event);
-        by_model
-            .entry((event.source.clone(), event.provider.clone(), event.model.clone()))
-            .or_default()
-            .add(event);
-
-        let (day, week, month) = period_keys(event.timestamp);
-        daily.entry(day).or_default().add(event);
-        weekly.entry(week).or_default().add(event);
-        monthly.entry(month).or_default().add(event);
-    }
-
-    let source_count = by_source.len();
-    let model_count = by_model.len();
-
-    let mut by_source = by_source
-        .into_iter()
-        .map(|(source, acc)| SourceUsage {
-            source,
-            sessions: acc.sessions.len(),
-            events: acc.events,
-            tokens: acc.tokens,
-        })
-        .collect::<Vec<_>>();
-    by_source.sort_by_key(|source| Reverse(source.tokens.total_tokens));
-
-    let mut by_model = by_model
-        .into_iter()
-        .map(|((source, provider, model), acc)| ModelUsage {
-            source,
-            provider,
-            model,
-            sessions: acc.sessions.len(),
-            events: acc.events,
-            tokens: acc.tokens,
-        })
-        .collect::<Vec<_>>();
-    by_model.sort_by_key(|model| Reverse(model.tokens.total_tokens));
-
-    UsageReport {
-        summary: UsageSummary {
-            events: total.events,
-            sessions: total.sessions.len(),
-            sources: source_count,
-            models: model_count,
-            token_source_events,
-            tokens: total.tokens,
-        },
-        by_source,
-        by_model,
-        daily: period_vec(daily),
-        weekly: period_vec(weekly),
-        monthly: period_vec(monthly),
-    }
-}
-
-fn dedupe_report_events(events: &[UsageEventRecord]) -> Vec<&UsageEventRecord> {
-    let mut codex_seen: HashSet<String> = HashSet::new();
-    let mut claude_seen: HashSet<String> = HashSet::new();
-    let mut deduped = Vec::with_capacity(events.len());
-
-    for event in events {
+impl UsageReportAccumulator {
+    fn add(&mut self, event: &UsageEventRecord) {
         if event.source == "codex" {
             let key = format!(
                 "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
@@ -223,21 +157,96 @@ fn dedupe_report_events(events: &[UsageEventRecord]) -> Vec<&UsageEventRecord> {
                 event.cache_write_tokens,
                 event.reasoning_tokens
             );
-            if !codex_seen.insert(key) {
-                continue;
+            if !self.codex_seen.insert(key) {
+                return;
             }
         } else if event.source == "claude-code"
             && event.event_key.starts_with("assistant:")
             && !event.event_key.contains(":line:")
-            && !claude_seen.insert(event.event_key.clone())
+            && !self.claude_seen.insert(event.event_key.clone())
         {
-            continue;
+            return;
         }
 
-        deduped.push(event);
+        self.total.add(event);
+        *self.token_source_events.entry(event.token_source.clone()).or_insert(0) += 1;
+        self.by_source.entry(event.source.clone()).or_default().add(event);
+        self.by_model
+            .entry((event.source.clone(), event.provider.clone(), event.model.clone()))
+            .or_default()
+            .add(event);
+
+        let (day, week, month) = period_keys(event.timestamp);
+        self.daily.entry(day).or_default().add(event);
+        self.weekly.entry(week).or_default().add(event);
+        self.monthly.entry(month).or_default().add(event);
     }
 
-    deduped
+    fn finish(self) -> UsageReport {
+        let source_count = self.by_source.len();
+        let model_count = self.by_model.len();
+
+        let mut by_source = self
+            .by_source
+            .into_iter()
+            .map(|(source, acc)| SourceUsage {
+                source,
+                sessions: acc.sessions.len(),
+                events: acc.events,
+                tokens: acc.tokens,
+            })
+            .collect::<Vec<_>>();
+        by_source.sort_by_key(|source| Reverse(source.tokens.total_tokens));
+
+        let mut by_model = self
+            .by_model
+            .into_iter()
+            .map(|((source, provider, model), acc)| ModelUsage {
+                source,
+                provider,
+                model,
+                sessions: acc.sessions.len(),
+                events: acc.events,
+                tokens: acc.tokens,
+            })
+            .collect::<Vec<_>>();
+        by_model.sort_by_key(|model| Reverse(model.tokens.total_tokens));
+
+        UsageReport {
+            summary: UsageSummary {
+                events: self.total.events,
+                sessions: self.total.sessions.len(),
+                sources: source_count,
+                models: model_count,
+                token_source_events: self.token_source_events,
+                tokens: self.total.tokens,
+            },
+            by_source,
+            by_model,
+            daily: period_vec(self.daily),
+            weekly: period_vec(self.weekly),
+            monthly: period_vec(self.monthly),
+        }
+    }
+}
+
+pub(crate) fn build_usage_report(store: &Store, filters: &UsageFilters) -> Result<UsageReport> {
+    let report = store.fold_usage_events(
+        filters.sources.as_deref(),
+        filters.time_range,
+        UsageReportAccumulator::default(),
+        |report, event| report.add(&event),
+    )?;
+    Ok(report.finish())
+}
+
+#[cfg(any(test, feature = "bench"))]
+pub(crate) fn aggregate_usage_events(events: &[UsageEventRecord]) -> UsageReport {
+    let mut report = UsageReportAccumulator::default();
+    for event in events {
+        report.add(event);
+    }
+    report.finish()
 }
 
 fn period_vec(map: BTreeMap<String, Accumulator>) -> Vec<PeriodUsage> {
