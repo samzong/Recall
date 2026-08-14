@@ -988,8 +988,28 @@ fn write_jsonl_file(store: &Store, options: &ExportOptions, path: &Path) -> Resu
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    let mut builder = tempfile::Builder::new();
+    #[cfg(not(unix))]
+    let builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    let existing_permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(fs::Permissions::from_mode(metadata.permissions().mode() & 0o777)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    if existing_permissions.is_none() {
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let mut temp = builder.tempfile_in(parent)?;
     crate::export::write_jsonl(store, options, temp.as_file_mut())?;
+    #[cfg(unix)]
+    if let Some(permissions) = existing_permissions {
+        temp.as_file().set_permissions(permissions)?;
+    }
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|error| error.error)?;
     Ok(())
@@ -1054,6 +1074,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("export.jsonl");
         fs::write(&path, "keep").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let mut options = ExportOptions {
@@ -1073,5 +1098,13 @@ mod tests {
         write_jsonl_file(&store, &options, &path).unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.path().join("export.jsonl")).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
     }
 }
