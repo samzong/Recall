@@ -14,85 +14,43 @@ pub(crate) enum InfoFormat {
 struct SourceSummary {
     label: String,
     id: String,
-    sessions: usize,
-    messages: usize,
+    sessions: u64,
+    messages: u64,
     range: String,
     error: Option<String>,
 }
 
 pub(crate) fn run(format: InfoFormat) -> Result<()> {
-    let all = adapters::all_adapters();
     let labels = adapters::source_labels();
     let mut config = AppConfig::load()?;
     config.normalize_sources(&labels);
     let store = Store::open()?;
+    let source_stats = store.indexed_source_stats()?;
     let progress = store.semantic_progress().unwrap_or_default();
     let worker = store.background_job_status("pipeline").unwrap_or_default();
 
     let mut rows = Vec::new();
-    let mut grand_sessions = 0usize;
-    let mut grand_messages = 0usize;
+    let mut grand_sessions = 0u64;
+    let mut grand_messages = 0u64;
 
-    for adapter in &all {
-        let id = adapter.id();
-        let label =
-            labels.iter().find(|(k, _)| k == id).map(|(_, v)| v.as_str()).unwrap_or(id).to_string();
+    for (id, label) in &labels {
+        let stats = source_stats.get(id);
+        let sessions = stats.map_or(0, |stats| stats.sessions);
+        let messages = stats.map_or(0, |stats| stats.messages);
+        grand_sessions += sessions;
+        grand_messages += messages;
 
-        match adapter.scan_summary() {
-            Ok(Some(summary)) => {
-                grand_sessions += summary.sessions;
-                grand_messages += summary.messages;
-
-                rows.push(SourceSummary {
-                    label,
-                    id: id.to_string(),
-                    sessions: summary.sessions,
-                    messages: summary.messages,
-                    range: format_date_range(summary.oldest_started_at, summary.newest_started_at),
-                    error: None,
-                });
-            }
-            Ok(None) => match adapter.scan() {
-                Ok(sessions) => {
-                    let session_count = sessions.len();
-                    let message_count: usize = sessions.iter().map(|s| s.messages.len()).sum();
-                    let oldest = sessions.iter().map(|s| s.started_at).min();
-                    let newest = sessions.iter().map(|s| s.started_at).max();
-
-                    grand_sessions += session_count;
-                    grand_messages += message_count;
-
-                    rows.push(SourceSummary {
-                        label,
-                        id: id.to_string(),
-                        sessions: session_count,
-                        messages: message_count,
-                        range: format_date_range(oldest, newest),
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    rows.push(SourceSummary {
-                        label,
-                        id: id.to_string(),
-                        sessions: 0,
-                        messages: 0,
-                        range: "-".to_string(),
-                        error: Some(e.to_string()),
-                    });
-                }
-            },
-            Err(e) => {
-                rows.push(SourceSummary {
-                    label,
-                    id: id.to_string(),
-                    sessions: 0,
-                    messages: 0,
-                    range: "-".to_string(),
-                    error: Some(e.to_string()),
-                });
-            }
-        }
+        rows.push(SourceSummary {
+            label: label.clone(),
+            id: id.clone(),
+            sessions,
+            messages,
+            range: format_date_range(
+                stats.and_then(|stats| stats.oldest_started_at),
+                stats.and_then(|stats| stats.newest_started_at),
+            ),
+            error: None,
+        });
     }
 
     if matches!(format, InfoFormat::Json) {
@@ -150,7 +108,7 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
         .max("Messages".len())
         .max(grand_messages.to_string().len());
 
-    println!("Source Scan");
+    println!("Indexed Sources");
     println!(
         "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}  Range",
         source = "Source",
@@ -176,7 +134,7 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
     }
     println!(
         "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}",
-        source = "Total scanned",
+        source = "Total indexed",
         sessions = grand_sessions,
         messages = grand_messages
     );

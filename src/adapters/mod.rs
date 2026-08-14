@@ -24,9 +24,6 @@ pub(crate) trait SourceAdapter {
     fn id(&self) -> &str;
     fn label(&self) -> &str;
     fn scan(&self) -> anyhow::Result<Vec<RawSession>>;
-    fn scan_summary(&self) -> anyhow::Result<Option<SourceScanSummary>> {
-        Ok(None)
-    }
     fn usage_parser_version(&self) -> Option<u32> {
         None
     }
@@ -160,13 +157,6 @@ pub(crate) struct SyncScanStats {
 pub(crate) struct SyncScanResult {
     pub(crate) sessions: Vec<RawSession>,
     pub(crate) stats: SyncScanStats,
-}
-
-pub(crate) struct SourceScanSummary {
-    pub(crate) sessions: usize,
-    pub(crate) messages: usize,
-    pub(crate) oldest_started_at: Option<i64>,
-    pub(crate) newest_started_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

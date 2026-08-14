@@ -6,8 +6,7 @@ use tracing::debug;
 
 use crate::adapters::events;
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SourceScanSummary, SyncScanResult,
-    SyncScanStats,
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
 use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role};
@@ -71,27 +70,6 @@ impl SourceAdapter for OpenCodeAdapter {
         scan_session_messages(&conn, sessions, true)
     }
 
-    fn scan_summary(&self) -> anyhow::Result<Option<SourceScanSummary>> {
-        let Some(conn) = open_opencode_db()? else {
-            return Ok(Some(SourceScanSummary {
-                sessions: 0,
-                messages: 0,
-                oldest_started_at: None,
-                newest_started_at: None,
-            }));
-        };
-
-        let sessions: usize =
-            conn.query_row("SELECT COUNT(*) FROM session", [], |row| row.get(0))?;
-        let oldest_started_at =
-            conn.query_row("SELECT MIN(time_created) FROM session", [], |row| row.get(0))?;
-        let newest_started_at =
-            conn.query_row("SELECT MAX(time_created) FROM session", [], |row| row.get(0))?;
-        let messages = count_total_parsed_messages(&conn)?;
-
-        Ok(Some(SourceScanSummary { sessions, messages, oldest_started_at, newest_started_at }))
-    }
-
     fn scan_for_sync(
         &self,
         store: &Store,
@@ -135,16 +113,6 @@ fn count_filtered_sessions(conn: &Connection, since_ts: Option<i64>) -> anyhow::
     )
     .map(|count| count as u32)
     .map_err(Into::into)
-}
-
-fn count_total_parsed_messages(conn: &Connection) -> anyhow::Result<usize> {
-    let sql = format!(
-        "SELECT COUNT(*)
-         FROM message m
-         JOIN part p ON p.message_id = m.id
-         WHERE {PARSED_PART_FILTER_SQL}"
-    );
-    conn.query_row(&sql, [], |row| row.get(0)).map_err(Into::into)
 }
 
 fn load_session_rows(conn: &Connection, since_ts: Option<i64>) -> anyhow::Result<Vec<SessionRow>> {
@@ -876,31 +844,6 @@ mod tests {
         assert_eq!(result.stats.filtered_sessions, 1);
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "new");
-        drop(conn);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn summary_reports_counts_without_full_scan() {
-        let (path, conn) = setup_opencode_db();
-        insert_session_with_message(&conn, "s1", 220, 100, "hello");
-        insert_session_with_message(&conn, "s2", 250, 200, "world");
-
-        let summary = SourceScanSummary {
-            sessions: conn.query_row("SELECT COUNT(*) FROM session", [], |row| row.get(0)).unwrap(),
-            messages: count_total_parsed_messages(&conn).unwrap(),
-            oldest_started_at: conn
-                .query_row("SELECT MIN(time_created) FROM session", [], |row| row.get(0))
-                .unwrap(),
-            newest_started_at: conn
-                .query_row("SELECT MAX(time_created) FROM session", [], |row| row.get(0))
-                .unwrap(),
-        };
-
-        assert_eq!(summary.sessions, 2);
-        assert_eq!(summary.messages, 2);
-        assert_eq!(summary.oldest_started_at, Some(100));
-        assert_eq!(summary.newest_started_at, Some(200));
         drop(conn);
         let _ = std::fs::remove_file(path);
     }

@@ -8,8 +8,8 @@ apply when working here.
 
 - The `SourceAdapter` trait in `mod.rs` is the authoritative contract, not the
   DEVELOPMENT.md example. `id()`, `label()`, `scan()`, and `resume_command()`
-  are required; `scan_summary()`, `scan_for_sync()`, `prune()`,
-  `app_command()`, and `usage_parser_version()` are optional overrides.
+  are required; `scan_for_sync()`, `prune()`, `app_command()`, and
+  `usage_parser_version()` are optional overrides.
 - Register new adapters in `all_adapters()` in `mod.rs`. Registration alone
   wires the adapter into sync, search, the TUI source filter, and the CLI
   `--source` flag. No schema change is needed — `sessions.source` is a value,

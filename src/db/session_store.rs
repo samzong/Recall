@@ -16,6 +16,13 @@ use crate::types::{
     Message, ParentLink, RawSessionEvent, RawUsageEvent, Role, Session, SessionTopology, ThreadRole,
 };
 
+pub(crate) struct IndexedSourceStats {
+    pub(crate) sessions: u64,
+    pub(crate) messages: u64,
+    pub(crate) oldest_started_at: Option<i64>,
+    pub(crate) newest_started_at: Option<i64>,
+}
+
 impl Store {
     pub(crate) fn session_meta(
         &self,
@@ -41,6 +48,27 @@ impl Store {
         )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| {
             Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?)))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn indexed_source_stats(&self) -> Result<HashMap<String, IndexedSourceStats>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source, COUNT(*), COALESCE(SUM(message_count), 0),
+                    MIN(started_at), MAX(started_at)
+             FROM sessions
+             GROUP BY source",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                IndexedSourceStats {
+                    sessions: row.get(1)?,
+                    messages: row.get(2)?,
+                    oldest_started_at: row.get(3)?,
+                    newest_started_at: row.get(4)?,
+                },
+            ))
         })?;
         rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
@@ -1224,5 +1252,40 @@ mod topology_tests {
             vec!["child".to_string()],
             "subagent stays visible when its parent is out of the active scope"
         );
+    }
+}
+
+#[cfg(test)]
+mod source_stats_tests {
+    use super::*;
+    use crate::db::schema;
+
+    #[test]
+    fn indexed_source_stats_use_persisted_session_counts() {
+        schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO sessions
+                    (id, source, source_id, title, started_at, message_count)
+                 VALUES
+                    ('c1', 'codex', 'raw-c1', 'one', 20, 2),
+                    ('c2', 'codex', 'raw-c2', 'two', 10, 3),
+                    ('o1', 'opencode', 'raw-o1', 'three', 30, 4);",
+            )
+            .unwrap();
+
+        let stats = store.indexed_source_stats().unwrap();
+
+        let codex = &stats["codex"];
+        assert_eq!(codex.sessions, 2);
+        assert_eq!(codex.messages, 5);
+        assert_eq!(codex.oldest_started_at, Some(10));
+        assert_eq!(codex.newest_started_at, Some(20));
+
+        let opencode = &stats["opencode"];
+        assert_eq!(opencode.sessions, 1);
+        assert_eq!(opencode.messages, 4);
     }
 }
