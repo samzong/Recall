@@ -984,6 +984,8 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 
 fn write_jsonl_file(store: &Store, options: &ExportOptions, path: &Path) -> Result<()> {
     ensure_parent_dir(path)?;
+    let target = resolve_output_target(path)?;
+    let path = target.as_path();
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1013,6 +1015,30 @@ fn write_jsonl_file(store: &Store, options: &ExportOptions, path: &Path) -> Resu
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+fn resolve_output_target(path: &Path) -> Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = fs::read_link(&target)?;
+                target = if link.is_absolute() {
+                    link
+                } else {
+                    target
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(link)
+                };
+            }
+            Ok(_) => return Ok(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("too many symbolic links in output path: {}", path.display())
 }
 
 fn read_tldr_file(path: &Path) -> Option<String> {
@@ -1072,13 +1098,21 @@ mod tests {
     #[test]
     fn jsonl_file_export_replaces_target_only_after_success() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("export.jsonl");
-        fs::write(&path, "keep").unwrap();
+        let target_path = dir.path().join("export.jsonl");
+        fs::write(&target_path, "keep").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            fs::set_permissions(&target_path, fs::Permissions::from_mode(0o640)).unwrap();
         }
+        #[cfg(unix)]
+        let path = {
+            let path = dir.path().join("export-link.jsonl");
+            std::os::unix::fs::symlink("export.jsonl", &path).unwrap();
+            path
+        };
+        #[cfg(not(unix))]
+        let path = target_path.clone();
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let mut options = ExportOptions {
@@ -1092,19 +1126,19 @@ mod tests {
         };
 
         assert!(write_jsonl_file(&store, &options, &path).is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "keep");
 
         options.session_ids.clear();
         write_jsonl_file(&store, &options, &path).unwrap();
-        assert_eq!(fs::read_to_string(path).unwrap(), "");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(dir.path().join("export.jsonl")).unwrap().permissions().mode() & 0o777,
-                0o640
-            );
+            assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+            assert_eq!(fs::metadata(target_path).unwrap().permissions().mode() & 0o777, 0o640);
         }
+        #[cfg(not(unix))]
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
