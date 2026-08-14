@@ -24,7 +24,7 @@ pub(crate) enum SessionCommands {
         query: Option<String>,
         #[arg(long, help = "Filter by source id or label")]
         source: Option<String>,
-        #[arg(long, help = "Filter by time range")]
+        #[arg(long, value_parser = crate::query::parse_time_range_arg, help = "Filter by time range")]
         time: Option<String>,
         #[arg(long, help = "Filter by project directory, including child paths")]
         project: Option<String>,
@@ -326,7 +326,7 @@ pub(crate) fn run_session_list(
 
     let sources = adapters::source_labels();
     let resolved_source = resolve_source_filter(source_filter, &sources)?;
-    let time_range = parse_time_range(time_filter);
+    let time_range = parse_time_range(time_filter)?;
 
     let store = Store::open()?;
     let scope = store.resolve_scope(project_filter, repo_filter)?.announce();

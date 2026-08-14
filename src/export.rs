@@ -48,13 +48,14 @@ pub(crate) fn run_cli(
     limit: usize,
     include_filter: Option<&str>,
 ) -> Result<()> {
+    let time_range = parse_time_range(time_filter)?;
     let store = Store::open()?;
     let sources = adapters::source_labels();
     let scope = store.resolve_scope(project_filter, repo_filter)?.announce();
     let options = ExportOptions {
         session_ids: Vec::new(),
         sources: resolve_source_filter(source_filter, &sources)?,
-        time_range: parse_time_range(time_filter),
+        time_range,
         scope,
         thread_role,
         limit: if limit == 0 { None } else { Some(limit) },

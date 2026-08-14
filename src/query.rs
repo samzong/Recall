@@ -39,11 +39,11 @@ pub(crate) fn run_search(
         );
     }
 
+    let time_range = parse_time_range(time_filter)?;
     let store = Store::open()?;
     let engine = SearchEngine::new(&store.conn);
     let sources = adapters::source_labels();
     let resolved_source = resolve_source_filter(source_filter, &sources)?;
-    let time_range = parse_time_range(time_filter);
     let scope = store.resolve_scope(project_filter, repo_filter)?.announce();
     let embedding = query_embedding(&store, query, |message| println!("{message}"))?;
 
@@ -98,12 +98,22 @@ pub(crate) fn resolve_source_filter(
     Ok(Some(vec![resolved]))
 }
 
-pub(crate) fn parse_time_range(time_filter: Option<&str>) -> TimeRange {
-    match time_filter.map(|t| t.to_lowercase()) {
-        Some(ref t) if t == "today" => TimeRange::Today,
-        Some(ref t) if t == "7d" || t == "week" => TimeRange::Week,
-        Some(ref t) if t == "30d" || t == "month" => TimeRange::Month,
-        _ => TimeRange::All,
+pub(crate) fn parse_time_range_arg(value: &str) -> std::result::Result<String, String> {
+    parse_time_range(Some(value)).map(|_| value.to_owned()).map_err(|error| error.to_string())
+}
+
+pub(crate) fn parse_time_range(time_filter: Option<&str>) -> Result<TimeRange> {
+    let Some(value) = time_filter else {
+        return Ok(TimeRange::All);
+    };
+    match value.to_lowercase().as_str() {
+        "today" => Ok(TimeRange::Today),
+        "7d" | "week" => Ok(TimeRange::Week),
+        "30d" | "month" => Ok(TimeRange::Month),
+        "all" => Ok(TimeRange::All),
+        _ => anyhow::bail!(
+            "unknown time range: {value}; expected today, 7d, week, 30d, month, or all"
+        ),
     }
 }
 

@@ -23,7 +23,7 @@ enum Commands {
         query: String,
         #[arg(long, help = "Filter by source id or label")]
         source: Option<String>,
-        #[arg(long, help = "Filter by time range")]
+        #[arg(long, value_parser = crate::query::parse_time_range_arg, help = "Filter by time range")]
         time: Option<String>,
         #[arg(long, help = "Filter by project directory, including child paths")]
         project: Option<String>,
@@ -62,14 +62,14 @@ enum Commands {
         json: bool,
         #[arg(long, help = "Filter by source id or label")]
         source: Option<String>,
-        #[arg(long, help = "Filter by time range")]
+        #[arg(long, value_parser = crate::query::parse_time_range_arg, help = "Filter by time range")]
         time: Option<String>,
     },
     #[command(about = "Export session records as JSON Lines")]
     Export {
         #[arg(long, help = "Filter by source id or label")]
         source: Option<String>,
-        #[arg(long, help = "Filter by time range")]
+        #[arg(long, value_parser = crate::query::parse_time_range_arg, help = "Filter by time range")]
         time: Option<String>,
         #[arg(long, help = "Filter by project directory, including child paths")]
         project: Option<String>,
@@ -385,6 +385,27 @@ mod tests {
     #[test]
     fn export_rejects_removed_jsonl_flag() {
         assert!(Cli::try_parse_from(["recall", "export", "--jsonl"]).is_err());
+    }
+
+    #[test]
+    fn time_filter_validates_values_for_every_command() {
+        let commands: &[&[&str]] = &[
+            &["recall", "search", "query", "--time", "definitely-invalid"],
+            &["recall", "session", "list", "--time", "definitely-invalid"],
+            &["recall", "usage", "--time", "definitely-invalid"],
+            &["recall", "export", "--time", "definitely-invalid"],
+        ];
+
+        for args in commands {
+            let Err(error) = Cli::try_parse_from(*args) else {
+                panic!("accepted invalid --time for {}", args[1]);
+            };
+            assert_eq!(error.exit_code(), 2);
+        }
+
+        for value in ["today", "7d", "week", "30d", "month", "all", "WEEK"] {
+            assert!(Cli::try_parse_from(["recall", "usage", "--time", value]).is_ok());
+        }
     }
 
     #[test]

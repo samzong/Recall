@@ -23,20 +23,19 @@ pub(crate) fn run_cli(
     source_filter: Option<&str>,
     time_filter: Option<&str>,
 ) -> Result<()> {
+    let time_range = parse_time_range(time_filter)?;
     let sources = usage_source_labels();
 
     if !json {
         let usage_source_filter = resolve_source_filter(source_filter, &sources)?;
-        let usage_time_filter = time_filter.map(|_| parse_time_range(time_filter));
+        let usage_time_filter = time_filter.map(|_| time_range);
         return crate::tui::runner::run(Some((usage_source_filter, usage_time_filter)));
     }
 
     run_usage_sync_job()?;
     let store = Store::open()?;
-    let filters = UsageFilters {
-        sources: resolve_source_filter(source_filter, &sources)?,
-        time_range: parse_time_range(time_filter),
-    };
+    let filters =
+        UsageFilters { sources: resolve_source_filter(source_filter, &sources)?, time_range };
     let report = build_usage_report(&store, &filters)?;
 
     println!("{}", serde_json::to_string_pretty(&report)?);
