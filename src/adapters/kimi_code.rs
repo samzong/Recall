@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use serde_json::Value;
 use tracing::warn;
 use walkdir::WalkDir;
@@ -90,7 +91,7 @@ fn resolve_kimi_dir() -> anyhow::Result<Option<PathBuf>> {
     resolve_home_dir(".kimi-code/sessions", "~/.kimi-code/sessions not found, skipping Kimi Code")
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct StateMeta {
     id: Option<String>,
     cwd: Option<String>,
@@ -99,18 +100,22 @@ struct StateMeta {
     is_custom_title: bool,
 }
 
-fn parse_state_json(content: &str) -> StateMeta {
-    let v: Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(_) => return StateMeta::default(),
-    };
-    StateMeta {
+fn parse_state_json(content: &str) -> anyhow::Result<StateMeta> {
+    let v: Value = serde_json::from_str(content)?;
+    anyhow::ensure!(v.is_object(), "state must be a JSON object");
+    Ok(StateMeta {
         id: v.get("id").and_then(|s| s.as_str()).map(str::to_string),
         cwd: v.get("cwd").and_then(|s| s.as_str()).map(str::to_string),
         created_at: json_i64(v.get("createdAt")),
         title: v.get("title").and_then(|s| s.as_str()).map(str::to_string),
         is_custom_title: v.get("isCustomTitle").and_then(|b| b.as_bool()).unwrap_or(false),
-    }
+    })
+}
+
+fn read_state_json(path: &Path) -> anyhow::Result<StateMeta> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    parse_state_json(&content).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn collect_session_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
@@ -136,8 +141,13 @@ fn collect_session_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
             continue;
         }
 
-        let meta =
-            fs::read_to_string(path).map(|content| parse_state_json(&content)).unwrap_or_default();
+        let meta = match read_state_json(path) {
+            Ok(meta) => meta,
+            Err(error) => {
+                warn!("{error}");
+                continue;
+            }
+        };
         let session_id = meta.id.clone().unwrap_or_else(|| dir_name.to_string());
         entries.push(FileScanEntry {
             session_id,
@@ -170,9 +180,7 @@ fn parse_kimi_session_file_impl(
     let Some(session_dir) = session_dir_for_wire(wire_path) else {
         return Ok(None);
     };
-    let meta = fs::read_to_string(session_dir.join("state.json"))
-        .map(|content| parse_state_json(&content))
-        .unwrap_or_default();
+    let meta = read_state_json(&session_dir.join("state.json"))?;
 
     let file = fs::File::open(wire_path)?;
     let reader = BufReader::new(file);
@@ -360,7 +368,7 @@ pub(crate) fn parse_kimi_session(
     wire_jsonl: &str,
     session_id: &str,
 ) -> Option<RawSession> {
-    let meta = parse_state_json(state_json);
+    let meta = parse_state_json(state_json).ok()?;
     let lines = wire_jsonl.lines().map(|line| Ok(line.to_string()));
     parse_kimi_wire(meta, session_id.to_string(), lines, 0, None, None).unwrap()
 }
@@ -437,6 +445,13 @@ mod tests {
     fn parse_kimi_session_empty_wire_returns_none() {
         let wire = r#"{"type":"metadata","protocol_version":"1.5","created_at":1700000000100}"#;
         assert!(parse_kimi_session(fixture_state(), wire, "session_abc").is_none());
+    }
+
+    #[test]
+    fn parse_kimi_session_invalid_state_returns_none() {
+        for state in ["{", "[]"] {
+            assert!(parse_kimi_session(state, fixture_wire(), "session_abc").is_none());
+        }
     }
 
     #[test]
