@@ -21,6 +21,13 @@ pub(crate) struct KimiCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 1;
 
+fn kimi_scan_options() -> file_scan::FileScanOptions {
+    file_scan::FileScanOptions {
+        usage_parser_version: Some(USAGE_PARSER_VERSION),
+        ..Default::default()
+    }
+}
+
 impl SourceAdapter for KimiCodeAdapter {
     fn id(&self) -> &str {
         "kimi-code"
@@ -66,15 +73,13 @@ impl SourceAdapter for KimiCodeAdapter {
         let Some(sessions_dir) = resolve_kimi_dir()? else {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
         };
-        let result = file_scan::run_file_scan_with_options(
+        let result = file_scan::run_file_scan_with_options_and_mtime(
             store,
             "kimi-code",
             since_ts,
-            file_scan::FileScanOptions {
-                usage_parser_version: Some(USAGE_PARSER_VERSION),
-                ..Default::default()
-            },
+            kimi_scan_options(),
             collect_session_entries(&sessions_dir),
+            kimi_session_mtime_ms,
             parse_kimi_session_file,
         )?;
         Ok(Some(result))
@@ -162,7 +167,7 @@ fn parse_kimi_session_file_impl(
     mtime_ms: i64,
 ) -> anyhow::Result<Option<RawSession>> {
     let wire_path = &entry.stat_target;
-    let Some(session_dir) = wire_path.parent().and_then(Path::parent).and_then(Path::parent) else {
+    let Some(session_dir) = session_dir_for_wire(wire_path) else {
         return Ok(None);
     };
     let meta = fs::read_to_string(session_dir.join("state.json"))
@@ -180,6 +185,18 @@ fn parse_kimi_session_file_impl(
         entry.directory.clone(),
         source_path,
     )
+}
+
+fn session_dir_for_wire(wire_path: &Path) -> Option<&Path> {
+    wire_path.parent().and_then(Path::parent).and_then(Path::parent)
+}
+
+fn kimi_session_mtime_ms(entry: &FileScanEntry) -> Option<i64> {
+    let wire_mtime = file_scan::stat_mtime_ms(&entry.stat_target)?;
+    let state_mtime = session_dir_for_wire(&entry.stat_target)
+        .and_then(|dir| file_scan::stat_mtime_ms(&dir.join("state.json")))
+        .unwrap_or(wire_mtime);
+    Some(wire_mtime.max(state_mtime))
 }
 
 fn parse_kimi_wire(
@@ -279,9 +296,7 @@ fn parse_kimi_wire(
     session.custom_title = custom_title;
     session.summary = summary;
     session.duration_minutes = duration_minutes;
-    if !usage_events.is_empty() {
-        session = session.with_usage(usage_events, USAGE_PARSER_VERSION);
-    }
+    session = session.with_usage(usage_events, USAGE_PARSER_VERSION);
     Ok(Some(session))
 }
 
@@ -352,6 +367,8 @@ pub(crate) fn parse_kimi_session(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
     use super::*;
 
     fn fixture_state() -> &'static str {
@@ -420,5 +437,88 @@ mod tests {
     fn parse_kimi_session_empty_wire_returns_none() {
         let wire = r#"{"type":"metadata","protocol_version":"1.5","created_at":1700000000100}"#;
         assert!(parse_kimi_session(fixture_state(), wire, "session_abc").is_none());
+    }
+
+    #[test]
+    fn parse_kimi_session_records_empty_usage_parse() {
+        let wire = r#"{"type":"context.append_message","time":1700000001000,"message":{"role":"user","origin":{"kind":"user"},"content":[{"type":"text","text":"hello"}]}}"#;
+        let session = parse_kimi_session(fixture_state(), wire, "session_abc").unwrap();
+
+        assert!(session.usage_events.is_empty());
+        assert_eq!(session.usage_parser_version, Some(USAGE_PARSER_VERSION));
+    }
+
+    #[test]
+    fn incremental_scan_reparses_when_only_state_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let session_dir = root.path().join("wd_repo").join("session_rename");
+        let wire_dir = session_dir.join("agents").join("main");
+        fs::create_dir_all(&wire_dir).unwrap();
+        let state_path = session_dir.join("state.json");
+        let wire_path = wire_dir.join("wire.jsonl");
+        fs::write(
+            &state_path,
+            r#"{"id":"session_rename","cwd":"/repo","createdAt":1700000000000,"title":"renamed","isCustomTitle":true}"#,
+        )
+        .unwrap();
+        fs::write(
+            &wire_path,
+            r#"{"type":"context.append_message","time":1700000001000,"message":{"role":"user","origin":{"kind":"user"},"content":[{"type":"text","text":"hello"}]}}"#,
+        )
+        .unwrap();
+
+        let wire_mtime = 1_700_000_002_000;
+        let state_mtime = wire_mtime + 1_000;
+        fs::File::open(&wire_path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_millis(wire_mtime as u64))
+            .unwrap();
+        fs::File::open(&state_path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_millis(state_mtime as u64))
+            .unwrap();
+
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (id, source, source_id, title, started_at, updated_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "stored-id",
+                    "kimi-code",
+                    "session_rename",
+                    "old title",
+                    1_700_000_000_000_i64,
+                    wire_mtime,
+                    1,
+                ],
+            )
+            .unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "kimi-code",
+                "session_rename",
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(wire_mtime),
+            )
+            .unwrap();
+
+        let result = file_scan::run_file_scan_with_options_and_mtime(
+            &store,
+            "kimi-code",
+            None,
+            kimi_scan_options(),
+            collect_session_entries(root.path()),
+            kimi_session_mtime_ms,
+            parse_kimi_session_file,
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.parsed, 1);
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].updated_at, Some(state_mtime));
+        assert_eq!(result.sessions[0].custom_title.as_deref(), Some("renamed"));
     }
 }

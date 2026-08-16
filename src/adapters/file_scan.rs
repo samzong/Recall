@@ -57,6 +57,31 @@ where
     I: IntoIterator<Item = FileScanEntry>,
     F: Fn(FileScanEntry, i64) -> Result<Option<RawSession>>,
 {
+    run_file_scan_with_options_and_mtime(
+        store,
+        source_id,
+        since_ts,
+        options,
+        entries,
+        |entry| stat_mtime_ms(&entry.stat_target),
+        parse_fn,
+    )
+}
+
+pub(crate) fn run_file_scan_with_options_and_mtime<I, F, M>(
+    store: &Store,
+    source_id: &str,
+    since_ts: Option<i64>,
+    options: FileScanOptions,
+    entries: I,
+    mtime_fn: M,
+    parse_fn: F,
+) -> Result<SyncScanResult>
+where
+    I: IntoIterator<Item = FileScanEntry>,
+    F: Fn(FileScanEntry, i64) -> Result<Option<RawSession>>,
+    M: Fn(&FileScanEntry) -> Option<i64>,
+{
     let existing = store.session_meta_map(source_id)?;
     let mut imported = store.imported_source_ids(source_id)?;
     let usage_state = match options.usage_parser_version {
@@ -76,7 +101,7 @@ where
 
     for entry in entries {
         stats.candidates += 1;
-        let Some(mtime_ms) = stat_mtime_ms(&entry.stat_target) else {
+        let Some(mtime_ms) = mtime_fn(&entry) else {
             stats.rejected_before_parse += 1;
             continue;
         };
