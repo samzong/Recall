@@ -52,17 +52,7 @@ impl SourceAdapter for KimiCodeAdapter {
         let Some(sessions_dir) = resolve_kimi_dir()? else {
             return Ok(vec![]);
         };
-
-        let mut sessions = Vec::new();
-        for entry in collect_session_entries(&sessions_dir) {
-            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
-                continue;
-            };
-            if let Some(raw) = parse_kimi_session_file(entry, mtime_ms)? {
-                sessions.push(raw);
-            }
-        }
-        Ok(sessions)
+        scan_kimi_sessions(&sessions_dir)
     }
 
     fn scan_for_sync(
@@ -89,6 +79,19 @@ impl SourceAdapter for KimiCodeAdapter {
 
 fn resolve_kimi_dir() -> anyhow::Result<Option<PathBuf>> {
     resolve_home_dir(".kimi-code/sessions", "~/.kimi-code/sessions not found, skipping Kimi Code")
+}
+
+fn scan_kimi_sessions(sessions_dir: &Path) -> anyhow::Result<Vec<RawSession>> {
+    let mut sessions = Vec::new();
+    for entry in collect_session_entries(sessions_dir) {
+        let Some(mtime_ms) = kimi_session_mtime_ms(&entry) else {
+            continue;
+        };
+        if let Some(raw) = parse_kimi_session_file(entry, mtime_ms)? {
+            sessions.push(raw);
+        }
+    }
+    Ok(sessions)
 }
 
 #[derive(Clone)]
@@ -535,5 +538,8 @@ mod tests {
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].updated_at, Some(state_mtime));
         assert_eq!(result.sessions[0].custom_title.as_deref(), Some("renamed"));
+
+        let sessions = scan_kimi_sessions(root.path()).unwrap();
+        assert_eq!(sessions[0].updated_at, Some(state_mtime));
     }
 }
