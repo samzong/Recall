@@ -54,6 +54,7 @@ One index across every AI coding CLI. Sync once, search everywhere, resume right
 | Cline           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
 | DeepSeek Harness |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |   ✅   |
 | Grok            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |        |
+| Kimi Code       |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 
 ## Acknowledgements
 

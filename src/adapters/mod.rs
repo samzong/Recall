@@ -10,6 +10,7 @@ pub(crate) mod file_scan;
 pub(crate) mod gemini;
 pub(crate) mod grok;
 pub(crate) mod json_util;
+pub(crate) mod kimi_code;
 pub(crate) mod kiro;
 pub(crate) mod opencode;
 pub(crate) mod paths;
@@ -190,6 +191,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(cursor::CursorAdapter),
         Box::new(cline::ClineAdapter),
         Box::new(deepseek_harness::DeepSeekHarnessAdapter),
+        Box::new(kimi_code::KimiCodeAdapter),
     ]
 }
 

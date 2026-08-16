@@ -1,5 +1,6 @@
 use crate::adapters::copilot::parse_copilot_events;
 use crate::adapters::gemini::parse_gemini_session;
+use crate::adapters::kimi_code::parse_kimi_session;
 use crate::adapters::kiro::parse_kiro_conversation;
 use crate::config::AppConfig;
 use crate::db::schema;
@@ -1539,6 +1540,49 @@ fn gemini_parser_skips_info_messages() {
 fn gemini_parser_empty_returns_none() {
     let json = r#"{"sessionId": "s", "messages": []}"#;
     assert!(parse_gemini_session(json, "fallback").unwrap().is_none());
+}
+
+#[test]
+fn kimi_parser_filters_injections_and_stream_parts() {
+    let state = r#"{"id":"session_k1","cwd":"/repo","title":"first ask","isCustomTitle":false}"#;
+    let wire = concat!(
+        r#"{"type":"context.append_message","time":1000,"message":{"id":"m1","role":"user","origin":{"kind":"user"},"content":[{"type":"text","text":"first ask"}]}}"#,
+        "\n",
+        r#"{"type":"context.append_message","time":1001,"message":{"id":"m2","role":"user","origin":{"kind":"injection"},"content":[{"type":"text","text":"<system-reminder>hidden</system-reminder>"}]}}"#,
+        "\n",
+        r#"{"type":"context.append_message","time":1002,"message":{"id":"m3","role":"user","origin":{"kind":"task"},"content":[{"type":"text","text":"task notification payload"}]}}"#,
+        "\n",
+        r#"{"type":"llm.request","time":1003,"model":"kimi-k3","provider":"moonshot"}"#,
+        "\n",
+        r#"{"type":"context.append_loop_event","time":1004,"event":{"type":"content.part","part":{"type":"think","think":"internal"}}}"#,
+        "\n",
+        r#"{"type":"context.append_loop_event","time":1005,"event":{"type":"content.part","part":{"type":"text","text":"visible answer"}}}"#,
+        "\n",
+        r#"{"type":"context.append_loop_event","time":1006,"event":{"type":"tool.result","result":{"output":"secret tool dump"}}}"#,
+        "\n",
+        r#"{"type":"usage.record","time":1007,"model":"kimi-k3","usage":{"inputOther":10,"output":5,"inputCacheRead":2,"inputCacheCreation":1}}"#,
+    );
+
+    let session = parse_kimi_session(state, wire, "session_k1").unwrap();
+    let contents: Vec<&str> = session.messages.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(contents, ["first ask", "visible answer"]);
+    assert!(!contents.iter().any(|c| c.contains("hidden")), "injections excluded");
+    assert!(
+        !contents.iter().any(|c| c.contains("task notification payload")),
+        "task-origin notifications excluded"
+    );
+    assert!(!contents.iter().any(|c| c.contains("internal")), "think parts excluded");
+    assert!(!contents.iter().any(|c| c.contains("secret tool dump")), "tool results excluded");
+    assert_eq!(session.usage_events.len(), 1);
+    assert_eq!(session.usage_events[0].provider, "moonshot");
+    assert_eq!(session.summary.as_deref(), Some("first ask"));
+}
+
+#[test]
+fn kimi_parser_aborted_wire_returns_none() {
+    let state = r#"{"id":"session_k2"}"#;
+    let wire = r#"{"type":"metadata","protocol_version":"1.5","created_at":1000}"#;
+    assert!(parse_kimi_session(state, wire, "session_k2").is_none());
 }
 
 #[test]
