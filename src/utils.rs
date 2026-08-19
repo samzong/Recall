@@ -157,11 +157,28 @@ pub(crate) fn title_from_user_messages(user_contents: &[&str]) -> String {
     }
 }
 
+/// Openers written by the agent harness rather than by the user: slash-command
+/// envelopes, skill preambles, resumed-session banners, tool errors, and
+/// interruption markers.
+///
+/// Claude Code emits the envelope as `<command-name>` followed by
+/// `<command-message>`, so matching only the latter never fires on a real
+/// transcript.
+const NOISE_FIRST_MESSAGE_PREFIXES: &[&str] = &[
+    "<command-name>",
+    "<command-message>",
+    "<local-command-caveat>",
+    "<system-reminder>",
+    "<tool_use_error>",
+    "[Request interrupted",
+    "# New session -",
+    "Base directory for this skill:",
+    "This session is being continued from",
+];
+
 fn is_noise_first_message(content: &str) -> bool {
     let trimmed = content.trim_start();
-    trimmed.starts_with("<command-message>")
-        || trimmed.starts_with("<local-command-caveat>")
-        || trimmed.starts_with("# New session -")
+    NOISE_FIRST_MESSAGE_PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -253,6 +270,24 @@ mod tests {
             "actually implement the feature",
         ];
         assert_eq!(title_from_user_messages(&msgs), "actually implement the feature");
+    }
+
+    #[test]
+    fn title_skips_command_envelope_led_by_command_name() {
+        let msgs = [
+            "<command-name>/clear</command-name>\n<command-message>clear</command-message>",
+            "review the sync regression",
+        ];
+        assert_eq!(title_from_user_messages(&msgs), "review the sync regression");
+    }
+
+    #[test]
+    fn title_skips_skill_preamble() {
+        let msgs = [
+            "Base directory for this skill: /Users/x/.claude/skills/recall",
+            "find the session about migrations",
+        ];
+        assert_eq!(title_from_user_messages(&msgs), "find the session about migrations");
     }
 
     #[test]

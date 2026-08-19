@@ -126,8 +126,6 @@ jobs:
         with:
           merge-multiple: true
 
-      # release-please already created the tag and the GitHub release with its
-      # changelog entry; this job only attaches the built binaries to it.
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
