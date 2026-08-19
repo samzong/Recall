@@ -486,43 +486,17 @@ impl Store {
         time_range: TimeRange,
         scope: &ProjectScope,
     ) -> Result<(u64, u64)> {
-        let mut session_sql = String::from("SELECT COUNT(*) FROM sessions s WHERE 1=1");
-        let mut session_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut session_param_idx = 1;
-        apply_scope_filters(
-            &mut session_sql,
-            &mut session_params,
-            &mut session_param_idx,
-            sources,
-            time_range,
-            scope,
+        let mut sql = String::from(
+            "SELECT COUNT(*), COALESCE(SUM(s.message_count), 0) FROM sessions s WHERE 1=1",
         );
-        let session_param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            session_params.iter().map(|p| p.as_ref()).collect();
-        let session_count: u64 =
-            self.conn.query_row(&session_sql, session_param_refs.as_slice(), |row| row.get(0))?;
-
-        let mut message_sql = String::from(
-            "SELECT COUNT(*)
-             FROM messages m
-             JOIN sessions s ON s.id = m.session_id
-             WHERE 1=1",
-        );
-        let mut message_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut message_param_idx = 1;
-        apply_scope_filters(
-            &mut message_sql,
-            &mut message_params,
-            &mut message_param_idx,
-            sources,
-            time_range,
-            scope,
-        );
-        let message_param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            message_params.iter().map(|p| p.as_ref()).collect();
-        let message_count: u64 =
-            self.conn.query_row(&message_sql, message_param_refs.as_slice(), |row| row.get(0))?;
-        Ok((session_count, message_count))
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+        apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, scope);
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        self.conn
+            .query_row(&sql, param_refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -1287,5 +1261,117 @@ mod source_stats_tests {
         let opencode = &stats["opencode"];
         assert_eq!(opencode.sessions, 1);
         assert_eq!(opencode.messages, 4);
+    }
+}
+
+#[cfg(test)]
+mod search_scope_stats_tests {
+    use super::*;
+    use crate::db::schema;
+    use crate::types::{Message, Role, Session};
+
+    fn store() -> Store {
+        schema::register_sqlite_vec();
+        Store::open_in_memory().unwrap()
+    }
+
+    fn session(
+        id: &str,
+        source: &str,
+        started_at: i64,
+        message_count: u32,
+        directory: Option<&str>,
+    ) -> Session {
+        Session {
+            id: id.to_string(),
+            source: source.to_string(),
+            source_id: format!("raw-{id}"),
+            title: id.to_string(),
+            directory: directory.map(str::to_string),
+            repo_remote: None,
+            repo_slug: None,
+            repo_name: None,
+            started_at,
+            updated_at: Some(started_at),
+            message_count,
+            entrypoint: None,
+            custom_title: None,
+            summary: None,
+            duration_minutes: None,
+            source_file_path: None,
+            is_import: false,
+        }
+    }
+
+    fn messages(session_id: &str, count: u32) -> Vec<Message> {
+        (0..count)
+            .map(|seq| Message {
+                session_id: session_id.to_string(),
+                role: Role::User,
+                content: format!("message {seq}"),
+                timestamp: Some(i64::from(seq)),
+                seq,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stats_for_search_scope_sum_session_counts_without_reading_messages() {
+        let store = store();
+        store.insert_session(&session("a", "codex", 10, 2, Some("/repo/a"))).unwrap();
+        store.insert_session(&session("b", "codex", 20, 3, Some("/repo/b"))).unwrap();
+        store.insert_session(&session("c", "opencode", 30, 4, Some("/other"))).unwrap();
+
+        assert_eq!(
+            store.stats_for_search_scope(None, TimeRange::All, &ProjectScope::Global).unwrap(),
+            (3, 9)
+        );
+        assert_eq!(
+            store
+                .stats_for_search_scope(
+                    Some(&["codex".to_string()]),
+                    TimeRange::All,
+                    &ProjectScope::Global
+                )
+                .unwrap(),
+            (2, 5)
+        );
+        assert_eq!(
+            store
+                .stats_for_search_scope(
+                    None,
+                    TimeRange::All,
+                    &ProjectScope::Directory("/repo/a".into())
+                )
+                .unwrap(),
+            (1, 2)
+        );
+    }
+
+    #[test]
+    fn persist_keeps_stored_message_count_aligned_with_message_rows() {
+        let store = store();
+        let first = session("a", "codex", 10, 2, None);
+        let second = session("b", "codex", 20, 3, None);
+        store.persist_session_with_usage(&first, &messages(&first.id, 2), &[], None).unwrap();
+        store.persist_session_with_usage(&second, &messages(&second.id, 3), &[], None).unwrap();
+
+        let stored: u32 = store
+            .conn
+            .query_row("SELECT message_count FROM sessions WHERE id = ?1", ["a"], |row| row.get(0))
+            .unwrap();
+        let rows: u32 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages WHERE session_id = ?1", ["a"], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 2);
+        assert_eq!(rows, 2);
+
+        assert_eq!(
+            store.stats_for_search_scope(None, TimeRange::All, &ProjectScope::Global).unwrap(),
+            (2, 5)
+        );
     }
 }
