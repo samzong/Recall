@@ -1,10 +1,28 @@
 name: CodSpeed
 
+# Benches measure core hot paths only. Docs, website, skills, and
+# extension PRs cannot change those measurements, so they skip this
+# job. That skip is safe while "Run benchmarks" is not a required
+# status check — if it becomes required, a skipped run stays Pending
+# and blocks merge; add a no-op success job before requiring it.
+# Force a run from the Actions tab via workflow_dispatch.
 on:
   push:
     branches: [main]
+    paths:
+      - "src/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/codspeed.yml"
   pull_request:
     branches: [main]
+    paths:
+      - "src/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/codspeed.yml"
   # Lets CodSpeed trigger backtest runs to build the initial baseline.
   workflow_dispatch:
 

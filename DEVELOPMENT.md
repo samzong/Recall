@@ -188,10 +188,13 @@ Always run `make check` before pushing. If it passes locally, CI will pass.
 
 ## Benchmarks
 
-Performance is tracked on every push and pull request by
+Performance is tracked by
 [CodSpeed](https://app.codspeed.io/samzong/Recall) via
-`.github/workflows/codspeed.yml`, using CPU simulation so results do not depend
-on runner noise.
+`.github/workflows/codspeed.yml` on pushes and pull requests that touch
+`src/`, `benches/`, `Cargo.toml`, `Cargo.lock`, or the workflow itself,
+using CPU simulation so results do not depend on runner noise. Docs,
+website, skills, and extension-only changes skip the job; force a run
+with `workflow_dispatch`.
 
 `benches/recall.rs` is a single [divan](https://github.com/nvzqz/divan) target
 grouped by pipeline stage:
