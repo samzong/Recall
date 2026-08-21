@@ -119,6 +119,41 @@ fn version_cmp_orders_releases() {
 }
 
 #[test]
+fn update_pending_uses_installed_release_not_crate_version() {
+    let release = crate::update::ReleaseInfo {
+        version: "0.5.0".to_string(),
+        asset_name: String::new(),
+        download_url: String::new(),
+    };
+    // rx's crate version stays 0.1.0 while core releases advance; once this
+    // release stream artifact is recorded as installed, it must not re-prompt.
+    assert!(!crate::update::update_pending(
+        "0.1.0",
+        &release,
+        &crate::update::state_with_installed(Some("0.5.0"))
+    ));
+    assert!(crate::update::update_pending(
+        "0.1.0",
+        &release,
+        &crate::update::state_with_installed(Some("0.4.0"))
+    ));
+    assert!(crate::update::update_pending(
+        "0.1.0",
+        &release,
+        &crate::update::state_with_installed(None)
+    ));
+}
+
+#[test]
+fn argv0_harness_resolves_aliases() {
+    assert_eq!(crate::args::argv0_harness("/usr/local/bin/rxc"), Some("claude"));
+    assert_eq!(crate::args::argv0_harness("rxx"), Some("codex"));
+    assert_eq!(crate::args::argv0_harness("rxo.exe"), Some("opencode"));
+    assert_eq!(crate::args::argv0_harness("rxp"), Some("pi"));
+    assert_eq!(crate::args::argv0_harness("/home/u/.cargo/bin/rx"), None);
+}
+
+#[test]
 fn release_asset_name_matches_host() {
     let name = crate::update::release_asset_name().unwrap();
     assert!(name.starts_with("recall-"));

@@ -61,16 +61,23 @@ pub(crate) fn rewrite_argv0(mut args: Vec<String>) -> Vec<String> {
     let Some(argv0) = args.first() else {
         return args;
     };
-    let name = Path::new(argv0).file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
-    let harness = match name {
-        "rxc" => "claude",
-        "rxx" => "codex",
-        "rxo" => "opencode",
-        "rxp" => "pi",
-        _ => return args,
+    let Some(harness) = argv0_harness(argv0) else {
+        return args;
     };
     args.insert(1, harness.to_string());
     args
+}
+
+/// Harness implied by an invoked alias such as `rxc`; `None` for plain `rx`.
+pub(crate) fn argv0_harness(argv0: &str) -> Option<&'static str> {
+    let name = Path::new(argv0).file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
+    match name {
+        "rxc" => Some("claude"),
+        "rxx" => Some("codex"),
+        "rxo" => Some("opencode"),
+        "rxp" => Some("pi"),
+        _ => None,
+    }
 }
 
 pub(crate) fn parse(args: &[String]) -> Result<Command> {

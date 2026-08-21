@@ -22,22 +22,22 @@ pub(crate) struct ReleaseInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct UpdateState {
+pub(crate) struct UpdateState {
     #[serde(default)]
     auto_update: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_check: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_installed: Option<String>,
 }
 
-pub(crate) fn run(yes: bool, _paths: &Paths) -> Result<()> {
+pub(crate) fn run(yes: bool, paths: &Paths) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let release = fetch_latest_release()?;
-    match version_cmp(current, &release.version) {
-        Ordering::Greater | Ordering::Equal => {
-            println!("rx {current} is up to date (latest: {})", release.version);
-            return Ok(());
-        }
-        Ordering::Less => {}
+    let state = load_state(paths)?;
+    if !update_pending(current, &release, &state) {
+        println!("rx {current} is up to date (latest: {})", release.version);
+        return Ok(());
     }
     if !yes && !confirm(&format!("Update rx {current} → {}?", release.version))? {
         println!("update cancelled");
@@ -45,8 +45,34 @@ pub(crate) fn run(yes: bool, _paths: &Paths) -> Result<()> {
     }
     eprintln!("Updating rx to {}...", release.version);
     install_release(&release)?;
+    record_installed(paths, &release.version)?;
     println!("Updated rx to {}", release.version);
     Ok(())
+}
+
+/// rx shares the core release stream but its own crate version does not advance,
+/// so the installed release tag — not `CARGO_PKG_VERSION` — decides whether the
+/// fetched release is already installed.
+pub(crate) fn update_pending(current: &str, release: &ReleaseInfo, state: &UpdateState) -> bool {
+    if state.last_installed.as_deref() == Some(release.version.as_str()) {
+        return false;
+    }
+    version_cmp(current, &release.version) == Ordering::Less
+}
+
+fn record_installed(paths: &Paths, version: &str) -> Result<()> {
+    let mut state = load_state(paths)?;
+    state.last_installed = Some(version.to_string());
+    save_state(paths, &state)
+}
+
+#[cfg(test)]
+pub(crate) fn state_with_installed(version: Option<&str>) -> UpdateState {
+    UpdateState {
+        auto_update: false,
+        last_check: None,
+        last_installed: version.map(str::to_string),
+    }
 }
 
 pub(crate) fn maybe_before_launch(
@@ -77,6 +103,7 @@ pub(crate) fn maybe_before_launch(
     if state.auto_update {
         eprintln!("Updating rx to {}...", release.version);
         install_release(&release)?;
+        record_installed(paths, &release.version)?;
         relaunch(raw_args)?;
     } else if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
         eprintln!("rx {} is available — run `rx update`", release.version);
@@ -87,11 +114,13 @@ pub(crate) fn maybe_before_launch(
                 save_state(paths, &state)?;
                 eprintln!("Updating rx to {}...", release.version);
                 install_release(&release)?;
+                record_installed(paths, &release.version)?;
                 relaunch(raw_args)?;
             }
             PromptChoice::UpdateNow => {
                 eprintln!("Updating rx to {}...", release.version);
                 install_release(&release)?;
+                record_installed(paths, &release.version)?;
                 relaunch(raw_args)?;
             }
             PromptChoice::NotNow => {}
@@ -136,6 +165,11 @@ fn confirm(message: &str) -> Result<bool> {
 fn relaunch(raw_args: &[String]) -> Result<()> {
     let exe = std::env::current_exe().context("cannot resolve rx executable path")?;
     let mut command = Command::new(&exe);
+    // current_exe() resolves aliases (rxc/rxx/rxo/rxp) to the plain rx binary,
+    // so the relaunched process would lose the argv0-selected harness.
+    if let Some(harness) = raw_args.first().and_then(|argv0| crate::args::argv0_harness(argv0)) {
+        command.arg(harness);
+    }
     command.args(raw_args.iter().skip(1));
     #[cfg(unix)]
     {
@@ -235,8 +269,12 @@ fn replace_executable(source: &Path) -> Result<()> {
     #[cfg(windows)]
     if target.is_file() {
         // Windows locks running executables: move the old binary aside so the
-        // staged update can take its place.
+        // staged update can take its place. A leftover backup from a previous
+        // update must go first — Windows rename does not replace destinations.
         let backup = target.with_extension("old.exe");
+        if backup.exists() {
+            let _ = fs::remove_file(&backup);
+        }
         fs::rename(&target, &backup)
             .with_context(|| format!("move running executable to {}", backup.display()))?;
     }
