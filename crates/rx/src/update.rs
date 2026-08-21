@@ -97,7 +97,7 @@ pub(crate) fn maybe_before_launch(
     };
     state.last_check = Some(now_rfc3339());
     save_state(paths, &state)?;
-    if version_cmp(current, &release.version) != Ordering::Less {
+    if !update_pending(current, &release, &state) {
         return Ok(());
     }
     if state.auto_update {
