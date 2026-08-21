@@ -87,19 +87,19 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p recall -p rx
 
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.artifact }}.tar.gz recall
+          tar czf ../../../${{ matrix.artifact }}.tar.gz recall rx
           cd ../../..
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/recall.exe -DestinationPath ${{ matrix.artifact }}.zip
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/recall.exe,target/${{ matrix.target }}/release/rx.exe -DestinationPath ${{ matrix.artifact }}.zip
 
       - uses: actions/upload-artifact@v5
         with:

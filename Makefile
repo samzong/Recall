@@ -62,15 +62,22 @@ doc: ## Generate API documentation
 
 .PHONY: install uninstall
 
-install: ## Install binary to ~/.cargo/bin
+install: ## Install binaries to ~/.cargo/bin
 	$(CARGO) install --path . --locked
+	$(CARGO) install --path crates/rx --locked
+	ln -sfn rx "$(HOME)/.cargo/bin/rxc"
+	ln -sfn rx "$(HOME)/.cargo/bin/rxx"
+	ln -sfn rx "$(HOME)/.cargo/bin/rxo"
+	ln -sfn rx "$(HOME)/.cargo/bin/rxp"
 	@if [ -d "$(HOME)/.zsh/completions" ]; then \
 		"$(HOME)/.cargo/bin/recall" completions zsh > "$(HOME)/.zsh/completions/_recall"; \
 		printf '$(GREEN)  ✓ Updated ~/.zsh/completions/_recall$(RESET)\n'; \
 	fi
 
-uninstall: ## Remove installed binary
+uninstall: ## Remove installed binaries
 	$(CARGO) uninstall recall
+	$(CARGO) uninstall rx
+	rm -f "$(HOME)/.cargo/bin/rxc" "$(HOME)/.cargo/bin/rxx" "$(HOME)/.cargo/bin/rxo" "$(HOME)/.cargo/bin/rxp"
 
 # ── Run ──────────────────────────────────────────────────────────────────────
 

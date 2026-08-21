@@ -11,7 +11,8 @@ Recall is a Rust CLI/TUI application that indexes AI coding sessions from local
 tools (Claude Code, Codex, OpenCode, Cursor, ...) into one SQLite database for
 full-text/semantic search, usage tracking, JSONL export/import, session
 sharing, and resume. The repo is a Cargo workspace: the core application crate
-at the root plus official extension crates under `extensions/`. Nothing is
+at the root, the independent `rx` launcher under `crates/rx`, plus official
+extension crates under `extensions/`. Nothing is
 published to crates.io — these are application binaries, not library crates.
 
 ## Commands
@@ -30,8 +31,9 @@ cargo test integration::eval_harness  # eval harness
 
 `make check` must pass before push. CI runs exactly the same command — there is
 no CI-only logic. The gate uses `--workspace` and `--features bench`, so it
-covers extension crates and the `bench_api` shim that `benches/` compiles
-against. Build a single extension with `cargo build -p recall-<name>`.
+covers extension crates, `crates/rx`, and the `bench_api` shim that `benches/` compiles
+against. Build a single extension with `cargo build -p recall-<name>`. Build the
+launcher with `cargo build -p rx`.
 
 Core releases use cargo-release: `make release-patch` is a dry run; add
 `EXECUTE=1` to bump, commit, tag, and push. The bump is chosen by whoever cuts
@@ -70,6 +72,10 @@ Data flow: source adapters → sync → SQLite → search → CLI/TUI.
 - `src/share/` — renders sessions to HTML and publishes share assets.
 - `src/cli.rs` — clap subcommands dispatching to the modules above; unknown
   subcommands fall through to extension dispatch.
+- `crates/rx/` — independent `rx` binary (workspace member, not an extension).
+  Gateway launcher for Claude Code and Codex. Does not depend on the `recall`
+  crate or read `recall.db`. Install also creates `rxc` / `rxx` / `rxo` / `rxp`
+  symlinks.
 - `src/extension.rs` — extension host: `recall <name>` runs the managed
   `recall-<name>` binary; `recall ext install/list/remove/upgrade` manages
   official extensions from the GitHub Pages catalog.
