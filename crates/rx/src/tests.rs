@@ -154,6 +154,18 @@ fn argv0_harness_resolves_aliases() {
 }
 
 #[test]
+fn claude_seed_replaces_wrong_typed_growthbook_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".claude.json");
+    fs::write(&config_path, r#"{"cachedGrowthBookFeatures": null}"#).unwrap();
+    let caches = crate::claude_catalog::SeedCaches::default();
+    crate::claude_catalog::write_seed_for_test(&config_path, &caches).unwrap();
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert!(document["cachedGrowthBookFeatures"].is_object());
+}
+
+#[test]
 fn release_asset_name_matches_host() {
     let name = crate::update::release_asset_name().unwrap();
     assert!(name.starts_with("recall-"));

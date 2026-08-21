@@ -14,6 +14,7 @@ pub(crate) fn config_content(spec: &ProviderSpec, base_url: &str, key: &str) -> 
             "provider": {
                 "openrouter": {
                     "options": {
+                        "baseURL": openai_base(base_url),
                         "apiKey": format!("{{env:{}}}", spec.env_key)
                     }
                 }

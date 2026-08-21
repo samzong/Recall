@@ -289,11 +289,15 @@ fn merge_seed(document: &mut Value, caches: &SeedCaches) {
             .get("cachedGrowthBookFeatures")
             .and_then(|value| value.get(TOOL_SEARCH_UNSUPPORTED_KEY)),
     );
+    // A wrong-typed cache (e.g. null) must be replaced, not unwrapped: this is
+    // best-effort seeding and a panic here would block the launch.
+    if !object.get("cachedGrowthBookFeatures").is_some_and(Value::is_object) {
+        object.insert("cachedGrowthBookFeatures".to_string(), json!({}));
+    }
     let growthbook = object
-        .entry("cachedGrowthBookFeatures")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .expect("cachedGrowthBookFeatures is an object");
+        .get_mut("cachedGrowthBookFeatures")
+        .and_then(Value::as_object_mut)
+        .expect("normalized cachedGrowthBookFeatures to an object");
     let preserved = previous_gb_deny
         .into_iter()
         .filter(|entry| !previous_rx_deny.contains(entry))

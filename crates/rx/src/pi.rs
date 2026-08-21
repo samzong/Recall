@@ -18,6 +18,21 @@ const PI_ENV_CLEAR: &[&str] = &[
 ];
 
 pub(crate) fn global_agent_dir() -> Result<PathBuf> {
+    // PI_CODING_AGENT_DIR is authoritative for pi's configuration location
+    // (see src/adapters/pi.rs); providers must land where the launched
+    // process will actually read them.
+    if let Some(dir) = std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let home = dirs::home_dir().unwrap_or_default();
+        let expanded = match dir.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(dir),
+        };
+        return Ok(expanded);
+    }
     let home = dirs::home_dir().context("cannot determine home directory")?;
     Ok(home.join(".pi").join("agent"))
 }

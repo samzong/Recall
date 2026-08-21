@@ -1269,7 +1269,7 @@ fn f32_slice_to_bytes_roundtrip() {
     assert_eq!(bytes.len(), 16);
 
     let roundtrip: Vec<f32> =
-        bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
     assert_eq!(original, roundtrip);
 }
 
