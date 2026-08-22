@@ -85,7 +85,7 @@ pub(crate) enum SeedOutcome {
     Fallback,
 }
 
-pub(crate) fn try_seed_openrouter(
+pub(crate) fn try_seed_user_catalog(
     base_url: &str,
     api_key: &str,
     env: &EnvLookup,
@@ -119,6 +119,10 @@ pub(crate) fn fetch_user_catalog(base_url: &str, api_key: &str) -> Result<Vec<Us
 
 pub(crate) fn parse_user_catalog(body: &str) -> Result<Vec<UserModel>> {
     let value: Value = serde_json::from_str(body).context("catalog response is not JSON")?;
+    parse_user_catalog_value(&value)
+}
+
+pub(crate) fn parse_user_catalog_value(value: &Value) -> Result<Vec<UserModel>> {
     let Some(data) = value.get("data").and_then(Value::as_array) else {
         bail!("catalog JSON has no data array");
     };
@@ -214,7 +218,7 @@ pub(crate) fn build_seed(models: &[UserModel]) -> SeedCaches {
     }
 }
 
-pub(crate) fn claude_settings_json(base_url: &str, seeded: bool) -> String {
+pub(crate) fn claude_settings_json(base_url: &str, seeded: bool, api_key_env: &str) -> String {
     let mut env = BTreeMap::new();
     for (key, value) in SETTINGS_CLEAR_ENV {
         env.insert((*key).to_string(), (*value).to_string());
@@ -230,7 +234,7 @@ pub(crate) fn claude_settings_json(base_url: &str, seeded: bool) -> String {
         env.insert("CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF".to_string(), "1".to_string());
     }
     serde_json::to_string(&json!({
-        "apiKeyHelper": "printf %s \"$OPENROUTER_API_KEY\"",
+        "apiKeyHelper": format!("printf %s \"${api_key_env}\""),
         "env": env,
     }))
     .expect("settings json serializes")

@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 pub(crate) enum CatalogShape {
     OpenAi,
     Anthropic,
+    Codex,
     Unknown,
 }
 
@@ -44,8 +45,27 @@ pub(crate) fn parse_catalog(body: &str) -> Result<(CatalogShape, Vec<String>, Ve
     let value: serde_json::Value = serde_json::from_str(body).context("response is not JSON")?;
     let envelope =
         value.as_object().map(|object| object.keys().cloned().collect()).unwrap_or_default();
+    if let Some(models) = value.get("models").and_then(|value| value.as_array()) {
+        let listed = models
+            .iter()
+            .filter_map(|entry| {
+                let id = entry
+                    .get("slug")
+                    .or_else(|| entry.get("id"))
+                    .and_then(|value| value.as_str())?
+                    .to_string();
+                let label = entry
+                    .get("display_name")
+                    .or_else(|| entry.get("name"))
+                    .and_then(|value| value.as_str())
+                    .map(one_line);
+                Some(ListedModel { id, label })
+            })
+            .collect::<Vec<_>>();
+        return Ok((CatalogShape::Codex, envelope, listed));
+    }
     let Some(data) = value.get("data").and_then(|value| value.as_array()) else {
-        bail!("JSON has no data array");
+        bail!("JSON has no data or models array");
     };
     let models = data
         .iter()

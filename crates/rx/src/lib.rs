@@ -3,6 +3,7 @@ mod catalog;
 mod claude_catalog;
 mod config;
 mod debug;
+mod install;
 mod launch;
 mod opencode;
 mod pi;
@@ -10,7 +11,7 @@ mod update;
 
 use anyhow::Result;
 
-use args::{Command, parse, rewrite_argv0};
+use args::{Command, argv0_harness, parse, rewrite_argv0};
 pub use config::Paths;
 use launch::{EnvLookup, plan};
 
@@ -19,8 +20,11 @@ pub fn run(raw_args: impl IntoIterator<Item = String>) -> Result<()> {
 }
 
 pub fn run_with(raw_args: Vec<String>, paths: &Paths, env: &EnvLookup) -> Result<()> {
-    let args = rewrite_argv0(raw_args.clone());
-    let command = parse(&args)?;
+    let command = if raw_args.first().and_then(|argv0| argv0_harness(argv0)).is_some() {
+        parse(&rewrite_argv0(raw_args.clone()))?
+    } else {
+        parse(&raw_args)?
+    };
     if matches!(command, Command::Launch(_)) {
         update::maybe_before_launch(paths, env, &raw_args)?;
     }
@@ -37,7 +41,9 @@ pub fn run_with(raw_args: Vec<String>, paths: &Paths, env: &EnvLookup) -> Result
         Command::Debug { subcommand, gateway } => debug::run(subcommand, gateway, paths, env),
         Command::Update { yes } => update::run(yes, paths),
         Command::Launch(request) => {
-            let plan = plan(&request, paths, env)?;
+            let program = install::ensure(request.harness, env)?;
+            let mut plan = plan(&request, paths, env)?;
+            plan.program = program.to_string_lossy().into_owned();
             if let Some(note) = &plan.stderr_note {
                 eprintln!("{note}");
             }
@@ -64,6 +70,7 @@ Options:
 
 Environment:
   RX_NO_UPDATE=1                   skip launch-time update checks
+  RX_NO_INSTALL=1                  skip offering to install a missing harness
 
 Developer: rx debug --help
 

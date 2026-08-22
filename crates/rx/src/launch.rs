@@ -59,6 +59,10 @@ impl EnvLookup {
         Self { overrides, real: false }
     }
 
+    pub(crate) fn is_real(&self) -> bool {
+        self.real
+    }
+
     pub(crate) fn get(&self, key: &str) -> Option<String> {
         if let Some(value) = self.overrides.get(key) {
             return Some(value.clone());
@@ -114,9 +118,30 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
         Harness::Codex => target.spec.default_model,
         Harness::OpenCode | Harness::Pi => None,
     });
-    if matches!(request.harness, Harness::Claude) && target.spec.id == "openrouter" {
-        let seed = claude_catalog::try_seed_openrouter(&target.base_url, &target.key, env)?;
-        return Ok(inject_claude_openrouter(request, &target.base_url, &target.key, model, seed));
+    if matches!(request.harness, Harness::Claude) {
+        let seed = if env.is_real() {
+            claude_catalog::try_seed_user_catalog(&target.base_url, &target.key, env)?
+        } else {
+            SeedOutcome::Fallback
+        };
+        if target.spec.id == "openrouter" {
+            return Ok(inject_claude_openrouter(
+                request,
+                &target.base_url,
+                &target.key,
+                model,
+                seed,
+            ));
+        }
+        if matches!(seed, SeedOutcome::Seeded { .. }) {
+            return Ok(inject_claude_tokener_seeded(
+                request,
+                target.spec,
+                &target.base_url,
+                &target.key,
+                model,
+            ));
+        }
     }
     inject(request, paths, env, target.spec, &target.base_url, &target.key, model)
 }
@@ -195,12 +220,12 @@ fn inject_claude_openrouter_impl(
     let seeded = matches!(seed, SeedOutcome::Seeded { .. });
     let mut args = request.passthrough.clone();
     if seeded && !claude_catalog::user_passes_settings(&request.passthrough) {
-        args.insert(0, claude_catalog::claude_settings_json(base_url, true));
+        args.insert(0, claude_catalog::claude_settings_json(base_url, true, "OPENROUTER_API_KEY"));
         args.insert(0, "--settings".to_string());
     }
     let stderr_note = match seed {
         SeedOutcome::Fallback => Some(
-            "[rx] OpenRouter catalog seed failed; falling back to gateway model discovery"
+            "[rx] gateway user catalog seed failed; falling back to gateway model discovery"
                 .to_string(),
         ),
         SeedOutcome::Seeded { .. } => None,
@@ -262,6 +287,64 @@ fn claude_openrouter_env(
     env_set
 }
 
+fn inject_claude_tokener_seeded(
+    request: &LaunchRequest,
+    spec: &ProviderSpec,
+    base_url: &str,
+    key: &str,
+    model: Option<&str>,
+) -> LaunchPlan {
+    let mut args = request.passthrough.clone();
+    if !claude_catalog::user_passes_settings(&request.passthrough) {
+        args.insert(0, claude_catalog::claude_settings_json(base_url, true, spec.env_key));
+        args.insert(0, "--settings".to_string());
+    }
+    LaunchPlan {
+        program: "claude".to_string(),
+        args,
+        env_set: claude_tokener_seeded_env(spec, base_url, key, model),
+        stderr_note: None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_claude_tokener_seeded_for_test(
+    request: &LaunchRequest,
+    spec: &ProviderSpec,
+    base_url: &str,
+    key: &str,
+    model: Option<&str>,
+) -> LaunchPlan {
+    inject_claude_tokener_seeded(request, spec, base_url, key, model)
+}
+
+fn claude_tokener_seeded_env(
+    spec: &ProviderSpec,
+    base_url: &str,
+    key: &str,
+    model: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env_set = vec![
+        ("ANTHROPIC_BASE_URL".to_string(), anthropic_base(base_url)),
+        ("ANTHROPIC_AUTH_TOKEN".to_string(), key.to_string()),
+        ("ANTHROPIC_API_KEY".to_string(), String::new()),
+        (spec.env_key.to_string(), key.to_string()),
+        ("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK".to_string(), "1".to_string()),
+        ("CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT".to_string(), "1".to_string()),
+        ("ENABLE_TOOL_SEARCH".to_string(), "true".to_string()),
+        ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".to_string(), "0".to_string()),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(), "1".to_string()),
+        ("CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(), "1000000".to_string()),
+        ("DISABLE_TELEMETRY".to_string(), "1".to_string()),
+        ("DISABLE_GROWTHBOOK".to_string(), "0".to_string()),
+        ("CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF".to_string(), "1".to_string()),
+    ];
+    if let Some(model) = model {
+        env_set.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
+    }
+    env_set
+}
+
 fn claude_env(
     spec: &ProviderSpec,
     base_url: &str,
@@ -275,24 +358,6 @@ fn claude_env(
         ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".to_string(), "1".to_string()),
         (spec.env_key.to_string(), key.to_string()),
     ];
-    if spec.id == "openrouter" {
-        let sonnet = model.unwrap_or("~anthropic/claude-sonnet-latest");
-        env_set.extend([
-            (
-                "ANTHROPIC_DEFAULT_FABLE_MODEL".to_string(),
-                "~anthropic/claude-fable-latest".to_string(),
-            ),
-            (
-                "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
-                "~anthropic/claude-opus-latest".to_string(),
-            ),
-            ("ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(), sonnet.to_string()),
-            (
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
-                "~anthropic/claude-haiku-latest".to_string(),
-            ),
-        ]);
-    }
     if let Some(model) = model {
         env_set.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
     }
@@ -356,7 +421,7 @@ fn inject(
             })
         }
         Harness::Pi => {
-            crate::pi::prepare(spec, base_url, key, paths)?;
+            crate::pi::prepare(spec, base_url, key, paths, env)?;
             Ok(LaunchPlan {
                 program: "pi".to_string(),
                 args: crate::pi::args(spec, model, &request.passthrough),

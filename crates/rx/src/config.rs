@@ -82,12 +82,12 @@ pub(crate) fn run(command: ConfigCommand, paths: &Paths) -> Result<()> {
         ConfigCommand::SetKey { provider, key } => {
             let spec = crate::launch::provider(&provider)?;
             let mut config = load_or_default(paths)?;
+            let mut keys = load_keys(paths)?;
             let entry = ensure_gateway_entry(&mut config, spec.id, spec.default_base_url);
             entry.auth = AuthMode::ApiKey;
-            save_config(paths, &config)?;
-            let mut keys = load_keys(paths)?;
             keys.values.insert(spec.id.to_string(), key);
             save_keys(paths, &keys)?;
+            save_config(paths, &config)?;
             println!("stored API key for {}", spec.id);
             Ok(())
         }

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 
 use crate::args::{Command, ConfigCommand, Harness, LaunchRequest, parse, rewrite_argv0};
 use crate::config::{self, Paths};
@@ -288,7 +291,7 @@ fn claude_openrouter_uses_api_key_and_discovery_fallback_without_seed() {
             .iter()
             .any(|(k, v)| k == "ANTHROPIC_MODEL" && v == "~anthropic/claude-sonnet-latest")
     );
-    assert!(plan.stderr_note.as_deref().unwrap().contains("catalog seed failed"));
+    assert!(plan.stderr_note.as_deref().unwrap().contains("user catalog seed failed"));
 }
 
 #[test]
@@ -433,13 +436,36 @@ fn pi_merge_provider_refuses_to_reset_corrupt_models_json() {
 fn pi_tokener_writes_recall_cache() {
     let (dir, paths) = temp_paths();
     let spec = launch::provider("tokener").unwrap();
-    if crate::pi::prepare(spec, "https://api.tokener.dev", "sk-test", &paths).is_err() {
-        return;
-    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        let size = stream.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /v1/models "));
+        let body = r#"{"data":[{"id":"gpt-5.6-sol"}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let agent_dir = dir.path().join("pi-agent");
+    let env = EnvLookup::isolated(HashMap::from([(
+        "PI_CODING_AGENT_DIR".to_string(),
+        agent_dir.display().to_string(),
+    )]));
+
+    crate::pi::prepare(spec, &base_url, "sk-test", &paths, &env).unwrap();
+    server.join().unwrap();
+
     let cache = dir.path().join("pi/tokener-provider.json");
     assert!(cache.is_file());
     let body = fs::read_to_string(cache).unwrap();
-    assert!(body.contains("\"baseUrl\": \"https://api.tokener.dev/v1\""));
+    assert!(body.contains(&format!("\"baseUrl\": \"{base_url}/v1\"")));
+    let models = fs::read_to_string(agent_dir.join("models.json")).unwrap();
+    assert!(models.contains("gpt-5.6-sol"));
 }
 
 #[test]
@@ -541,6 +567,32 @@ fn config_set_key_is_redacted_and_secret() {
 }
 
 #[test]
+fn config_set_key_does_not_switch_auth_when_keys_cannot_be_loaded() {
+    let (_dir, paths) = temp_paths();
+    fs::write(
+        &paths.config,
+        r#"default_gateway = "openrouter"
+
+[gateway.openrouter]
+base_url = "https://openrouter.ai/api"
+auth = "env"
+"#,
+    )
+    .unwrap();
+    fs::write(&paths.keys, "{").unwrap();
+
+    let error = config::run(
+        ConfigCommand::SetKey { provider: "openrouter".to_string(), key: "sk-secret".to_string() },
+        &paths,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("failed to parse"), "{error}");
+
+    let config = config::load(&paths).unwrap().unwrap();
+    assert_eq!(config.gateway["openrouter"].auth, config::AuthMode::Env);
+}
+
+#[test]
 fn url_helpers_strip_or_add_v1() {
     assert_eq!(
         launch::anthropic_base("https://openrouter.ai/api/v1/"),
@@ -587,7 +639,7 @@ fn debug_models_requires_configured_gateway() {
 }
 
 #[test]
-fn parse_catalog_detects_openai_and_anthropic_shapes() {
+fn parse_catalog_detects_openai_anthropic_and_codex_shapes() {
     let (shape, envelope, models) = crate::catalog::parse_catalog(
         r#"{"data":[{"id":"openai/gpt-4","name":"GPT-4"}],"total_count":1}"#,
     )
@@ -604,6 +656,15 @@ fn parse_catalog_detects_openai_and_anthropic_shapes() {
     assert_eq!(shape, crate::catalog::CatalogShape::Anthropic);
     assert!(envelope.contains(&"has_more".to_string()));
     assert_eq!(models[0].id, "anthropic/openai/gpt-4");
+
+    let (shape, envelope, models) = crate::catalog::parse_catalog(
+        r#"{"models":[{"slug":"gpt-5.6-sol","display_name":"GPT 5.6 Sol"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(shape, crate::catalog::CatalogShape::Codex);
+    assert_eq!(envelope, vec!["models".to_string()]);
+    assert_eq!(models[0].id, "gpt-5.6-sol");
+    assert_eq!(models[0].label.as_deref(), Some("GPT 5.6 Sol"));
 }
 
 #[test]
@@ -632,13 +693,71 @@ fn render_splits_openai_and_anthropic_ids() {
             label: Some("B".to_string()),
         }],
     };
-    let text =
-        crate::debug::models::render("tokener", "https://api.tokener.dev", &openai, &anthropic);
-    assert!(text.contains("## OpenAI (Codex)"));
-    assert!(text.contains("## Anthropic (Claude Code)"));
+    let codex = crate::debug::models::Probe {
+        url: "https://example.test/v1/models?client_version=0.149.0".to_string(),
+        headers: vec!["Authorization: Bearer".to_string()],
+        status: Some(200),
+        error: None,
+        envelope: vec!["models".to_string()],
+        shape: crate::catalog::CatalogShape::Codex,
+        models: vec![crate::catalog::ListedModel {
+            id: "gpt-5.6-sol".to_string(),
+            label: Some("GPT 5.6 Sol".to_string()),
+        }],
+    };
+    let user = crate::debug::models::Probe {
+        url: "https://example.test/v1/models/user?limit=1000".to_string(),
+        headers: vec!["Authorization: Bearer".to_string()],
+        status: Some(200),
+        error: None,
+        envelope: vec!["data".to_string(), "total_count".to_string()],
+        shape: crate::catalog::CatalogShape::OpenAi,
+        models: vec![crate::catalog::ListedModel {
+            id: "anthropic/claude-sonnet-5".to_string(),
+            label: Some("Sonnet 5".to_string()),
+        }],
+    };
+    let text = crate::debug::models::render(
+        "tokener",
+        "https://api.tokener.dev",
+        &openai,
+        &codex,
+        &anthropic,
+        &user,
+    );
+    assert!(text.contains("## OpenAI (GET /v1/models)"));
+    assert!(text.contains("## Codex (GET /v1/models?client_version=...)"));
+    assert!(text.contains("## Claude seed (GET /v1/models/user?limit=1000)"));
     assert!(text.contains("only OpenAI: 2"));
     assert!(text.contains("only Anthropic: 1"));
-    assert!(text.contains("Claude filter (id contains claude|anthropic): 1/1"));
+    assert!(text.contains("Claude discovery filter (id contains claude|anthropic): 1/1"));
+    assert!(text.contains("Claude user catalog models: 1"));
+}
+
+#[test]
+fn tokener_seeded_plan_uses_auth_token_and_settings() {
+    let plan = launch::inject_claude_tokener_seeded_for_test(
+        &LaunchRequest {
+            harness: Harness::Claude,
+            gateway: Some("tokener".to_string()),
+            passthrough: vec!["fix it".to_string()],
+        },
+        launch::provider("tokener").unwrap(),
+        "http://localhost:8080",
+        "sk-tokener",
+        None,
+    );
+    assert_eq!(plan.args[0], "--settings");
+    assert!(plan.args[1].contains("TOKENER_API_KEY"));
+    assert_eq!(plan.args[2], "fix it");
+    assert!(plan.env_set.iter().any(|(k, v)| k == "ANTHROPIC_AUTH_TOKEN" && v == "sk-tokener"));
+    assert!(plan.env_set.iter().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_empty()));
+    assert!(
+        plan.env_set
+            .iter()
+            .any(|(k, v)| k == "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" && v == "0")
+    );
+    assert!(plan.stderr_note.is_none());
 }
 
 #[test]
@@ -756,7 +875,7 @@ fn live_openrouter_seed_populates_claude_json() {
         ("CLAUDE_CONFIG_DIR".to_string(), dir.path().display().to_string()),
         ("OPENROUTER_API_KEY".to_string(), key),
     ]));
-    let outcome = crate::claude_catalog::try_seed_openrouter(
+    let outcome = crate::claude_catalog::try_seed_user_catalog(
         "https://openrouter.ai/api",
         &env.get("OPENROUTER_API_KEY").unwrap(),
         &env,
@@ -768,4 +887,70 @@ fn live_openrouter_seed_populates_claude_json() {
             .unwrap();
     let count = document["additionalModelOptionsCache"].as_array().unwrap().len();
     assert!(count > 100, "expected a large seeded catalog, got {count}");
+}
+
+#[test]
+fn install_specs_use_official_urls() {
+    let claude = crate::install::spec(Harness::Claude);
+    assert_eq!(claude.url, "https://claude.ai/install.sh");
+    assert_eq!(claude.shell, "bash");
+    assert_eq!(
+        crate::install::command_line(&claude),
+        "curl -fsSL https://claude.ai/install.sh | bash"
+    );
+
+    let codex = crate::install::spec(Harness::Codex);
+    assert_eq!(codex.url, "https://chatgpt.com/codex/install.sh");
+    assert_eq!(codex.shell, "sh");
+
+    let opencode = crate::install::spec(Harness::OpenCode);
+    assert_eq!(opencode.url, "https://opencode.ai/install");
+    assert_eq!(opencode.shell, "bash");
+
+    let pi = crate::install::spec(Harness::Pi);
+    assert_eq!(pi.url, "https://pi.dev/install.sh");
+    assert_eq!(pi.shell, "sh");
+}
+
+#[test]
+fn install_lookup_finds_extra_dir_when_absent_from_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("pi");
+    fs::write(&bin, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let found = crate::install::lookup_with("pi", "", &[dir.path().to_path_buf()], None).unwrap();
+    assert_eq!(found, bin);
+    assert!(crate::install::lookup_with("pi", "", &[], None).is_none());
+}
+
+#[test]
+fn install_lookup_honors_windows_executable_extensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("codex.exe");
+    fs::write(&bin, "windows executable").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let found = crate::install::lookup_with(
+        "codex",
+        "",
+        &[dir.path().to_path_buf()],
+        Some(std::ffi::OsStr::new(".COM;.EXE;.exe")),
+    )
+    .unwrap();
+    assert!(found.is_file());
+    assert_eq!(found.parent(), bin.parent());
+    assert!(found.file_name().unwrap().to_string_lossy().eq_ignore_ascii_case("codex.exe"));
+}
+
+#[test]
+fn isolated_env_skips_install_offer() {
+    let path = crate::install::ensure(Harness::Pi, &EnvLookup::isolated(HashMap::new())).unwrap();
+    assert_eq!(path, std::path::PathBuf::from("pi"));
 }

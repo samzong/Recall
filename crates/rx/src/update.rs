@@ -95,7 +95,7 @@ pub(crate) fn maybe_before_launch(
             return Ok(());
         }
     };
-    state.last_check = Some(now_rfc3339());
+    state.last_check = Some(now_unix_seconds());
     save_state(paths, &state)?;
     if !update_pending(current, &release, &state) {
         return Ok(());
@@ -380,18 +380,18 @@ fn should_check(state: &UpdateState) -> bool {
     let Some(last_check) = &state.last_check else {
         return true;
     };
-    let Ok(parsed) = chrono_like_parse(last_check) else {
+    let Ok(parsed) = parse_unix_seconds(last_check) else {
         return true;
     };
     SystemTime::now().duration_since(parsed).is_ok_and(|elapsed| elapsed >= CHECK_INTERVAL)
 }
 
-fn now_rfc3339() -> String {
+fn now_unix_seconds() -> String {
     let seconds = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!("{seconds}")
 }
 
-fn chrono_like_parse(value: &str) -> Result<SystemTime> {
+fn parse_unix_seconds(value: &str) -> Result<SystemTime> {
     let seconds: u64 = value.parse().context("parse last_check timestamp")?;
     Ok(UNIX_EPOCH + Duration::from_secs(seconds))
 }

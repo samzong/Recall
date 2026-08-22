@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::config::Paths;
-use crate::launch::{ProviderSpec, openai_base};
+use crate::launch::{EnvLookup, ProviderSpec, openai_base};
 use crate::opencode;
 
 const PI_ENV_CLEAR: &[&str] = &[
@@ -17,21 +17,31 @@ const PI_ENV_CLEAR: &[&str] = &[
     "GEMINI_API_KEY",
 ];
 
-pub(crate) fn global_agent_dir() -> Result<PathBuf> {
+pub(crate) fn global_agent_dir(env: &EnvLookup) -> Result<PathBuf> {
     // PI_CODING_AGENT_DIR is authoritative for pi's configuration location
     // (see src/adapters/pi.rs); providers must land where the launched
     // process will actually read them.
-    if let Some(dir) = std::env::var("PI_CODING_AGENT_DIR")
-        .ok()
+    if let Some(dir) = env
+        .get("PI_CODING_AGENT_DIR")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
-        let home = dirs::home_dir().unwrap_or_default();
         let expanded = match dir.strip_prefix("~/") {
-            Some(rest) => home.join(rest),
+            Some(rest) => {
+                let home = if env.is_real() {
+                    dirs::home_dir()
+                } else {
+                    env.get("HOME").filter(|value| !value.trim().is_empty()).map(PathBuf::from)
+                }
+                .context("cannot expand PI_CODING_AGENT_DIR without a home directory")?;
+                home.join(rest)
+            }
             None => PathBuf::from(dir),
         };
         return Ok(expanded);
+    }
+    if !env.is_real() {
+        bail!("PI_CODING_AGENT_DIR is required in an isolated environment");
     }
     let home = dirs::home_dir().context("cannot determine home directory")?;
     Ok(home.join(".pi").join("agent"))
@@ -41,7 +51,13 @@ pub(crate) fn recall_pi_dir(paths: &Paths) -> PathBuf {
     paths.dir.join("pi")
 }
 
-pub(crate) fn prepare(spec: &ProviderSpec, base_url: &str, key: &str, paths: &Paths) -> Result<()> {
+pub(crate) fn prepare(
+    spec: &ProviderSpec,
+    base_url: &str,
+    key: &str,
+    paths: &Paths,
+    env: &EnvLookup,
+) -> Result<()> {
     if spec.id != "tokener" {
         return Ok(());
     }
@@ -50,7 +66,7 @@ pub(crate) fn prepare(spec: &ProviderSpec, base_url: &str, key: &str, paths: &Pa
     fs::create_dir_all(&recall_dir)
         .with_context(|| format!("failed to create {}", recall_dir.display()))?;
     write_json_atomic(&recall_dir.join("tokener-provider.json"), &provider)?;
-    let agent_dir = global_agent_dir()?;
+    let agent_dir = global_agent_dir(env)?;
     fs::create_dir_all(&agent_dir)
         .with_context(|| format!("failed to create {}", agent_dir.display()))?;
     merge_provider(&agent_dir.join("models.json"), "tokener", provider)
