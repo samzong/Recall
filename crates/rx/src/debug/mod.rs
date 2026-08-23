@@ -44,13 +44,9 @@ pub(crate) fn help_text() -> &'static str {
 rx debug — developer diagnostics (unstable; not for everyday use)
 
 Usage:
-  rx debug models [--gateway <profile>]
+  rx debug <subcommand> [--gateway <profile>]
 
 Subcommands:
   models    probe gateway /models and /v1/models catalog endpoints
-
-Options:
-  --gateway <profile>   select gateway (same flag as launch commands)
-  -h, --help                       show this help
 "
 }

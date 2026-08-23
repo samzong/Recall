@@ -72,9 +72,6 @@ Usage:
 Environment:
   RX_NO_UPDATE=1     skip launch-time update checks
   RX_NO_INSTALL=1    skip offering to install a missing harness
-
-Unconfigured, rx execs the harness unchanged; gateway flags are stripped
-and every other argument passes through.
 "
 }
 

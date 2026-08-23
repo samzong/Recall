@@ -190,7 +190,7 @@ fn passthrough(request: &LaunchRequest) -> LaunchPlan {
         args: request.passthrough.clone(),
         env_set: Vec::new(),
         stderr_note: Some(format!(
-            "[rx] no gateway configured; launching {} as-is (configure: rx config set gateway <name>)",
+            "[rx] no gateway configured; launching {} as-is (configure: rx config set gateway <profile>)",
             request.harness.as_str()
         )),
     }
