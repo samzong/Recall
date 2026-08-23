@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::Path;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use crate::args::{Command, ConfigCommand, Harness, LaunchRequest, parse, rewrite_argv0};
@@ -122,29 +124,66 @@ fn version_cmp_orders_releases() {
 }
 
 #[test]
-fn update_pending_uses_installed_release_not_crate_version() {
+fn release_version_matches_core_package() {
+    let manifest: toml::Value = toml::from_str(include_str!("../../../Cargo.toml")).unwrap();
+    assert_eq!(crate::RELEASE_VERSION, manifest["package"]["version"].as_str().unwrap());
+}
+
+#[test]
+fn update_pending_uses_release_version() {
     let release = crate::update::ReleaseInfo {
         version: "0.5.0".to_string(),
         asset_name: String::new(),
         download_url: String::new(),
     };
-    // rx's crate version stays 0.1.0 while core releases advance; once this
-    // release stream artifact is recorded as installed, it must not re-prompt.
-    assert!(!crate::update::update_pending(
-        "0.1.0",
-        &release,
-        &crate::update::state_with_installed(Some("0.5.0"))
-    ));
-    assert!(crate::update::update_pending(
-        "0.1.0",
-        &release,
-        &crate::update::state_with_installed(Some("0.4.0"))
-    ));
-    assert!(crate::update::update_pending(
-        "0.1.0",
-        &release,
-        &crate::update::state_with_installed(None)
-    ));
+    assert!(!crate::update::update_pending("0.5.0", &release));
+    assert!(crate::update::update_pending("0.4.0", &release));
+}
+
+#[test]
+fn homebrew_managed_rx_requires_brew_upgrade() {
+    for path in [
+        "/opt/homebrew/Cellar/recall/0.5.1/bin/rx",
+        "/usr/local/Cellar/recall/0.5.1/bin/rx",
+        "/home/linuxbrew/.linuxbrew/Cellar/recall/0.5.1/bin/rx",
+        "/srv/custom-brew/Cellar/recall/0.5.1/bin/rx",
+    ] {
+        assert_eq!(
+            crate::update::self_update_blocker_for_test(Path::new(path)),
+            Some(crate::update::HOMEBREW_UPDATE_HINT)
+        );
+    }
+    assert_eq!(
+        crate::update::self_update_blocker_for_test(Path::new("/Users/x/.cargo/bin/rx")),
+        None
+    );
+    assert_eq!(
+        crate::update::self_update_blocker_for_test(Path::new(
+            "/opt/homebrew/Cellar/other/0.5.1/bin/rx"
+        )),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn homebrew_managed_rx_is_detected_through_bin_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let cellar_rx = dir.path().join("Cellar/recall/0.5.1/bin/rx");
+    fs::create_dir_all(cellar_rx.parent().unwrap()).unwrap();
+    fs::write(&cellar_rx, b"rx").unwrap();
+    let linked_rx = dir.path().join("bin/rx");
+    fs::create_dir_all(linked_rx.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&cellar_rx, &linked_rx).unwrap();
+
+    assert_eq!(
+        crate::update::self_update_blocker_for_test(&linked_rx),
+        Some(crate::update::HOMEBREW_UPDATE_HINT)
+    );
+    assert_eq!(
+        crate::update::homebrew_launch_update_notice_for_test(&linked_rx, "0.6.0"),
+        Some("rx 0.6.0 is available — run `brew upgrade recall`".to_string())
+    );
 }
 
 #[test]
@@ -1007,6 +1046,83 @@ fn openrouter_seed_writes_claude_json() {
             .unwrap()
             .iter()
             .any(|entry| entry == "google/gemini-3.7-flash")
+    );
+}
+
+#[test]
+fn concurrent_claude_seed_writes_preserve_both_catalogs() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".claude.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&serde_json::json!({
+            "padding": "x".repeat(4_000_000)
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut writers = Vec::new();
+    for id in ["anthropic/claude-race-a", "anthropic/claude-race-b"] {
+        let path = config_path.clone();
+        let barrier = Arc::clone(&barrier);
+        let caches = crate::claude_catalog::build_seed(&[crate::claude_catalog::UserModel {
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            context_length: Some(200_000),
+            canonical_slug: None,
+            supported_efforts: vec![],
+            pricing: None,
+        }]);
+        writers.push(thread::spawn(move || {
+            barrier.wait();
+            crate::claude_catalog::write_seed_for_test(&path, &caches).unwrap();
+        }));
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let values = document["additionalModelOptionsCache"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["value"].as_str())
+        .collect::<Vec<_>>();
+    assert!(values.contains(&"claude-race-a"));
+    assert!(values.contains(&"claude-race-b"));
+}
+
+#[test]
+fn claude_seed_remerges_external_config_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".claude.json");
+    fs::write(&config_path, r#"{"before":true}"#).unwrap();
+    let caches = crate::claude_catalog::build_seed(&[crate::claude_catalog::UserModel {
+        id: "anthropic/claude-race-rx".to_string(),
+        name: Some("Race RX".to_string()),
+        context_length: Some(200_000),
+        canonical_slug: None,
+        supported_efforts: vec![],
+        pricing: None,
+    }]);
+    let external_path = config_path.clone();
+    crate::claude_catalog::write_seed_with_hook_for_test(&config_path, &caches, |attempt| {
+        if attempt == 0 {
+            fs::write(&external_path, r#"{"external":"keep"}"#).unwrap();
+        }
+    })
+    .unwrap();
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(document["external"], "keep");
+    assert!(
+        document["additionalModelOptionsCache"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["value"] == "claude-race-rx")
     );
 }
 

@@ -15,6 +15,8 @@ use args::{Command, argv0_harness, parse, rewrite_argv0};
 pub use config::Paths;
 use launch::{EnvLookup, plan};
 
+pub(crate) const RELEASE_VERSION: &str = env!("RX_RELEASE_VERSION");
+
 pub fn run(raw_args: impl IntoIterator<Item = String>) -> Result<()> {
     run_with(raw_args.into_iter().collect(), &Paths::user()?, &EnvLookup::real())
 }
@@ -38,12 +40,12 @@ pub fn run_with(raw_args: Vec<String>, paths: &Paths, env: &EnvLookup) -> Result
             Ok(())
         }
         Command::Version => {
-            println!("rx {}", env!("CARGO_PKG_VERSION"));
+            println!("rx {RELEASE_VERSION}");
             Ok(())
         }
         Command::Config(command) => config::run(command, paths),
         Command::Debug { subcommand, gateway } => debug::run(subcommand, gateway, paths, env),
-        Command::Update { yes } => update::run(yes, paths),
+        Command::Update { yes } => update::run(yes),
         Command::Launch(request) => {
             let program = install::ensure(request.harness, env)?;
             let mut plan = plan(&request, paths, env)?;

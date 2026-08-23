@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde_json::{Value, json};
 
 use crate::launch::{EnvLookup, anthropic_base};
@@ -14,6 +15,7 @@ const MAX_CONTEXT: i64 = 1_000_000;
 const OPENAI_COMPACT_WINDOW: i64 = 258_000;
 const TOOL_SEARCH_UNSUPPORTED_KEY: &str = "tengu_tool_search_unsupported_models";
 const RX_SEEDED_DENYLIST_KEY: &str = "rxSeededToolSearchDenylist";
+const MAX_WRITE_ATTEMPTS: usize = 4;
 
 const BASE_TOOL_SEARCH_DENY: &[&str] = &["claude-3-5-haiku", "claude-3-haiku"];
 
@@ -260,9 +262,38 @@ fn claude_config_path(env: &EnvLookup) -> PathBuf {
 }
 
 fn write_seed(path: &Path, caches: &SeedCaches) -> Result<()> {
-    let mut document = read_config_document(path)?;
-    merge_seed(&mut document, caches);
-    write_config_document(path, &document)
+    write_seed_with_hook(path, caches, |_| {})
+}
+
+fn write_seed_with_hook<F>(path: &Path, caches: &SeedCaches, mut after_read: F) -> Result<()>
+where
+    F: FnMut(usize),
+{
+    let parent =
+        path.parent().ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".rx.lock");
+    let lock_path = PathBuf::from(lock_path);
+    // The stable sidecar must outlive each lock holder. Removing it after
+    // unlock could split existing waiters and new writers across two inodes.
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    for attempt in 0..MAX_WRITE_ATTEMPTS {
+        let (mut document, snapshot) = read_config_document(path)?;
+        after_read(attempt);
+        merge_seed(&mut document, caches);
+        if write_config_document(path, &document, snapshot.as_deref())? {
+            return Ok(());
+        }
+    }
+    bail!("{} changed repeatedly while seeding catalog", path.display())
 }
 
 #[cfg(test)]
@@ -270,17 +301,36 @@ pub(crate) fn write_seed_for_test(path: &Path, caches: &SeedCaches) -> Result<()
     write_seed(path, caches)
 }
 
-fn read_config_document(path: &Path) -> Result<Value> {
-    match fs::read_to_string(path) {
-        Ok(contents) => {
-            let value: Value = serde_json::from_str(&contents)
+#[cfg(test)]
+pub(crate) fn write_seed_with_hook_for_test<F>(
+    path: &Path,
+    caches: &SeedCaches,
+    after_read: F,
+) -> Result<()>
+where
+    F: FnMut(usize),
+{
+    write_seed_with_hook(path, caches, after_read)
+}
+
+fn read_config_document(path: &Path) -> Result<(Value, Option<Vec<u8>>)> {
+    match read_config_bytes(path)? {
+        Some(contents) => {
+            let value: Value = serde_json::from_slice(&contents)
                 .with_context(|| format!("failed to parse {}", path.display()))?;
             if !value.is_object() {
                 bail!("{} root is not a JSON object", path.display());
             }
-            Ok(value)
+            Ok((value, Some(contents)))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        None => Ok((json!({}), None)),
+    }
+}
+
+fn read_config_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
     }
 }
@@ -417,10 +467,9 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn write_config_document(path: &Path, document: &Value) -> Result<()> {
+fn write_config_document(path: &Path, document: &Value, expected: Option<&[u8]>) -> Result<bool> {
     let parent =
         path.parent().ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let contents =
         serde_json::to_string_pretty(document).context("failed to serialize .claude.json")?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
@@ -430,10 +479,13 @@ fn write_config_document(path: &Path, document: &Value) -> Result<()> {
     temp.as_file()
         .sync_all()
         .with_context(|| format!("failed to sync temporary file in {}", parent.display()))?;
+    if read_config_bytes(path)?.as_deref() != expected {
+        return Ok(false);
+    }
     temp.persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(())
+    Ok(true)
 }
 
 fn strip_anthropic_prefix(id: &str) -> String {

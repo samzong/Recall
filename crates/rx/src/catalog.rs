@@ -30,8 +30,7 @@ pub(crate) fn fetch(url: &str, headers: &[(&str, String)]) -> Result<(u16, Strin
         .http_status_as_error(false)
         .build()
         .into();
-    let mut request =
-        agent.get(url).header("User-Agent", format!("rx/{}", env!("CARGO_PKG_VERSION")));
+    let mut request = agent.get(url).header("User-Agent", format!("rx/{}", crate::RELEASE_VERSION));
     for (name, value) in headers {
         request = request.header(*name, value);
     }

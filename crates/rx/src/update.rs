@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,8 @@ use crate::launch::EnvLookup;
 
 const GITHUB_REPO: &str = "samzong/Recall";
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const HOMEBREW_UPDATE_HINT: &str =
+    "rx is managed by Homebrew; run `brew upgrade recall`";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReleaseInfo {
@@ -27,52 +30,28 @@ pub(crate) struct UpdateState {
     auto_update: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_check: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_installed: Option<String>,
 }
 
-pub(crate) fn run(yes: bool, paths: &Paths) -> Result<()> {
-    let current = env!("CARGO_PKG_VERSION");
+pub(crate) fn run(yes: bool) -> Result<()> {
+    let current = crate::RELEASE_VERSION;
     let release = fetch_latest_release()?;
-    let state = load_state(paths)?;
-    if !update_pending(current, &release, &state) {
+    if !update_pending(current, &release) {
         println!("rx {current} is up to date (latest: {})", release.version);
         return Ok(());
     }
+    ensure_current_executable_self_update_allowed()?;
     if !yes && !confirm(&format!("Update rx {current} → {}?", release.version))? {
         println!("update cancelled");
         return Ok(());
     }
     eprintln!("Updating rx to {}...", release.version);
     install_release(&release)?;
-    record_installed(paths, &release.version)?;
     println!("Updated rx to {}", release.version);
     Ok(())
 }
 
-/// rx shares the core release stream but its own crate version does not advance,
-/// so the installed release tag — not `CARGO_PKG_VERSION` — decides whether the
-/// fetched release is already installed.
-pub(crate) fn update_pending(current: &str, release: &ReleaseInfo, state: &UpdateState) -> bool {
-    if state.last_installed.as_deref() == Some(release.version.as_str()) {
-        return false;
-    }
+pub(crate) fn update_pending(current: &str, release: &ReleaseInfo) -> bool {
     version_cmp(current, &release.version) == Ordering::Less
-}
-
-fn record_installed(paths: &Paths, version: &str) -> Result<()> {
-    let mut state = load_state(paths)?;
-    state.last_installed = Some(version.to_string());
-    save_state(paths, &state)
-}
-
-#[cfg(test)]
-pub(crate) fn state_with_installed(version: Option<&str>) -> UpdateState {
-    UpdateState {
-        auto_update: false,
-        last_check: None,
-        last_installed: version.map(str::to_string),
-    }
 }
 
 pub(crate) fn maybe_before_launch(
@@ -87,7 +66,7 @@ pub(crate) fn maybe_before_launch(
     if !should_check(&state) {
         return Ok(());
     }
-    let current = env!("CARGO_PKG_VERSION");
+    let current = crate::RELEASE_VERSION;
     let release = match fetch_latest_release() {
         Ok(release) => release,
         Err(error) => {
@@ -97,13 +76,17 @@ pub(crate) fn maybe_before_launch(
     };
     state.last_check = Some(now_unix_seconds());
     save_state(paths, &state)?;
-    if !update_pending(current, &release, &state) {
+    if !update_pending(current, &release) {
+        return Ok(());
+    }
+    let current_exe = std::env::current_exe().context("cannot resolve rx executable path")?;
+    if let Some(notice) = homebrew_launch_update_notice(&current_exe, &release.version) {
+        eprintln!("{notice}");
         return Ok(());
     }
     if state.auto_update {
         eprintln!("Updating rx to {}...", release.version);
         install_release(&release)?;
-        record_installed(paths, &release.version)?;
         relaunch(raw_args)?;
     } else if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
         eprintln!("rx {} is available — run `rx update`", release.version);
@@ -114,13 +97,11 @@ pub(crate) fn maybe_before_launch(
                 save_state(paths, &state)?;
                 eprintln!("Updating rx to {}...", release.version);
                 install_release(&release)?;
-                record_installed(paths, &release.version)?;
                 relaunch(raw_args)?;
             }
             PromptChoice::UpdateNow => {
                 eprintln!("Updating rx to {}...", release.version);
                 install_release(&release)?;
-                record_installed(paths, &release.version)?;
                 relaunch(raw_args)?;
             }
             PromptChoice::NotNow => {}
@@ -266,6 +247,7 @@ fn replace_executable(source: &Path) -> Result<()> {
         bail!("release archive did not contain rx at {}", source.display());
     }
     let target = std::env::current_exe().context("cannot resolve rx executable path")?;
+    ensure_self_update_allowed(&target)?;
     #[cfg(windows)]
     if target.is_file() {
         // Windows locks running executables: move the old binary aside so the
@@ -290,6 +272,53 @@ fn replace_executable(source: &Path) -> Result<()> {
     Ok(())
 }
 
+fn ensure_current_executable_self_update_allowed() -> Result<()> {
+    let target = std::env::current_exe().context("cannot resolve rx executable path")?;
+    ensure_self_update_allowed(&target)
+}
+
+fn ensure_self_update_allowed(path: &Path) -> Result<()> {
+    if let Some(hint) = self_update_blocker(path) {
+        bail!(hint);
+    }
+    Ok(())
+}
+
+fn self_update_blocker(path: &Path) -> Option<&'static str> {
+    homebrew_update_hint(path).or_else(|| {
+        fs::canonicalize(path).ok().and_then(|resolved| homebrew_update_hint(&resolved))
+    })
+}
+
+fn homebrew_launch_update_notice(path: &Path, latest: &str) -> Option<String> {
+    self_update_blocker(path)
+        .map(|_| format!("rx {latest} is available — run `brew upgrade recall`"))
+}
+
+fn homebrew_update_hint(path: &Path) -> Option<&'static str> {
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    components
+        .windows(2)
+        .any(|pair| pair[0] == OsStr::new("Cellar") && pair[1] == OsStr::new("recall"))
+        .then_some(HOMEBREW_UPDATE_HINT)
+}
+
+#[cfg(test)]
+pub(crate) fn self_update_blocker_for_test(path: &Path) -> Option<&'static str> {
+    self_update_blocker(path)
+}
+
+#[cfg(test)]
+pub(crate) fn homebrew_launch_update_notice_for_test(path: &Path, latest: &str) -> Option<String> {
+    homebrew_launch_update_notice(path, latest)
+}
+
 fn http_get(url: &str, headers: &[(&str, &str)]) -> Result<String> {
     let bytes = http_get_bytes(url, headers)?;
     String::from_utf8(bytes).context("response is not UTF-8")
@@ -301,8 +330,7 @@ fn http_get_bytes(url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>> {
         .http_status_as_error(false)
         .build()
         .into();
-    let mut request =
-        agent.get(url).header("User-Agent", format!("rx/{}", env!("CARGO_PKG_VERSION")));
+    let mut request = agent.get(url).header("User-Agent", format!("rx/{}", crate::RELEASE_VERSION));
     for (name, value) in headers {
         request = request.header(*name, *value);
     }

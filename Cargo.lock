@@ -3135,6 +3135,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "flate2",
+ "fs2",
  "serde",
  "serde_json",
  "tar",
