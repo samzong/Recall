@@ -530,6 +530,34 @@ fn missing_key_errors_before_exec() {
 }
 
 #[test]
+fn custom_profile_does_not_inherit_driver_env_key() {
+    let (_dir, paths) = temp_paths();
+    fs::write(
+        &paths.config,
+        r#"default_gateway = "tokener-dev"
+
+[gateway.tokener-dev]
+driver = "tokener"
+base_url = "https://dev.gateway.test"
+"#,
+    )
+    .unwrap();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "TOKENER_API_KEY".to_string(),
+        "sk-prod".to_string(),
+    )]));
+
+    let error = launch::plan(
+        &LaunchRequest { harness: Harness::Codex, gateway: None, passthrough: Vec::new() },
+        &paths,
+        &env,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("no API key for gateway 'tokener-dev'"), "{error}");
+}
+
+#[test]
 fn config_set_key_is_redacted_and_secret() {
     let (_dir, paths) = temp_paths();
     config::run(ConfigCommand::SetGateway { name: "openrouter".to_string() }, &paths).unwrap();

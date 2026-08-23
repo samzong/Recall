@@ -215,7 +215,9 @@ fn resolve_key(
             if let Some(key) = crate::config::stored_key(paths, profile_id)? {
                 return Ok(key);
             }
-            if let Some(key) = env.get(driver.env_key) {
+            if profile_id == driver.id
+                && let Some(key) = env.get(driver.env_key)
+            {
                 return Ok(key);
             }
             bail!(

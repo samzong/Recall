@@ -26,6 +26,11 @@ case "$title" in
 esac
 
 entry="$(git-cliff --unreleased --tag "v${version}")"
+if [ "${DRY_RUN:-false}" = "true" ]; then
+	echo "regenerate-changelog: CHANGELOG.md validated for v${version} (dry run)"
+	exit 0
+fi
+
 {
 	printf '%s\n' "$title"
 	printf '%s\n' "$entry"
