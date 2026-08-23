@@ -62,24 +62,19 @@ rx — launch agent harnesses through a configured API gateway
 
 Usage:
   rx <harness> [args...]
+  rx --gateway <profile> <harness> [args...]
   rx config set gateway <profile>
   rx config set key <profile> <key>
   rx config get [name]
   rx update [--yes]
-
-Options:
-  --gateway <profile>              select gateway for this launch
-  -h, --help                       show this help
-  -V, --version                    show version
+  rx debug --help
 
 Environment:
-  RX_NO_UPDATE=1                   skip launch-time update checks
-  RX_NO_INSTALL=1                  skip offering to install a missing harness
+  RX_NO_UPDATE=1     skip launch-time update checks
+  RX_NO_INSTALL=1    skip offering to install a missing harness
 
-Developer: rx debug --help
-
-With no gateway configured, rx execs the harness unchanged.
-Gateway flags are stripped; every other argument is passed through.
+Unconfigured, rx execs the harness unchanged; gateway flags are stripped
+and every other argument passes through.
 "
 }
 
