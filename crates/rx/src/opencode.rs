@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::catalog;
@@ -96,6 +96,9 @@ pub(crate) fn fetch_model_map(base_url: &str, key: &str) -> Result<BTreeMap<Stri
 fn opencode_auth_path(env: &EnvLookup) -> Result<PathBuf> {
     if let Some(dir) = env.get("XDG_DATA_HOME").filter(|value| !value.trim().is_empty()) {
         return Ok(PathBuf::from(dir).join("opencode").join("auth.json"));
+    }
+    if !env.is_real() {
+        bail!("XDG_DATA_HOME is required in an isolated environment");
     }
     let home = dirs::home_dir().context("cannot determine home directory")?;
     Ok(home.join(".local").join("share").join("opencode").join("auth.json"))
