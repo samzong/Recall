@@ -20,7 +20,7 @@ pub(crate) struct Probe {
 
 pub(crate) fn run(gateway: Option<String>, paths: &Paths, env: &EnvLookup) -> Result<()> {
     let Some(target) = launch::configured_gateway(gateway.as_deref(), paths, env)? else {
-        bail!("no gateway configured; run: rx config set gateway <openrouter|tokener>");
+        bail!("no gateway configured; run: rx config set gateway <profile>");
     };
     let auth_header = ("Authorization", format!("Bearer {}", target.key));
     let openai_url = format!("{}/models", launch::openai_base(&target.base_url));
@@ -36,7 +36,7 @@ pub(crate) fn run(gateway: Option<String>, paths: &Paths, env: &EnvLookup) -> Re
     let codex = probe(&codex_url, &codex_headers);
     let anthropic = probe(&anthropic_url, &anthropic_headers);
     let user = probe_user(&user_url, std::slice::from_ref(&auth_header));
-    print!("{}", render(target.spec.id, &target.base_url, &openai, &codex, &anthropic, &user));
+    print!("{}", render(&target.profile_id, &target.base_url, &openai, &codex, &anthropic, &user));
     Ok(())
 }
 

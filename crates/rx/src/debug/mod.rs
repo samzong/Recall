@@ -16,7 +16,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Subcommand> {
         None | Some("-h") | Some("--help") => Ok(Subcommand::Help),
         Some("models") => {
             if args.len() != 1 {
-                bail!("usage: rx debug models [--gateway <openrouter|tokener>]");
+                bail!("usage: rx debug models [--gateway <profile>]");
             }
             Ok(Subcommand::Models)
         }
@@ -44,13 +44,13 @@ pub(crate) fn help_text() -> &'static str {
 rx debug — developer diagnostics (unstable; not for everyday use)
 
 Usage:
-  rx debug models [--gateway <openrouter|tokener>]
+  rx debug models [--gateway <profile>]
 
 Subcommands:
   models    probe gateway /models and /v1/models catalog endpoints
 
 Options:
-  --gateway <openrouter|tokener>   select gateway (same flag as launch commands)
+  --gateway <profile>   select gateway (same flag as launch commands)
   -h, --help                       show this help
 "
 }

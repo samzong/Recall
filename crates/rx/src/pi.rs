@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::config::Paths;
-use crate::launch::{EnvLookup, ProviderSpec, openai_base};
+use crate::launch::{DriverSpec, EnvLookup, openai_base};
 use crate::opencode;
 
 const PI_ENV_CLEAR: &[&str] = &[
@@ -52,50 +52,47 @@ pub(crate) fn recall_pi_dir(paths: &Paths) -> PathBuf {
 }
 
 pub(crate) fn prepare(
-    spec: &ProviderSpec,
+    provider_id: &str,
+    driver: &DriverSpec,
     base_url: &str,
     key: &str,
     paths: &Paths,
     env: &EnvLookup,
 ) -> Result<()> {
-    if spec.id != "tokener" {
+    if driver.id != "tokener" {
         return Ok(());
     }
-    let provider = tokener_provider(spec, base_url, key)?;
+    let provider = tokener_provider(driver, base_url, key)?;
     let recall_dir = recall_pi_dir(paths);
     fs::create_dir_all(&recall_dir)
         .with_context(|| format!("failed to create {}", recall_dir.display()))?;
-    write_json_atomic(&recall_dir.join("tokener-provider.json"), &provider)?;
+    write_json_atomic(&recall_dir.join(format!("{provider_id}-provider.json")), &provider)?;
     let agent_dir = global_agent_dir(env)?;
     fs::create_dir_all(&agent_dir)
         .with_context(|| format!("failed to create {}", agent_dir.display()))?;
-    merge_provider(&agent_dir.join("models.json"), "tokener", provider)
+    merge_provider(&agent_dir.join("models.json"), provider_id, provider)
 }
 
-pub(crate) fn env_set(spec: &ProviderSpec, key: &str) -> Vec<(String, String)> {
-    let mut env_set = vec![(spec.env_key.to_string(), key.to_string())];
+pub(crate) fn env_set(driver: &DriverSpec, key: &str) -> Vec<(String, String)> {
+    let mut env_set = vec![(driver.env_key.to_string(), key.to_string())];
     for name in PI_ENV_CLEAR {
         env_set.push(((*name).to_string(), String::new()));
     }
     env_set
 }
 
-pub(crate) fn args(
-    spec: &ProviderSpec,
-    model: Option<&str>,
-    passthrough: &[String],
-) -> Vec<String> {
+pub(crate) fn args(provider_id: &str, model: Option<&str>, passthrough: &[String]) -> Vec<String> {
     let mut args = Vec::new();
     if !user_sets_models_flag(passthrough) {
         args.push("--models".to_string());
-        args.push(format!("{}/*", spec.id));
+        args.push(format!("{provider_id}/*"));
     }
     if let Some(model) = model.filter(|_| !user_sets_model(passthrough)) {
         args.push("--model".to_string());
-        args.push(opencode::prefixed_model(spec.id, model));
+        args.push(opencode::prefixed_model(provider_id, model));
     } else if !user_sets_provider(passthrough) {
         args.push("--provider".to_string());
-        args.push(spec.id.to_string());
+        args.push(provider_id.to_string());
     }
     args.extend(passthrough.iter().cloned());
     args
@@ -109,7 +106,7 @@ fn user_sets_provider(passthrough: &[String]) -> bool {
     passthrough.iter().any(|arg| arg == "--provider" || arg.starts_with("--provider="))
 }
 
-fn tokener_provider(spec: &ProviderSpec, base_url: &str, key: &str) -> Result<Value> {
+fn tokener_provider(driver: &DriverSpec, base_url: &str, key: &str) -> Result<Value> {
     let models: Vec<Value> =
         opencode::fetch_model_map(base_url, key)?.keys().map(|id| json!({ "id": id })).collect();
     if models.is_empty() {
@@ -117,7 +114,7 @@ fn tokener_provider(spec: &ProviderSpec, base_url: &str, key: &str) -> Result<Va
     }
     Ok(json!({
         "baseUrl": openai_base(base_url),
-        "apiKey": format!("${}", spec.env_key),
+        "apiKey": format!("${}", driver.env_key),
         "api": "openai-responses",
         "authHeader": true,
         "models": models

@@ -6,16 +6,21 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::catalog;
-use crate::launch::{EnvLookup, ProviderSpec, openai_base};
+use crate::launch::{DriverSpec, EnvLookup, openai_base};
 
-pub(crate) fn config_content(spec: &ProviderSpec, base_url: &str, key: &str) -> Result<String> {
-    let value = match spec.id {
+pub(crate) fn config_content(
+    provider_id: &str,
+    driver: &DriverSpec,
+    base_url: &str,
+    key: &str,
+) -> Result<String> {
+    let value = match driver.id {
         "openrouter" => json!({
             "provider": {
-                "openrouter": {
+                provider_id: {
                     "options": {
                         "baseURL": openai_base(base_url),
-                        "apiKey": format!("{{env:{}}}", spec.env_key)
+                        "apiKey": format!("{{env:{}}}", driver.env_key)
                     }
                 }
             }
@@ -24,12 +29,12 @@ pub(crate) fn config_content(spec: &ProviderSpec, base_url: &str, key: &str) -> 
             let models = fetch_model_map(base_url, key)?;
             json!({
                 "provider": {
-                    "tokener": {
+                    provider_id: {
                         "npm": "@ai-sdk/openai-compatible",
                         "name": "Tokener",
                         "options": {
                             "baseURL": openai_base(base_url),
-                            "apiKey": format!("{{env:{}}}", spec.env_key)
+                            "apiKey": format!("{{env:{}}}", driver.env_key)
                         },
                         "models": models
                     }
@@ -42,11 +47,11 @@ pub(crate) fn config_content(spec: &ProviderSpec, base_url: &str, key: &str) -> 
 }
 
 pub(crate) fn auth_conflict_note(
-    spec: &ProviderSpec,
+    driver: &DriverSpec,
     key: &str,
     env: &EnvLookup,
 ) -> Option<String> {
-    if spec.id != "openrouter" {
+    if driver.id != "openrouter" {
         return None;
     }
     let path = opencode_auth_path(env).ok()?;

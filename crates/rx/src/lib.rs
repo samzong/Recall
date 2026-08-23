@@ -58,13 +58,13 @@ rx — launch agent harnesses through a configured API gateway
 
 Usage:
   rx <harness> [args...]
-  rx config set gateway <openrouter|tokener>
-  rx config set key <openrouter|tokener> <key>
+  rx config set gateway <profile>
+  rx config set key <profile> <key>
   rx config get [name]
   rx update [--yes]
 
 Options:
-  --gateway <openrouter|tokener>   select gateway for this launch
+  --gateway <profile>              select gateway for this launch
   -h, --help                       show this help
   -V, --version                    show version
 

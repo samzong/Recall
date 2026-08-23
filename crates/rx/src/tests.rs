@@ -221,7 +221,7 @@ fn config_set_and_get_parse() {
     assert_eq!(
         parse_line(&["rx", "config", "set", "key", "tokener", "sk-test"]),
         Command::Config(ConfigCommand::SetKey {
-            provider: "tokener".to_string(),
+            profile: "tokener".to_string(),
             key: "sk-test".to_string(),
         })
     );
@@ -435,7 +435,7 @@ fn pi_merge_provider_refuses_to_reset_corrupt_models_json() {
 #[test]
 fn pi_tokener_writes_recall_cache() {
     let (dir, paths) = temp_paths();
-    let spec = launch::provider("tokener").unwrap();
+    let driver = launch::driver("tokener").unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
@@ -457,7 +457,7 @@ fn pi_tokener_writes_recall_cache() {
         agent_dir.display().to_string(),
     )]));
 
-    crate::pi::prepare(spec, &base_url, "sk-test", &paths, &env).unwrap();
+    crate::pi::prepare("tokener", driver, &base_url, "sk-test", &paths, &env).unwrap();
     server.join().unwrap();
 
     let cache = dir.path().join("pi/tokener-provider.json");
@@ -534,7 +534,7 @@ fn config_set_key_is_redacted_and_secret() {
     let (_dir, paths) = temp_paths();
     config::run(ConfigCommand::SetGateway { name: "openrouter".to_string() }, &paths).unwrap();
     config::run(
-        ConfigCommand::SetKey { provider: "openrouter".to_string(), key: "sk-secret".to_string() },
+        ConfigCommand::SetKey { profile: "openrouter".to_string(), key: "sk-secret".to_string() },
         &paths,
     )
     .unwrap();
@@ -582,7 +582,7 @@ auth = "env"
     fs::write(&paths.keys, "{").unwrap();
 
     let error = config::run(
-        ConfigCommand::SetKey { provider: "openrouter".to_string(), key: "sk-secret".to_string() },
+        ConfigCommand::SetKey { profile: "openrouter".to_string(), key: "sk-secret".to_string() },
         &paths,
     )
     .unwrap_err();
@@ -590,6 +590,167 @@ auth = "env"
 
     let config = config::load(&paths).unwrap().unwrap();
     assert_eq!(config.gateway["openrouter"].auth, config::AuthMode::Env);
+}
+
+#[test]
+fn custom_gateway_profiles_keep_independent_keys_and_driver_behavior() {
+    let (dir, paths) = temp_paths();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dev_base_url = format!("http://{}", listener.local_addr().unwrap());
+    fs::write(
+        &paths.config,
+        format!(
+            r#"default_gateway = "tokener-dev"
+
+[gateway.tokener-dev]
+driver = "tokener"
+base_url = "{dev_base_url}"
+model = "gpt-dev"
+
+[gateway.tokener-prod]
+driver = "tokener"
+base_url = "https://prod.gateway.test"
+model = "gpt-prod"
+"#
+        ),
+    )
+    .unwrap();
+
+    config::run(
+        ConfigCommand::SetKey { profile: "tokener-dev".to_string(), key: "sk-dev".to_string() },
+        &paths,
+    )
+    .unwrap();
+    config::run(
+        ConfigCommand::SetKey { profile: "tokener-prod".to_string(), key: "sk-prod".to_string() },
+        &paths,
+    )
+    .unwrap();
+    config::run(ConfigCommand::SetGateway { name: "tokener-prod".to_string() }, &paths).unwrap();
+
+    let listing = config::format_get(&paths, None).unwrap();
+    assert!(listing.contains("default_gateway = tokener-prod"));
+    assert!(listing.contains("[tokener-dev]\ndriver = tokener"));
+    assert!(listing.contains("[tokener-prod]\ndriver = tokener"));
+
+    let agent_dir = dir.path().join("pi-agent");
+    let env = EnvLookup::isolated(HashMap::from([(
+        "PI_CODING_AGENT_DIR".to_string(),
+        agent_dir.display().to_string(),
+    )]));
+    let codex = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Codex,
+            gateway: Some("tokener-dev".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(codex.args[1], "model_provider=\"tokener-dev\"");
+    assert!(codex.args[3].contains("model_providers.tokener-dev="));
+    assert!(codex.args[3].contains(&format!("base_url=\"{dev_base_url}/v1\"")));
+    assert_eq!(codex.env_set, vec![("TOKENER_API_KEY".to_string(), "sk-dev".to_string())]);
+
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let size = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /v1/models "));
+            let body = r#"{"data":[{"id":"gpt-dev"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+
+    let opencode = launch::plan(
+        &LaunchRequest {
+            harness: Harness::OpenCode,
+            gateway: Some("tokener-dev".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(opencode.args, ["-m", "tokener-dev/gpt-dev"]);
+    let opencode_config = opencode
+        .env_set
+        .iter()
+        .find(|(name, _)| name == "OPENCODE_CONFIG_CONTENT")
+        .map(|(_, value)| serde_json::from_str::<serde_json::Value>(value).unwrap())
+        .unwrap();
+    assert!(opencode_config["provider"]["tokener-dev"].is_object());
+    assert!(opencode_config["provider"]["tokener"].is_null());
+
+    let pi = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Pi,
+            gateway: Some("tokener-dev".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(pi.args, ["--models", "tokener-dev/*", "--model", "tokener-dev/gpt-dev"]);
+    assert!(dir.path().join("pi/tokener-dev-provider.json").is_file());
+    let pi_models: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(agent_dir.join("models.json")).unwrap()).unwrap();
+    assert!(pi_models["providers"]["tokener-dev"].is_object());
+    assert!(pi_models["providers"]["tokener"].is_null());
+    server.join().unwrap();
+
+    let claude = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Claude,
+            gateway: Some("tokener-prod".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert!(
+        claude
+            .env_set
+            .iter()
+            .any(|(key, value)| key == "ANTHROPIC_BASE_URL" && value == "https://prod.gateway.test")
+    );
+    assert!(
+        claude
+            .env_set
+            .iter()
+            .any(|(key, value)| key == "ANTHROPIC_AUTH_TOKEN" && value == "sk-prod")
+    );
+}
+
+#[test]
+fn gateway_profile_names_cannot_escape_generated_config_boundaries() {
+    let (_dir, paths) = temp_paths();
+    fs::write(
+        &paths.config,
+        r#"default_gateway = "../prod"
+
+[gateway."../prod"]
+driver = "tokener"
+"#,
+    )
+    .unwrap();
+
+    let error = launch::plan(
+        &LaunchRequest { harness: Harness::Pi, gateway: None, passthrough: Vec::new() },
+        &paths,
+        &EnvLookup::isolated(HashMap::new()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("invalid gateway profile name '../prod'"), "{error}");
 }
 
 #[test]
@@ -742,7 +903,7 @@ fn tokener_seeded_plan_uses_auth_token_and_settings() {
             gateway: Some("tokener".to_string()),
             passthrough: vec!["fix it".to_string()],
         },
-        launch::provider("tokener").unwrap(),
+        launch::driver("tokener").unwrap(),
         "http://localhost:8080",
         "sk-tokener",
         None,

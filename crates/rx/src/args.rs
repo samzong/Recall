@@ -43,7 +43,7 @@ pub(crate) struct LaunchRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfigCommand {
     SetGateway { name: String },
-    SetKey { provider: String, key: String },
+    SetKey { profile: String, key: String },
     Get { name: Option<String> },
 }
 
@@ -113,25 +113,25 @@ fn parse_config(args: &[String]) -> Result<ConfigCommand> {
     match args.first().map(String::as_str) {
         Some("set") => match args.get(1).map(String::as_str) {
             Some("gateway") => {
-                let name = args.get(2).ok_or_else(|| {
-                    anyhow::anyhow!("usage: rx config set gateway <openrouter|tokener>")
-                })?;
+                let name = args
+                    .get(2)
+                    .ok_or_else(|| anyhow::anyhow!("usage: rx config set gateway <profile>"))?;
                 if args.len() != 3 {
-                    bail!("usage: rx config set gateway <openrouter|tokener>");
+                    bail!("usage: rx config set gateway <profile>");
                 }
                 Ok(ConfigCommand::SetGateway { name: name.to_string() })
             }
             Some("key") => {
-                let provider = args.get(2).ok_or_else(|| {
-                    anyhow::anyhow!("usage: rx config set key <openrouter|tokener> <key>")
-                })?;
-                let key = args.get(3).ok_or_else(|| {
-                    anyhow::anyhow!("usage: rx config set key <openrouter|tokener> <key>")
-                })?;
+                let profile = args
+                    .get(2)
+                    .ok_or_else(|| anyhow::anyhow!("usage: rx config set key <profile> <key>"))?;
+                let key = args
+                    .get(3)
+                    .ok_or_else(|| anyhow::anyhow!("usage: rx config set key <profile> <key>"))?;
                 if args.len() != 4 {
-                    bail!("usage: rx config set key <openrouter|tokener> <key>");
+                    bail!("usage: rx config set key <profile> <key>");
                 }
-                Ok(ConfigCommand::SetKey { provider: provider.to_string(), key: key.to_string() })
+                Ok(ConfigCommand::SetKey { profile: profile.to_string(), key: key.to_string() })
             }
             _ => bail!("usage: rx config set <gateway|key> ..."),
         },

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -55,6 +55,8 @@ pub(crate) struct RxConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct GatewayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -71,24 +73,24 @@ struct KeyFile {
 pub(crate) fn run(command: ConfigCommand, paths: &Paths) -> Result<()> {
     match command {
         ConfigCommand::SetGateway { name } => {
-            let spec = crate::launch::provider(&name)?;
             let mut config = load_or_default(paths)?;
-            config.default_gateway = Some(spec.id.to_string());
-            ensure_gateway_entry(&mut config, spec.id, spec.default_base_url);
+            let driver = crate::launch::profile_driver(&name, config.gateway.get(&name))?;
+            config.default_gateway = Some(name.clone());
+            ensure_gateway_entry(&mut config, &name, driver);
             save_config(paths, &config)?;
-            println!("default gateway: {}", spec.id);
+            println!("default gateway: {name}");
             Ok(())
         }
-        ConfigCommand::SetKey { provider, key } => {
-            let spec = crate::launch::provider(&provider)?;
+        ConfigCommand::SetKey { profile, key } => {
             let mut config = load_or_default(paths)?;
+            let driver = crate::launch::profile_driver(&profile, config.gateway.get(&profile))?;
             let mut keys = load_keys(paths)?;
-            let entry = ensure_gateway_entry(&mut config, spec.id, spec.default_base_url);
+            let entry = ensure_gateway_entry(&mut config, &profile, driver);
             entry.auth = AuthMode::ApiKey;
-            keys.values.insert(spec.id.to_string(), key);
+            keys.values.insert(profile.clone(), key);
             save_keys(paths, &keys)?;
             save_config(paths, &config)?;
-            println!("stored API key for {}", spec.id);
+            println!("stored API key for {profile}");
             Ok(())
         }
         ConfigCommand::Get { name } => {
@@ -112,8 +114,8 @@ pub(crate) fn load(paths: &Paths) -> Result<Option<RxConfig>> {
     }
 }
 
-pub(crate) fn stored_key(paths: &Paths, provider: &str) -> Result<Option<String>> {
-    Ok(load_keys(paths)?.values.get(provider).cloned())
+pub(crate) fn stored_key(paths: &Paths, profile: &str) -> Result<Option<String>> {
+    Ok(load_keys(paths)?.values.get(profile).cloned())
 }
 
 fn load_or_default(paths: &Paths) -> Result<RxConfig> {
@@ -123,10 +125,10 @@ fn load_or_default(paths: &Paths) -> Result<RxConfig> {
 fn ensure_gateway_entry<'a>(
     config: &'a mut RxConfig,
     id: &str,
-    default_base_url: &str,
+    driver: &crate::launch::DriverSpec,
 ) -> &'a mut GatewayConfig {
     config.gateway.entry(id.to_string()).or_insert_with(|| GatewayConfig {
-        base_url: Some(default_base_url.to_string()),
+        base_url: Some(driver.default_base_url.to_string()),
         auth: AuthMode::ApiKey,
         ..Default::default()
     })
@@ -142,9 +144,14 @@ pub(crate) fn format_get(paths: &Paths, name: Option<&str>) -> Result<String> {
                 Some(gateway) => out.push_str(&format!("default_gateway = {gateway}\n")),
                 None => out.push_str("default_gateway = (unset)\n"),
             }
-            for spec in crate::launch::PROVIDERS {
+            let profiles: BTreeSet<String> = crate::launch::DRIVERS
+                .iter()
+                .map(|driver| driver.id.to_string())
+                .chain(config.gateway.keys().cloned())
+                .collect();
+            for profile in profiles {
                 out.push('\n');
-                out.push_str(&format_provider(&config, &keys, spec.id)?);
+                out.push_str(&format_provider(&config, &keys, &profile)?);
             }
             Ok(out)
         }
@@ -157,17 +164,19 @@ pub(crate) fn format_get(paths: &Paths, name: Option<&str>) -> Result<String> {
 }
 
 fn format_provider(config: &RxConfig, keys: &KeyFile, name: &str) -> Result<String> {
-    let spec = crate::launch::provider(name)?;
-    let entry = config.gateway.get(spec.id);
+    let entry = config.gateway.get(name);
+    let driver = crate::launch::profile_driver(name, entry)?;
     let base_url =
-        entry.and_then(|entry| entry.base_url.as_deref()).unwrap_or(spec.default_base_url);
+        entry.and_then(|entry| entry.base_url.as_deref()).unwrap_or(driver.default_base_url);
     let auth = entry.map(|entry| entry.auth).unwrap_or_default();
-    let key = if keys.values.contains_key(spec.id) { "set" } else { "unset" };
-    let model =
-        entry.and_then(|entry| entry.model.as_deref()).or(spec.default_model).unwrap_or("(unset)");
+    let key = if keys.values.contains_key(name) { "set" } else { "unset" };
+    let model = entry
+        .and_then(|entry| entry.model.as_deref())
+        .or(driver.default_model)
+        .unwrap_or("(unset)");
     Ok(format!(
-        "[{}]\nbase_url = {base_url}\nmodel = {model}\nauth = {}\nkey = {key}\n",
-        spec.id,
+        "[{name}]\ndriver = {}\nbase_url = {base_url}\nmodel = {model}\nauth = {}\nkey = {key}\n",
+        driver.id,
         auth.as_str()
     ))
 }
