@@ -20,6 +20,7 @@ fuzzy-matcher = "0.3"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 tar = "0.4"
 tempfile = "3"
 toml = "0.8"

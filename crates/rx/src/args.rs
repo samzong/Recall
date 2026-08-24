@@ -8,6 +8,7 @@ pub(crate) enum Harness {
     Codex,
     OpenCode,
     Pi,
+    Dsh,
 }
 
 impl Harness {
@@ -17,6 +18,7 @@ impl Harness {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
+            Self::Dsh => "dsh",
         }
     }
 
@@ -26,6 +28,7 @@ impl Harness {
             "codex" => Some(Self::Codex),
             "opencode" => Some(Self::OpenCode),
             "pi" => Some(Self::Pi),
+            "dsh" => Some(Self::Dsh),
             _ => None,
         }
     }
@@ -83,6 +86,7 @@ pub(crate) fn argv0_harness(argv0: &str) -> Option<&'static str> {
         "rxx" => Some("codex"),
         "rxo" => Some("opencode"),
         "rxp" => Some("pi"),
+        "rxd" => Some("dsh"),
         _ => None,
     }
 }

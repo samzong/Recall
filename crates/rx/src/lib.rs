@@ -2,6 +2,7 @@ mod args;
 mod catalog;
 mod claude_catalog;
 mod config;
+mod dsh;
 mod install;
 mod launch;
 mod opencode;

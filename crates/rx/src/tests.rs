@@ -290,6 +290,7 @@ fn argv0_harness_resolves_aliases() {
     assert_eq!(crate::args::argv0_harness("rxx"), Some("codex"));
     assert_eq!(crate::args::argv0_harness("rxo.exe"), Some("opencode"));
     assert_eq!(crate::args::argv0_harness("rxp"), Some("pi"));
+    assert_eq!(crate::args::argv0_harness("rxd"), Some("dsh"));
     assert_eq!(crate::args::argv0_harness("/home/u/.cargo/bin/rx"), None);
 }
 
@@ -339,6 +340,32 @@ fn rxp_inserts_pi() {
             harness: Harness::Pi,
             provider: None,
             passthrough: vec!["--print".to_string(), "hi".to_string()],
+        })
+    );
+}
+
+#[test]
+fn rxd_inserts_dsh() {
+    let command = parse_line(&["rxd", "--resume"]);
+    assert_eq!(
+        command,
+        Command::Launch(LaunchRequest {
+            harness: Harness::Dsh,
+            provider: None,
+            passthrough: vec!["--resume".to_string()],
+        })
+    );
+}
+
+#[test]
+fn rx_dsh_is_a_harness() {
+    let command = parse_line(&["rx", "dsh", "--resume"]);
+    assert_eq!(
+        command,
+        Command::Launch(LaunchRequest {
+            harness: Harness::Dsh,
+            provider: None,
+            passthrough: vec!["--resume".to_string()],
         })
     );
 }
@@ -529,6 +556,24 @@ fn unconfigured_launch_is_passthrough() {
 }
 
 #[test]
+fn unconfigured_dsh_still_boots_tui_profile() {
+    let (_dir, paths) = temp_paths();
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Dsh,
+            provider: None,
+            passthrough: vec!["--resume".to_string()],
+        },
+        &paths,
+        &EnvLookup::isolated(HashMap::new()),
+    )
+    .unwrap();
+    assert_eq!(plan.program, "dsh");
+    assert_eq!(plan.args, vec!["--profile", "dsh-tui", "--resume"]);
+    assert!(plan.env_set.is_empty());
+}
+
+#[test]
 fn claude_openrouter_uses_api_key_and_discovery_fallback_without_seed() {
     let (_dir, paths) = temp_paths();
     let env = EnvLookup::isolated(HashMap::from([(
@@ -680,6 +725,145 @@ fn opencode_non_generated_catalog_failure_degrades_to_base_config() {
     let document: serde_json::Value = serde_json::from_str(&config).unwrap();
     assert_eq!(document["provider"]["openrouter"]["options"]["baseURL"], format!("{base_url}/v1"));
     assert!(document["provider"]["openrouter"].get("models").is_none());
+}
+
+#[test]
+fn dsh_deepseek_uses_official_adapter_and_clears_pi_ai_routes() {
+    let (_dir, paths) = temp_paths();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "DEEPSEEK_API_KEY".to_string(),
+        "sk-ds-test".to_string(),
+    )]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Dsh,
+            provider: Some("deepseek".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(plan.program, "dsh");
+    assert_eq!(plan.args[0], "--profile");
+    assert_eq!(plan.args[1], "dsh-tui");
+    assert_eq!(plan.args[2], "--patch");
+    assert_eq!(plan.args[3], paths.dir.join("dsh").join("launch.cordis.yml").to_string_lossy());
+    assert_eq!(plan.env_set, vec![("DEEPSEEK_API_KEY".to_string(), "sk-ds-test".to_string())]);
+    let patch = fs::read_to_string(paths.dir.join("dsh").join("launch.cordis.yml")).unwrap();
+    assert!(patch.contains("id: settings"));
+    assert!(!patch.contains("disabled: true"));
+    let settings: serde_yaml::Value = serde_yaml::from_str(
+        &fs::read_to_string(paths.dir.join("dsh").join("settings.yaml")).unwrap(),
+    )
+    .unwrap();
+    assert!(settings["llm-pi-ai"]["providers"].as_mapping().unwrap().is_empty());
+    assert_eq!(settings["agent-default-model"]["provider"], "deepseek-official");
+}
+
+#[test]
+fn dsh_tokener_injects_provider_catalog() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) =
+        serve_openai_models(r#"{"data":[{"id":"kimi-k3"},{"id":"gpt-5.6-sol"}]}"#);
+    fs::write(&paths.config, format!("[provider.tokener]\nbase_url = \"{base_url}\"\n")).unwrap();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "TOKENER_API_KEY".to_string(),
+        "sk-tokener".to_string(),
+    )]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Dsh,
+            provider: Some("tokener".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(plan.env_set, vec![("TOKENER_API_KEY".to_string(), "sk-tokener".to_string())]);
+    let settings: serde_yaml::Value = serde_yaml::from_str(
+        &fs::read_to_string(paths.dir.join("dsh").join("settings.yaml")).unwrap(),
+    )
+    .unwrap();
+    let models = settings["llm-pi-ai"]["providers"]["tokener"]["models"].as_sequence().unwrap();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0]["id"], "kimi-k3");
+    assert_eq!(models[1]["id"], "gpt-5.6-sol");
+    assert_eq!(settings["agent-default-model"]["provider"], "tokener");
+    assert!(settings["agent-default-model"].get("model").is_none());
+}
+
+#[test]
+fn dsh_tokener_launch_owns_settings_and_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsh_home = dir.path().join("dsh-home");
+    fs::create_dir_all(&dsh_home).unwrap();
+    fs::write(
+        dsh_home.join("settings.yaml"),
+        r#"
+dsh-tui:
+  lang: zh
+permission:
+  defaultPreset: danger-full-access
+llm-pi-ai:
+  providers:
+    openrouter: { apiKeyEnv: OPENROUTER_API_KEY }
+    kimi-coding: { baseURL: https://api.tokener.dev, apiKeyEnv: KIMI_CODING_API_KEY }
+agent-default-model:
+  provider: openrouter
+  model: openrouter/auto
+"#,
+    )
+    .unwrap();
+    let (_recall, paths) = temp_paths();
+    let (base_url, server) =
+        serve_openai_models(r#"{"data":[{"id":"kimi-k3"},{"id":"gpt-5.6-sol"}]}"#);
+    fs::write(
+        &paths.config,
+        format!("[provider.tokener]\nbase_url = \"{base_url}\"\nmodel = \"kimi-k3\"\n"),
+    )
+    .unwrap();
+    let env = EnvLookup::isolated(HashMap::from([
+        ("TOKENER_API_KEY".to_string(), "sk-tokener".to_string()),
+        ("DSH_HOME".to_string(), dsh_home.display().to_string()),
+    ]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Dsh,
+            provider: Some("tokener".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(plan.env_set, vec![("TOKENER_API_KEY".to_string(), "sk-tokener".to_string())]);
+    let patch = fs::read_to_string(&plan.args[3]).unwrap();
+    assert!(patch.contains("id: settings"));
+    assert!(patch.contains("id: llm-deepseek"));
+    assert!(patch.contains("disabled: true"));
+    let overlay = paths.dir.join("dsh").join("settings.yaml");
+    assert!(patch.contains(&overlay.display().to_string()));
+    let settings: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&overlay).unwrap()).unwrap();
+    assert_eq!(settings["dsh-tui"]["lang"], "zh");
+    assert_eq!(settings["permission"]["defaultPreset"], "danger-full-access");
+    let providers = settings["llm-pi-ai"]["providers"].as_mapping().unwrap();
+    assert_eq!(providers.len(), 1);
+    assert!(providers.get(serde_yaml::Value::from("kimi-coding")).is_none());
+    assert_eq!(settings["llm-pi-ai"]["providers"]["tokener"]["apiKeyEnv"], "TOKENER_API_KEY");
+    assert_eq!(settings["llm-pi-ai"]["providers"]["tokener"]["baseURL"], format!("{base_url}/v1"));
+    let models = settings["llm-pi-ai"]["providers"]["tokener"]["models"].as_sequence().unwrap();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0]["id"], "kimi-k3");
+    assert_eq!(models[1]["id"], "gpt-5.6-sol");
+    assert_eq!(settings["agent-default-model"]["provider"], "tokener");
+    assert_eq!(settings["agent-default-model"]["model"], "kimi-k3");
+    let original = fs::read_to_string(dsh_home.join("settings.yaml")).unwrap();
+    assert!(original.contains("kimi-coding"));
 }
 
 #[test]
@@ -2162,6 +2346,10 @@ fn install_specs_use_official_urls() {
     let pi = crate::install::spec(Harness::Pi);
     assert_eq!(pi.url, "https://pi.dev/install.sh");
     assert_eq!(pi.shell, "sh");
+
+    let dsh = crate::install::spec(Harness::Dsh);
+    assert_eq!(dsh.program, "dsh");
+    assert_eq!(dsh.display, "DeepSeek Harness");
 }
 
 #[test]
@@ -2205,4 +2393,6 @@ fn install_lookup_honors_windows_executable_extensions() {
 fn isolated_env_skips_install_offer() {
     let path = crate::install::ensure(Harness::Pi, &EnvLookup::isolated(HashMap::new())).unwrap();
     assert_eq!(path, std::path::PathBuf::from("pi"));
+    let dsh = crate::install::ensure(Harness::Dsh, &EnvLookup::isolated(HashMap::new())).unwrap();
+    assert_eq!(dsh, std::path::PathBuf::from("dsh"));
 }

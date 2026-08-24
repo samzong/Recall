@@ -1,16 +1,12 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 #[cfg(unix)]
 use std::fs;
-#[cfg(unix)]
-use std::process::{Command, Stdio};
-
-#[cfg(unix)]
-use anyhow::Context;
 
 use crate::args::Harness;
 use crate::launch::EnvLookup;
@@ -49,6 +45,12 @@ pub(crate) fn spec(harness: Harness) -> InstallSpec {
             url: "https://pi.dev/install.sh",
             shell: "sh",
         },
+        Harness::Dsh => InstallSpec {
+            program: "dsh",
+            display: "DeepSeek Harness",
+            url: "https://www.npmjs.com/package/@deepseek-ai/dsh",
+            shell: "sh",
+        },
     }
 }
 
@@ -57,6 +59,9 @@ pub(crate) fn command_line(spec: &InstallSpec) -> String {
 }
 
 pub(crate) fn ensure(harness: Harness, env: &EnvLookup) -> Result<PathBuf> {
+    if matches!(harness, Harness::Dsh) {
+        return ensure_dsh(env);
+    }
     if !env.is_real() {
         return Ok(PathBuf::from(harness.as_str()));
     }
@@ -65,15 +70,7 @@ pub(crate) fn ensure(harness: Harness, env: &EnvLookup) -> Result<PathBuf> {
         return Ok(path);
     }
     let cmd = command_line(&spec);
-    if env.get("RX_NO_INSTALL").is_some_and(|value| !value.is_empty() && value != "0") {
-        bail!("{} is not installed (RX_NO_INSTALL=1). Install with:\n  {cmd}", spec.display);
-    }
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-        bail!("{} is not installed. Install with:\n  {cmd}", spec.display);
-    }
-    if !confirm(&format!("{} is not installed. Install now?", spec.display))? {
-        bail!("install cancelled. Install with:\n  {cmd}");
-    }
+    offer_install(spec.display, &cmd, env)?;
     eprintln!("[rx] {cmd}");
     run_official_installer(&spec)?;
     lookup(spec.program).ok_or_else(|| {
@@ -174,6 +171,102 @@ fn run_official_installer(spec: &InstallSpec) -> Result<()> {
         }
         Ok(())
     }
+}
+
+fn ensure_dsh(env: &EnvLookup) -> Result<PathBuf> {
+    if !env.is_real() {
+        return Ok(PathBuf::from("dsh"));
+    }
+    if let Some(path) = lookup_program("dsh") {
+        if crate::dsh::profile_ready(env) {
+            return Ok(path);
+        }
+        offer_install("DeepSeek Harness TUI profile", &crate::dsh::profile_hint(), env)?;
+        ensure_pnpm()?;
+        install_dsh_profile(&path, env)?;
+        return Ok(path);
+    }
+    offer_install("DeepSeek Harness", &crate::dsh::install_hint(), env)?;
+    install_dsh_packages()?;
+    let path = lookup_program("dsh").ok_or_else(|| {
+        anyhow::anyhow!(
+            "DeepSeek Harness finished installing but dsh was not found. Add npm's global bin to PATH, then retry."
+        )
+    })?;
+    if !crate::dsh::profile_ready(env) {
+        install_dsh_profile(&path, env)?;
+    }
+    Ok(path)
+}
+
+fn install_dsh_packages() -> Result<()> {
+    let cmd = crate::dsh::npm_install_cmd();
+    eprintln!("[rx] {cmd}");
+    run_npm(&["install", "-g", crate::dsh::CLI_PACKAGE, crate::dsh::PLUGIN_PACKAGE], &cmd)?;
+    ensure_pnpm()
+}
+
+fn ensure_pnpm() -> Result<()> {
+    if lookup_program("pnpm").is_some() {
+        return Ok(());
+    }
+    let cmd = "npm install -g pnpm";
+    eprintln!("[rx] {cmd}");
+    run_npm(&["install", "-g", "pnpm"], cmd)
+}
+
+fn install_dsh_profile(dsh: &Path, env: &EnvLookup) -> Result<()> {
+    let cmd = crate::dsh::profile_hint();
+    eprintln!("[rx] {cmd}");
+    run_command(
+        dsh,
+        &["plugin", "--profile", crate::dsh::PROFILE, "add", crate::dsh::PLUGIN_PACKAGE],
+        "dsh plugin",
+    )?;
+    if crate::dsh::profile_ready(env) {
+        return Ok(());
+    }
+    bail!("dsh plugin finished but the dsh-tui profile is still missing. Install with:\n  {cmd}")
+}
+
+fn offer_install(display: &str, hint: &str, env: &EnvLookup) -> Result<()> {
+    if env.get("RX_NO_INSTALL").is_some_and(|value| !value.is_empty() && value != "0") {
+        bail!("{display} is not installed (RX_NO_INSTALL=1). Install with:\n  {hint}");
+    }
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        bail!("{display} is not installed. Install with:\n  {hint}");
+    }
+    if !confirm(&format!("{display} is not installed. Install now?"))? {
+        bail!("install cancelled. Install with:\n  {hint}");
+    }
+    Ok(())
+}
+
+fn lookup_program(program: &str) -> Option<PathBuf> {
+    if let Some(path) = lookup(program) {
+        return Some(path);
+    }
+    let dir = lookup("npm")?.parent()?.to_path_buf();
+    lookup_with(program, "", &[dir], executable_extensions().as_deref())
+}
+
+fn run_npm(args: &[&str], label: &str) -> Result<()> {
+    let npm = lookup_program("npm").context("npm is required to install DeepSeek Harness")?;
+    run_command(&npm, args, label)
+}
+
+fn run_command(program: &Path, args: &[&str], label: &str) -> Result<()> {
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to start {label}"))?;
+    if !status.success() {
+        bail!("{label} exited with {status}");
+    }
+    Ok(())
 }
 
 fn confirm(message: &str) -> Result<bool> {

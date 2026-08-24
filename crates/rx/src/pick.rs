@@ -16,7 +16,7 @@ use ratatui::{
 use crate::EnvLookup;
 use crate::args::Harness;
 
-const VIEWPORT_HEIGHT: u16 = 8;
+const VIEWPORT_HEIGHT: u16 = 9;
 
 struct Palette {
     accent: Color,
@@ -43,11 +43,12 @@ struct Choice {
     alias: &'static str,
 }
 
-const CHOICES: [Choice; 4] = [
+const CHOICES: [Choice; 5] = [
     Choice { harness: Harness::Claude, alias: "rxc" },
     Choice { harness: Harness::Codex, alias: "rxx" },
     Choice { harness: Harness::OpenCode, alias: "rxo" },
     Choice { harness: Harness::Pi, alias: "rxp" },
+    Choice { harness: Harness::Dsh, alias: "rxd" },
 ];
 
 struct App {

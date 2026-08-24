@@ -76,7 +76,7 @@ Data flow: source adapters → sync → SQLite → search → CLI/TUI.
 - `crates/rx/` — independent `rx` binary (workspace member, not an extension).
   Gateway launcher for Claude Code, Codex, OpenCode, and Pi. Does not depend on
   the `recall` crate or read `recall.db`. Install also creates `rxc` / `rxx` /
-  `rxo` / `rxp` symlinks. Bundled providers are generated from
+  `rxo` / `rxp` / `rxd` symlinks. Bundled providers are generated from
   `crates/rx/data/provider-admission.json` into `crates/rx/data/providers.json`;
   both files are committed. See `crates/rx/PROVIDERS.md`.
 - `src/extension.rs` — extension host: `recall <name>` runs the managed

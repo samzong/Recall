@@ -102,7 +102,7 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
     let model = target.model.as_deref().or(match request.harness {
         Harness::Claude => target.provider.claude_default_model,
         Harness::Codex => target.provider.default_model,
-        Harness::OpenCode | Harness::Pi => None,
+        Harness::OpenCode | Harness::Pi | Harness::Dsh => None,
     });
     if matches!(request.harness, Harness::Claude) {
         let seed = if env.is_real() {
@@ -141,7 +141,10 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
 fn passthrough(request: &LaunchRequest) -> LaunchPlan {
     LaunchPlan {
         program: request.harness.as_str().to_string(),
-        args: request.passthrough.clone(),
+        args: match request.harness {
+            Harness::Dsh => crate::dsh::args(&request.passthrough, None),
+            _ => request.passthrough.clone(),
+        },
         env_set: Vec::new(),
         stderr_note: Some(format!(
             "[rx] no provider configured; launching {} as-is (configure: rx providers login)",
@@ -443,6 +446,16 @@ fn inject(
                 program: "pi".to_string(),
                 args: crate::pi::args(provider_id, model, &request.passthrough),
                 env_set: crate::pi::env_set(&provider.env, key),
+                stderr_note: None,
+            })
+        }
+        Harness::Dsh => {
+            let patch =
+                crate::dsh::prepare(provider_id, provider, base_url, key, model, paths, env)?;
+            Ok(LaunchPlan {
+                program: "dsh".to_string(),
+                args: crate::dsh::args(&request.passthrough, Some(&patch)),
+                env_set: crate::dsh::env_set(provider_id, provider, key),
                 stderr_note: None,
             })
         }
