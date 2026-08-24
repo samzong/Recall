@@ -2931,6 +2931,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "recall-powercontext"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "recall-probe"
 version = "0.1.0"
 
