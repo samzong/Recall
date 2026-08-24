@@ -132,7 +132,7 @@ pub(super) fn render_filter_overview(f: &mut Frame, app: &App) {
         app.filter_focus == FilterFocus::Time,
     ));
     lines.push(filter_overview_line(
-        "Sort",
+        "Query Sort",
         app.draft_sort_label(),
         "←/→",
         app.filter_focus == FilterFocus::Sort,

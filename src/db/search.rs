@@ -171,11 +171,10 @@ impl<'a> SearchEngine<'a> {
         filters: &SearchFilters,
         limit: Option<usize>,
     ) -> anyhow::Result<Vec<Hit>> {
-        let escaped = fts5_escape(query);
-        if escaped.is_empty() {
+        let match_query = fts5_query(query);
+        if match_query.is_empty() {
             return Ok(vec![]);
         }
-
         let mut sql = String::from(
             "SELECT m.session_id, SUBSTR(m.content, 1, 200) AS snip,
                     MIN(messages_fts.rank) AS best_rank
@@ -185,7 +184,7 @@ impl<'a> SearchEngine<'a> {
              WHERE messages_fts MATCH ?1",
         );
 
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(escaped)];
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(match_query)];
         let mut param_idx = 2;
         apply_filters(&mut sql, &mut params, &mut param_idx, filters);
 
@@ -335,18 +334,66 @@ fn rrf_merge(fts_hits: &[Hit], vec_hits: &[Hit], k: u32) -> Vec<(String, f64, Ma
     results
 }
 
-fn fts5_escape(query: &str) -> String {
-    let tokens: Vec<&str> = query.split_whitespace().collect();
-    if tokens.is_empty() {
-        return String::new();
+const FTS_PREFIX_MIN_CHARS: usize = 2;
+
+fn tokenize_query(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|token| {
+            token
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn fts5_term(token: &str, prefix: bool) -> String {
+    let mut term = String::from("\"");
+    term.push_str(&token.replace('"', "\"\""));
+    term.push('"');
+    if prefix {
+        term.push('*');
     }
+    term
+}
+
+fn fts5_query(query: &str) -> String {
+    let tokens = tokenize_query(query);
+    let last = tokens.len().saturating_sub(1);
     tokens
         .iter()
-        .map(|t| {
-            let cleaned: String = t.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
-            cleaned.to_lowercase()
+        .enumerate()
+        .map(|(index, token)| {
+            let prefix = index == last && token.chars().count() >= FTS_PREFIX_MIN_CHARS;
+            fts5_term(token, prefix)
         })
-        .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
         .join(" OR ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fts5_query, tokenize_query};
+
+    #[test]
+    fn tokenize_query_strips_punctuation_and_case() {
+        assert_eq!(
+            tokenize_query("context power café Codex "),
+            vec!["context", "power", "café", "codex"]
+        );
+        assert_eq!(tokenize_query("bug OR 1=1 --"), vec!["bug", "or", "11"]);
+    }
+
+    #[test]
+    fn fts5_query_quotes_terms_and_prefixes_last_token() {
+        assert_eq!(
+            fts5_query("context power café Codex "),
+            r#""context" OR "power" OR "café" OR "codex"*"#
+        );
+        assert_eq!(fts5_query("a"), r#""a""#);
+        assert_eq!(fts5_query("AND OR NOT"), r#""and" OR "or" OR "not"*"#);
+    }
 }

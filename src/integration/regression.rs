@@ -668,6 +668,67 @@ fn fts_search_sql_keywords_safe() {
 }
 
 #[test]
+fn fts_search_keeps_partial_matches_when_full_match_exists() {
+    let store = setup();
+    store.insert_session(&make_session("both", "test", "both", "Both")).unwrap();
+    store.insert_session(&make_session("partial", "test", "partial", "Partial")).unwrap();
+    store
+        .insert_messages(&[
+            make_message("both", Role::User, "debug tokio runtime", 0),
+            make_message("both", Role::Assistant, "look at streams backpressure", 1),
+            make_message("partial", Role::User, "tokio parser", 0),
+        ])
+        .unwrap();
+
+    let engine = SearchEngine::new(&store.conn);
+    let mut ids: Vec<_> = engine
+        .hybrid_search("tokio streams", None, &no_filters(), 10, 3)
+        .unwrap()
+        .into_iter()
+        .map(|result| result.session.id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["both".to_string(), "partial".to_string()]);
+}
+
+#[test]
+fn fts_search_matches_any_term_without_full_match() {
+    let store = setup();
+    store.insert_session(&make_session("alpha", "test", "alpha", "Alpha")).unwrap();
+    store.insert_session(&make_session("beta", "test", "beta", "Beta")).unwrap();
+    store
+        .insert_messages(&[
+            make_message("alpha", Role::User, "only tokio here", 0),
+            make_message("beta", Role::User, "only streams here", 0),
+        ])
+        .unwrap();
+
+    let engine = SearchEngine::new(&store.conn);
+    let mut ids: Vec<_> = engine
+        .hybrid_search("tokio streams", None, &no_filters(), 10, 3)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.session.id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
+}
+
+#[test]
+fn fts_search_prefixes_last_token() {
+    let store = setup();
+    store.insert_session(&make_session("s1", "test", "s1", "Power")).unwrap();
+    store
+        .insert_messages(&[make_message("s1", Role::User, "enable powercontext backfill", 0)])
+        .unwrap();
+
+    let engine = SearchEngine::new(&store.conn);
+    let results = engine.hybrid_search("powercon", None, &no_filters(), 10, 3).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].session.id, "s1");
+}
+
+#[test]
 fn hybrid_search_fts_only_without_embedding() {
     let store = setup();
     let session = make_session("s1", "test", "raw1", "Debugging session");
