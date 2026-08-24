@@ -1,0 +1,417 @@
+#!/bin/sh
+set -eu
+
+CODEX_VERSION="0.149.0"
+USER_AGENT="rx-probe/1"
+
+usage() {
+  printf '%s\n' \
+    "usage: crates/rx/scripts/probe-rx-provider --base-url <url> --api-key <key>" \
+    "" \
+    "Live admission probe for a candidate rx provider. Requires curl and jq." \
+    "" \
+    "  --base-url URL         OpenAI-compatible /v1 endpoint (or RX_PROVIDER_URL)" \
+    "  --api-key KEY          API key (or RX_PROVIDER_KEY)" \
+    "  --openai-model ID      model for /v1/chat/completions and /v1/responses" \
+    "  --claude-model ID      model for /v1/messages" \
+    "  --codex-version VER    Codex client_version (default: ${CODEX_VERSION})" \
+    "  --json                 machine-readable result"
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf '%s\n' "$1 is required" >&2
+    exit 2
+  fi
+}
+
+need_value() {
+  if [ $# -lt 2 ]; then
+    printf '%s\n' "$1 requires a value" >&2
+    exit 2
+  fi
+}
+
+trim_slash() {
+  printf '%s' "$1" | sed 's:/*$::'
+}
+
+openai_base() {
+  trimmed=$(trim_slash "$1")
+  case $trimmed in
+    */v1) printf '%s\n' "$trimmed" ;;
+    *) printf '%s/v1\n' "$trimmed" ;;
+  esac
+}
+
+origin_base() {
+  trimmed=$(trim_slash "$1")
+  case $trimmed in
+    */v1) printf '%s\n' "${trimmed%/v1}" ;;
+    *) printf '%s\n' "$trimmed" ;;
+  esac
+}
+
+http_status() {
+  awk 'toupper($1) ~ /^HTTP\// { code=$2 } END { print code }' "$1"
+}
+
+preview() {
+  tr '\n' ' ' <"$1" | awk '{
+    if (length($0) <= 200) print $0
+    else print substr($0, 1, 200) "..."
+  }'
+}
+
+looks_like_sse() {
+  awk '
+    NF {
+      line = $0
+      sub(/^[ \t\r]+/, "", line)
+      if (line ~ /^(data:|event:|:)/) found = 1
+      exit
+    }
+    END { if (!found) exit 1 }
+  ' "$1"
+}
+
+looks_like_json() {
+  awk '
+    NF {
+      line = $0
+      sub(/^[ \t\r]+/, "", line)
+      if (line ~ /^[\[{]/) found = 1
+      exit
+    }
+    END { if (!found) exit 1 }
+  ' "$1"
+}
+
+fail_auth() {
+  printf '%s\n' "AUTH_FAILED: provider returned HTTP 401" >&2
+  exit 2
+}
+
+record() {
+  jq -nc --arg id "$1" --argjson pass "$2" --arg detail "$3" \
+    '{id:$id, pass:($pass == 1), detail:$detail}' >>"$results"
+}
+
+data_ids() {
+  jq -r '.data[]? | select(.id | type == "string") | .id' "$1" 2>/dev/null || true
+}
+
+count_lines() {
+  if [ -s "$1" ]; then
+    wc -l <"$1" | tr -d ' '
+  else
+    printf '0\n'
+  fi
+}
+
+pick_openai_model() {
+  if [ -n "$openai_model" ]; then
+    printf '%s\n' "$openai_model"
+    return
+  fi
+  picked=$(awk '{ if (tolower($0) !~ /claude|anthropic/) { print; exit } }' "$1")
+  if [ -n "$picked" ]; then
+    printf '%s\n' "$picked"
+    return
+  fi
+  awk 'NF { print; exit }' "$1"
+}
+
+pick_claude_model() {
+  if [ -n "$claude_model" ]; then
+    printf '%s\n' "$claude_model"
+    return
+  fi
+  picked=$(awk '{ if (tolower($0) ~ /claude|anthropic/) { print; exit } }' "$1" "$2")
+  if [ -n "$picked" ]; then
+    printf '%s\n' "$picked"
+    return
+  fi
+  awk 'NF { print; exit }' "$1" "$2"
+}
+
+curl_get() {
+  url=$1
+  shift
+  if ! curl -sS --max-time 15 -D "$hdr" -o "$body" \
+    -H "Authorization: Bearer ${api_key}" \
+    -H "User-Agent: ${USER_AGENT}" \
+    -H "Accept: application/json" \
+    "$@" \
+    "$url" >/dev/null
+  then
+    status=""
+    return 0
+  fi
+  status=$(http_status "$hdr")
+  if [ "$status" = "401" ]; then
+    fail_auth
+  fi
+}
+
+check_catalog_data() {
+  name=$1
+  url=$2
+  dest=$3
+  shift 3
+  : >"$dest"
+  curl_get "$url" "$@"
+  if [ -z "$status" ]; then
+    record "$name" 0 "request failed"
+    return 0
+  fi
+  if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+    record "$name" 0 "HTTP ${status}: $(preview "$body")"
+    return 0
+  fi
+  if ! jq -e '.data | type == "array"' "$body" >/dev/null 2>&1; then
+    record "$name" 0 "missing data[]"
+    return 0
+  fi
+  data_ids "$body" >"$dest"
+  n=$(count_lines "$dest")
+  if [ "$n" = "0" ]; then
+    record "$name" 0 "data[] has no id"
+    return 0
+  fi
+  record "$name" 1 "${n} models"
+}
+
+check_codex_models() {
+  curl_get "${v1}/models?client_version=${codex_version}" -H "User-Agent: codex/${codex_version}"
+  if [ -z "$status" ]; then
+    record codex_models 0 "request failed"
+    return 0
+  fi
+  if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+    record codex_models 0 "HTTP ${status}: $(preview "$body")"
+    return 0
+  fi
+  if ! jq -e '.models | type == "array"' "$body" >/dev/null 2>&1; then
+    record codex_models 0 "Codex requires models[]; OpenAI data[] is not enough"
+    return 0
+  fi
+  n=$(jq -r '[.models[]? | select(.slug | type == "string" and length > 0)] | length' "$body")
+  if [ "$n" = "0" ]; then
+    record codex_models 0 "models[] has no non-empty slug"
+    return 0
+  fi
+  record codex_models 1 "${n} models"
+}
+
+curl_stream() {
+  url=$1
+  payload=$2
+  shift 2
+  : >"$body"
+  : >"$hdr"
+  : >"$err"
+  curl -sS -N --max-time 8 -D "$hdr" -o "$body" \
+    -H "Authorization: Bearer ${api_key}" \
+    -H "User-Agent: ${USER_AGENT}" \
+    -H "Content-Type: application/json" \
+    -H "Accept: text/event-stream" \
+    "$@" \
+    -d "$payload" \
+    "$url" >/dev/null 2>"$err" &
+  pid=$!
+  n=0
+  while [ "$n" -lt 8 ]; do
+    if [ -s "$body" ]; then
+      break
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    n=$((n + 1))
+    sleep 1
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" || true
+  status=$(http_status "$hdr")
+  if [ "$status" = "401" ]; then
+    fail_auth
+  fi
+}
+
+check_stream() {
+  name=$1
+  url=$2
+  payload=$3
+  label=$4
+  shift 4
+  curl_stream "$url" "$payload" "$@"
+  if [ -z "$status" ]; then
+    if [ -s "$err" ]; then
+      record "$name" 0 "$(preview "$err")"
+    else
+      record "$name" 0 "request failed"
+    fi
+    return 0
+  fi
+  if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+    record "$name" 0 "HTTP ${status}: $(preview "$body")"
+    return 0
+  fi
+  if looks_like_sse "$body"; then
+    record "$name" 1 "SSE ${label}"
+    return 0
+  fi
+  if looks_like_json "$body"; then
+    record "$name" 0 "non-streaming JSON; Codex/Claude require SSE"
+    return 0
+  fi
+  record "$name" 0 "no SSE frame: $(preview "$body")"
+}
+
+base_url=${RX_PROVIDER_URL:-${RX_PROVIDER_BASE_URL:-}}
+api_key=${RX_PROVIDER_KEY:-${RX_PROVIDER_API_KEY:-}}
+openai_model=""
+claude_model=""
+codex_version=$CODEX_VERSION
+json=0
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --base-url)
+      need_value "$@"
+      base_url=$2
+      shift 2
+      ;;
+    --base-url=*)
+      base_url=${1#*=}
+      shift
+      ;;
+    --api-key)
+      need_value "$@"
+      api_key=$2
+      shift 2
+      ;;
+    --api-key=*)
+      api_key=${1#*=}
+      shift
+      ;;
+    --openai-model)
+      need_value "$@"
+      openai_model=$2
+      shift 2
+      ;;
+    --openai-model=*)
+      openai_model=${1#*=}
+      shift
+      ;;
+    --claude-model)
+      need_value "$@"
+      claude_model=$2
+      shift 2
+      ;;
+    --claude-model=*)
+      claude_model=${1#*=}
+      shift
+      ;;
+    --codex-version)
+      need_value "$@"
+      codex_version=$2
+      shift 2
+      ;;
+    --codex-version=*)
+      codex_version=${1#*=}
+      shift
+      ;;
+    --json)
+      json=1
+      shift
+      ;;
+    *)
+      printf '%s\n' "unexpected argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$base_url" ]; then
+  printf '%s\n' "missing --base-url (or RX_PROVIDER_URL)" >&2
+  exit 2
+fi
+if [ -z "$api_key" ]; then
+  printf '%s\n' "missing --api-key (or RX_PROVIDER_KEY)" >&2
+  exit 2
+fi
+
+require_cmd curl
+require_cmd jq
+
+v1=$(openai_base "$base_url")
+origin=$(origin_base "$base_url")
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+hdr=$work/hdr
+body=$work/body
+err=$work/err
+openai_ids=$work/openai_ids
+anthropic_ids=$work/anthropic_ids
+user_ids=$work/user_ids
+results=$work/results
+status=""
+: >"$results"
+
+check_catalog_data openai_models "${v1}/models" "$openai_ids"
+check_codex_models
+check_catalog_data anthropic_models "${origin}/v1/models?limit=1000" "$anthropic_ids" \
+  -H "anthropic-version: 2023-06-01"
+check_catalog_data claude_user_models "${origin}/v1/models/user?limit=1000" "$user_ids"
+
+openai_pick=$(pick_openai_model "$openai_ids")
+claude_pick=$(pick_claude_model "$user_ids" "$anthropic_ids")
+
+if [ -z "$openai_pick" ]; then
+  record chat_completions 0 "no OpenAI model id"
+  record responses 0 "no OpenAI model id"
+else
+  chat_body=$(jq -nc --arg model "$openai_pick" \
+    '{model:$model,messages:[{role:"user",content:"ping"}],max_tokens:1,stream:true}')
+  responses_body=$(jq -nc --arg model "$openai_pick" \
+    '{model:$model,input:"ping",store:false,stream:true}')
+  check_stream chat_completions "${v1}/chat/completions" "$chat_body" "$openai_pick"
+  check_stream responses "${v1}/responses" "$responses_body" "$openai_pick"
+fi
+
+if [ -z "$claude_pick" ]; then
+  record messages 0 "no Claude model id"
+else
+  messages_body=$(jq -nc --arg model "$claude_pick" \
+    '{model:$model,max_tokens:16,stream:true,messages:[{role:"user",content:"ping"}]}')
+  check_stream messages "${origin}/v1/messages" "$messages_body" "$claude_pick" \
+    -H "anthropic-version: 2023-06-01"
+fi
+
+if jq -s -e 'all(.pass)' "$results" >/dev/null; then
+  verdict=ADMIT
+else
+  verdict=REJECT
+fi
+
+if [ "$json" -eq 1 ]; then
+  jq -s --arg base_url "$v1" --arg verdict "$verdict" \
+    '{base_url:$base_url, verdict:$verdict, checks:.}' "$results"
+else
+  printf 'base_url: %s\n' "$v1"
+  jq -r '"\(.id)\t\(if .pass then "PASS" else "FAIL" end)\t\(.detail)"' "$results" |
+    awk -F '\t' '{ printf "%-20s  %s  %s\n", $1, $2, $3 }'
+  printf '%s\n' "$verdict"
+fi
+
+if [ "$verdict" = "ADMIT" ]; then
+  exit 0
+fi
+exit 1

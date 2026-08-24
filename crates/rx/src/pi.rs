@@ -6,8 +6,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::config::Paths;
-use crate::launch::{DriverSpec, EnvLookup, openai_base};
+use crate::launch::{EnvLookup, openai_base};
 use crate::opencode;
+use crate::provider::{Provider, Setup};
 
 const PI_ENV_CLEAR: &[&str] = &[
     "ANTHROPIC_API_KEY",
@@ -53,16 +54,16 @@ pub(crate) fn recall_pi_dir(paths: &Paths) -> PathBuf {
 
 pub(crate) fn prepare(
     provider_id: &str,
-    driver: &DriverSpec,
+    provider: &Provider,
     base_url: &str,
     key: &str,
     paths: &Paths,
     env: &EnvLookup,
 ) -> Result<()> {
-    if driver.id != "tokener" {
+    if provider.setup != Setup::Generated {
         return Ok(());
     }
-    let provider = tokener_provider(driver, base_url, key)?;
+    let provider = generated_provider(provider, base_url, key)?;
     let recall_dir = recall_pi_dir(paths);
     fs::create_dir_all(&recall_dir)
         .with_context(|| format!("failed to create {}", recall_dir.display()))?;
@@ -73,8 +74,8 @@ pub(crate) fn prepare(
     merge_provider(&agent_dir.join("models.json"), provider_id, provider)
 }
 
-pub(crate) fn env_set(driver: &DriverSpec, key: &str) -> Vec<(String, String)> {
-    let mut env_set = vec![(driver.env_key.to_string(), key.to_string())];
+pub(crate) fn env_set(env_key: &str, key: &str) -> Vec<(String, String)> {
+    let mut env_set = vec![(env_key.to_string(), key.to_string())];
     for name in PI_ENV_CLEAR {
         env_set.push(((*name).to_string(), String::new()));
     }
@@ -106,15 +107,15 @@ fn user_sets_provider(passthrough: &[String]) -> bool {
     passthrough.iter().any(|arg| arg == "--provider" || arg.starts_with("--provider="))
 }
 
-fn tokener_provider(driver: &DriverSpec, base_url: &str, key: &str) -> Result<Value> {
+fn generated_provider(provider: &Provider, base_url: &str, key: &str) -> Result<Value> {
     let models: Vec<Value> =
         opencode::fetch_model_map(base_url, key)?.keys().map(|id| json!({ "id": id })).collect();
     if models.is_empty() {
-        bail!("tokener returned no models from {}", openai_base(base_url));
+        bail!("{} returned no models from {}", provider.name, openai_base(base_url));
     }
     Ok(json!({
         "baseUrl": openai_base(base_url),
-        "apiKey": format!("${}", driver.env_key),
+        "apiKey": format!("${}", provider.env),
         "api": "openai-responses",
         "authHeader": true,
         "models": models

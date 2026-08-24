@@ -1,6 +1,6 @@
 [package]
 name = "recall"
-version = "0.5.1"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "Unified search, usage tracking, and JSONL export for AI coding sessions"
@@ -11,6 +11,9 @@ publish = false
 members = [".", "crates/rx", "extensions/recall-probe", "extensions/recall-reflect"]
 default-members = ["."]
 resolver = "2"
+
+[workspace.package]
+version = "0.5.1"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

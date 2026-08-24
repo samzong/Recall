@@ -6,52 +6,52 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::catalog;
-use crate::launch::{DriverSpec, EnvLookup, openai_base};
+use crate::launch::{EnvLookup, openai_base};
+use crate::provider::{Provider, Setup};
 
 pub(crate) fn config_content(
     provider_id: &str,
-    driver: &DriverSpec,
+    provider: &Provider,
     base_url: &str,
     key: &str,
 ) -> Result<String> {
-    let value = match driver.id {
-        "openrouter" => json!({
+    let value = match provider.setup {
+        Setup::OpenRouter => json!({
             "provider": {
                 provider_id: {
                     "options": {
                         "baseURL": openai_base(base_url),
-                        "apiKey": format!("{{env:{}}}", driver.env_key)
+                        "apiKey": format!("{{env:{}}}", provider.env)
                     }
                 }
             }
         }),
-        "tokener" => {
+        Setup::Generated => {
             let models = fetch_model_map(base_url, key)?;
             json!({
                 "provider": {
                     provider_id: {
                         "npm": "@ai-sdk/openai-compatible",
-                        "name": "Tokener",
+                        "name": provider.name,
                         "options": {
                             "baseURL": openai_base(base_url),
-                            "apiKey": format!("{{env:{}}}", driver.env_key)
+                            "apiKey": format!("{{env:{}}}", provider.env)
                         },
                         "models": models
                     }
                 }
             })
         }
-        _ => json!({}),
     };
     serde_json::to_string(&value).context("failed to serialize OPENCODE_CONFIG_CONTENT")
 }
 
 pub(crate) fn auth_conflict_note(
-    driver: &DriverSpec,
+    provider: &Provider,
     key: &str,
     env: &EnvLookup,
 ) -> Option<String> {
-    if driver.id != "openrouter" {
+    if provider.setup != Setup::OpenRouter {
         return None;
     }
     let path = opencode_auth_path(env).ok()?;
@@ -65,7 +65,7 @@ pub(crate) fn auth_conflict_note(
     });
     if stored_key.is_some_and(|stored_key| stored_key != key) {
         Some(format!(
-            "[rx] opencode stored OpenRouter credential at {} differs from rx gateway key; remove or update it to avoid auth conflicts",
+            "[rx] opencode stored OpenRouter credential at {} differs from rx provider key; remove or update it to avoid auth conflicts",
             path.display()
         ))
     } else {
@@ -82,7 +82,7 @@ pub(crate) fn fetch_model_map(base_url: &str, key: &str) -> Result<BTreeMap<Stri
     let url = format!("{}/models", openai_base(base_url));
     let body = catalog::fetch_get(&url, &[("Authorization", format!("Bearer {key}"))])?;
     let payload: Value =
-        serde_json::from_str(&body).context("tokener models response is not JSON")?;
+        serde_json::from_str(&body).context("provider models response is not JSON")?;
     let Some(rows) = payload.get("data").and_then(Value::as_array) else {
         return Ok(BTreeMap::new());
     };

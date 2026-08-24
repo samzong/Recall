@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+
+source_url="https://models.dev/api.json"
+script_dir="$(CDPATH= cd "$(dirname "$0")" && pwd)"
+rx_root="$(dirname "$script_dir")"
+admission="$rx_root/data/provider-admission.json"
+output="$rx_root/data/providers.json"
+updated_at="${UPDATED_AT:-$(date -u +%F)}"
+source_file="$(mktemp)"
+output_file="$(mktemp)"
+trap 'rm -f "$source_file" "$output_file"' EXIT
+
+curl -fsSL "$source_url" -o "$source_file"
+jq --slurpfile admission "$admission" --arg source "$source_url" --arg updated_at "$updated_at" '
+  ($admission[0].models_dev_ids) as $ids
+  | ([
+      $ids[] as $id
+      | .[$id] as $provider
+      | if ($id | test("^[A-Za-z0-9_-]+$") | not) then
+          error("admitted models.dev provider has an invalid rx provider ID: \($id)")
+        elif $provider == null then
+          error("admitted models.dev provider not found: \($id)")
+        elif ($provider.api | type) != "string" then
+          error("admitted models.dev provider has no API endpoint: \($id)")
+        elif (($provider.api | startswith("https://")) | not)
+          or ($provider.api | contains("${")) then
+          error("admitted models.dev provider must have one fixed HTTPS endpoint: \($id)")
+        elif (($provider.env // []) | length) != 1 then
+          error("admitted models.dev provider must have exactly one credential ENV: \($id)")
+        else
+          {
+            id: $id,
+            name: $provider.name,
+            endpoint: $provider.api,
+            env: $provider.env[0]
+          }
+        end
+    ] + $admission[0].managed)
+  | {
+      source: $source,
+      updated_at: $updated_at,
+      providers: .
+    }
+' "$source_file" > "$output_file"
+
+mkdir -p "$(dirname "$output")"
+install -m 0644 "$output_file" "$output"

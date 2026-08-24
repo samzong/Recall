@@ -2,8 +2,6 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use crate::debug;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Harness {
     Claude,
@@ -36,15 +34,17 @@ impl Harness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LaunchRequest {
     pub harness: Harness,
-    pub gateway: Option<String>,
+    pub provider: Option<String>,
     pub passthrough: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ConfigCommand {
-    SetGateway { name: String },
-    SetKey { profile: String, key: String },
-    Get { name: Option<String> },
+pub(crate) enum ProvidersCommand {
+    Help,
+    List,
+    Login { provider: Option<String> },
+    Logout { provider: Option<String> },
+    Use { provider: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +52,7 @@ pub(crate) enum Command {
     Help,
     Version,
     Launch(LaunchRequest),
-    Config(ConfigCommand),
-    Debug { subcommand: debug::Subcommand, gateway: Option<String> },
+    Providers(ProvidersCommand),
     Update { yes: bool },
 }
 
@@ -82,21 +81,20 @@ pub(crate) fn argv0_harness(argv0: &str) -> Option<&'static str> {
 
 pub(crate) fn parse(args: &[String]) -> Result<Command> {
     let rest = args.get(1..).unwrap_or(&[]);
-    let (gateway, rest) = extract_gateway(rest)?;
+    let (provider, rest) = extract_provider(rest)?;
     match rest.first().map(String::as_str) {
         None => bail!("missing harness name\n\n{}", crate::help_text().trim_end()),
         Some("-h" | "--help") => Ok(Command::Help),
         Some("-V" | "--version") => Ok(Command::Version),
-        Some("config") => {
-            if gateway.is_some() {
-                bail!("--gateway is not valid with rx config");
+        Some("providers") => {
+            if provider.is_some() {
+                bail!("--provider is not valid with rx providers");
             }
-            Ok(Command::Config(parse_config(&rest[1..])?))
+            Ok(Command::Providers(parse_providers(&rest[1..])?))
         }
-        Some("debug") => Ok(Command::Debug { subcommand: debug::parse(&rest[1..])?, gateway }),
         Some("update") => {
-            if gateway.is_some() {
-                bail!("--gateway is not valid with rx update");
+            if provider.is_some() {
+                bail!("--provider is not valid with rx update");
             }
             Ok(Command::Update { yes: parse_update_args(&rest[1..])? })
         }
@@ -104,49 +102,44 @@ pub(crate) fn parse(args: &[String]) -> Result<Command> {
             let Some(harness) = Harness::parse(name) else {
                 bail!("unknown harness: {name}\n\n{}", crate::help_text().trim_end());
             };
-            Ok(Command::Launch(LaunchRequest { harness, gateway, passthrough: rest[1..].to_vec() }))
+            Ok(Command::Launch(LaunchRequest {
+                harness,
+                provider,
+                passthrough: rest[1..].to_vec(),
+            }))
         }
     }
 }
 
-fn parse_config(args: &[String]) -> Result<ConfigCommand> {
+fn parse_providers(args: &[String]) -> Result<ProvidersCommand> {
     match args.first().map(String::as_str) {
-        Some("set") => match args.get(1).map(String::as_str) {
-            Some("gateway") => {
-                let name = args
-                    .get(2)
-                    .ok_or_else(|| anyhow::anyhow!("usage: rx config set gateway <profile>"))?;
-                if args.len() != 3 {
-                    bail!("usage: rx config set gateway <profile>");
-                }
-                Ok(ConfigCommand::SetGateway { name: name.to_string() })
-            }
-            Some("key") => {
-                let profile = args
-                    .get(2)
-                    .ok_or_else(|| anyhow::anyhow!("usage: rx config set key <profile> <key>"))?;
-                let key = args
-                    .get(3)
-                    .ok_or_else(|| anyhow::anyhow!("usage: rx config set key <profile> <key>"))?;
-                if args.len() != 4 {
-                    bail!("usage: rx config set key <profile> <key>");
-                }
-                Ok(ConfigCommand::SetKey { profile: profile.to_string(), key: key.to_string() })
-            }
-            _ => bail!("usage: rx config set <gateway|key> ..."),
-        },
-        Some("get") => {
-            if args.len() > 2 {
-                bail!("usage: rx config get [name]");
-            }
-            Ok(ConfigCommand::Get { name: args.get(1).cloned() })
+        None | Some("-h" | "--help" | "help") if args.len() <= 1 => Ok(ProvidersCommand::Help),
+        Some("list") if args.len() == 1 => Ok(ProvidersCommand::List),
+        Some(command @ ("login" | "logout" | "use")) => {
+            let provider = parse_provider_argument(command, &args[1..])?;
+            Ok(match command {
+                "login" => ProvidersCommand::Login { provider },
+                "logout" => ProvidersCommand::Logout { provider },
+                "use" => ProvidersCommand::Use { provider },
+                _ => unreachable!(),
+            })
         }
-        _ => bail!("usage: rx config <set|get> ..."),
+        Some(command) => {
+            bail!("unknown providers command: {command}\n\n{}", crate::providers::help())
+        }
+        None => unreachable!(),
     }
 }
 
-fn extract_gateway(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
-    let mut gateway = None;
+fn parse_provider_argument(command: &str, args: &[String]) -> Result<Option<String>> {
+    if args.len() > 1 {
+        bail!("usage: rx providers {command} [provider]");
+    }
+    Ok(args.first().cloned())
+}
+
+fn extract_provider(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
+    let mut provider = None;
     let mut rest = Vec::new();
     let mut i = 0;
     let mut raw = false;
@@ -158,25 +151,25 @@ fn extract_gateway(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
             i += 1;
             continue;
         }
-        if !raw && arg == "--gateway" {
+        if !raw && arg == "--provider" {
             let value =
-                args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--gateway requires a value"))?;
-            gateway = Some(value.clone());
+                args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--provider requires a value"))?;
+            provider = Some(value.clone());
             i += 2;
             continue;
         }
-        if !raw && let Some(value) = arg.strip_prefix("--gateway=") {
+        if !raw && let Some(value) = arg.strip_prefix("--provider=") {
             if value.is_empty() {
-                bail!("--gateway requires a value");
+                bail!("--provider requires a value");
             }
-            gateway = Some(value.to_string());
+            provider = Some(value.to_string());
             i += 1;
             continue;
         }
         rest.push(arg.clone());
         i += 1;
     }
-    Ok((gateway, rest))
+    Ok((provider, rest))
 }
 
 fn parse_update_args(args: &[String]) -> Result<bool> {

@@ -2,11 +2,12 @@ mod args;
 mod catalog;
 mod claude_catalog;
 mod config;
-mod debug;
 mod install;
 mod launch;
 mod opencode;
 mod pi;
+mod provider;
+mod providers;
 mod update;
 
 use anyhow::Result;
@@ -15,7 +16,7 @@ use args::{Command, argv0_harness, parse, rewrite_argv0};
 pub use config::Paths;
 use launch::{EnvLookup, plan};
 
-pub(crate) const RELEASE_VERSION: &str = env!("RX_RELEASE_VERSION");
+pub(crate) const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn run(raw_args: impl IntoIterator<Item = String>) -> Result<()> {
     run_with(raw_args.into_iter().collect(), &Paths::user()?, &EnvLookup::real())
@@ -43,8 +44,7 @@ pub fn run_with(raw_args: Vec<String>, paths: &Paths, env: &EnvLookup) -> Result
             println!("rx {RELEASE_VERSION}");
             Ok(())
         }
-        Command::Config(command) => config::run(command, paths),
-        Command::Debug { subcommand, gateway } => debug::run(subcommand, gateway, paths, env),
+        Command::Providers(command) => providers::run(command, paths, env),
         Command::Update { yes } => update::run(yes),
         Command::Launch(request) => {
             let program = install::ensure(request.harness, env)?;
@@ -60,16 +60,13 @@ pub fn run_with(raw_args: Vec<String>, paths: &Paths, env: &EnvLookup) -> Result
 
 pub fn help_text() -> &'static str {
     "\
-rx — launch agent harnesses through a configured API gateway
+rx — launch agent harnesses through a configured AI provider
 
 Usage:
   rx <harness> [args...]
-  rx --gateway <profile> <harness> [args...]
-  rx config set gateway <profile>
-  rx config set key <profile> <key>
-  rx config get [name]
+  rx --provider <provider> <harness> [args...]
+  rx providers <list|login|logout|use>
   rx update [--yes]
-  rx debug --help
 
 Environment:
   RX_NO_UPDATE=1     skip launch-time update checks

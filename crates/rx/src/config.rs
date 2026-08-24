@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::args::ConfigCommand;
-
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub dir: PathBuf,
@@ -35,29 +33,22 @@ pub(crate) enum AuthMode {
     Env,
 }
 
-impl AuthMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ApiKey => "api_key",
-            Self::Env => "env",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RxConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_gateway: Option<String>,
+    pub default_provider: Option<String>,
     #[serde(default)]
-    pub gateway: BTreeMap<String, GatewayConfig>,
+    pub provider: BTreeMap<String, ProviderConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct GatewayConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub driver: Option<String>,
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default)]
@@ -68,36 +59,6 @@ pub(crate) struct GatewayConfig {
 struct KeyFile {
     #[serde(flatten)]
     values: BTreeMap<String, String>,
-}
-
-pub(crate) fn run(command: ConfigCommand, paths: &Paths) -> Result<()> {
-    match command {
-        ConfigCommand::SetGateway { name } => {
-            let mut config = load_or_default(paths)?;
-            let driver = crate::launch::profile_driver(&name, config.gateway.get(&name))?;
-            config.default_gateway = Some(name.clone());
-            ensure_gateway_entry(&mut config, &name, driver);
-            save_config(paths, &config)?;
-            println!("default gateway: {name}");
-            Ok(())
-        }
-        ConfigCommand::SetKey { profile, key } => {
-            let mut config = load_or_default(paths)?;
-            let driver = crate::launch::profile_driver(&profile, config.gateway.get(&profile))?;
-            let mut keys = load_keys(paths)?;
-            let entry = ensure_gateway_entry(&mut config, &profile, driver);
-            entry.auth = AuthMode::ApiKey;
-            keys.values.insert(profile.clone(), key);
-            save_keys(paths, &keys)?;
-            save_config(paths, &config)?;
-            println!("stored API key for {profile}");
-            Ok(())
-        }
-        ConfigCommand::Get { name } => {
-            print!("{}", format_get(paths, name.as_deref())?);
-            Ok(())
-        }
-    }
 }
 
 pub(crate) fn load(paths: &Paths) -> Result<Option<RxConfig>> {
@@ -114,71 +75,54 @@ pub(crate) fn load(paths: &Paths) -> Result<Option<RxConfig>> {
     }
 }
 
-pub(crate) fn stored_key(paths: &Paths, profile: &str) -> Result<Option<String>> {
-    Ok(load_keys(paths)?.values.get(profile).cloned())
+pub(crate) fn stored_key(paths: &Paths, provider: &str) -> Result<Option<String>> {
+    Ok(load_keys(paths)?.values.get(provider).cloned())
 }
 
-fn load_or_default(paths: &Paths) -> Result<RxConfig> {
+pub(crate) fn load_or_default(paths: &Paths) -> Result<RxConfig> {
     Ok(load(paths)?.unwrap_or_default())
 }
 
-fn ensure_gateway_entry<'a>(
-    config: &'a mut RxConfig,
-    id: &str,
-    driver: &crate::launch::DriverSpec,
-) -> &'a mut GatewayConfig {
-    config.gateway.entry(id.to_string()).or_insert_with(|| GatewayConfig {
-        base_url: Some(driver.default_base_url.to_string()),
-        auth: AuthMode::ApiKey,
-        ..Default::default()
-    })
+fn ensure_provider_entry<'a>(config: &'a mut RxConfig, id: &str) -> &'a mut ProviderConfig {
+    config.provider.entry(id.to_string()).or_default()
 }
 
-pub(crate) fn format_get(paths: &Paths, name: Option<&str>) -> Result<String> {
-    let config = load_or_default(paths)?;
-    let keys = load_keys(paths)?;
-    match name {
-        None => {
-            let mut out = String::new();
-            match config.default_gateway.as_deref() {
-                Some(gateway) => out.push_str(&format!("default_gateway = {gateway}\n")),
-                None => out.push_str("default_gateway = (unset)\n"),
-            }
-            let profiles: BTreeSet<String> = crate::launch::DRIVERS
-                .iter()
-                .map(|driver| driver.id.to_string())
-                .chain(config.gateway.keys().cloned())
-                .collect();
-            for profile in profiles {
-                out.push('\n');
-                out.push_str(&format_provider(&config, &keys, &profile)?);
-            }
-            Ok(out)
+pub(crate) fn stored_providers(paths: &Paths) -> Result<BTreeSet<String>> {
+    Ok(load_keys(paths)?.values.keys().cloned().collect())
+}
+
+pub(crate) fn set_default(paths: &Paths, provider: &str) -> Result<()> {
+    let mut config = load_or_default(paths)?;
+    crate::provider::resolve(provider, config.provider.get(provider))?;
+    config.default_provider = Some(provider.to_string());
+    save_config(paths, &config)
+}
+
+pub(crate) fn login(paths: &Paths, provider: &str, key: String) -> Result<()> {
+    let mut config = load_or_default(paths)?;
+    crate::provider::resolve(provider, config.provider.get(provider))?;
+    let mut keys = load_keys(paths)?;
+    let entry = ensure_provider_entry(&mut config, provider);
+    entry.auth = AuthMode::ApiKey;
+    keys.values.insert(provider.to_string(), key);
+    config.default_provider = Some(provider.to_string());
+    save_keys(paths, &keys)?;
+    save_config(paths, &config)
+}
+
+pub(crate) fn logout(paths: &Paths, provider: &str) -> Result<bool> {
+    let mut config = load_or_default(paths)?;
+    crate::provider::resolve(provider, config.provider.get(provider))?;
+    let mut keys = load_keys(paths)?;
+    let removed = keys.values.remove(provider).is_some();
+    if removed {
+        if config.default_provider.as_deref() == Some(provider) {
+            config.default_provider = None;
         }
-        Some("gateway") => match config.default_gateway {
-            Some(gateway) => Ok(format!("{gateway}\n")),
-            None => Ok("(unset)\n".to_string()),
-        },
-        Some(name) => Ok(format_provider(&config, &keys, name)?),
+        save_keys(paths, &keys)?;
+        save_config(paths, &config)?;
     }
-}
-
-fn format_provider(config: &RxConfig, keys: &KeyFile, name: &str) -> Result<String> {
-    let entry = config.gateway.get(name);
-    let driver = crate::launch::profile_driver(name, entry)?;
-    let base_url =
-        entry.and_then(|entry| entry.base_url.as_deref()).unwrap_or(driver.default_base_url);
-    let auth = entry.map(|entry| entry.auth).unwrap_or_default();
-    let key = if keys.values.contains_key(name) { "set" } else { "unset" };
-    let model = entry
-        .and_then(|entry| entry.model.as_deref())
-        .or(driver.default_model)
-        .unwrap_or("(unset)");
-    Ok(format!(
-        "[{name}]\ndriver = {}\nbase_url = {base_url}\nmodel = {model}\nauth = {}\nkey = {key}\n",
-        driver.id,
-        auth.as_str()
-    ))
+    Ok(removed)
 }
 
 fn load_keys(paths: &Paths) -> Result<KeyFile> {

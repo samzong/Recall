@@ -1,0 +1,24 @@
+{
+  "source": "https://models.dev/api.json",
+  "updated_at": "2026-08-24",
+  "providers": [
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "endpoint": "https://openrouter.ai/api/v1",
+      "env": "OPENROUTER_API_KEY"
+    },
+    {
+      "id": "tokener",
+      "name": "Tokener",
+      "endpoint": "https://api.tokener.dev/v1",
+      "env": "TOKENER_API_KEY"
+    },
+    {
+      "id": "tokener-dev",
+      "name": "Tokener Dev",
+      "endpoint": "https://api-dev.tokener.dev/v1",
+      "env": "TOKENER_DEV_API_KEY"
+    }
+  ]
+}

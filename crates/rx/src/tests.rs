@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use crate::args::{Command, ConfigCommand, Harness, LaunchRequest, parse, rewrite_argv0};
+use crate::args::{Command, Harness, LaunchRequest, ProvidersCommand, parse, rewrite_argv0};
 use crate::config::{self, Paths};
 use crate::launch::{self, EnvLookup};
 
@@ -31,7 +31,7 @@ fn rxc_inserts_claude() {
         command,
         Command::Launch(LaunchRequest {
             harness: Harness::Claude,
-            gateway: None,
+            provider: None,
             passthrough: vec!["fix login".to_string()],
         })
     );
@@ -44,32 +44,32 @@ fn rxx_inserts_codex() {
         command,
         Command::Launch(LaunchRequest {
             harness: Harness::Codex,
-            gateway: None,
+            provider: None,
             passthrough: vec!["exec".to_string(), "cargo test".to_string()],
         })
     );
 }
 
 #[test]
-fn rxc_keeps_leading_gateway_flag() {
-    let command = parse_line(&["rxc", "--gateway", "tokener"]);
+fn rxc_keeps_leading_provider_flag() {
+    let command = parse_line(&["rxc", "--provider", "tokener"]);
     assert_eq!(
         command,
         Command::Launch(LaunchRequest {
             harness: Harness::Claude,
-            gateway: Some("tokener".to_string()),
+            provider: Some("tokener".to_string()),
             passthrough: Vec::new(),
         })
     );
 }
 
 #[test]
-fn gateway_flag_before_or_after_harness() {
-    let before = parse_line(&["rx", "--gateway", "openrouter", "claude", "--resume", "abc"]);
-    let after = parse_line(&["rx", "claude", "--gateway=openrouter", "--resume", "abc"]);
+fn provider_flag_before_or_after_harness() {
+    let before = parse_line(&["rx", "--provider", "openrouter", "claude", "--resume", "abc"]);
+    let after = parse_line(&["rx", "claude", "--provider=openrouter", "--resume", "abc"]);
     let expected = Command::Launch(LaunchRequest {
         harness: Harness::Claude,
-        gateway: Some("openrouter".to_string()),
+        provider: Some("openrouter".to_string()),
         passthrough: vec!["--resume".to_string(), "abc".to_string()],
     });
     assert_eq!(before, expected);
@@ -77,14 +77,14 @@ fn gateway_flag_before_or_after_harness() {
 }
 
 #[test]
-fn gateway_after_double_dash_is_passthrough() {
-    let command = parse_line(&["rx", "claude", "--", "--gateway", "openrouter"]);
+fn provider_after_double_dash_is_passthrough() {
+    let command = parse_line(&["rx", "claude", "--", "--provider", "openrouter"]);
     assert_eq!(
         command,
         Command::Launch(LaunchRequest {
             harness: Harness::Claude,
-            gateway: None,
-            passthrough: vec!["--".to_string(), "--gateway".to_string(), "openrouter".to_string()],
+            provider: None,
+            passthrough: vec!["--".to_string(), "--provider".to_string(), "openrouter".to_string()],
         })
     );
 }
@@ -96,7 +96,7 @@ fn claude_help_is_passthrough() {
         command,
         Command::Launch(LaunchRequest {
             harness: Harness::Claude,
-            gateway: None,
+            provider: None,
             passthrough: vec!["--help".to_string()],
         })
     );
@@ -106,6 +106,11 @@ fn claude_help_is_passthrough() {
 fn rx_help_and_version() {
     assert_eq!(parse_line(&["rx", "--help"]), Command::Help);
     assert_eq!(parse_line(&["rx", "-V"]), Command::Version);
+    assert!(!crate::help_text().contains("rx config"));
+    assert!(crate::help_text().contains("rx --provider <provider> <harness>"));
+    assert!(crate::help_text().contains("rx providers <list|login|logout|use>"));
+    assert!(!crate::help_text().contains("rx providers list\n"));
+    assert!(!crate::help_text().contains("rx debug"));
 }
 
 #[test]
@@ -126,7 +131,10 @@ fn version_cmp_orders_releases() {
 #[test]
 fn release_version_matches_core_package() {
     let manifest: toml::Value = toml::from_str(include_str!("../../../Cargo.toml")).unwrap();
-    assert_eq!(crate::RELEASE_VERSION, manifest["package"]["version"].as_str().unwrap());
+    assert_eq!(
+        crate::RELEASE_VERSION,
+        manifest["workspace"]["package"]["version"].as_str().unwrap()
+    );
 }
 
 #[test]
@@ -226,7 +234,7 @@ fn rxo_inserts_opencode() {
         command,
         Command::Launch(LaunchRequest {
             harness: Harness::OpenCode,
-            gateway: None,
+            provider: None,
             passthrough: vec!["run".to_string(), "hello".to_string()],
         })
     );
@@ -239,35 +247,96 @@ fn rxp_inserts_pi() {
         command,
         Command::Launch(LaunchRequest {
             harness: Harness::Pi,
-            gateway: None,
+            provider: None,
             passthrough: vec!["--print".to_string(), "hi".to_string()],
         })
     );
 }
 
 #[test]
-fn missing_gateway_value_errors() {
-    let error = parse(&args(&["rx", "claude", "--gateway"])).unwrap_err();
-    assert!(error.to_string().contains("--gateway requires a value"), "{error}");
+fn missing_provider_value_errors() {
+    let error = parse(&args(&["rx", "claude", "--provider"])).unwrap_err();
+    assert!(error.to_string().contains("--provider requires a value"), "{error}");
 }
 
 #[test]
-fn config_set_and_get_parse() {
+fn providers_commands_parse() {
+    assert_eq!(parse_line(&["rx", "providers"]), Command::Providers(ProvidersCommand::Help));
     assert_eq!(
-        parse_line(&["rx", "config", "set", "gateway", "openrouter"]),
-        Command::Config(ConfigCommand::SetGateway { name: "openrouter".to_string() })
+        parse_line(&["rx", "providers", "list"]),
+        Command::Providers(ProvidersCommand::List)
     );
     assert_eq!(
-        parse_line(&["rx", "config", "set", "key", "tokener", "sk-test"]),
-        Command::Config(ConfigCommand::SetKey {
-            profile: "tokener".to_string(),
-            key: "sk-test".to_string(),
-        })
+        parse_line(&["rx", "providers", "login"]),
+        Command::Providers(ProvidersCommand::Login { provider: None })
     );
     assert_eq!(
-        parse_line(&["rx", "config", "get"]),
-        Command::Config(ConfigCommand::Get { name: None })
+        parse_line(&["rx", "providers", "logout"]),
+        Command::Providers(ProvidersCommand::Logout { provider: None })
     );
+    assert_eq!(
+        parse_line(&["rx", "providers", "use"]),
+        Command::Providers(ProvidersCommand::Use { provider: None })
+    );
+    assert_eq!(
+        parse_line(&["rx", "providers", "login", "tokener-dev"]),
+        Command::Providers(ProvidersCommand::Login { provider: Some("tokener-dev".to_string()) })
+    );
+    assert_eq!(
+        parse_line(&["rx", "providers", "logout", "tokener-dev"]),
+        Command::Providers(ProvidersCommand::Logout { provider: Some("tokener-dev".to_string()) })
+    );
+    assert_eq!(
+        parse_line(&["rx", "providers", "use", "tokener-dev"]),
+        Command::Providers(ProvidersCommand::Use { provider: Some("tokener-dev".to_string()) })
+    );
+}
+
+#[test]
+fn provider_command_rejects_multiple_provider_arguments() {
+    let error = parse(&args(&["rx", "providers", "use", "openrouter", "tokener"])).unwrap_err();
+    assert!(error.to_string().contains("usage: rx providers use [provider]"), "{error}");
+}
+
+#[test]
+fn bundled_providers_match_the_admission_list() {
+    let admission: serde_json::Value =
+        serde_json::from_str(include_str!("../data/provider-admission.json")).unwrap();
+    let admitted = admission["models_dev_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(admission["managed"].as_array().unwrap())
+        .map(|entry| entry.as_str().or_else(|| entry["id"].as_str()).unwrap().to_string())
+        .collect::<Vec<_>>();
+    let bundled =
+        crate::provider::catalog().iter().map(|provider| provider.id.clone()).collect::<Vec<_>>();
+    assert_eq!(bundled, admitted);
+    assert_eq!(bundled.first().map(String::as_str), Some("openrouter"));
+    for provider in crate::provider::catalog() {
+        crate::provider::validate_id(&provider.id).unwrap();
+        assert!(provider.endpoint.starts_with("https://"), "{}", provider.id);
+        assert!(!provider.endpoint.contains("${"), "{}", provider.id);
+        assert!(!provider.env.is_empty(), "{}", provider.id);
+    }
+}
+
+#[test]
+fn provider_login_and_logout_store_no_driver_or_catalog_endpoint() {
+    let (_dir, paths) = temp_paths();
+    config::login(&paths, "openrouter", "sk-secret".to_string()).unwrap();
+
+    let config = config::load(&paths).unwrap().unwrap();
+    assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+    assert!(config::stored_providers(&paths).unwrap().contains("openrouter"));
+    let serialized = fs::read_to_string(&paths.config).unwrap();
+    assert!(!serialized.contains("driver"));
+    assert!(!serialized.contains("base_url"));
+
+    assert!(config::logout(&paths, "openrouter").unwrap());
+    let config = config::load(&paths).unwrap().unwrap();
+    assert_eq!(config.default_provider, None);
+    assert!(!config::stored_providers(&paths).unwrap().contains("openrouter"));
 }
 
 #[test]
@@ -276,7 +345,7 @@ fn unconfigured_launch_is_passthrough() {
     let plan = launch::plan(
         &LaunchRequest {
             harness: Harness::Claude,
-            gateway: None,
+            provider: None,
             passthrough: vec!["--resume".to_string(), "abc".to_string()],
         },
         &paths,
@@ -286,7 +355,7 @@ fn unconfigured_launch_is_passthrough() {
     assert_eq!(plan.program, "claude");
     assert_eq!(plan.args, vec!["--resume", "abc"]);
     assert!(plan.env_set.is_empty());
-    assert!(plan.stderr_note.as_deref().unwrap().contains("no gateway configured"));
+    assert!(plan.stderr_note.as_deref().unwrap().contains("no provider configured"));
 }
 
 #[test]
@@ -299,7 +368,7 @@ fn claude_openrouter_uses_api_key_and_discovery_fallback_without_seed() {
     let plan = launch::plan(
         &LaunchRequest {
             harness: Harness::Claude,
-            gateway: Some("openrouter".to_string()),
+            provider: Some("openrouter".to_string()),
             passthrough: vec!["fix it".to_string()],
         },
         &paths,
@@ -334,6 +403,22 @@ fn claude_openrouter_uses_api_key_and_discovery_fallback_without_seed() {
 }
 
 #[test]
+fn configured_openrouter_credential_is_the_implicit_default() {
+    let (_dir, paths) = temp_paths();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "OPENROUTER_API_KEY".to_string(),
+        "sk-or-test".to_string(),
+    )]));
+    let plan = launch::plan(
+        &LaunchRequest { harness: Harness::Codex, provider: None, passthrough: Vec::new() },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(plan.args[1], "model_provider=\"openrouter\"");
+}
+
+#[test]
 fn claude_injection_tokener_still_uses_auth_token() {
     let (_dir, paths) = temp_paths();
     let env = EnvLookup::isolated(HashMap::from([(
@@ -343,7 +428,7 @@ fn claude_injection_tokener_still_uses_auth_token() {
     let plan = launch::plan(
         &LaunchRequest {
             harness: Harness::Claude,
-            gateway: Some("tokener".to_string()),
+            provider: Some("tokener".to_string()),
             passthrough: vec!["fix it".to_string()],
         },
         &paths,
@@ -364,7 +449,7 @@ fn codex_openrouter_overrides_model_and_uses_command_auth() {
     let plan = launch::plan(
         &LaunchRequest {
             harness: Harness::Codex,
-            gateway: Some("openrouter".to_string()),
+            provider: Some("openrouter".to_string()),
             passthrough: Vec::new(),
         },
         &paths,
@@ -393,7 +478,7 @@ fn opencode_openrouter_injects_config_and_model() {
     let plan = launch::plan(
         &LaunchRequest {
             harness: Harness::OpenCode,
-            gateway: Some("openrouter".to_string()),
+            provider: Some("openrouter".to_string()),
             passthrough: vec!["run".to_string(), "hello".to_string()],
         },
         &paths,
@@ -423,7 +508,7 @@ fn pi_openrouter_injects_provider_without_extension() {
     let plan = launch::plan(
         &LaunchRequest {
             harness: Harness::Pi,
-            gateway: Some("openrouter".to_string()),
+            provider: Some("openrouter".to_string()),
             passthrough: vec!["--print".to_string(), "hi".to_string()],
         },
         &paths,
@@ -474,7 +559,7 @@ fn pi_merge_provider_refuses_to_reset_corrupt_models_json() {
 #[test]
 fn pi_tokener_writes_recall_cache() {
     let (dir, paths) = temp_paths();
-    let driver = launch::driver("tokener").unwrap();
+    let provider = crate::provider::find("tokener").unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
@@ -496,7 +581,7 @@ fn pi_tokener_writes_recall_cache() {
         agent_dir.display().to_string(),
     )]));
 
-    crate::pi::prepare("tokener", driver, &base_url, "sk-test", &paths, &env).unwrap();
+    crate::pi::prepare("tokener", provider, &base_url, "sk-test", &paths, &env).unwrap();
     server.join().unwrap();
 
     let cache = dir.path().join("pi/tokener-provider.json");
@@ -517,7 +602,7 @@ fn codex_passthrough_model_flag_wins() {
     let plan = launch::plan(
         &LaunchRequest {
             harness: Harness::Codex,
-            gateway: Some("openrouter".to_string()),
+            provider: Some("openrouter".to_string()),
             passthrough: vec!["--model".to_string(), "anthropic/claude-sonnet-4.6".to_string()],
         },
         &paths,
@@ -539,7 +624,7 @@ fn codex_tokener_does_not_invent_a_model() {
     let plan = launch::plan(
         &LaunchRequest {
             harness: Harness::Codex,
-            gateway: Some("tokener".to_string()),
+            provider: Some("tokener".to_string()),
             passthrough: vec!["exec".to_string(), "cargo test".to_string()],
         },
         &paths,
@@ -558,26 +643,28 @@ fn missing_key_errors_before_exec() {
     let error = launch::plan(
         &LaunchRequest {
             harness: Harness::Claude,
-            gateway: Some("openrouter".to_string()),
+            provider: Some("openrouter".to_string()),
             passthrough: Vec::new(),
         },
         &paths,
         &EnvLookup::isolated(HashMap::new()),
     )
     .unwrap_err();
-    assert!(error.to_string().contains("no API key for gateway 'openrouter'"), "{error}");
+    assert_eq!(
+        error.to_string(),
+        "no API key for provider 'openrouter'; run: rx providers login openrouter (or set $OPENROUTER_API_KEY)"
+    );
 }
 
 #[test]
-fn custom_profile_does_not_inherit_driver_env_key() {
+fn custom_provider_does_not_inherit_catalog_env_key() {
     let (_dir, paths) = temp_paths();
     fs::write(
         &paths.config,
-        r#"default_gateway = "tokener-dev"
+        r#"default_provider = "tokener-dev"
 
-[gateway.tokener-dev]
-driver = "tokener"
-base_url = "https://dev.gateway.test"
+[provider.tokener-dev]
+base_url = "https://dev.provider.test"
 "#,
     )
     .unwrap();
@@ -587,29 +674,23 @@ base_url = "https://dev.gateway.test"
     )]));
 
     let error = launch::plan(
-        &LaunchRequest { harness: Harness::Codex, gateway: None, passthrough: Vec::new() },
+        &LaunchRequest { harness: Harness::Codex, provider: None, passthrough: Vec::new() },
         &paths,
         &env,
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("no API key for gateway 'tokener-dev'"), "{error}");
+    assert!(error.to_string().contains("no API key for provider 'tokener-dev'"), "{error}");
 }
 
 #[test]
-fn config_set_key_is_redacted_and_secret() {
+fn provider_login_stores_secret_permissions_and_launches() {
     let (_dir, paths) = temp_paths();
-    config::run(ConfigCommand::SetGateway { name: "openrouter".to_string() }, &paths).unwrap();
-    config::run(
-        ConfigCommand::SetKey { profile: "openrouter".to_string(), key: "sk-secret".to_string() },
-        &paths,
-    )
-    .unwrap();
+    config::login(&paths, "openrouter", "sk-secret".to_string()).unwrap();
 
-    let listing = config::format_get(&paths, None).unwrap();
-    assert!(listing.contains("default_gateway = openrouter"));
-    assert!(listing.contains("key = set"));
-    assert!(!listing.contains("sk-secret"));
+    let loaded = config::load(&paths).unwrap().unwrap();
+    assert_eq!(loaded.default_provider.as_deref(), Some("openrouter"));
+    assert_eq!(loaded.provider["openrouter"].auth, config::AuthMode::ApiKey);
 
     let stored = fs::read_to_string(&paths.keys).unwrap();
     assert!(stored.contains("sk-secret"));
@@ -625,7 +706,7 @@ fn config_set_key_is_redacted_and_secret() {
 
     let env = EnvLookup::isolated(HashMap::new());
     let plan = launch::plan(
-        &LaunchRequest { harness: Harness::Claude, gateway: None, passthrough: Vec::new() },
+        &LaunchRequest { harness: Harness::Claude, provider: None, passthrough: Vec::new() },
         &paths,
         &env,
     )
@@ -634,13 +715,13 @@ fn config_set_key_is_redacted_and_secret() {
 }
 
 #[test]
-fn config_set_key_does_not_switch_auth_when_keys_cannot_be_loaded() {
+fn provider_login_does_not_switch_auth_when_keys_cannot_be_loaded() {
     let (_dir, paths) = temp_paths();
     fs::write(
         &paths.config,
-        r#"default_gateway = "openrouter"
+        r#"default_provider = "openrouter"
 
-[gateway.openrouter]
+[provider.openrouter]
 base_url = "https://openrouter.ai/api"
 auth = "env"
 "#,
@@ -648,57 +729,110 @@ auth = "env"
     .unwrap();
     fs::write(&paths.keys, "{").unwrap();
 
-    let error = config::run(
-        ConfigCommand::SetKey { profile: "openrouter".to_string(), key: "sk-secret".to_string() },
-        &paths,
-    )
-    .unwrap_err();
+    let error = config::login(&paths, "openrouter", "sk-secret".to_string()).unwrap_err();
     assert!(error.to_string().contains("failed to parse"), "{error}");
 
     let config = config::load(&paths).unwrap().unwrap();
-    assert_eq!(config.gateway["openrouter"].auth, config::AuthMode::Env);
+    assert_eq!(config.provider["openrouter"].auth, config::AuthMode::Env);
 }
 
 #[test]
-fn custom_gateway_profiles_keep_independent_keys_and_driver_behavior() {
+fn provider_default_selection_preserves_env_auth() {
+    let (_dir, paths) = temp_paths();
+    fs::write(
+        &paths.config,
+        r#"[provider.custom]
+base_url = "https://provider.test/v1"
+env = "CUSTOM_API_KEY"
+auth = "env"
+"#,
+    )
+    .unwrap();
+
+    config::set_default(&paths, "custom").unwrap();
+
+    let loaded = config::load(&paths).unwrap().unwrap();
+    assert_eq!(loaded.default_provider.as_deref(), Some("custom"));
+    assert_eq!(loaded.provider["custom"].auth, config::AuthMode::Env);
+    assert!(!paths.keys.exists());
+}
+
+#[test]
+fn provider_default_selection_does_not_create_auth_config() {
+    let (_dir, paths) = temp_paths();
+
+    config::set_default(&paths, "openrouter").unwrap();
+
+    let loaded = config::load(&paths).unwrap().unwrap();
+    assert_eq!(loaded.default_provider.as_deref(), Some("openrouter"));
+    assert!(!loaded.provider.contains_key("openrouter"));
+}
+
+#[test]
+fn provider_use_argument_sets_default_without_a_terminal() {
+    let (_dir, paths) = temp_paths();
+    config::login(&paths, "openrouter", "sk-openrouter".to_string()).unwrap();
+    config::login(&paths, "tokener-dev", "sk-dev".to_string()).unwrap();
+
+    crate::run_with(
+        args(&["rx", "providers", "use", "openrouter"]),
+        &paths,
+        &EnvLookup::isolated(HashMap::new()),
+    )
+    .unwrap();
+
+    let loaded = config::load(&paths).unwrap().unwrap();
+    assert_eq!(loaded.default_provider.as_deref(), Some("openrouter"));
+}
+
+#[test]
+fn provider_logout_argument_removes_key_without_a_terminal() {
+    let (_dir, paths) = temp_paths();
+    config::login(&paths, "tokener-dev", "sk-dev".to_string()).unwrap();
+
+    crate::run_with(
+        args(&["rx", "providers", "logout", "tokener-dev"]),
+        &paths,
+        &EnvLookup::isolated(HashMap::new()),
+    )
+    .unwrap();
+
+    assert!(config::stored_key(&paths, "tokener-dev").unwrap().is_none());
+}
+
+#[test]
+fn providers_keep_independent_keys_and_behavior() {
     let (dir, paths) = temp_paths();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let dev_base_url = format!("http://{}", listener.local_addr().unwrap());
     fs::write(
         &paths.config,
         format!(
-            r#"default_gateway = "tokener-dev"
+            r#"default_provider = "tokener-dev"
 
-[gateway.tokener-dev]
-driver = "tokener"
+[provider.tokener-dev]
 base_url = "{dev_base_url}"
 model = "gpt-dev"
 
-[gateway.tokener-prod]
-driver = "tokener"
-base_url = "https://prod.gateway.test"
+[provider.tokener-prod]
+base_url = "https://prod.provider.test"
 model = "gpt-prod"
 "#
         ),
     )
     .unwrap();
 
-    config::run(
-        ConfigCommand::SetKey { profile: "tokener-dev".to_string(), key: "sk-dev".to_string() },
-        &paths,
-    )
-    .unwrap();
-    config::run(
-        ConfigCommand::SetKey { profile: "tokener-prod".to_string(), key: "sk-prod".to_string() },
-        &paths,
-    )
-    .unwrap();
-    config::run(ConfigCommand::SetGateway { name: "tokener-prod".to_string() }, &paths).unwrap();
+    config::login(&paths, "tokener-prod", "sk-prod".to_string()).unwrap();
+    config::login(&paths, "tokener-dev", "sk-dev".to_string()).unwrap();
+    config::set_default(&paths, "tokener-prod").unwrap();
 
-    let listing = config::format_get(&paths, None).unwrap();
-    assert!(listing.contains("default_gateway = tokener-prod"));
-    assert!(listing.contains("[tokener-dev]\ndriver = tokener"));
-    assert!(listing.contains("[tokener-prod]\ndriver = tokener"));
+    let loaded = config::load(&paths).unwrap().unwrap();
+    assert_eq!(loaded.default_provider.as_deref(), Some("tokener-prod"));
+    assert_eq!(loaded.provider["tokener-dev"].base_url.as_deref(), Some(dev_base_url.as_str()));
+    assert_eq!(
+        loaded.provider["tokener-prod"].base_url.as_deref(),
+        Some("https://prod.provider.test")
+    );
 
     let agent_dir = dir.path().join("pi-agent");
     let env = EnvLookup::isolated(HashMap::from([(
@@ -708,7 +842,7 @@ model = "gpt-prod"
     let codex = launch::plan(
         &LaunchRequest {
             harness: Harness::Codex,
-            gateway: Some("tokener-dev".to_string()),
+            provider: Some("tokener-dev".to_string()),
             passthrough: Vec::new(),
         },
         &paths,
@@ -718,7 +852,7 @@ model = "gpt-prod"
     assert_eq!(codex.args[1], "model_provider=\"tokener-dev\"");
     assert!(codex.args[3].contains("model_providers.tokener-dev="));
     assert!(codex.args[3].contains(&format!("base_url=\"{dev_base_url}/v1\"")));
-    assert_eq!(codex.env_set, vec![("TOKENER_API_KEY".to_string(), "sk-dev".to_string())]);
+    assert_eq!(codex.env_set, vec![("TOKENER_DEV_API_KEY".to_string(), "sk-dev".to_string())]);
 
     let server = thread::spawn(move || {
         for _ in 0..2 {
@@ -739,7 +873,7 @@ model = "gpt-prod"
     let opencode = launch::plan(
         &LaunchRequest {
             harness: Harness::OpenCode,
-            gateway: Some("tokener-dev".to_string()),
+            provider: Some("tokener-dev".to_string()),
             passthrough: Vec::new(),
         },
         &paths,
@@ -759,7 +893,7 @@ model = "gpt-prod"
     let pi = launch::plan(
         &LaunchRequest {
             harness: Harness::Pi,
-            gateway: Some("tokener-dev".to_string()),
+            provider: Some("tokener-dev".to_string()),
             passthrough: Vec::new(),
         },
         &paths,
@@ -777,7 +911,7 @@ model = "gpt-prod"
     let claude = launch::plan(
         &LaunchRequest {
             harness: Harness::Claude,
-            gateway: Some("tokener-prod".to_string()),
+            provider: Some("tokener-prod".to_string()),
             passthrough: Vec::new(),
         },
         &paths,
@@ -785,10 +919,9 @@ model = "gpt-prod"
     )
     .unwrap();
     assert!(
-        claude
-            .env_set
-            .iter()
-            .any(|(key, value)| key == "ANTHROPIC_BASE_URL" && value == "https://prod.gateway.test")
+        claude.env_set.iter().any(
+            |(key, value)| key == "ANTHROPIC_BASE_URL" && value == "https://prod.provider.test"
+        )
     );
     assert!(
         claude
@@ -799,25 +932,25 @@ model = "gpt-prod"
 }
 
 #[test]
-fn gateway_profile_names_cannot_escape_generated_config_boundaries() {
+fn provider_names_cannot_escape_generated_config_boundaries() {
     let (_dir, paths) = temp_paths();
     fs::write(
         &paths.config,
-        r#"default_gateway = "../prod"
+        r#"default_provider = "../prod"
 
-[gateway."../prod"]
-driver = "tokener"
+[provider."../prod"]
+base_url = "https://provider.test/v1"
 "#,
     )
     .unwrap();
 
     let error = launch::plan(
-        &LaunchRequest { harness: Harness::Pi, gateway: None, passthrough: Vec::new() },
+        &LaunchRequest { harness: Harness::Pi, provider: None, passthrough: Vec::new() },
         &paths,
         &EnvLookup::isolated(HashMap::new()),
     )
     .unwrap_err();
-    assert!(error.to_string().contains("invalid gateway profile name '../prod'"), "{error}");
+    assert!(error.to_string().contains("invalid provider name '../prod'"), "{error}");
 }
 
 #[test]
@@ -831,146 +964,20 @@ fn url_helpers_strip_or_add_v1() {
 }
 
 #[test]
-fn debug_models_parses_gateway_flag() {
-    assert_eq!(
-        parse_line(&["rx", "debug", "models"]),
-        Command::Debug { subcommand: crate::debug::Subcommand::Models, gateway: None }
-    );
-    assert_eq!(
-        parse_line(&["rx", "--gateway", "tokener", "debug", "models"]),
-        Command::Debug {
-            subcommand: crate::debug::Subcommand::Models,
-            gateway: Some("tokener".to_string()),
-        }
-    );
-    assert_eq!(
-        parse_line(&["rx", "debug", "models", "--gateway=openrouter"]),
-        Command::Debug {
-            subcommand: crate::debug::Subcommand::Models,
-            gateway: Some("openrouter".to_string()),
-        }
-    );
+fn debug_is_not_a_harness() {
+    let error = parse(&args(&["rx", "debug", "models"])).unwrap_err();
+    assert!(error.to_string().contains("unknown harness: debug"), "{error}");
 }
 
 #[test]
-fn debug_models_rejects_extra_args() {
-    let error = parse(&args(&["rx", "debug", "models", "extra"])).unwrap_err();
-    assert!(error.to_string().contains("usage: rx debug models"), "{error}");
-}
-
-#[test]
-fn debug_models_requires_configured_gateway() {
-    let (_dir, paths) = temp_paths();
-    let error =
-        crate::debug::models::run(None, &paths, &EnvLookup::isolated(HashMap::new())).unwrap_err();
-    assert!(error.to_string().contains("no gateway configured"), "{error}");
-}
-
-#[test]
-fn parse_catalog_detects_openai_anthropic_and_codex_shapes() {
-    let (shape, envelope, models) = crate::catalog::parse_catalog(
-        r#"{"data":[{"id":"openai/gpt-4","name":"GPT-4"}],"total_count":1}"#,
-    )
-    .unwrap();
-    assert_eq!(shape, crate::catalog::CatalogShape::OpenAi);
-    assert_eq!(envelope, vec!["data".to_string(), "total_count".to_string()]);
-    assert_eq!(models[0].id, "openai/gpt-4");
-    assert_eq!(models[0].label.as_deref(), Some("GPT-4"));
-
-    let (shape, envelope, models) = crate::catalog::parse_catalog(
-        r#"{"data":[{"id":"anthropic/openai/gpt-4","display_name":"GPT-4"}],"has_more":false}"#,
-    )
-    .unwrap();
-    assert_eq!(shape, crate::catalog::CatalogShape::Anthropic);
-    assert!(envelope.contains(&"has_more".to_string()));
-    assert_eq!(models[0].id, "anthropic/openai/gpt-4");
-
-    let (shape, envelope, models) = crate::catalog::parse_catalog(
-        r#"{"models":[{"slug":"gpt-5.6-sol","display_name":"GPT 5.6 Sol"}]}"#,
-    )
-    .unwrap();
-    assert_eq!(shape, crate::catalog::CatalogShape::Codex);
-    assert_eq!(envelope, vec!["models".to_string()]);
-    assert_eq!(models[0].id, "gpt-5.6-sol");
-    assert_eq!(models[0].label.as_deref(), Some("GPT 5.6 Sol"));
-}
-
-#[test]
-fn render_splits_openai_and_anthropic_ids() {
-    let openai = crate::debug::models::Probe {
-        url: "https://example.test/v1/models".to_string(),
-        headers: vec!["Authorization: Bearer".to_string()],
-        status: Some(200),
-        error: None,
-        envelope: vec!["data".to_string()],
-        shape: crate::catalog::CatalogShape::OpenAi,
-        models: vec![
-            crate::catalog::ListedModel { id: "a".to_string(), label: None },
-            crate::catalog::ListedModel { id: "b".to_string(), label: None },
-        ],
-    };
-    let anthropic = crate::debug::models::Probe {
-        url: "https://example.test/v1/models?limit=1000".to_string(),
-        headers: vec!["Authorization: Bearer".to_string()],
-        status: Some(200),
-        error: None,
-        envelope: vec!["data".to_string()],
-        shape: crate::catalog::CatalogShape::Anthropic,
-        models: vec![crate::catalog::ListedModel {
-            id: "anthropic/b".to_string(),
-            label: Some("B".to_string()),
-        }],
-    };
-    let codex = crate::debug::models::Probe {
-        url: "https://example.test/v1/models?client_version=0.149.0".to_string(),
-        headers: vec!["Authorization: Bearer".to_string()],
-        status: Some(200),
-        error: None,
-        envelope: vec!["models".to_string()],
-        shape: crate::catalog::CatalogShape::Codex,
-        models: vec![crate::catalog::ListedModel {
-            id: "gpt-5.6-sol".to_string(),
-            label: Some("GPT 5.6 Sol".to_string()),
-        }],
-    };
-    let user = crate::debug::models::Probe {
-        url: "https://example.test/v1/models/user?limit=1000".to_string(),
-        headers: vec!["Authorization: Bearer".to_string()],
-        status: Some(200),
-        error: None,
-        envelope: vec!["data".to_string(), "total_count".to_string()],
-        shape: crate::catalog::CatalogShape::OpenAi,
-        models: vec![crate::catalog::ListedModel {
-            id: "anthropic/claude-sonnet-5".to_string(),
-            label: Some("Sonnet 5".to_string()),
-        }],
-    };
-    let text = crate::debug::models::render(
-        "tokener",
-        "https://api.tokener.dev",
-        &openai,
-        &codex,
-        &anthropic,
-        &user,
-    );
-    assert!(text.contains("## OpenAI (GET /v1/models)"));
-    assert!(text.contains("## Codex (GET /v1/models?client_version=...)"));
-    assert!(text.contains("## Claude seed (GET /v1/models/user?limit=1000)"));
-    assert!(text.contains("only OpenAI: 2"));
-    assert!(text.contains("only Anthropic: 1"));
-    assert!(text.contains("Claude discovery filter (id contains claude|anthropic): 1/1"));
-    assert!(text.contains("Claude user catalog models: 1"));
-}
-
-#[test]
-fn tokener_seeded_plan_uses_auth_token_and_settings() {
-    let plan = launch::inject_claude_tokener_seeded_for_test(
+fn generated_provider_seeded_plan_uses_auth_token_and_settings() {
+    let plan = launch::inject_claude_generated_seeded_for_test(
         &LaunchRequest {
             harness: Harness::Claude,
-            gateway: Some("tokener".to_string()),
+            provider: Some("tokener".to_string()),
             passthrough: vec!["fix it".to_string()],
         },
-        launch::driver("tokener").unwrap(),
+        "TOKENER_API_KEY",
         "http://localhost:8080",
         "sk-tokener",
         None,
@@ -1143,7 +1150,7 @@ fn openrouter_seeded_plan_injects_settings() {
     let plan = launch::inject_claude_openrouter_for_test(
         &LaunchRequest {
             harness: Harness::Claude,
-            gateway: Some("openrouter".to_string()),
+            provider: Some("openrouter".to_string()),
             passthrough: vec!["fix it".to_string()],
         },
         "https://openrouter.ai/api",
@@ -1170,8 +1177,11 @@ fn live_openrouter_seed_populates_claude_json() {
     let dir = tempfile::tempdir().unwrap();
     let recall = dir.path().join(".recall");
     fs::create_dir_all(&recall).unwrap();
-    fs::write(recall.join("rx.toml"), "default_gateway = \"openrouter\"\n\n[gateway.openrouter]\n")
-        .unwrap();
+    fs::write(
+        recall.join("rx.toml"),
+        "default_provider = \"openrouter\"\n\n[provider.openrouter]\n",
+    )
+    .unwrap();
     let key = std::env::var("OPENROUTER_API_KEY")
         .or_else(|_| std::env::var("ORI_OPENROUTER_API_KEY"))
         .expect("set OPENROUTER_API_KEY for live seed test");

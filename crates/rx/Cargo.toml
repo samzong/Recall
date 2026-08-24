@@ -1,24 +1,23 @@
 [package]
 name = "rx"
-# Distribution and update identity follows the root Recall version via build.rs.
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
-description = "Launch agent harnesses through a configured API gateway"
+description = "Launch agent harnesses through a configured AI provider"
 repository = "https://github.com/samzong/Recall"
 publish = false
 
 [package.metadata.release]
 release = false
 
-[build-dependencies]
-toml = "0.8"
-
 [dependencies]
 anyhow = "1"
+crossterm = "0.28"
 dirs = "6"
 fs2 = "0.4"
 flate2 = "1"
+fuzzy-matcher = "0.3"
+ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tar = "0.4"

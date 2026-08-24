@@ -5,74 +5,8 @@ use anyhow::{Result, bail};
 
 use crate::args::{Harness, LaunchRequest};
 use crate::claude_catalog::{self, SeedOutcome};
-use crate::config::{AuthMode, GatewayConfig, Paths};
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DriverSpec {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub default_base_url: &'static str,
-    pub env_key: &'static str,
-    pub default_model: Option<&'static str>,
-    pub claude_default_model: Option<&'static str>,
-}
-
-pub(crate) const DRIVERS: &[DriverSpec] = &[
-    DriverSpec {
-        id: "openrouter",
-        name: "OpenRouter",
-        default_base_url: "https://openrouter.ai/api",
-        env_key: "OPENROUTER_API_KEY",
-        default_model: Some("~openai/gpt-latest"),
-        claude_default_model: Some("~anthropic/claude-sonnet-latest"),
-    },
-    DriverSpec {
-        id: "tokener",
-        name: "Tokener",
-        default_base_url: "https://api.tokener.dev",
-        env_key: "TOKENER_API_KEY",
-        default_model: None,
-        claude_default_model: None,
-    },
-];
-
-pub(crate) fn driver(id: &str) -> Result<&'static DriverSpec> {
-    DRIVERS.iter().find(|driver| driver.id == id).ok_or_else(|| {
-        anyhow::anyhow!("unknown gateway driver: {id} (supported: openrouter, tokener)")
-    })
-}
-
-pub(crate) fn profile_driver(
-    profile_id: &str,
-    entry: Option<&GatewayConfig>,
-) -> Result<&'static DriverSpec> {
-    validate_profile_id(profile_id)?;
-    if let Some(driver_id) = entry.and_then(|entry| entry.driver.as_deref()) {
-        return driver(driver_id).map_err(|_| {
-            anyhow::anyhow!(
-                "gateway profile '{profile_id}' has unknown driver '{driver_id}' (supported: openrouter, tokener)"
-            )
-        });
-    }
-    if let Ok(driver) = driver(profile_id) {
-        return Ok(driver);
-    }
-    if entry.is_some() {
-        bail!(
-            "gateway profile '{profile_id}' must set driver = \"openrouter\" or driver = \"tokener\""
-        );
-    }
-    bail!("unknown gateway profile: {profile_id} (define it in rx.toml or use openrouter/tokener)")
-}
-
-fn validate_profile_id(id: &str) -> Result<()> {
-    if !id.is_empty()
-        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Ok(());
-    }
-    bail!("invalid gateway profile name '{id}'; use only letters, numbers, '-' and '_'")
-}
+use crate::config::{AuthMode, Paths};
+use crate::provider::{Provider, Setup};
 
 #[derive(Debug, Clone, Default)]
 pub struct EnvLookup {
@@ -111,49 +45,58 @@ pub struct LaunchPlan {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct GatewayTarget {
-    pub profile_id: String,
-    pub driver: &'static DriverSpec,
+pub(crate) struct ProviderTarget {
+    pub provider_id: String,
+    pub provider: Provider,
     pub base_url: String,
     pub key: String,
     pub model: Option<String>,
 }
 
-pub(crate) fn configured_gateway(
+pub(crate) fn configured_provider(
     override_id: Option<&str>,
     paths: &Paths,
     env: &EnvLookup,
-) -> Result<Option<GatewayTarget>> {
+) -> Result<Option<ProviderTarget>> {
     let config = crate::config::load(paths)?;
-    let gateway_id = override_id
+    let configured_id = override_id
         .map(str::to_string)
-        .or_else(|| config.as_ref().and_then(|config| config.default_gateway.clone()));
-    let Some(gateway_id) = gateway_id else {
-        return Ok(None);
+        .or_else(|| config.as_ref().and_then(|config| config.default_provider.clone()));
+    let provider_id = match configured_id {
+        Some(provider_id) => provider_id,
+        None => {
+            let entry = config.as_ref().and_then(|config| config.provider.get("openrouter"));
+            let openrouter = crate::provider::resolve("openrouter", entry)?;
+            if crate::config::stored_key(paths, "openrouter")?.is_some()
+                || env.get(&openrouter.env).is_some()
+            {
+                "openrouter".to_string()
+            } else {
+                return Ok(None);
+            }
+        }
     };
-    let entry = config.as_ref().and_then(|config| config.gateway.get(&gateway_id));
-    let driver = profile_driver(&gateway_id, entry)?;
-    let base_url =
-        entry.and_then(|entry| entry.base_url.as_deref()).unwrap_or(driver.default_base_url);
+    let entry = config.as_ref().and_then(|config| config.provider.get(&provider_id));
+    let provider = crate::provider::resolve(&provider_id, entry)?;
     let auth = entry.map(|entry| entry.auth).unwrap_or(AuthMode::ApiKey);
-    let key = resolve_key(&gateway_id, driver, auth, paths, env)?;
+    let key = resolve_key(&provider, auth, paths, env)?;
     let model = entry.and_then(|entry| entry.model.clone());
-    Ok(Some(GatewayTarget {
-        profile_id: gateway_id,
-        driver,
-        base_url: base_url.to_string(),
+    Ok(Some(ProviderTarget {
+        provider_id,
+        base_url: provider.endpoint.clone(),
+        provider,
         key,
         model,
     }))
 }
 
 pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> Result<LaunchPlan> {
-    let Some(target) = configured_gateway(request.gateway.as_deref(), paths, env)? else {
+    let Some(target) = configured_provider(request.provider.as_deref(), paths, env)? else {
         return Ok(passthrough(request));
     };
     let model = target.model.as_deref().or(match request.harness {
-        Harness::Claude => target.driver.claude_default_model,
-        Harness::Codex => target.driver.default_model,
+        Harness::Claude => target.provider.claude_default_model,
+        Harness::Codex => target.provider.default_model,
         Harness::OpenCode | Harness::Pi => None,
     });
     if matches!(request.harness, Harness::Claude) {
@@ -162,7 +105,7 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
         } else {
             SeedOutcome::Fallback
         };
-        if target.driver.id == "openrouter" {
+        if target.provider.setup == Setup::OpenRouter {
             return Ok(inject_claude_openrouter(
                 request,
                 &target.base_url,
@@ -172,9 +115,9 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
             ));
         }
         if matches!(seed, SeedOutcome::Seeded { .. }) {
-            return Ok(inject_claude_tokener_seeded(
+            return Ok(inject_claude_generated_seeded(
                 request,
-                target.driver,
+                &target.provider.env,
                 &target.base_url,
                 &target.key,
                 model,
@@ -190,41 +133,40 @@ fn passthrough(request: &LaunchRequest) -> LaunchPlan {
         args: request.passthrough.clone(),
         env_set: Vec::new(),
         stderr_note: Some(format!(
-            "[rx] no gateway configured; launching {} as-is (configure: rx config set gateway <profile>)",
+            "[rx] no provider configured; launching {} as-is (configure: rx providers login)",
             request.harness.as_str()
         )),
     }
 }
 
 fn resolve_key(
-    profile_id: &str,
-    driver: &DriverSpec,
+    provider: &Provider,
     auth: AuthMode,
     paths: &Paths,
     env: &EnvLookup,
 ) -> Result<String> {
     match auth {
-        AuthMode::Env => env.get(driver.env_key).ok_or_else(|| {
+        AuthMode::Env => env.get(&provider.env).ok_or_else(|| {
             anyhow::anyhow!(
-                "gateway '{}' is set to auth = env, but ${} is not set",
-                profile_id,
-                driver.env_key
+                "provider '{}' is set to auth = env, but ${} is not set",
+                provider.id,
+                provider.env
             )
         }),
         AuthMode::ApiKey => {
-            if let Some(key) = crate::config::stored_key(paths, profile_id)? {
+            if let Some(key) = crate::config::stored_key(paths, &provider.id)? {
                 return Ok(key);
             }
-            if profile_id == driver.id
-                && let Some(key) = env.get(driver.env_key)
+            if crate::provider::find(&provider.id).is_some()
+                && let Some(key) = env.get(&provider.env)
             {
                 return Ok(key);
             }
             bail!(
-                "no API key for gateway '{}'; run: rx config set key {} <key>  (or set ${} and auth = \"env\")",
-                profile_id,
-                profile_id,
-                driver.env_key
+                "no API key for provider '{}'; run: rx providers login {} (or set ${})",
+                provider.id,
+                provider.id,
+                provider.env
             )
         }
     }
@@ -266,7 +208,7 @@ fn inject_claude_openrouter_impl(
     }
     let stderr_note = match seed {
         SeedOutcome::Fallback => Some(
-            "[rx] gateway user catalog seed failed; falling back to gateway model discovery"
+            "[rx] provider user catalog seed failed; falling back to provider model discovery"
                 .to_string(),
         ),
         SeedOutcome::Seeded { .. } => None,
@@ -328,39 +270,39 @@ fn claude_openrouter_env(
     env_set
 }
 
-fn inject_claude_tokener_seeded(
+fn inject_claude_generated_seeded(
     request: &LaunchRequest,
-    driver: &DriverSpec,
+    env_key: &str,
     base_url: &str,
     key: &str,
     model: Option<&str>,
 ) -> LaunchPlan {
     let mut args = request.passthrough.clone();
     if !claude_catalog::user_passes_settings(&request.passthrough) {
-        args.insert(0, claude_catalog::claude_settings_json(base_url, true, driver.env_key));
+        args.insert(0, claude_catalog::claude_settings_json(base_url, true, env_key));
         args.insert(0, "--settings".to_string());
     }
     LaunchPlan {
         program: "claude".to_string(),
         args,
-        env_set: claude_tokener_seeded_env(driver, base_url, key, model),
+        env_set: claude_generated_seeded_env(env_key, base_url, key, model),
         stderr_note: None,
     }
 }
 
 #[cfg(test)]
-pub(crate) fn inject_claude_tokener_seeded_for_test(
+pub(crate) fn inject_claude_generated_seeded_for_test(
     request: &LaunchRequest,
-    driver: &DriverSpec,
+    env_key: &str,
     base_url: &str,
     key: &str,
     model: Option<&str>,
 ) -> LaunchPlan {
-    inject_claude_tokener_seeded(request, driver, base_url, key, model)
+    inject_claude_generated_seeded(request, env_key, base_url, key, model)
 }
 
-fn claude_tokener_seeded_env(
-    driver: &DriverSpec,
+fn claude_generated_seeded_env(
+    env_key: &str,
     base_url: &str,
     key: &str,
     model: Option<&str>,
@@ -369,7 +311,7 @@ fn claude_tokener_seeded_env(
         ("ANTHROPIC_BASE_URL".to_string(), anthropic_base(base_url)),
         ("ANTHROPIC_AUTH_TOKEN".to_string(), key.to_string()),
         ("ANTHROPIC_API_KEY".to_string(), String::new()),
-        (driver.env_key.to_string(), key.to_string()),
+        (env_key.to_string(), key.to_string()),
         ("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK".to_string(), "1".to_string()),
         ("CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT".to_string(), "1".to_string()),
         ("ENABLE_TOOL_SEARCH".to_string(), "true".to_string()),
@@ -387,7 +329,7 @@ fn claude_tokener_seeded_env(
 }
 
 fn claude_env(
-    driver: &DriverSpec,
+    env_key: &str,
     base_url: &str,
     key: &str,
     model: Option<&str>,
@@ -397,7 +339,7 @@ fn claude_env(
         ("ANTHROPIC_AUTH_TOKEN".to_string(), key.to_string()),
         ("ANTHROPIC_API_KEY".to_string(), String::new()),
         ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".to_string(), "1".to_string()),
-        (driver.env_key.to_string(), key.to_string()),
+        (env_key.to_string(), key.to_string()),
     ];
     if let Some(model) = model {
         env_set.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
@@ -409,27 +351,27 @@ fn inject(
     request: &LaunchRequest,
     paths: &Paths,
     env: &EnvLookup,
-    target: &GatewayTarget,
+    target: &ProviderTarget,
     model: Option<&str>,
 ) -> Result<LaunchPlan> {
-    let profile_id = target.profile_id.as_str();
-    let driver = target.driver;
+    let provider_id = target.provider_id.as_str();
+    let provider = &target.provider;
     let base_url = target.base_url.as_str();
     let key = target.key.as_str();
     match request.harness {
         Harness::Claude => Ok(LaunchPlan {
             program: "claude".to_string(),
             args: request.passthrough.clone(),
-            env_set: claude_env(driver, base_url, key, model),
+            env_set: claude_env(&provider.env, base_url, key, model),
             stderr_note: None,
         }),
         Harness::Codex => {
             let openai_base = openai_base(base_url);
             let mut args = vec![
                 "-c".to_string(),
-                format!("model_provider=\"{profile_id}\""),
+                format!("model_provider=\"{provider_id}\""),
                 "-c".to_string(),
-                codex_provider_override(profile_id, driver, &openai_base),
+                codex_provider_override(provider_id, provider, &openai_base),
             ];
             if let Some(model) = model.filter(|_| !user_sets_model(&request.passthrough)) {
                 args.push("-c".to_string());
@@ -439,19 +381,18 @@ fn inject(
             Ok(LaunchPlan {
                 program: "codex".to_string(),
                 args,
-                env_set: vec![(driver.env_key.to_string(), key.to_string())],
+                env_set: vec![(provider.env.clone(), key.to_string())],
                 stderr_note: None,
             })
         }
         Harness::OpenCode => {
-            let provider_id = if driver.id == "tokener" { profile_id } else { driver.id };
-            let env_set = vec![
-                (driver.env_key.to_string(), key.to_string()),
-                (
-                    "OPENCODE_CONFIG_CONTENT".to_string(),
-                    crate::opencode::config_content(provider_id, driver, base_url, key)?,
-                ),
-            ];
+            let provider_id =
+                if provider.setup == Setup::Generated { provider_id } else { provider.id.as_str() };
+            let mut env_set = vec![(provider.env.clone(), key.to_string())];
+            env_set.push((
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                crate::opencode::config_content(provider_id, provider, base_url, key)?,
+            ));
             let mut args = request.passthrough.clone();
             if let Some(model) = model.filter(|_| !user_sets_opencode_model(&request.passthrough)) {
                 args.insert(0, crate::opencode::prefixed_model(provider_id, model));
@@ -461,29 +402,30 @@ fn inject(
                 program: "opencode".to_string(),
                 args,
                 env_set,
-                stderr_note: crate::opencode::auth_conflict_note(driver, key, env),
+                stderr_note: crate::opencode::auth_conflict_note(provider, key, env),
             })
         }
         Harness::Pi => {
-            let provider_id = if driver.id == "tokener" { profile_id } else { driver.id };
-            crate::pi::prepare(provider_id, driver, base_url, key, paths, env)?;
+            let provider_id =
+                if provider.setup == Setup::Generated { provider_id } else { provider.id.as_str() };
+            crate::pi::prepare(provider_id, provider, base_url, key, paths, env)?;
             Ok(LaunchPlan {
                 program: "pi".to_string(),
                 args: crate::pi::args(provider_id, model, &request.passthrough),
-                env_set: crate::pi::env_set(driver, key),
+                env_set: crate::pi::env_set(&provider.env, key),
                 stderr_note: None,
             })
         }
     }
 }
 
-fn codex_provider_override(profile_id: &str, driver: &DriverSpec, openai_base: &str) -> String {
+fn codex_provider_override(provider_id: &str, provider: &Provider, openai_base: &str) -> String {
     format!(
         "model_providers.{}={{name=\"{}\", base_url=\"{}\", wire_api=\"responses\", supports_websockets=false, {}}}",
-        profile_id,
-        driver.name,
+        provider_id,
+        provider.name,
         openai_base,
-        auth_override(driver.env_key)
+        auth_override(&provider.env)
     )
 }
 

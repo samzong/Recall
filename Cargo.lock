@@ -1269,6 +1269,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzzy-matcher"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54614a3312934d066701a80f20f15fa3b56d67ac7722b39eea5b4c9dd1d66c94"
+dependencies = [
+ "thread_local",
+]
+
+[[package]]
 name = "gemm"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3130,12 +3139,15 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rx"
-version = "0.1.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
+ "crossterm",
  "dirs",
  "flate2",
  "fs2",
+ "fuzzy-matcher",
+ "ratatui",
  "serde",
  "serde_json",
  "tar",
