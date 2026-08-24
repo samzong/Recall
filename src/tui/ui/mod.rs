@@ -412,6 +412,35 @@ mod tests {
     }
 
     #[test]
+    fn render_preview_neutral_content_inherits_terminal_palette() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.results = vec![numbered_session_result(1)];
+        app.preview_messages = vec![Message {
+            session_id: "session1".to_string(),
+            role: Role::User,
+            content: "hello".to_string(),
+            timestamp: None,
+            seq: 0,
+        }];
+
+        let width = 80;
+        let height = 10;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let frame = terminal.draw(|f| render(f, &app)).unwrap();
+        let inner =
+            crate::tui::layout::search_layout(Rect::new(0, 0, width, height)).preview_inner();
+        let first_body_cell = &frame.buffer[(inner.x + 2, inner.y + 1)];
+
+        assert_eq!(first_body_cell.symbol(), "h");
+        assert_eq!(first_body_cell.fg, Color::Reset);
+        assert_eq!(first_body_cell.bg, Color::Reset);
+    }
+
+    #[test]
     fn render_viewing_shows_one_line_session_summary_below_title() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
@@ -536,6 +565,7 @@ mod tests {
         assert!(rendered.contains("copy URL"));
         assert!(rendered.contains("[Enter/Esc]"));
         assert!(rendered.contains("close"));
+        assert_eq!(terminal.backend().buffer()[(7, 5)].bg, Color::Reset);
     }
 
     #[test]
@@ -592,6 +622,14 @@ mod tests {
         assert!(rendered.contains("OpenCode (opencode)"));
         assert!(rendered.contains("[Enter]"));
         assert!(rendered.contains("select"));
+
+        let width = 90u16.clamp(36, 56);
+        let height = (crate::handoff::TARGETS.len() as u16 + 5).max(8);
+        let rect = Rect::new((90 - width) / 2, (18 - height) / 2, width, height);
+        let selected = &terminal.backend().buffer()
+            [(rect.x + 1, rect.y + 2 + app.handoff_target_selected as u16)];
+        assert_eq!(selected.fg, THEME.selected_fg);
+        assert_eq!(selected.bg, THEME.selected_bg);
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {

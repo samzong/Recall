@@ -71,7 +71,10 @@ pub(super) fn render_subagents_picker(f: &mut Frame, app: &App) {
         let selected = index == app.subagent_selected;
         let marker = if selected { ">" } else { " " };
         let style = if selected {
-            Style::default().fg(THEME.selected_fg).bg(THEME.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(THEME.selected_fg)
+                .bg(THEME.selected_bg)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(THEME.text)
         };
@@ -129,7 +132,10 @@ pub(super) fn render_handoff_target_picker(f: &mut Frame, app: &App) {
         let selected = index == app.handoff_target_selected;
         let marker = if selected { ">" } else { " " };
         let style = if selected {
-            Style::default().fg(THEME.selected_fg).bg(THEME.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(THEME.selected_fg)
+                .bg(THEME.selected_bg)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(THEME.text)
         };
@@ -397,7 +403,7 @@ pub(super) fn render_settings(f: &mut Frame, app: &App) {
         .style(Style::default().bg(THEME.popup_bg));
 
     let mut lines = Vec::new();
-    let selected_style = Style::default().bg(THEME.accent).fg(THEME.selected_fg);
+    let selected_style = Style::default().bg(THEME.selected_bg).fg(THEME.selected_fg);
     let normal_style = Style::default().fg(THEME.text);
 
     lines.push(Line::from(vec![

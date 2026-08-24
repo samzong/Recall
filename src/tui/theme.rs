@@ -41,7 +41,7 @@ pub(crate) struct Theme {
 }
 
 pub(crate) const THEME: Theme = Theme {
-    text: Color::White,
+    text: Color::Reset,
     text_muted: Color::DarkGray,
     accent: Color::Yellow,
     highlight: Color::Cyan,
@@ -52,7 +52,7 @@ pub(crate) const THEME: Theme = Theme {
     border_focus: Color::Cyan,
     border_idle: Color::DarkGray,
     background: Color::Reset,
-    popup_bg: Color::Black,
+    popup_bg: Color::Reset,
 
     selected_fg: Color::Black,
     selected_bg: Color::Cyan,
