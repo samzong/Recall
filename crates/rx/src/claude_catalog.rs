@@ -15,6 +15,12 @@ const MAX_CONTEXT: i64 = 1_000_000;
 const OPENAI_COMPACT_WINDOW: i64 = 258_000;
 const TOOL_SEARCH_UNSUPPORTED_KEY: &str = "tengu_tool_search_unsupported_models";
 const RX_SEEDED_DENYLIST_KEY: &str = "rxSeededToolSearchDenylist";
+const RX_SEEDED_CATALOG_KEY: &str = "rxSeededCatalog";
+const MODEL_OPTIONS_CACHE_KEY: &str = "additionalModelOptionsCache";
+const MODEL_ACCESS_CACHE_KEY: &str = "modelAccessCache";
+const MODEL_COSTS_CACHE_KEY: &str = "additionalModelCostsCache";
+const COMPACT_WINDOWS_CACHE_KEY: &str = "autoCompactWindowsCache";
+const TOOL_SEARCH_DENYLIST_MARKER_KEY: &str = "toolSearchDenylist";
 const MAX_WRITE_ATTEMPTS: usize = 4;
 
 const BASE_TOOL_SEARCH_DENY: &[&str] = &["claude-3-5-haiku", "claude-3-haiku"];
@@ -337,125 +343,256 @@ fn read_config_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
 
 fn merge_seed(document: &mut Value, caches: &SeedCaches) {
     let object = document.as_object_mut().expect("claude config root is an object");
-    let previous_rx_deny = string_array(object.get(RX_SEEDED_DENYLIST_KEY));
-    let previous_gb_deny = string_array(
+    let mut catalog_marker =
+        object.get(RX_SEEDED_CATALOG_KEY).and_then(Value::as_object).cloned().unwrap_or_default();
+
+    merge_tool_search_denylist(object, caches, &mut catalog_marker);
+    merge_model_options(object, caches, &mut catalog_marker);
+    merge_model_access(object, caches, &mut catalog_marker);
+    merge_costs(object, caches, &mut catalog_marker);
+    merge_compact_windows(object, caches, &mut catalog_marker);
+    catalog_marker.insert("version".to_string(), json!(1));
+    object.insert(RX_SEEDED_CATALOG_KEY.to_string(), Value::Object(catalog_marker));
+}
+
+fn merge_tool_search_denylist(
+    object: &mut serde_json::Map<String, Value>,
+    caches: &SeedCaches,
+    marker: &mut serde_json::Map<String, Value>,
+) {
+    let previous_marker = marker
+        .get(TOOL_SEARCH_DENYLIST_MARKER_KEY)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(|| {
+            string_array(object.get(RX_SEEDED_DENYLIST_KEY))
+                .into_iter()
+                .map(|identity| {
+                    let payload = Value::String(identity.clone());
+                    (identity, owned_marker(&payload))
+                })
+                .collect()
+        });
+    let existing = string_array(
         object
             .get("cachedGrowthBookFeatures")
             .and_then(|value| value.get(TOOL_SEARCH_UNSUPPORTED_KEY)),
     );
-    // A wrong-typed cache (e.g. null) must be replaced, not unwrapped: this is
-    // best-effort seeding and a panic here would block the launch.
+    let mut occupied = HashSet::new();
+    let mut blocked = HashSet::new();
+    let mut seen_marker = HashSet::new();
+    let mut reconciled = Vec::new();
+    let mut next_marker = serde_json::Map::new();
+    for identity in existing {
+        if let Some(previous) = previous_marker.get(&identity) {
+            seen_marker.insert(identity.clone());
+            if owned_payload(previous).is_some_and(|payload| payload == &identity) {
+                continue;
+            }
+            blocked.insert(identity.clone());
+            next_marker.insert(identity.clone(), external_marker());
+        }
+        occupied.insert(identity.clone());
+        reconciled.push(identity);
+    }
+    for identity in previous_marker.keys().filter(|identity| !seen_marker.contains(*identity)) {
+        blocked.insert(identity.clone());
+        next_marker.insert(identity.clone(), external_marker());
+    }
+
+    let desired = BASE_TOOL_SEARCH_DENY
+        .iter()
+        .map(|identity| (*identity).to_string())
+        .chain(caches.tool_search_denylist.iter().cloned());
+    for identity in desired {
+        if !blocked.contains(&identity) && occupied.insert(identity.clone()) {
+            let payload = Value::String(identity.clone());
+            next_marker.insert(identity.clone(), owned_marker(&payload));
+            reconciled.push(identity);
+        }
+    }
+    reconciled.sort();
+    reconciled.dedup();
+
     if !object.get("cachedGrowthBookFeatures").is_some_and(Value::is_object) {
         object.insert("cachedGrowthBookFeatures".to_string(), json!({}));
     }
-    let growthbook = object
+    object
         .get_mut("cachedGrowthBookFeatures")
         .and_then(Value::as_object_mut)
-        .expect("normalized cachedGrowthBookFeatures to an object");
-    let preserved = previous_gb_deny
-        .into_iter()
-        .filter(|entry| !previous_rx_deny.contains(entry))
-        .collect::<Vec<_>>();
-    let mut denylist = BASE_TOOL_SEARCH_DENY
-        .iter()
-        .map(|value| (*value).to_string())
-        .chain(preserved)
-        .chain(caches.tool_search_denylist.iter().cloned())
-        .collect::<Vec<_>>();
-    denylist.sort();
-    denylist.dedup();
-
-    growthbook.insert(TOOL_SEARCH_UNSUPPORTED_KEY.to_string(), json!(denylist));
+        .expect("normalized cachedGrowthBookFeatures to an object")
+        .insert(TOOL_SEARCH_UNSUPPORTED_KEY.to_string(), json!(reconciled));
     object.insert(
         "cachedGrowthBookFeaturesAt".to_string(),
         json!(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()),
     );
-    object.insert(RX_SEEDED_DENYLIST_KEY.to_string(), json!(caches.tool_search_denylist));
-
-    merge_model_options(object, caches);
-    merge_model_access(object, caches);
-    merge_costs(object, caches);
-    merge_compact_windows(object, caches);
+    let mut legacy_owned = next_marker
+        .iter()
+        .filter_map(|(identity, state)| owned_payload(state).map(|_| identity.clone()))
+        .collect::<Vec<_>>();
+    legacy_owned.sort();
+    object.insert(RX_SEEDED_DENYLIST_KEY.to_string(), json!(legacy_owned));
+    marker.insert(TOOL_SEARCH_DENYLIST_MARKER_KEY.to_string(), Value::Object(next_marker));
 }
 
-fn merge_model_options(object: &mut serde_json::Map<String, Value>, caches: &SeedCaches) {
-    let existing = model_options(object.get("additionalModelOptionsCache"));
-    let existing_values: HashSet<String> = existing
+fn merge_model_options(
+    object: &mut serde_json::Map<String, Value>,
+    caches: &SeedCaches,
+    marker: &mut serde_json::Map<String, Value>,
+) {
+    let desired = caches
+        .additional_model_options
         .iter()
-        .filter_map(|entry| entry.get("value").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect();
-    let mut merged = existing;
-    for option in &caches.additional_model_options {
-        if existing_values.contains(&option.value) {
-            continue;
-        }
-        merged.push(json!({
+        .map(|option| {
+            json!({
             "value": option.value,
             "label": option.label,
             "description": option.description,
-        }));
-    }
-    object.insert("additionalModelOptionsCache".to_string(), Value::Array(merged));
-}
-
-fn merge_model_access(object: &mut serde_json::Map<String, Value>, caches: &SeedCaches) {
-    let existing = model_access_entries(object.get("modelAccessCache"));
-    let existing_names: HashSet<String> = existing
-        .iter()
-        .filter_map(|entry| entry.get("apiName").and_then(Value::as_str))
-        .map(str::to_string)
+            })
+        })
         .collect();
-    let mut merged = existing;
-    for access in &caches.model_access {
-        if existing_names.contains(&access.api_name) {
+    reconcile_array_cache(object, marker, MODEL_OPTIONS_CACHE_KEY, "value", desired);
+}
+
+fn merge_model_access(
+    object: &mut serde_json::Map<String, Value>,
+    caches: &SeedCaches,
+    marker: &mut serde_json::Map<String, Value>,
+) {
+    let desired = caches
+        .model_access
+        .iter()
+        .map(|access| {
+            let mut entry = json!({ "apiName": access.api_name, "entitled": true });
+            if let Some(level) = &access.max_effort_level {
+                entry["maxEffortLevel"] = json!(level);
+            }
+            entry
+        })
+        .collect();
+    reconcile_array_cache(object, marker, MODEL_ACCESS_CACHE_KEY, "apiName", desired);
+}
+
+fn merge_costs(
+    object: &mut serde_json::Map<String, Value>,
+    caches: &SeedCaches,
+    marker: &mut serde_json::Map<String, Value>,
+) {
+    reconcile_object_cache(object, marker, MODEL_COSTS_CACHE_KEY, &caches.additional_model_costs);
+}
+
+fn merge_compact_windows(
+    object: &mut serde_json::Map<String, Value>,
+    caches: &SeedCaches,
+    marker: &mut serde_json::Map<String, Value>,
+) {
+    let desired = caches
+        .auto_compact_windows
+        .iter()
+        .map(|(key, value)| (key.clone(), json!(value)))
+        .collect();
+    reconcile_object_cache(object, marker, COMPACT_WINDOWS_CACHE_KEY, &desired);
+}
+
+fn reconcile_array_cache(
+    object: &mut serde_json::Map<String, Value>,
+    marker: &mut serde_json::Map<String, Value>,
+    cache_key: &str,
+    identity_key: &str,
+    desired: Vec<Value>,
+) {
+    let previous_marker =
+        marker.get(cache_key).and_then(Value::as_object).cloned().unwrap_or_default();
+    let existing = object.get(cache_key).and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut occupied = HashSet::new();
+    let mut blocked = HashSet::new();
+    let mut seen_marker = HashSet::new();
+    let mut reconciled = Vec::new();
+    let mut next_marker = serde_json::Map::new();
+    for entry in existing {
+        let Some(identity) = entry.get(identity_key).and_then(Value::as_str).map(str::to_string)
+        else {
+            reconciled.push(entry);
             continue;
+        };
+        if let Some(previous) = previous_marker.get(&identity) {
+            seen_marker.insert(identity.clone());
+            if owned_payload(previous).is_some_and(|payload| payload == &entry) {
+                continue;
+            }
+            blocked.insert(identity.clone());
+            next_marker.insert(identity.clone(), external_marker());
         }
-        let mut entry = json!({ "apiName": access.api_name, "entitled": true });
-        if let Some(level) = &access.max_effort_level {
-            entry["maxEffortLevel"] = json!(level);
+        occupied.insert(identity);
+        reconciled.push(entry);
+    }
+    for identity in previous_marker.keys().filter(|identity| !seen_marker.contains(*identity)) {
+        blocked.insert(identity.clone());
+        next_marker.insert(identity.clone(), external_marker());
+    }
+
+    for entry in desired {
+        let Some(identity) = entry.get(identity_key).and_then(Value::as_str).map(str::to_string)
+        else {
+            continue;
+        };
+        if !blocked.contains(&identity) && occupied.insert(identity.clone()) {
+            next_marker.insert(identity, owned_marker(&entry));
+            reconciled.push(entry);
         }
-        merged.push(entry);
     }
-    object.insert("modelAccessCache".to_string(), Value::Array(merged));
+
+    object.insert(cache_key.to_string(), Value::Array(reconciled));
+    marker.insert(cache_key.to_string(), Value::Object(next_marker));
 }
 
-fn merge_costs(object: &mut serde_json::Map<String, Value>, caches: &SeedCaches) {
-    let mut merged = object
-        .get("additionalModelCostsCache")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    for (key, value) in &caches.additional_model_costs {
-        merged.entry(key.clone()).or_insert_with(|| value.clone());
+fn reconcile_object_cache(
+    object: &mut serde_json::Map<String, Value>,
+    marker: &mut serde_json::Map<String, Value>,
+    cache_key: &str,
+    desired: &BTreeMap<String, Value>,
+) {
+    let previous_marker =
+        marker.get(cache_key).and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut reconciled =
+        object.get(cache_key).and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut blocked = HashSet::new();
+    let mut next_marker = serde_json::Map::new();
+    for (key, previous) in previous_marker {
+        if owned_payload(&previous)
+            .is_some_and(|payload| reconciled.get(&key).is_some_and(|current| current == payload))
+        {
+            reconciled.remove(&key);
+        } else {
+            blocked.insert(key.clone());
+            next_marker.insert(key, external_marker());
+        }
     }
-    object.insert("additionalModelCostsCache".to_string(), Value::Object(merged));
-}
 
-fn merge_compact_windows(object: &mut serde_json::Map<String, Value>, caches: &SeedCaches) {
-    let mut merged = object
-        .get("autoCompactWindowsCache")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    for (key, value) in &caches.auto_compact_windows {
-        merged.entry(key.clone()).or_insert(json!(value));
+    for (key, payload) in desired {
+        if !blocked.contains(key) && !reconciled.contains_key(key) {
+            reconciled.insert(key.clone(), payload.clone());
+            next_marker.insert(key.clone(), owned_marker(payload));
+        }
     }
-    object.insert("autoCompactWindowsCache".to_string(), Value::Object(merged));
+
+    object.insert(cache_key.to_string(), Value::Object(reconciled));
+    marker.insert(cache_key.to_string(), Value::Object(next_marker));
 }
 
-fn model_options(value: Option<&Value>) -> Vec<Value> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| items.iter().filter(|item| item.get("value").is_some()).cloned().collect())
-        .unwrap_or_default()
+fn owned_payload(marker: &Value) -> Option<&Value> {
+    let marker = marker.as_object()?;
+    (marker.get("state").and_then(Value::as_str) == Some("owned"))
+        .then(|| marker.get("payload"))
+        .flatten()
 }
 
-fn model_access_entries(value: Option<&Value>) -> Vec<Value> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| items.iter().filter(|item| item.get("apiName").is_some()).cloned().collect())
-        .unwrap_or_default()
+fn owned_marker(payload: &Value) -> Value {
+    json!({ "state": "owned", "payload": payload })
+}
+
+fn external_marker() -> Value {
+    json!({ "state": "external" })
 }
 
 fn string_array(value: Option<&Value>) -> Vec<String> {

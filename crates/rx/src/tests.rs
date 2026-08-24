@@ -1057,7 +1057,255 @@ fn openrouter_seed_writes_claude_json() {
 }
 
 #[test]
-fn concurrent_claude_seed_writes_preserve_both_catalogs() {
+fn claude_seed_refreshes_and_removes_unmodified_owned_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".claude.json");
+    let first_seed = crate::claude_catalog::build_seed(&[
+        crate::claude_catalog::UserModel {
+            id: "anthropic/claude-current".to_string(),
+            name: Some("Current Old".to_string()),
+            context_length: Some(200_000),
+            canonical_slug: None,
+            supported_efforts: vec!["high".to_string()],
+            pricing: Some(crate::claude_catalog::Pricing {
+                prompt: Some("0.000001".to_string()),
+                completion: Some("0.000003".to_string()),
+                input_cache_read: None,
+                input_cache_write: None,
+                web_search: None,
+            }),
+        },
+        crate::claude_catalog::UserModel {
+            id: "anthropic/claude-removed".to_string(),
+            name: Some("Removed".to_string()),
+            context_length: Some(200_000),
+            canonical_slug: None,
+            supported_efforts: vec![],
+            pricing: Some(crate::claude_catalog::Pricing {
+                prompt: Some("0.000001".to_string()),
+                completion: Some("0.000003".to_string()),
+                input_cache_read: None,
+                input_cache_write: None,
+                web_search: None,
+            }),
+        },
+    ]);
+    crate::claude_catalog::write_seed_for_test(&config_path, &first_seed).unwrap();
+
+    let second_seed = crate::claude_catalog::build_seed(&[crate::claude_catalog::UserModel {
+        id: "anthropic/claude-current".to_string(),
+        name: Some("Current New".to_string()),
+        context_length: Some(300_000),
+        canonical_slug: None,
+        supported_efforts: vec!["max".to_string()],
+        pricing: Some(crate::claude_catalog::Pricing {
+            prompt: Some("0.000002".to_string()),
+            completion: Some("0.000004".to_string()),
+            input_cache_read: None,
+            input_cache_write: None,
+            web_search: None,
+        }),
+    }]);
+    crate::claude_catalog::write_seed_for_test(&config_path, &second_seed).unwrap();
+
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let options = document["additionalModelOptionsCache"].as_array().unwrap();
+    assert!(options.iter().any(|entry| {
+        entry["value"] == "claude-current"
+            && entry["label"] == "Current New"
+            && entry["description"] == "300K context"
+    }));
+    assert!(!options.iter().any(|entry| entry["value"] == "claude-removed"));
+
+    let access = document["modelAccessCache"].as_array().unwrap();
+    assert!(
+        access.iter().any(|entry| {
+            entry["apiName"] == "claude-current" && entry["maxEffortLevel"] == "max"
+        })
+    );
+    assert!(!access.iter().any(|entry| entry["apiName"] == "claude-removed"));
+    assert_eq!(document["additionalModelCostsCache"]["claude-current"]["inputTokens"], 2.0);
+    assert!(document["additionalModelCostsCache"].get("claude-removed").is_none());
+    assert_eq!(document["autoCompactWindowsCache"]["claude-current"], 300_000);
+    assert!(document["autoCompactWindowsCache"].get("claude-removed").is_none());
+}
+
+#[test]
+fn claude_seed_preserves_user_modified_and_unowned_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".claude.json");
+    fs::write(
+        &config_path,
+        r#"{"additionalModelOptionsCache":[{"value":"user-owned","label":"User","description":"manual"}]}"#,
+    )
+    .unwrap();
+    let seed = crate::claude_catalog::build_seed(&[crate::claude_catalog::UserModel {
+        id: "anthropic/claude-edited".to_string(),
+        name: Some("RX".to_string()),
+        context_length: Some(200_000),
+        canonical_slug: None,
+        supported_efforts: vec!["high".to_string()],
+        pricing: Some(crate::claude_catalog::Pricing {
+            prompt: Some("0.000001".to_string()),
+            completion: Some("0.000003".to_string()),
+            input_cache_read: None,
+            input_cache_write: None,
+            web_search: None,
+        }),
+    }]);
+    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
+
+    let mut document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let edited_option = document["additionalModelOptionsCache"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["value"] == "claude-edited")
+        .unwrap();
+    edited_option["label"] = serde_json::json!("User Override");
+    let edited_access = document["modelAccessCache"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["apiName"] == "claude-edited")
+        .unwrap();
+    edited_access["entitled"] = serde_json::json!(false);
+    document["additionalModelCostsCache"]["claude-edited"]["inputTokens"] = serde_json::json!(99.0);
+    document["autoCompactWindowsCache"]["claude-edited"] = serde_json::json!(123_456);
+    fs::write(&config_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    crate::claude_catalog::write_seed_for_test(
+        &config_path,
+        &crate::claude_catalog::SeedCaches::default(),
+    )
+    .unwrap();
+    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
+
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let options = document["additionalModelOptionsCache"].as_array().unwrap();
+    assert!(
+        options.iter().any(|entry| {
+            entry["value"] == "claude-edited" && entry["label"] == "User Override"
+        })
+    );
+    assert!(options.iter().any(|entry| entry["value"] == "user-owned"));
+    assert!(
+        document["modelAccessCache"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["apiName"] == "claude-edited" && entry["entitled"] == false })
+    );
+    assert_eq!(document["additionalModelCostsCache"]["claude-edited"]["inputTokens"], 99.0);
+    assert_eq!(document["autoCompactWindowsCache"]["claude-edited"], 123_456);
+}
+
+#[test]
+fn claude_seed_preserves_user_deletion_of_owned_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".claude.json");
+    let seed = crate::claude_catalog::build_seed(&[crate::claude_catalog::UserModel {
+        id: "openai/deleted".to_string(),
+        name: Some("Deleted".to_string()),
+        context_length: Some(200_000),
+        canonical_slug: None,
+        supported_efforts: vec!["high".to_string()],
+        pricing: Some(crate::claude_catalog::Pricing {
+            prompt: Some("0.000001".to_string()),
+            completion: Some("0.000003".to_string()),
+            input_cache_read: None,
+            input_cache_write: None,
+            web_search: None,
+        }),
+    }]);
+    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
+
+    let mut document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    document["additionalModelOptionsCache"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["value"] != "openai/deleted");
+    document["modelAccessCache"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["apiName"] != "openai/deleted");
+    document["additionalModelCostsCache"].as_object_mut().unwrap().remove("openai/deleted");
+    document["autoCompactWindowsCache"].as_object_mut().unwrap().remove("openai/deleted");
+    document["cachedGrowthBookFeatures"]["tengu_tool_search_unsupported_models"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry != "openai/deleted");
+    fs::write(&config_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
+    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
+
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert!(
+        !document["additionalModelOptionsCache"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["value"] == "openai/deleted")
+    );
+    assert!(
+        !document["modelAccessCache"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["apiName"] == "openai/deleted")
+    );
+    assert!(document["additionalModelCostsCache"].get("openai/deleted").is_none());
+    assert!(document["autoCompactWindowsCache"].get("openai/deleted").is_none());
+    assert!(
+        !document["cachedGrowthBookFeatures"]["tengu_tool_search_unsupported_models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == "openai/deleted")
+    );
+}
+
+#[test]
+fn claude_seed_does_not_claim_unmarked_matching_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".claude.json");
+    fs::write(
+        &config_path,
+        r#"{"additionalModelOptionsCache":[{"value":"claude-existing","label":"User","description":"manual"}]}"#,
+    )
+    .unwrap();
+    let seed = crate::claude_catalog::build_seed(&[crate::claude_catalog::UserModel {
+        id: "anthropic/claude-existing".to_string(),
+        name: Some("RX".to_string()),
+        context_length: Some(200_000),
+        canonical_slug: None,
+        supported_efforts: vec![],
+        pricing: None,
+    }]);
+    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
+    crate::claude_catalog::write_seed_for_test(
+        &config_path,
+        &crate::claude_catalog::SeedCaches::default(),
+    )
+    .unwrap();
+
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert!(document["additionalModelOptionsCache"].as_array().unwrap().iter().any(|entry| {
+        entry["value"] == "claude-existing"
+            && entry["label"] == "User"
+            && entry["description"] == "manual"
+    }));
+}
+
+#[test]
+fn concurrent_claude_seed_writes_leave_one_complete_catalog() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join(".claude.json");
     fs::write(
@@ -1097,8 +1345,21 @@ fn concurrent_claude_seed_writes_preserve_both_catalogs() {
         .iter()
         .filter_map(|entry| entry["value"].as_str())
         .collect::<Vec<_>>();
-    assert!(values.contains(&"claude-race-a"));
-    assert!(values.contains(&"claude-race-b"));
+    assert_eq!(values.len(), 1);
+    assert!(matches!(values[0], "claude-race-a" | "claude-race-b"));
+    assert_eq!(
+        document["rxSeededCatalog"]["additionalModelOptionsCache"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        values
+    );
+    assert_eq!(document["rxSeededCatalog"]["modelAccessCache"].as_object().unwrap().len(), 1);
+    assert_eq!(
+        document["rxSeededCatalog"]["autoCompactWindowsCache"].as_object().unwrap().len(),
+        1
+    );
 }
 
 #[test]
