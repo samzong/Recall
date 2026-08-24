@@ -455,6 +455,27 @@ fn bundled_providers_match_the_admission_list() {
     assert_eq!(deepseek.anthropic_base.as_deref(), Some("https://api.deepseek.com/anthropic"));
     assert_eq!(deepseek.default_context, Some(1_000_000));
     assert_eq!(crate::provider::claude_base(deepseek), "https://api.deepseek.com/anthropic");
+    let moonshot = crate::provider::find("moonshotai").unwrap();
+    assert_eq!(moonshot.endpoint, "https://api.moonshot.ai/v1");
+    assert_eq!(moonshot.anthropic_base.as_deref(), Some("https://api.moonshot.ai/anthropic"));
+    let minimax = crate::provider::find("minimax").unwrap();
+    assert_eq!(minimax.endpoint, "https://api.minimax.io/v1");
+    assert_eq!(minimax.anthropic_base.as_deref(), Some("https://api.minimax.io/anthropic"));
+    assert_eq!(crate::provider::claude_base(minimax), "https://api.minimax.io/anthropic");
+    let siliconflow = crate::provider::find("siliconflow").unwrap();
+    assert_eq!(siliconflow.endpoint, "https://api.siliconflow.com/v1");
+    assert_eq!(siliconflow.env, "SILICONFLOW_API_KEY");
+    assert_eq!(siliconflow.anthropic_base, None);
+    assert_eq!(crate::provider::claude_base(siliconflow), "https://api.siliconflow.com");
+    let zai = crate::provider::find("zai").unwrap();
+    assert_eq!(zai.endpoint, "https://api.z.ai/api/paas/v4");
+    assert_eq!(zai.env, "ZHIPU_API_KEY");
+    assert_eq!(zai.anthropic_base.as_deref(), Some("https://api.z.ai/api/anthropic"));
+    assert_eq!(crate::provider::claude_base(zai), "https://api.z.ai/api/anthropic");
+    assert_eq!(launch::openai_base(&zai.endpoint), "https://api.z.ai/api/paas/v4");
+    let zhipu = crate::provider::find("zhipuai").unwrap();
+    assert_eq!(zhipu.endpoint, "https://open.bigmodel.cn/api/paas/v4");
+    assert_eq!(zhipu.anthropic_base.as_deref(), Some("https://open.bigmodel.cn/api/anthropic"));
     for provider in crate::provider::catalog() {
         crate::provider::validate_id(&provider.id).unwrap();
         assert!(provider.endpoint.starts_with("https://"), "{}", provider.id);

@@ -15,12 +15,298 @@
       "env": "TOKENER_API_KEY"
     },
     {
+      "id": "abacus",
+      "name": "Abacus",
+      "endpoint": "https://routellm.abacus.ai/v1",
+      "env": "ABACUS_API_KEY"
+    },
+    {
+      "id": "alibaba",
+      "name": "Alibaba",
+      "endpoint": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "env": "DASHSCOPE_API_KEY",
+      "anthropic_base": "https://dashscope-intl.aliyuncs.com/apps/anthropic"
+    },
+    {
+      "id": "alibaba-cn",
+      "name": "Alibaba (China)",
+      "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "env": "DASHSCOPE_API_KEY",
+      "anthropic_base": "https://dashscope.aliyuncs.com/apps/anthropic"
+    },
+    {
+      "id": "alibaba-coding-plan",
+      "name": "Alibaba Coding Plan",
+      "endpoint": "https://coding-intl.dashscope.aliyuncs.com/v1",
+      "env": "ALIBABA_CODING_PLAN_API_KEY",
+      "anthropic_base": "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic"
+    },
+    {
+      "id": "alibaba-coding-plan-cn",
+      "name": "Alibaba Coding Plan (China)",
+      "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
+      "env": "ALIBABA_CODING_PLAN_API_KEY",
+      "anthropic_base": "https://coding.dashscope.aliyuncs.com/apps/anthropic"
+    },
+    {
+      "id": "alibaba-token-plan",
+      "name": "Alibaba Token Plan",
+      "endpoint": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+      "env": "ALIBABA_TOKEN_PLAN_API_KEY",
+      "anthropic_base": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic"
+    },
+    {
+      "id": "alibaba-token-plan-cn",
+      "name": "Alibaba Token Plan (China)",
+      "endpoint": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      "env": "ALIBABA_TOKEN_PLAN_API_KEY",
+      "anthropic_base": "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"
+    },
+    {
+      "id": "ambient",
+      "name": "Ambient",
+      "endpoint": "https://api.ambient.xyz/v1",
+      "env": "AMBIENT_API_KEY"
+    },
+    {
+      "id": "cortecs",
+      "name": "Cortecs",
+      "endpoint": "https://api.cortecs.ai/v1",
+      "env": "CORTECS_API_KEY"
+    },
+    {
       "id": "deepseek",
       "name": "DeepSeek",
       "endpoint": "https://api.deepseek.com",
       "env": "DEEPSEEK_API_KEY",
       "default_context": 1000000,
       "anthropic_base": "https://api.deepseek.com/anthropic"
+    },
+    {
+      "id": "echo",
+      "name": "Echo",
+      "endpoint": "https://echo.tracerml.ai/v1",
+      "env": "ECHO_API_KEY",
+      "default_context": 262144
+    },
+    {
+      "id": "empiriolabs",
+      "name": "EmpirioLabs AI",
+      "endpoint": "https://api.empiriolabs.ai/v1",
+      "env": "EMPIRIOLABS_API_KEY"
+    },
+    {
+      "id": "fastrouter",
+      "name": "FastRouter",
+      "endpoint": "https://go.fastrouter.ai/api/v1",
+      "env": "FASTROUTER_API_KEY"
+    },
+    {
+      "id": "freemodel",
+      "name": "FreeModel",
+      "endpoint": "https://cc.freemodel.dev/v1",
+      "env": "FREEMODEL_API_KEY"
+    },
+    {
+      "id": "friendli",
+      "name": "Friendli",
+      "endpoint": "https://api.friendli.ai/serverless/v1",
+      "env": "FRIENDLI_TOKEN"
+    },
+    {
+      "id": "helicone",
+      "name": "Helicone",
+      "endpoint": "https://ai-gateway.helicone.ai/v1",
+      "env": "HELICONE_API_KEY"
+    },
+    {
+      "id": "huggingface",
+      "name": "Hugging Face",
+      "endpoint": "https://router.huggingface.co/v1",
+      "env": "HF_TOKEN"
+    },
+    {
+      "id": "hyper",
+      "name": "Charm Hyper",
+      "endpoint": "https://hyper.charm.land/v1",
+      "env": "HYPER_API_KEY"
+    },
+    {
+      "id": "impossibl",
+      "name": "Impossibl",
+      "endpoint": "https://api.impossibl.com/v1",
+      "env": "IMPOSSIBL_API_KEY"
+    },
+    {
+      "id": "kenari",
+      "name": "Kenari",
+      "endpoint": "https://kenari.id/v1",
+      "env": "KENARI_API_KEY"
+    },
+    {
+      "id": "kilo",
+      "name": "Kilo Gateway",
+      "endpoint": "https://api.kilo.ai/api/gateway",
+      "env": "KILO_API_KEY"
+    },
+    {
+      "id": "lilac",
+      "name": "Lilac",
+      "endpoint": "https://api.getlilac.com/v1",
+      "env": "LILAC_API_KEY"
+    },
+    {
+      "id": "llmgateway",
+      "name": "DevPass (LLM Gateway)",
+      "endpoint": "https://api.llmgateway.io/v1",
+      "env": "LLMGATEWAY_API_KEY"
+    },
+    {
+      "id": "llmgateway-providers",
+      "name": "LLM Gateway",
+      "endpoint": "https://api.llmgateway.io/v1",
+      "env": "LLMGATEWAY_API_KEY"
+    },
+    {
+      "id": "llmtr",
+      "name": "LLMTR",
+      "endpoint": "https://llmtr.com/v1",
+      "env": "LLMTR_API_KEY"
+    },
+    {
+      "id": "minimax",
+      "name": "MiniMax (minimax.io)",
+      "endpoint": "https://api.minimax.io/v1",
+      "env": "MINIMAX_API_KEY",
+      "anthropic_base": "https://api.minimax.io/anthropic"
+    },
+    {
+      "id": "minimax-cn",
+      "name": "MiniMax (minimaxi.com)",
+      "endpoint": "https://api.minimaxi.com/v1",
+      "env": "MINIMAX_API_KEY",
+      "anthropic_base": "https://api.minimaxi.com/anthropic"
+    },
+    {
+      "id": "moonshotai",
+      "name": "Moonshot AI",
+      "endpoint": "https://api.moonshot.ai/v1",
+      "env": "MOONSHOT_API_KEY",
+      "anthropic_base": "https://api.moonshot.ai/anthropic"
+    },
+    {
+      "id": "moonshotai-cn",
+      "name": "Moonshot AI (China)",
+      "endpoint": "https://api.moonshot.cn/v1",
+      "env": "MOONSHOT_API_KEY",
+      "anthropic_base": "https://api.moonshot.cn/anthropic"
+    },
+    {
+      "id": "nearai",
+      "name": "NEAR AI Cloud",
+      "endpoint": "https://cloud-api.near.ai/v1",
+      "env": "NEARAI_API_KEY"
+    },
+    {
+      "id": "ollama-cloud",
+      "name": "Ollama Cloud",
+      "endpoint": "https://ollama.com/v1",
+      "env": "OLLAMA_API_KEY"
+    },
+    {
+      "id": "opencode",
+      "name": "OpenCode Zen",
+      "endpoint": "https://opencode.ai/zen/v1",
+      "env": "OPENCODE_API_KEY"
+    },
+    {
+      "id": "opencode-go",
+      "name": "OpenCode Go",
+      "endpoint": "https://opencode.ai/zen/go/v1",
+      "env": "OPENCODE_API_KEY"
+    },
+    {
+      "id": "pioneer",
+      "name": "Pioneer",
+      "endpoint": "https://api.pioneer.ai/v1",
+      "env": "PIONEER_API_KEY"
+    },
+    {
+      "id": "poe",
+      "name": "Poe",
+      "endpoint": "https://api.poe.com/v1",
+      "env": "POE_API_KEY"
+    },
+    {
+      "id": "requesty",
+      "name": "Requesty",
+      "endpoint": "https://router.requesty.ai/v1",
+      "env": "REQUESTY_API_KEY"
+    },
+    {
+      "id": "routing-run",
+      "name": "routing.run",
+      "endpoint": "https://api.routing.run/v1",
+      "env": "ROUTING_RUN_API_KEY"
+    },
+    {
+      "id": "siliconflow",
+      "name": "SiliconFlow",
+      "endpoint": "https://api.siliconflow.com/v1",
+      "env": "SILICONFLOW_API_KEY"
+    },
+    {
+      "id": "siliconflow-cn",
+      "name": "SiliconFlow (China)",
+      "endpoint": "https://api.siliconflow.cn/v1",
+      "env": "SILICONFLOW_CN_API_KEY"
+    },
+    {
+      "id": "the-grid-ai",
+      "name": "The Grid AI",
+      "endpoint": "https://api.thegrid.ai/v1",
+      "env": "THEGRID_API_KEY"
+    },
+    {
+      "id": "trustedrouter",
+      "name": "TrustedRouter",
+      "endpoint": "https://api.trustedrouter.com/v1",
+      "env": "TRUSTEDROUTER_API_KEY",
+      "default_context": 1000000
+    },
+    {
+      "id": "zai",
+      "name": "Z.AI",
+      "endpoint": "https://api.z.ai/api/paas/v4",
+      "env": "ZHIPU_API_KEY",
+      "anthropic_base": "https://api.z.ai/api/anthropic"
+    },
+    {
+      "id": "zai-coding-plan",
+      "name": "Z.AI Coding Plan",
+      "endpoint": "https://api.z.ai/api/coding/paas/v4",
+      "env": "ZHIPU_API_KEY",
+      "anthropic_base": "https://api.z.ai/api/anthropic"
+    },
+    {
+      "id": "zenmux",
+      "name": "ZenMux",
+      "endpoint": "https://zenmux.ai/api/v1",
+      "env": "ZENMUX_API_KEY"
+    },
+    {
+      "id": "zhipuai",
+      "name": "Zhipu AI",
+      "endpoint": "https://open.bigmodel.cn/api/paas/v4",
+      "env": "ZHIPU_API_KEY",
+      "anthropic_base": "https://open.bigmodel.cn/api/anthropic"
+    },
+    {
+      "id": "zhipuai-coding-plan",
+      "name": "Zhipu AI Coding Plan",
+      "endpoint": "https://open.bigmodel.cn/api/coding/paas/v4",
+      "env": "ZHIPU_API_KEY",
+      "anthropic_base": "https://open.bigmodel.cn/api/anthropic"
     },
     {
       "id": "tokener-dev",
