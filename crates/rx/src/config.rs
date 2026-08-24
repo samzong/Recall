@@ -48,6 +48,8 @@ pub(crate) struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

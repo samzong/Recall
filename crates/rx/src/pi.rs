@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::catalog;
 use crate::config::Paths;
 use crate::launch::{EnvLookup, openai_base};
 use crate::opencode;
@@ -60,18 +61,22 @@ pub(crate) fn prepare(
     paths: &Paths,
     env: &EnvLookup,
 ) -> Result<()> {
-    if provider.setup != Setup::Generated {
+    let allow_fetch = env.is_real() || provider.setup == Setup::Generated;
+    let document = generated_provider(provider, provider_id, base_url, key, paths, allow_fetch)?;
+    if document.get("models").and_then(Value::as_array).is_none_or(|models| models.is_empty()) {
+        if provider.setup == Setup::Generated {
+            bail!("{} returned no models from {}", provider.name, openai_base(base_url));
+        }
         return Ok(());
     }
-    let provider = generated_provider(provider, base_url, key)?;
     let recall_dir = recall_pi_dir(paths);
     fs::create_dir_all(&recall_dir)
         .with_context(|| format!("failed to create {}", recall_dir.display()))?;
-    write_json_atomic(&recall_dir.join(format!("{provider_id}-provider.json")), &provider)?;
+    write_json_atomic(&recall_dir.join(format!("{provider_id}-provider.json")), &document)?;
     let agent_dir = global_agent_dir(env)?;
     fs::create_dir_all(&agent_dir)
         .with_context(|| format!("failed to create {}", agent_dir.display()))?;
-    merge_provider(&agent_dir.join("models.json"), provider_id, provider)
+    merge_provider(&agent_dir.join("models.json"), provider_id, document)
 }
 
 pub(crate) fn env_set(env_key: &str, key: &str) -> Vec<(String, String)> {
@@ -107,12 +112,22 @@ fn user_sets_provider(passthrough: &[String]) -> bool {
     passthrough.iter().any(|arg| arg == "--provider" || arg.starts_with("--provider="))
 }
 
-fn generated_provider(provider: &Provider, base_url: &str, key: &str) -> Result<Value> {
-    let models: Vec<Value> =
-        opencode::fetch_model_map(base_url, key)?.keys().map(|id| json!({ "id": id })).collect();
-    if models.is_empty() {
-        bail!("{} returned no models from {}", provider.name, openai_base(base_url));
-    }
+fn generated_provider(
+    provider: &Provider,
+    provider_id: &str,
+    base_url: &str,
+    key: &str,
+    paths: &Paths,
+    allow_fetch: bool,
+) -> Result<Value> {
+    let models = match catalog::load_pi_models(paths, provider_id, base_url, key, allow_fetch) {
+        Ok(models) => models,
+        Err(error) if provider.setup != Setup::Generated => {
+            eprintln!("[rx] model catalog skipped: {error:#}");
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
     Ok(json!({
         "baseUrl": openai_base(base_url),
         "apiKey": format!("${}", provider.env),

@@ -19,6 +19,10 @@ struct SnapshotProvider {
     name: String,
     endpoint: String,
     env: String,
+    #[serde(default)]
+    anthropic_base: Option<String>,
+    #[serde(default)]
+    default_context: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +36,8 @@ pub(crate) struct Provider {
     pub id: String,
     pub name: String,
     pub endpoint: String,
+    pub anthropic_base: Option<String>,
+    pub default_context: Option<i64>,
     pub env: String,
     pub setup: Setup,
     pub default_model: Option<&'static str>,
@@ -61,6 +67,15 @@ pub(crate) fn resolve(id: &str, entry: Option<&ProviderConfig>) -> Result<Provid
         if let Some(env) = entry.and_then(|entry| entry.env.as_ref()) {
             provider.env.clone_from(env);
         }
+        if let Some(anthropic_base) = entry.and_then(|entry| entry.anthropic_base.as_ref()) {
+            provider.anthropic_base = Some(anthropic_base.clone());
+        } else if entry.and_then(|entry| entry.base_url.as_ref()).is_some() {
+            // A base_url override points at a different origin, so the bundled
+            // Anthropic endpoint no longer applies. Clear it so claude_base
+            // falls back to the overridden endpoint instead of sending the key
+            // to the original provider.
+            provider.anthropic_base = None;
+        }
         return Ok(provider);
     }
     let Some(entry) = entry else {
@@ -75,11 +90,17 @@ pub(crate) fn resolve(id: &str, entry: Option<&ProviderConfig>) -> Result<Provid
         id: id.to_string(),
         name: id.to_string(),
         endpoint: endpoint.clone(),
+        anthropic_base: entry.anthropic_base.clone(),
+        default_context: None,
         env: entry.env.clone().unwrap_or_else(|| generated_env(id)),
         setup: Setup::Generated,
         default_model: None,
         claude_default_model: None,
     })
+}
+
+pub(crate) fn claude_base(provider: &Provider) -> String {
+    crate::catalog::anthropic_base(provider.anthropic_base.as_deref().unwrap_or(&provider.endpoint))
 }
 
 pub(crate) fn available(config: &RxConfig) -> Result<Vec<Provider>> {
@@ -114,6 +135,8 @@ fn from_snapshot(provider: SnapshotProvider) -> Provider {
         id: provider.id,
         name: provider.name,
         endpoint: provider.endpoint,
+        anthropic_base: provider.anthropic_base,
+        default_context: provider.default_context,
         env: provider.env,
         setup,
         default_model,

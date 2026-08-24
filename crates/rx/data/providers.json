@@ -15,6 +15,14 @@
       "env": "TOKENER_API_KEY"
     },
     {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "endpoint": "https://api.deepseek.com",
+      "env": "DEEPSEEK_API_KEY",
+      "default_context": 1000000,
+      "anthropic_base": "https://api.deepseek.com/anthropic"
+    },
+    {
       "id": "tokener-dev",
       "name": "Tokener Dev",
       "endpoint": "https://api-dev.tokener.dev/v1",

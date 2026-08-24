@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -6,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::catalog;
+use crate::config::Paths;
 use crate::launch::{EnvLookup, openai_base};
 use crate::provider::{Provider, Setup};
 
@@ -14,36 +14,33 @@ pub(crate) fn config_content(
     provider: &Provider,
     base_url: &str,
     key: &str,
+    paths: &Paths,
+    allow_fetch: bool,
 ) -> Result<String> {
-    let value = match provider.setup {
-        Setup::OpenRouter => json!({
-            "provider": {
-                provider_id: {
-                    "options": {
-                        "baseURL": openai_base(base_url),
-                        "apiKey": format!("{{env:{}}}", provider.env)
-                    }
-                }
-            }
-        }),
-        Setup::Generated => {
-            let models = fetch_model_map(base_url, key)?;
-            json!({
-                "provider": {
-                    provider_id: {
-                        "npm": "@ai-sdk/openai-compatible",
-                        "name": provider.name,
-                        "options": {
-                            "baseURL": openai_base(base_url),
-                            "apiKey": format!("{{env:{}}}", provider.env)
-                        },
-                        "models": models
-                    }
-                }
-            })
+    let models = match catalog::load_opencode_models(paths, provider_id, base_url, key, allow_fetch)
+    {
+        Ok(models) => models,
+        Err(error) if provider.setup != Setup::Generated => {
+            eprintln!("[rx] model catalog skipped: {error:#}");
+            Default::default()
         }
+        Err(error) => return Err(error),
     };
-    serde_json::to_string(&value).context("failed to serialize OPENCODE_CONFIG_CONTENT")
+    let mut entry = json!({
+        "name": provider.name,
+        "options": {
+            "baseURL": openai_base(base_url),
+            "apiKey": format!("{{env:{}}}", provider.env)
+        }
+    });
+    if provider.setup == Setup::Generated {
+        entry["npm"] = json!("@ai-sdk/openai-compatible");
+    }
+    if !models.is_empty() {
+        entry["models"] = json!(models);
+    }
+    serde_json::to_string(&json!({ "provider": { provider_id: entry } }))
+        .context("failed to serialize OPENCODE_CONFIG_CONTENT")
 }
 
 pub(crate) fn auth_conflict_note(
@@ -76,21 +73,6 @@ pub(crate) fn auth_conflict_note(
 pub(crate) fn prefixed_model(provider_id: &str, model: &str) -> String {
     let prefix = format!("{provider_id}/");
     if model.starts_with(&prefix) { model.to_string() } else { format!("{prefix}{model}") }
-}
-
-pub(crate) fn fetch_model_map(base_url: &str, key: &str) -> Result<BTreeMap<String, Value>> {
-    let url = format!("{}/models", openai_base(base_url));
-    let body = catalog::fetch_get(&url, &[("Authorization", format!("Bearer {key}"))])?;
-    let payload: Value =
-        serde_json::from_str(&body).context("provider models response is not JSON")?;
-    let Some(rows) = payload.get("data").and_then(Value::as_array) else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(rows
-        .iter()
-        .filter_map(|row| row.get("id").and_then(Value::as_str))
-        .map(|id| (id.to_string(), json!({ "name": id })))
-        .collect())
 }
 
 fn opencode_auth_path(env: &EnvLookup) -> Result<PathBuf> {

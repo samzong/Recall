@@ -4,9 +4,12 @@ use std::process::{Command, Stdio};
 use anyhow::{Result, bail};
 
 use crate::args::{Harness, LaunchRequest};
+use crate::catalog;
 use crate::claude_catalog::{self, SeedOutcome};
 use crate::config::{AuthMode, Paths};
 use crate::provider::{Provider, Setup};
+
+pub(crate) use crate::catalog::{anthropic_base, openai_base};
 
 #[derive(Debug, Clone, Default)]
 pub struct EnvLookup {
@@ -49,6 +52,7 @@ pub(crate) struct ProviderTarget {
     pub provider_id: String,
     pub provider: Provider,
     pub base_url: String,
+    pub claude_url: String,
     pub key: String,
     pub model: Option<String>,
 }
@@ -84,6 +88,7 @@ pub(crate) fn configured_provider(
     Ok(Some(ProviderTarget {
         provider_id,
         base_url: provider.endpoint.clone(),
+        claude_url: crate::provider::claude_base(&provider),
         provider,
         key,
         model,
@@ -101,14 +106,20 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
     });
     if matches!(request.harness, Harness::Claude) {
         let seed = if env.is_real() {
-            claude_catalog::try_seed_user_catalog(&target.base_url, &target.key, env)?
+            claude_catalog::try_seed_user_catalog(
+                paths,
+                &target.provider_id,
+                &target.base_url,
+                &target.key,
+                env,
+            )?
         } else {
             SeedOutcome::Fallback
         };
         if target.provider.setup == Setup::OpenRouter {
             return Ok(inject_claude_openrouter(
                 request,
-                &target.base_url,
+                &target.claude_url,
                 &target.key,
                 model,
                 seed,
@@ -118,7 +129,7 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
             return Ok(inject_claude_generated_seeded(
                 request,
                 &target.provider.env,
-                &target.base_url,
+                &target.claude_url,
                 &target.key,
                 model,
             ));
@@ -208,7 +219,7 @@ fn inject_claude_openrouter_impl(
     }
     let stderr_note = match seed {
         SeedOutcome::Fallback => Some(
-            "[rx] provider user catalog seed failed; falling back to provider model discovery"
+            "[rx] provider catalog seed failed; falling back to provider model discovery"
                 .to_string(),
         ),
         SeedOutcome::Seeded { .. } => None,
@@ -362,7 +373,7 @@ fn inject(
         Harness::Claude => Ok(LaunchPlan {
             program: "claude".to_string(),
             args: request.passthrough.clone(),
-            env_set: claude_env(&provider.env, base_url, key, model),
+            env_set: claude_env(&provider.env, &target.claude_url, key, model),
             stderr_note: None,
         }),
         Harness::Codex => {
@@ -373,6 +384,18 @@ fn inject(
                 "-c".to_string(),
                 codex_provider_override(provider_id, provider, &openai_base),
             ];
+            if env.is_real() {
+                match catalog::prepare_codex_catalog(paths, provider_id, base_url, key) {
+                    Ok(Some(path)) => {
+                        args.push("-c".to_string());
+                        args.push(format!("model_catalog_json=\"{}\"", path.display()));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("[rx] catalog seed skipped: {error:#}");
+                    }
+                }
+            }
             if let Some(model) = model.filter(|_| !user_sets_model(&request.passthrough)) {
                 args.push("-c".to_string());
                 args.push(format!("model=\"{model}\""));
@@ -391,7 +414,14 @@ fn inject(
             let mut env_set = vec![(provider.env.clone(), key.to_string())];
             env_set.push((
                 "OPENCODE_CONFIG_CONTENT".to_string(),
-                crate::opencode::config_content(provider_id, provider, base_url, key)?,
+                crate::opencode::config_content(
+                    provider_id,
+                    provider,
+                    base_url,
+                    key,
+                    paths,
+                    env.is_real() || provider.setup == Setup::Generated,
+                )?,
             ));
             let mut args = request.passthrough.clone();
             if let Some(model) = model.filter(|_| !user_sets_opencode_model(&request.passthrough)) {
@@ -465,16 +495,6 @@ fn user_sets_model(passthrough: &[String]) -> bool {
         i += 1;
     }
     false
-}
-
-pub(crate) fn anthropic_base(url: &str) -> String {
-    let trimmed = url.trim_end_matches('/');
-    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
-}
-
-pub(crate) fn openai_base(url: &str) -> String {
-    let trimmed = url.trim_end_matches('/');
-    if trimmed.ends_with("/v1") { trimmed.to_string() } else { format!("{trimmed}/v1") }
 }
 
 pub(crate) fn exec(plan: &LaunchPlan) -> Result<()> {

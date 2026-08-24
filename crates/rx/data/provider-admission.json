@@ -1,7 +1,12 @@
 {
   "models_dev_ids": [
-    "openrouter"
+    "openrouter",
+    "deepseek"
   ],
+  "endpoint": {},
+  "anthropic_base": {
+    "deepseek": "https://api.deepseek.com/anthropic"
+  },
   "managed": [
     {
       "id": "tokener",

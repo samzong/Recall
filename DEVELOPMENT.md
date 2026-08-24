@@ -172,7 +172,7 @@ make run                    # TUI filter should include MT
 CI runs `make check` — the same single command you run locally. There is no separate CI-only logic.
 
 ```
-make check = cargo fmt --check → cargo clippy → cargo test
+make check = cargo audit → cargo fmt --check → cargo clippy --workspace --all-targets --features bench -- -D warnings → cargo test --workspace
 ```
 
 Regression and eval harness tests live in `src/integration/` inside the library crate. Run them with:

@@ -12,9 +12,10 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
 };
 
-use crate::args::ProvidersCommand;
+use crate::args::{ModelsCommand, ProvidersCommand};
+use crate::catalog;
 use crate::config::{AuthMode, Paths};
-use crate::launch::EnvLookup;
+use crate::launch::{self, EnvLookup};
 use crate::provider::Provider;
 
 const PAGE_SIZE: usize = 8;
@@ -75,6 +76,8 @@ struct App {
 
 impl App {
     fn new(action: Action, providers: Vec<ProviderState>) -> Self {
+        let mut providers = providers;
+        sort_provider_states(&mut providers);
         let mut app = Self {
             action,
             step: Step::Provider,
@@ -298,6 +301,7 @@ pub(crate) fn run(command: ProvidersCommand, paths: &Paths, env: &EnvLookup) -> 
         ProvidersCommand::Login { provider } => login(paths, env, provider.as_deref()),
         ProvidersCommand::Logout { provider } => logout(paths, env, provider.as_deref()),
         ProvidersCommand::Use { provider } => use_provider(paths, env, provider.as_deref()),
+        ProvidersCommand::Models(command) => models(command, paths, env),
     }
 }
 
@@ -308,8 +312,53 @@ pub(crate) fn help() -> &'static str {
         "  rx providers list\n",
         "  rx providers login [provider]\n",
         "  rx providers logout [provider]\n",
-        "  rx providers use [provider]\n\n",
+        "  rx providers use [provider]\n",
+        "  rx providers models update [provider]\n\n",
     )
+}
+
+pub(crate) fn models_help() -> &'static str {
+    concat!(
+        "rx providers models — update provider model catalogs\n\n",
+        "Usage:\n",
+        "  rx providers models update [provider]\n\n",
+    )
+}
+
+fn models(command: ModelsCommand, paths: &Paths, env: &EnvLookup) -> Result<()> {
+    match command {
+        ModelsCommand::Help => {
+            print!("{}", models_help());
+            Ok(())
+        }
+        ModelsCommand::Update { provider } => update_models(paths, env, provider.as_deref()),
+    }
+}
+
+fn update_models(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Result<()> {
+    let mut ids = Vec::new();
+    if let Some(id) = requested {
+        ids.push(id.to_string());
+    } else {
+        for state in provider_states(paths, env)? {
+            if state.configured() {
+                ids.push(state.provider.id.clone());
+            }
+        }
+        if ids.is_empty() {
+            println!("No providers configured. Run: rx providers login");
+            return Ok(());
+        }
+    }
+    for id in ids {
+        let Some(target) = launch::configured_provider(Some(&id), paths, env)? else {
+            bail!("no API key for provider '{id}'; run: rx providers login {id}");
+        };
+        let count =
+            catalog::update_models(paths, &target.provider_id, &target.base_url, &target.key)?;
+        println!("{}: {count} models", target.provider_id);
+    }
+    Ok(())
 }
 
 fn list(paths: &Paths, env: &EnvLookup) -> Result<()> {
@@ -410,7 +459,7 @@ fn provider_index(states: &[ProviderState], id: &str, configured: bool) -> Resul
 fn provider_states(paths: &Paths, env: &EnvLookup) -> Result<Vec<ProviderState>> {
     let config = crate::config::load_or_default(paths)?;
     let stored = crate::config::stored_providers(paths)?;
-    crate::provider::available(&config)?
+    let mut states = crate::provider::available(&config)?
         .into_iter()
         .map(|provider| {
             let entry = config.provider.get(&provider.id);
@@ -426,9 +475,34 @@ fn provider_states(paths: &Paths, env: &EnvLookup) -> Result<Vec<ProviderState>>
             };
             let default =
                 config.default_provider.as_deref().unwrap_or("openrouter") == provider.id.as_str();
-            Ok(ProviderState { provider, credential, environment_active, default })
+            ProviderState { provider, credential, environment_active, default }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    sort_provider_states(&mut states);
+    Ok(states)
+}
+
+fn sort_provider_states(states: &mut [ProviderState]) {
+    states.sort_by(|left, right| {
+        pin_rank(&left.provider.id)
+            .cmp(&pin_rank(&right.provider.id))
+            .then_with(|| right.configured().cmp(&left.configured()))
+            .then_with(|| {
+                left.provider
+                    .name
+                    .to_ascii_lowercase()
+                    .cmp(&right.provider.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.provider.id.cmp(&right.provider.id))
+    });
+}
+
+fn pin_rank(id: &str) -> u8 {
+    match id {
+        "openrouter" => 0,
+        "tokener" => 1,
+        _ => 2,
+    }
 }
 
 fn render_list(providers: &[&ProviderState]) -> String {
@@ -725,6 +799,8 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
                 endpoint: format!("https://{id}.test/v1"),
+                anthropic_base: None,
+                default_context: None,
                 env: format!("{}_API_KEY", id.to_ascii_uppercase()),
                 setup: Setup::Generated,
                 default_model: None,
@@ -734,6 +810,26 @@ mod tests {
             environment_active: false,
             default,
         }
+    }
+
+    #[test]
+    fn picker_pins_openrouter_and_tokener_then_configured_then_alpha() {
+        let app = App::new(
+            Action::Login,
+            vec![
+                state("zenmux", "Zenmux", true, false),
+                state("tokener", "Tokener", false, false),
+                state("abacus", "Abacus", false, false),
+                state("openrouter", "OpenRouter", false, false),
+                state("deepseek", "DeepSeek", true, false),
+            ],
+        );
+        let names = app
+            .filtered_providers()
+            .into_iter()
+            .map(|index| app.providers[index].provider.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["OpenRouter", "Tokener", "DeepSeek", "Zenmux", "Abacus"]);
     }
 
     #[test]

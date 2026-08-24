@@ -14,6 +14,8 @@ trap 'rm -f "$source_file" "$output_file"' EXIT
 curl -fsSL "$source_url" -o "$source_file"
 jq --slurpfile admission "$admission" --arg source "$source_url" --arg updated_at "$updated_at" '
   ($admission[0].models_dev_ids) as $ids
+  | ($admission[0].endpoint // {}) as $ends
+  | ($admission[0].anthropic_base // {}) as $claude
   | ([
       $ids[] as $id
       | .[$id] as $provider
@@ -29,14 +31,32 @@ jq --slurpfile admission "$admission" --arg source "$source_url" --arg updated_a
         elif (($provider.env // []) | length) != 1 then
           error("admitted models.dev provider must have exactly one credential ENV: \($id)")
         else
-          {
-            id: $id,
-            name: $provider.name,
-            endpoint: $provider.api,
-            env: $provider.env[0]
-          }
+          ([$provider.models[]?.limit.context | select(type == "number")] | unique) as $ctx
+          | {
+              id: $id,
+              name: $provider.name,
+              endpoint: $provider.api,
+              env: $provider.env[0]
+            }
+            + (if ($ctx | length) == 1 then {default_context: $ctx[0]} else {} end)
         end
-    ] + $admission[0].managed)
+    ]) as $dev
+  | ($admission[0].managed) as $managed
+  | (
+      if ($dev | length) == 0 then $managed
+      elif ($managed | length) == 0 then $dev
+      else [$dev[0]] + [$managed[0]] + $dev[1:] + $managed[1:]
+      end
+    )
+  | map(
+      . + (if ($ends[.id] | type) == "string" then
+            if (($ends[.id] | startswith("https://")) | not) or ($ends[.id] | contains("${")) then
+              error("admission endpoint override must be one fixed HTTPS URL: \(.id)")
+            else {endpoint: $ends[.id]}
+            end
+          else {} end)
+        + (if ($claude[.id] | type) == "string" then {anthropic_base: $claude[.id]} else {} end)
+    )
   | {
       source: $source,
       updated_at: $updated_at,

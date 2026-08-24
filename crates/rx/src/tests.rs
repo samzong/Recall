@@ -6,7 +6,9 @@ use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use crate::args::{Command, Harness, LaunchRequest, ProvidersCommand, parse, rewrite_argv0};
+use crate::args::{
+    Command, Harness, LaunchRequest, ModelsCommand, ProvidersCommand, parse, rewrite_argv0,
+};
 use crate::config::{self, Paths};
 use crate::launch::{self, EnvLookup};
 
@@ -22,6 +24,76 @@ fn temp_paths() -> (tempfile::TempDir, Paths) {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::in_dir(dir.path().to_path_buf());
     (dir, paths)
+}
+
+fn serve_openai_models(body: &str) -> (String, thread::JoinHandle<()>) {
+    serve_openai_models_times(body, 1)
+}
+
+fn serve_openai_models_times(body: &str, times: usize) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let body = body.to_string();
+    let server = thread::spawn(move || {
+        for _ in 0..times {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let size = stream.read(&mut request).unwrap();
+            let req = String::from_utf8_lossy(&request[..size]);
+            assert!(req.contains("GET /v1/models "), "{req}");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    (base_url, server)
+}
+
+fn serve_openai_error(status: u16) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 2048];
+        let _ = stream.read(&mut request);
+        write!(
+            stream,
+            "HTTP/1.1 {status} ERR\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfail"
+        )
+        .unwrap();
+    });
+    (base_url, server)
+}
+
+fn serve_openai_models_then_error(body: &str, status: u16) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let body = body.to_string();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 2048];
+        let size = stream.read(&mut request).unwrap();
+        let req = String::from_utf8_lossy(&request[..size]);
+        assert!(req.contains("GET /v1/models "), "{req}");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 2048];
+        let _ = stream.read(&mut request);
+        write!(
+            stream,
+            "HTTP/1.1 {status} ERR\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfail"
+        )
+        .unwrap();
+    });
+    (base_url, server)
 }
 
 #[test]
@@ -103,12 +175,30 @@ fn claude_help_is_passthrough() {
 }
 
 #[test]
+fn bare_rx_is_harness_picker() {
+    assert_eq!(parse_line(&["rx"]), Command::PickHarness { provider: None });
+}
+
+#[test]
+fn bare_rx_with_provider_is_harness_picker() {
+    assert_eq!(
+        parse_line(&["rx", "--provider", "deepseek"]),
+        Command::PickHarness { provider: Some("deepseek".to_string()) }
+    );
+    assert_eq!(
+        parse_line(&["rx", "--provider=deepseek"]),
+        Command::PickHarness { provider: Some("deepseek".to_string()) }
+    );
+}
+
+#[test]
 fn rx_help_and_version() {
     assert_eq!(parse_line(&["rx", "--help"]), Command::Help);
     assert_eq!(parse_line(&["rx", "-V"]), Command::Version);
     assert!(!crate::help_text().contains("rx config"));
     assert!(crate::help_text().contains("rx --provider <provider> <harness>"));
     assert!(crate::help_text().contains("rx providers <list|login|logout|use>"));
+    assert!(crate::help_text().contains("rx providers models update [provider]"));
     assert!(!crate::help_text().contains("rx providers list\n"));
     assert!(!crate::help_text().contains("rx debug"));
 }
@@ -290,6 +380,20 @@ fn providers_commands_parse() {
         parse_line(&["rx", "providers", "use", "tokener-dev"]),
         Command::Providers(ProvidersCommand::Use { provider: Some("tokener-dev".to_string()) })
     );
+    assert_eq!(
+        parse_line(&["rx", "providers", "models"]),
+        Command::Providers(ProvidersCommand::Models(ModelsCommand::Help))
+    );
+    assert_eq!(
+        parse_line(&["rx", "providers", "models", "update"]),
+        Command::Providers(ProvidersCommand::Models(ModelsCommand::Update { provider: None }))
+    );
+    assert_eq!(
+        parse_line(&["rx", "providers", "models", "update", "openrouter"]),
+        Command::Providers(ProvidersCommand::Models(ModelsCommand::Update {
+            provider: Some("openrouter".to_string()),
+        }))
+    );
 }
 
 #[test]
@@ -299,25 +403,70 @@ fn provider_command_rejects_multiple_provider_arguments() {
 }
 
 #[test]
+fn providers_models_unknown_command_errors() {
+    let error = parse(&args(&["rx", "providers", "models", "list"])).unwrap_err();
+    assert!(error.to_string().contains("unknown providers models command: list"), "{error}");
+}
+
+#[test]
+fn providers_models_update_rejects_multiple_provider_arguments() {
+    let error = parse(&args(&["rx", "providers", "models", "update", "openrouter", "tokener"]))
+        .unwrap_err();
+    assert!(error.to_string().contains("usage: rx providers models update [provider]"), "{error}");
+}
+
+#[test]
 fn bundled_providers_match_the_admission_list() {
     let admission: serde_json::Value =
         serde_json::from_str(include_str!("../data/provider-admission.json")).unwrap();
-    let admitted = admission["models_dev_ids"]
+    let models_dev = admission["models_dev_ids"]
         .as_array()
         .unwrap()
         .iter()
-        .chain(admission["managed"].as_array().unwrap())
-        .map(|entry| entry.as_str().or_else(|| entry["id"].as_str()).unwrap().to_string())
+        .map(|entry| entry.as_str().unwrap().to_string())
         .collect::<Vec<_>>();
+    let managed = admission["managed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let mut admitted = Vec::new();
+    if let Some(first) = models_dev.first() {
+        admitted.push(first.clone());
+    }
+    if let Some(second) = managed.first() {
+        admitted.push(second.clone());
+    }
+    if models_dev.len() > 1 {
+        admitted.extend(models_dev.into_iter().skip(1));
+    }
+    if managed.len() > 1 {
+        admitted.extend(managed.into_iter().skip(1));
+    }
     let bundled =
         crate::provider::catalog().iter().map(|provider| provider.id.clone()).collect::<Vec<_>>();
     assert_eq!(bundled, admitted);
     assert_eq!(bundled.first().map(String::as_str), Some("openrouter"));
+    assert_eq!(bundled.get(1).map(String::as_str), Some("tokener"));
+    let deepseek = crate::provider::find("deepseek").unwrap();
+    assert_eq!(deepseek.endpoint, "https://api.deepseek.com");
+    assert_eq!(deepseek.env, "DEEPSEEK_API_KEY");
+    assert_eq!(deepseek.anthropic_base.as_deref(), Some("https://api.deepseek.com/anthropic"));
+    assert_eq!(deepseek.default_context, Some(1_000_000));
+    assert_eq!(crate::provider::claude_base(deepseek), "https://api.deepseek.com/anthropic");
     for provider in crate::provider::catalog() {
         crate::provider::validate_id(&provider.id).unwrap();
         assert!(provider.endpoint.starts_with("https://"), "{}", provider.id);
         assert!(!provider.endpoint.contains("${"), "{}", provider.id);
         assert!(!provider.env.is_empty(), "{}", provider.id);
+        if let Some(claude) = &provider.anthropic_base {
+            assert!(claude.starts_with("https://"), "{}", provider.id);
+            assert!(!claude.contains("${"), "{}", provider.id);
+        }
+        if let Some(context) = provider.default_context {
+            assert!(context > 0, "{}", provider.id);
+        }
     }
 }
 
@@ -399,7 +548,7 @@ fn claude_openrouter_uses_api_key_and_discovery_fallback_without_seed() {
             .iter()
             .any(|(k, v)| k == "ANTHROPIC_MODEL" && v == "~anthropic/claude-sonnet-latest")
     );
-    assert!(plan.stderr_note.as_deref().unwrap().contains("user catalog seed failed"));
+    assert!(plan.stderr_note.as_deref().unwrap().contains("catalog seed failed"));
 }
 
 #[test]
@@ -496,6 +645,20 @@ fn opencode_openrouter_injects_config_and_model() {
         .unwrap();
     assert!(config.contains("openrouter"));
     assert!(config.contains("OPENROUTER_API_KEY"));
+}
+
+#[test]
+fn opencode_non_generated_catalog_failure_degrades_to_base_config() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) = serve_openai_error(500);
+    let provider = crate::provider::find("openrouter").unwrap();
+    let config =
+        crate::opencode::config_content("openrouter", provider, &base_url, "sk-test", &paths, true)
+            .unwrap();
+    server.join().unwrap();
+    let document: serde_json::Value = serde_json::from_str(&config).unwrap();
+    assert_eq!(document["provider"]["openrouter"]["options"]["baseURL"], format!("{base_url}/v1"));
+    assert!(document["provider"]["openrouter"].get("models").is_none());
 }
 
 #[test]
@@ -855,19 +1018,18 @@ model = "gpt-prod"
     assert_eq!(codex.env_set, vec![("TOKENER_DEV_API_KEY".to_string(), "sk-dev".to_string())]);
 
     let server = thread::spawn(move || {
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0; 1024];
-            let size = stream.read(&mut request).unwrap();
-            assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /v1/models "));
-            let body = r#"{"data":[{"id":"gpt-dev"}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-        }
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 2048];
+        let size = stream.read(&mut request).unwrap();
+        let req = String::from_utf8_lossy(&request[..size]);
+        assert!(req.contains("GET /v1/models "), "{req}");
+        let body = r#"{"data":[{"id":"gpt-dev"}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
     });
 
     let opencode = launch::plan(
@@ -961,6 +1123,389 @@ fn url_helpers_strip_or_add_v1() {
     );
     assert_eq!(launch::openai_base("https://api.tokener.dev"), "https://api.tokener.dev/v1");
     assert_eq!(launch::openai_base("https://openrouter.ai/api/v1"), "https://openrouter.ai/api/v1");
+    assert_eq!(launch::openai_base("https://api.z.ai/api/paas/v4"), "https://api.z.ai/api/paas/v4");
+    assert_eq!(
+        launch::openai_base("https://api.z.ai/api/coding/paas/v4/"),
+        "https://api.z.ai/api/coding/paas/v4"
+    );
+}
+
+#[test]
+fn claude_base_uses_explicit_anthropic_origin() {
+    let openrouter = crate::provider::find("openrouter").unwrap();
+    assert_eq!(crate::provider::claude_base(openrouter), "https://openrouter.ai/api");
+
+    let override_entry = crate::config::ProviderConfig {
+        anthropic_base: Some("https://api.deepseek.com/anthropic/v1".to_string()),
+        ..crate::config::ProviderConfig::default()
+    };
+    let overridden = crate::provider::resolve("openrouter", Some(&override_entry)).unwrap();
+    assert_eq!(crate::provider::claude_base(&overridden), "https://api.deepseek.com/anthropic");
+    assert_eq!(overridden.endpoint, openrouter.endpoint);
+
+    let (_dir, paths) = temp_paths();
+    fs::write(
+        &paths.config,
+        r#"default_provider = "moonshot"
+
+[provider.moonshot]
+base_url = "https://api.moonshot.ai/v1"
+anthropic_base = "https://api.moonshot.ai/anthropic"
+"#,
+    )
+    .unwrap();
+    config::login(&paths, "moonshot", "sk-moon".to_string()).unwrap();
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Claude,
+            provider: Some("moonshot".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &EnvLookup::isolated(HashMap::new()),
+    )
+    .unwrap();
+    assert!(
+        plan.env_set
+            .iter()
+            .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "https://api.moonshot.ai/anthropic")
+    );
+    let codex = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Codex,
+            provider: Some("moonshot".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &EnvLookup::isolated(HashMap::new()),
+    )
+    .unwrap();
+    assert!(codex.args[3].contains("base_url=\"https://api.moonshot.ai/v1\""));
+}
+
+#[test]
+fn base_url_override_clears_bundled_anthropic_base() {
+    let deepseek = crate::provider::find("deepseek").unwrap();
+    assert_eq!(crate::provider::claude_base(deepseek), "https://api.deepseek.com/anthropic");
+
+    let override_entry = crate::config::ProviderConfig {
+        base_url: Some("https://proxy.example.com/v1".to_string()),
+        ..crate::config::ProviderConfig::default()
+    };
+    let overridden = crate::provider::resolve("deepseek", Some(&override_entry)).unwrap();
+    assert_eq!(overridden.endpoint, "https://proxy.example.com/v1");
+    assert_eq!(crate::provider::claude_base(&overridden), "https://proxy.example.com");
+}
+
+#[test]
+fn openai_data_becomes_codex_model_catalog_json() {
+    let models = crate::catalog::parse_openai_models(
+        r#"{"data":[{"id":"gpt-5.6-sol","name":"GPT 5.6 Sol"},{"id":"claude-sonnet-5"}]}"#,
+    )
+    .unwrap();
+    let catalog = crate::catalog::synthesize_codex_catalog(&models);
+    assert_eq!(catalog["models"][0]["slug"], "gpt-5.6-sol");
+    assert_eq!(catalog["models"][0]["display_name"], "GPT 5.6 Sol");
+    assert_eq!(catalog["models"][0]["visibility"], "list");
+    assert_eq!(catalog["models"][0]["supported_in_api"], true);
+    assert_eq!(catalog["models"][0]["context_window"], 200_000);
+    assert_eq!(catalog["models"][0]["supported_reasoning_levels"], serde_json::json!([]));
+    assert_eq!(catalog["models"][0]["shell_type"], "shell_command");
+    assert_eq!(catalog["models"][0]["priority"], 1);
+    assert_eq!(catalog["models"][0]["truncation_policy"]["mode"], "bytes");
+    assert_eq!(catalog["models"][0]["base_instructions"], "");
+    assert_eq!(catalog["models"][1]["slug"], "claude-sonnet-5");
+    assert_eq!(catalog["models"][1]["display_name"], "claude-sonnet-5");
+}
+
+#[test]
+fn openai_data_without_context_still_seeds_claude_picker() {
+    let models =
+        crate::catalog::parse_openai_models(r#"{"data":[{"id":"openai/gpt-5.6-sol"}]}"#).unwrap();
+    let seed = crate::claude_catalog::seed_from_listed("tokener", &models);
+    assert_eq!(seed.provider_id, "tokener");
+    assert_eq!(seed.additional_model_options.len(), 1);
+    assert_eq!(seed.additional_model_options[0].value, "openai/gpt-5.6-sol");
+}
+
+#[test]
+fn openai_body_without_context_falls_back_to_listed_claude_seed() {
+    let body = r#"{"data":[{"id":"deepseek-v4-flash"},{"id":"deepseek-v4-pro"}]}"#;
+    let models = crate::catalog::parse_openai_models(body).unwrap();
+    let seed = crate::claude_catalog::seed_from_openai_body("deepseek", body, &models);
+    assert_eq!(seed.provider_id, "deepseek");
+    assert_eq!(seed.additional_model_options.len(), 2);
+    assert_eq!(seed.additional_model_options[0].value, "deepseek-v4-flash");
+    assert_eq!(seed.additional_model_options[0].description, "1M context");
+    assert_eq!(seed.additional_model_options[1].value, "deepseek-v4-pro");
+    assert_eq!(seed.auto_compact_windows["deepseek-v4-flash"], 1_000_000);
+}
+
+#[test]
+fn openai_body_fills_omitted_context_among_models_with_windows() {
+    let body = r#"{"data":[{"id":"with-ctx","context_length":200000},{"id":"no-ctx"}]}"#;
+    let models = crate::catalog::parse_openai_models(body).unwrap();
+    let seed = crate::claude_catalog::seed_from_openai_body("tokener", body, &models);
+    let values = seed
+        .additional_model_options
+        .iter()
+        .map(|option| option.value.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["with-ctx", "no-ctx"]);
+    assert_eq!(seed.auto_compact_windows["no-ctx"], 200_000);
+    assert_eq!(
+        seed.additional_model_options
+            .iter()
+            .find(|option| option.value == "no-ctx")
+            .unwrap()
+            .description,
+        "200K context"
+    );
+}
+
+#[test]
+fn isolated_codex_plan_does_not_write_model_catalog_json() {
+    let (_dir, paths) = temp_paths();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "TOKENER_API_KEY".to_string(),
+        "sk-tokener".to_string(),
+    )]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Codex,
+            provider: Some("tokener".to_string()),
+            passthrough: vec!["exec".to_string()],
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert!(!plan.args.iter().any(|arg| arg.contains("model_catalog_json")));
+    assert!(!paths.dir.join("catalogs").exists());
+}
+
+#[test]
+fn prepare_codex_catalog_writes_processed_provider_file() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) = serve_openai_models(
+        r#"{"data":[{"id":"gpt-5.6-sol","name":"Sol","context_length":200000}]}"#,
+    );
+    let path = crate::catalog::prepare_codex_catalog(&paths, "tokener", &base_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(path, paths.dir.join("catalogs/tokener.json"));
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(document["models"][0]["slug"], "gpt-5.6-sol");
+    assert_eq!(document["models"][0]["display_name"], "Sol");
+    assert!(document.get("fetched_at").is_none());
+    assert!(paths.dir.join("catalogs/tokener.claude.json").is_file());
+    assert!(paths.dir.join("catalogs/tokener.opencode.json").is_file());
+    assert!(paths.dir.join("catalogs/tokener.pi.json").is_file());
+    assert!(paths.dir.join("catalogs/tokener.meta.json").is_file());
+}
+
+#[test]
+fn missing_context_uses_models_dev_provider_default() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"deepseek-v4-flash"}]}"#);
+    let path = crate::catalog::prepare_codex_catalog(&paths, "deepseek", &base_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    server.join().unwrap();
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(document["models"][0]["context_window"], 1_000_000);
+    let seed: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(paths.dir.join("catalogs/deepseek.claude.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(seed["additional_model_options"][0]["description"], "1M context");
+}
+
+#[test]
+fn providers_models_update_bypasses_fresh_cache() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) =
+        serve_openai_models_times(r#"{"data":[{"id":"first"},{"id":"second"}]}"#, 2);
+    crate::catalog::prepare_codex_catalog(&paths, "openrouter", &base_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    let count = crate::catalog::update_models(&paths, "openrouter", &base_url, "sk-test").unwrap();
+    server.join().unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn providers_models_update_command_fetches_configured_provider() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"sol"}]}"#);
+    fs::write(&paths.config, format!("[provider.lab]\nbase_url = \"{base_url}\"\n")).unwrap();
+    config::login(&paths, "lab", "sk-test".to_string()).unwrap();
+    crate::providers::run(
+        ProvidersCommand::Models(ModelsCommand::Update { provider: Some("lab".to_string()) }),
+        &paths,
+        &EnvLookup::isolated(HashMap::new()),
+    )
+    .unwrap();
+    server.join().unwrap();
+    assert!(paths.dir.join("catalogs/lab.json").is_file());
+    assert!(paths.dir.join("catalogs/lab.claude.json").is_file());
+}
+
+#[test]
+fn provider_catalog_cache_is_reused_until_expiry() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"gpt-5.6-sol","name":"Sol"}]}"#);
+    let first = crate::catalog::prepare_codex_catalog(&paths, "openrouter", &base_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    server.join().unwrap();
+    let second = crate::catalog::prepare_codex_catalog(&paths, "openrouter", &base_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, second);
+    let models =
+        crate::catalog::load_opencode_models(&paths, "openrouter", &base_url, "sk-test", false)
+            .unwrap();
+    assert!(models.contains_key("gpt-5.6-sol"));
+    let pi =
+        crate::catalog::load_pi_models(&paths, "openrouter", &base_url, "sk-test", false).unwrap();
+    assert_eq!(pi[0]["id"], "gpt-5.6-sol");
+}
+
+#[test]
+fn catalogs_are_written_per_provider() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) = serve_openai_models_times(r#"{"data":[{"id":"shared-model"}]}"#, 2);
+    crate::catalog::prepare_codex_catalog(&paths, "openrouter", &base_url, "sk-or")
+        .unwrap()
+        .unwrap();
+    crate::catalog::prepare_codex_catalog(&paths, "tokener", &base_url, "sk-tokener")
+        .unwrap()
+        .unwrap();
+    server.join().unwrap();
+    assert!(paths.dir.join("catalogs/openrouter.json").is_file());
+    assert!(paths.dir.join("catalogs/tokener.json").is_file());
+    assert_ne!(paths.dir.join("catalogs/openrouter.json"), paths.dir.join("catalogs/tokener.json"));
+}
+
+#[test]
+fn expired_catalog_is_refetched() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) = serve_openai_models_times(r#"{"data":[{"id":"gpt-5.6-sol"}]}"#, 2);
+    crate::catalog::prepare_codex_catalog(&paths, "openrouter", &base_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    let meta_path = paths.dir.join("catalogs/openrouter.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["fetched_at"] = serde_json::json!(0);
+    fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+    crate::catalog::prepare_codex_catalog(&paths, "openrouter", &base_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn catalog_endpoint_change_misses_cache() {
+    let (_dir, paths) = temp_paths();
+    let (first_url, first_server) = serve_openai_models(r#"{"data":[{"id":"first"}]}"#);
+    crate::catalog::prepare_codex_catalog(&paths, "tokener", &first_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    first_server.join().unwrap();
+    let (second_url, second_server) = serve_openai_models(r#"{"data":[{"id":"second"}]}"#);
+    let path = crate::catalog::prepare_codex_catalog(&paths, "tokener", &second_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    second_server.join().unwrap();
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(document["models"][0]["slug"], "second");
+}
+
+#[test]
+fn catalog_refresh_failure_does_not_reuse_other_endpoint() {
+    let (_dir, paths) = temp_paths();
+    let (first_url, first_server) = serve_openai_models(r#"{"data":[{"id":"first"}]}"#);
+    crate::catalog::prepare_codex_catalog(&paths, "tokener", &first_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    first_server.join().unwrap();
+    let (error_url, error_server) = serve_openai_error(500);
+    let error = crate::catalog::prepare_codex_catalog(&paths, "tokener", &error_url, "sk-test")
+        .unwrap_err();
+    error_server.join().unwrap();
+    assert!(error.to_string().contains("HTTP 500"), "{error:#}");
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(paths.dir.join("catalogs/tokener.json")).unwrap())
+            .unwrap();
+    assert_eq!(document["models"][0]["slug"], "first");
+}
+
+#[test]
+fn catalog_refresh_failure_reuses_same_endpoint() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) = serve_openai_models_then_error(r#"{"data":[{"id":"first"}]}"#, 500);
+    crate::catalog::prepare_codex_catalog(&paths, "tokener", &base_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    let meta_path = paths.dir.join("catalogs/tokener.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["fetched_at"] = serde_json::json!(0);
+    fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+    let path = crate::catalog::prepare_codex_catalog(&paths, "tokener", &base_url, "sk-test")
+        .unwrap()
+        .unwrap();
+    server.join().unwrap();
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(document["models"][0]["slug"], "first");
+}
+
+#[test]
+fn claude_seed_uses_openai_models_and_merges_from_cache() {
+    let (_dir, paths) = temp_paths();
+    let config_dir = tempfile::tempdir().unwrap();
+    let (base_url, server) = serve_openai_models(
+        r#"{"data":[{"id":"claude-sonnet-5","display_name":"Sonnet 5","max_input_tokens":200000}]}"#,
+    );
+    let env = EnvLookup::isolated(HashMap::from([(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        config_dir.path().display().to_string(),
+    )]));
+    let first = crate::claude_catalog::try_seed_user_catalog(
+        &paths,
+        "openrouter",
+        &base_url,
+        "sk-test",
+        &env,
+    )
+    .unwrap();
+    server.join().unwrap();
+    assert!(matches!(first, crate::claude_catalog::SeedOutcome::Seeded { model_count: 1 }));
+    let cached: crate::claude_catalog::SeedCaches = serde_json::from_str(
+        &fs::read_to_string(paths.dir.join("catalogs/openrouter.claude.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cached.provider_id, "openrouter");
+    let second = crate::claude_catalog::try_seed_user_catalog(
+        &paths,
+        "openrouter",
+        &base_url,
+        "sk-test",
+        &env,
+    )
+    .unwrap();
+    assert!(matches!(second, crate::claude_catalog::SeedOutcome::Seeded { model_count: 1 }));
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(config_dir.path().join(".claude.json")).unwrap())
+            .unwrap();
+    assert_eq!(document["additionalModelOptionsCache"][0]["value"], "claude-sonnet-5");
 }
 
 #[test]
@@ -1057,6 +1602,115 @@ fn openrouter_seed_writes_claude_json() {
 }
 
 #[test]
+fn claude_seed_replaces_previous_provider_catalog_without_dropping_unowned_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".claude.json");
+    let openrouter = crate::catalog::parse_openai_models(
+        r#"{"data":[{"id":"google/gemini-3.7-flash","name":"Gemini","context_length":200000}]}"#,
+    )
+    .unwrap();
+    crate::claude_catalog::write_seed_for_test(
+        &config_path,
+        &crate::claude_catalog::seed_from_listed("openrouter", &openrouter),
+    )
+    .unwrap();
+
+    let mut document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    document["additionalModelOptionsCache"].as_array_mut().unwrap().push(serde_json::json!({
+        "value": "user-model",
+        "label": "User",
+        "description": "manual",
+    }));
+    document["modelAccessCache"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({ "apiName": "user-model", "entitled": true }));
+    document["additionalModelCostsCache"]["user-model"] =
+        serde_json::json!({ "inputTokens": 42.0 });
+    document["autoCompactWindowsCache"]["user-model"] = serde_json::json!(123_456);
+    document["cachedGrowthBookFeatures"]["tengu_tool_search_unsupported_models"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("user-model"));
+    fs::write(&config_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    let tokener = crate::catalog::parse_openai_models(
+        r#"{"data":[{"id":"claude-sonnet-5","name":"Sonnet 5","context_length":200000}]}"#,
+    )
+    .unwrap();
+    crate::claude_catalog::write_seed_for_test(
+        &config_path,
+        &crate::claude_catalog::seed_from_listed("tokener", &tokener),
+    )
+    .unwrap();
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let values = document["additionalModelOptionsCache"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["value"].as_str())
+        .collect::<Vec<_>>();
+    assert!(!values.contains(&"google/gemini-3.7-flash"));
+    assert!(values.contains(&"claude-sonnet-5"));
+    assert!(values.contains(&"user-model"));
+    assert_eq!(document["rxSeededCatalog"]["provider_id"], "tokener");
+
+    let access = document["modelAccessCache"].as_array().unwrap();
+    assert!(!access.iter().any(|entry| entry["apiName"] == "google/gemini-3.7-flash"));
+    assert!(access.iter().any(|entry| entry["apiName"] == "claude-sonnet-5"));
+    assert!(access.iter().any(|entry| entry["apiName"] == "user-model"));
+    assert_eq!(document["additionalModelCostsCache"]["user-model"]["inputTokens"], 42.0);
+    assert_eq!(document["autoCompactWindowsCache"]["user-model"], 123_456);
+    let denylist = document["cachedGrowthBookFeatures"]["tengu_tool_search_unsupported_models"]
+        .as_array()
+        .unwrap();
+    assert!(!denylist.iter().any(|entry| entry == "google/gemini-3.7-flash"));
+    assert!(denylist.iter().any(|entry| entry == "user-model"));
+}
+
+#[test]
+fn claude_seed_first_run_preserves_preexisting_catalog_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".claude.json");
+    fs::write(
+        &config_path,
+        r#"{"additionalModelOptionsCache":[{"value":"user-model","label":"User","description":"manual"}],"modelAccessCache":[{"apiName":"user-model","entitled":true}]}"#,
+    )
+    .unwrap();
+    let models = crate::catalog::parse_openai_models(
+        r#"{"data":[{"id":"claude-sonnet-5","name":"Sonnet 5","context_length":200000}]}"#,
+    )
+    .unwrap();
+    crate::claude_catalog::write_seed_for_test(
+        &config_path,
+        &crate::claude_catalog::seed_from_listed("openrouter", &models),
+    )
+    .unwrap();
+
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let values = document["additionalModelOptionsCache"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["value"].as_str())
+        .collect::<Vec<_>>();
+    assert!(values.contains(&"user-model"), "preexisting entry was dropped: {values:?}");
+    assert!(values.contains(&"claude-sonnet-5"));
+    assert!(
+        document["modelAccessCache"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["apiName"] == "user-model"),
+        "preexisting model access entry was dropped"
+    );
+    assert_eq!(document["rxSeededCatalog"]["provider_id"], "openrouter");
+}
+
+#[test]
 fn claude_seed_refreshes_and_removes_unmodified_owned_payloads() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join(".claude.json");
@@ -1132,7 +1786,7 @@ fn claude_seed_refreshes_and_removes_unmodified_owned_payloads() {
 }
 
 #[test]
-fn claude_seed_preserves_user_modified_and_unowned_payloads() {
+fn claude_seed_reclaims_modified_owned_payloads_and_preserves_unowned() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join(".claude.json");
     fs::write(
@@ -1187,9 +1841,7 @@ fn claude_seed_preserves_user_modified_and_unowned_payloads() {
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     let options = document["additionalModelOptionsCache"].as_array().unwrap();
     assert!(
-        options.iter().any(|entry| {
-            entry["value"] == "claude-edited" && entry["label"] == "User Override"
-        })
+        options.iter().any(|entry| { entry["value"] == "claude-edited" && entry["label"] == "RX" })
     );
     assert!(options.iter().any(|entry| entry["value"] == "user-owned"));
     assert!(
@@ -1197,14 +1849,14 @@ fn claude_seed_preserves_user_modified_and_unowned_payloads() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|entry| { entry["apiName"] == "claude-edited" && entry["entitled"] == false })
+            .any(|entry| { entry["apiName"] == "claude-edited" && entry["entitled"] == true })
     );
-    assert_eq!(document["additionalModelCostsCache"]["claude-edited"]["inputTokens"], 99.0);
-    assert_eq!(document["autoCompactWindowsCache"]["claude-edited"], 123_456);
+    assert_eq!(document["additionalModelCostsCache"]["claude-edited"]["inputTokens"], 1.0);
+    assert_eq!(document["autoCompactWindowsCache"]["claude-edited"], 200_000);
 }
 
 #[test]
-fn claude_seed_preserves_user_deletion_of_owned_payloads() {
+fn claude_seed_recreates_deleted_owned_payloads() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join(".claude.json");
     let seed = crate::claude_catalog::build_seed(&[crate::claude_catalog::UserModel {
@@ -1247,23 +1899,23 @@ fn claude_seed_preserves_user_deletion_of_owned_payloads() {
     let document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     assert!(
-        !document["additionalModelOptionsCache"]
+        document["additionalModelOptionsCache"]
             .as_array()
             .unwrap()
             .iter()
             .any(|entry| entry["value"] == "openai/deleted")
     );
     assert!(
-        !document["modelAccessCache"]
+        document["modelAccessCache"]
             .as_array()
             .unwrap()
             .iter()
             .any(|entry| entry["apiName"] == "openai/deleted")
     );
-    assert!(document["additionalModelCostsCache"].get("openai/deleted").is_none());
-    assert!(document["autoCompactWindowsCache"].get("openai/deleted").is_none());
+    assert_eq!(document["additionalModelCostsCache"]["openai/deleted"]["inputTokens"], 1.0);
+    assert_eq!(document["autoCompactWindowsCache"]["openai/deleted"], 200_000);
     assert!(
-        !document["cachedGrowthBookFeatures"]["tengu_tool_search_unsupported_models"]
+        document["cachedGrowthBookFeatures"]["tengu_tool_search_unsupported_models"]
             .as_array()
             .unwrap()
             .iter()
@@ -1451,7 +2103,10 @@ fn live_openrouter_seed_populates_claude_json() {
         ("CLAUDE_CONFIG_DIR".to_string(), dir.path().display().to_string()),
         ("OPENROUTER_API_KEY".to_string(), key),
     ]));
+    let paths = Paths::in_dir(recall);
     let outcome = crate::claude_catalog::try_seed_user_catalog(
+        &paths,
+        "openrouter",
         "https://openrouter.ai/api",
         &env.get("OPENROUTER_API_KEY").unwrap(),
         &env,

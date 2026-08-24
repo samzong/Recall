@@ -6,9 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::launch::{EnvLookup, anthropic_base};
+use crate::catalog::{self, ListedModel};
+use crate::config::Paths;
+use crate::launch::EnvLookup;
 
 const MIN_CONTEXT: i64 = 100_000;
 const MAX_CONTEXT: i64 = 1_000_000;
@@ -65,21 +68,23 @@ pub(crate) struct Pricing {
     pub web_search: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelOption {
     pub value: String,
     pub label: String,
     pub description: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelAccess {
     pub api_name: String,
     pub max_effort_level: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) struct SeedCaches {
+    #[serde(default)]
+    pub provider_id: String,
     pub additional_model_options: Vec<ModelOption>,
     pub model_access: Vec<ModelAccess>,
     pub tool_search_denylist: Vec<String>,
@@ -94,22 +99,17 @@ pub(crate) enum SeedOutcome {
 }
 
 pub(crate) fn try_seed_user_catalog(
+    paths: &Paths,
+    provider_id: &str,
     base_url: &str,
     api_key: &str,
     env: &EnvLookup,
 ) -> Result<SeedOutcome> {
-    let models = match fetch_user_catalog(base_url, api_key) {
-        Ok(models) if !models.is_empty() => models,
-        Ok(_) => return Ok(SeedOutcome::Fallback),
-        Err(_) => return Ok(SeedOutcome::Fallback),
+    let caches = match catalog::load_claude_seed(paths, provider_id, base_url, api_key) {
+        Ok(Some(caches)) if !caches.additional_model_options.is_empty() => caches,
+        _ => return Ok(SeedOutcome::Fallback),
     };
-    let caches = build_seed(&models);
-    if caches.additional_model_options.is_empty() {
-        return Ok(SeedOutcome::Fallback);
-    }
     let config_path = claude_config_path(env);
-    // Seeding is an optional enhancement: any local failure must degrade to
-    // Fallback instead of blocking the launch.
     match write_seed(&config_path, &caches) {
         Ok(()) => Ok(SeedOutcome::Seeded { model_count: caches.additional_model_options.len() }),
         Err(error) => {
@@ -119,10 +119,57 @@ pub(crate) fn try_seed_user_catalog(
     }
 }
 
-pub(crate) fn fetch_user_catalog(base_url: &str, api_key: &str) -> Result<Vec<UserModel>> {
-    let url = format!("{}/v1/models/user?limit=1000", anthropic_base(base_url));
-    let body = crate::catalog::fetch_get(&url, &[("Authorization", format!("Bearer {api_key}"))])?;
-    parse_user_catalog(&body)
+pub(crate) fn seed_from_listed(provider_id: &str, models: &[ListedModel]) -> SeedCaches {
+    with_provider(provider_id, build_seed(&from_listed_models(provider_id, models)))
+}
+
+pub(crate) fn seed_from_openai_body(
+    provider_id: &str,
+    body: &str,
+    fallback: &[ListedModel],
+) -> SeedCaches {
+    if let Ok(models) = parse_user_catalog(body)
+        && !models.is_empty()
+    {
+        let models = apply_fallback_context(provider_id, models);
+        let seed = with_provider(provider_id, build_seed(&models));
+        if !seed.additional_model_options.is_empty() {
+            return seed;
+        }
+    }
+    seed_from_listed(provider_id, fallback)
+}
+
+fn apply_fallback_context(provider_id: &str, models: Vec<UserModel>) -> Vec<UserModel> {
+    let fallback = catalog::fallback_context(provider_id);
+    models
+        .into_iter()
+        .map(|model| UserModel {
+            context_length: Some(model.context_length.unwrap_or(fallback)),
+            ..model
+        })
+        .collect()
+}
+
+fn with_provider(provider_id: &str, mut caches: SeedCaches) -> SeedCaches {
+    caches.provider_id = provider_id.to_string();
+    caches
+}
+
+fn from_listed_models(provider_id: &str, models: &[ListedModel]) -> Vec<UserModel> {
+    models
+        .iter()
+        .map(|model| UserModel {
+            id: model.id.clone(),
+            name: model.name.clone(),
+            context_length: Some(
+                model.context_length.unwrap_or(catalog::fallback_context(provider_id)),
+            ),
+            canonical_slug: None,
+            supported_efforts: Vec::new(),
+            pricing: None,
+        })
+        .collect()
 }
 
 pub(crate) fn parse_user_catalog(body: &str) -> Result<Vec<UserModel>> {
@@ -139,8 +186,15 @@ pub(crate) fn parse_user_catalog_value(value: &Value) -> Result<Vec<UserModel>> 
 
 fn parse_user_model(entry: &Value) -> Option<UserModel> {
     let id = entry.get("id")?.as_str()?.to_string();
-    let name = entry.get("name").and_then(Value::as_str).map(str::to_string);
-    let context_length = entry.get("context_length").and_then(Value::as_i64);
+    let name = entry
+        .get("name")
+        .or_else(|| entry.get("display_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let context_length = entry
+        .get("context_length")
+        .or_else(|| entry.get("max_input_tokens"))
+        .and_then(Value::as_i64);
     let canonical_slug = entry.get("canonical_slug").and_then(Value::as_str).map(str::to_string);
     let supported_efforts = entry
         .get("reasoning")
@@ -218,6 +272,7 @@ pub(crate) fn build_seed(models: &[UserModel]) -> SeedCaches {
     denylist.dedup();
 
     SeedCaches {
+        provider_id: String::new(),
         additional_model_options,
         model_access,
         tool_search_denylist: denylist,
@@ -231,7 +286,7 @@ pub(crate) fn claude_settings_json(base_url: &str, seeded: bool, api_key_env: &s
     for (key, value) in SETTINGS_CLEAR_ENV {
         env.insert((*key).to_string(), (*value).to_string());
     }
-    env.insert("ANTHROPIC_BASE_URL".to_string(), anthropic_base(base_url));
+    env.insert("ANTHROPIC_BASE_URL".to_string(), catalog::anthropic_base(base_url));
     if seeded {
         env.insert("ENABLE_TOOL_SEARCH".to_string(), "true".to_string());
         env.insert("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".to_string(), "0".to_string());
@@ -345,14 +400,42 @@ fn merge_seed(document: &mut Value, caches: &SeedCaches) {
     let object = document.as_object_mut().expect("claude config root is an object");
     let mut catalog_marker =
         object.get(RX_SEEDED_CATALOG_KEY).and_then(Value::as_object).cloned().unwrap_or_default();
-
     merge_tool_search_denylist(object, caches, &mut catalog_marker);
     merge_model_options(object, caches, &mut catalog_marker);
     merge_model_access(object, caches, &mut catalog_marker);
     merge_costs(object, caches, &mut catalog_marker);
     merge_compact_windows(object, caches, &mut catalog_marker);
+    catalog_marker.insert("provider_id".to_string(), json!(caches.provider_id));
     catalog_marker.insert("version".to_string(), json!(1));
     object.insert(RX_SEEDED_CATALOG_KEY.to_string(), Value::Object(catalog_marker));
+}
+
+fn model_option_values(caches: &SeedCaches) -> Vec<Value> {
+    caches
+        .additional_model_options
+        .iter()
+        .map(|option| {
+            json!({
+                "value": option.value,
+                "label": option.label,
+                "description": option.description,
+            })
+        })
+        .collect()
+}
+
+fn model_access_values(caches: &SeedCaches) -> Vec<Value> {
+    caches
+        .model_access
+        .iter()
+        .map(|access| {
+            let mut entry = json!({ "apiName": access.api_name, "entitled": true });
+            if let Some(level) = &access.max_effort_level {
+                entry["maxEffortLevel"] = json!(level);
+            }
+            entry
+        })
+        .collect()
 }
 
 fn merge_tool_search_denylist(
@@ -378,26 +461,16 @@ fn merge_tool_search_denylist(
             .get("cachedGrowthBookFeatures")
             .and_then(|value| value.get(TOOL_SEARCH_UNSUPPORTED_KEY)),
     );
+    let managed: HashSet<_> = previous_marker.keys().cloned().collect();
     let mut occupied = HashSet::new();
-    let mut blocked = HashSet::new();
-    let mut seen_marker = HashSet::new();
     let mut reconciled = Vec::new();
     let mut next_marker = serde_json::Map::new();
     for identity in existing {
-        if let Some(previous) = previous_marker.get(&identity) {
-            seen_marker.insert(identity.clone());
-            if owned_payload(previous).is_some_and(|payload| payload == &identity) {
-                continue;
-            }
-            blocked.insert(identity.clone());
-            next_marker.insert(identity.clone(), external_marker());
+        if managed.contains(&identity) {
+            continue;
         }
         occupied.insert(identity.clone());
         reconciled.push(identity);
-    }
-    for identity in previous_marker.keys().filter(|identity| !seen_marker.contains(*identity)) {
-        blocked.insert(identity.clone());
-        next_marker.insert(identity.clone(), external_marker());
     }
 
     let desired = BASE_TOOL_SEARCH_DENY
@@ -405,7 +478,7 @@ fn merge_tool_search_denylist(
         .map(|identity| (*identity).to_string())
         .chain(caches.tool_search_denylist.iter().cloned());
     for identity in desired {
-        if !blocked.contains(&identity) && occupied.insert(identity.clone()) {
+        if occupied.insert(identity.clone()) {
             let payload = Value::String(identity.clone());
             next_marker.insert(identity.clone(), owned_marker(&payload));
             reconciled.push(identity);
@@ -426,10 +499,7 @@ fn merge_tool_search_denylist(
         "cachedGrowthBookFeaturesAt".to_string(),
         json!(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()),
     );
-    let mut legacy_owned = next_marker
-        .iter()
-        .filter_map(|(identity, state)| owned_payload(state).map(|_| identity.clone()))
-        .collect::<Vec<_>>();
+    let mut legacy_owned = next_marker.keys().cloned().collect::<Vec<_>>();
     legacy_owned.sort();
     object.insert(RX_SEEDED_DENYLIST_KEY.to_string(), json!(legacy_owned));
     marker.insert(TOOL_SEARCH_DENYLIST_MARKER_KEY.to_string(), Value::Object(next_marker));
@@ -440,18 +510,13 @@ fn merge_model_options(
     caches: &SeedCaches,
     marker: &mut serde_json::Map<String, Value>,
 ) {
-    let desired = caches
-        .additional_model_options
-        .iter()
-        .map(|option| {
-            json!({
-            "value": option.value,
-            "label": option.label,
-            "description": option.description,
-            })
-        })
-        .collect();
-    reconcile_array_cache(object, marker, MODEL_OPTIONS_CACHE_KEY, "value", desired);
+    reconcile_array_cache(
+        object,
+        marker,
+        MODEL_OPTIONS_CACHE_KEY,
+        "value",
+        model_option_values(caches),
+    );
 }
 
 fn merge_model_access(
@@ -459,18 +524,13 @@ fn merge_model_access(
     caches: &SeedCaches,
     marker: &mut serde_json::Map<String, Value>,
 ) {
-    let desired = caches
-        .model_access
-        .iter()
-        .map(|access| {
-            let mut entry = json!({ "apiName": access.api_name, "entitled": true });
-            if let Some(level) = &access.max_effort_level {
-                entry["maxEffortLevel"] = json!(level);
-            }
-            entry
-        })
-        .collect();
-    reconcile_array_cache(object, marker, MODEL_ACCESS_CACHE_KEY, "apiName", desired);
+    reconcile_array_cache(
+        object,
+        marker,
+        MODEL_ACCESS_CACHE_KEY,
+        "apiName",
+        model_access_values(caches),
+    );
 }
 
 fn merge_costs(
@@ -504,9 +564,8 @@ fn reconcile_array_cache(
     let previous_marker =
         marker.get(cache_key).and_then(Value::as_object).cloned().unwrap_or_default();
     let existing = object.get(cache_key).and_then(Value::as_array).cloned().unwrap_or_default();
+    let managed: HashSet<_> = previous_marker.keys().cloned().collect();
     let mut occupied = HashSet::new();
-    let mut blocked = HashSet::new();
-    let mut seen_marker = HashSet::new();
     let mut reconciled = Vec::new();
     let mut next_marker = serde_json::Map::new();
     for entry in existing {
@@ -515,20 +574,11 @@ fn reconcile_array_cache(
             reconciled.push(entry);
             continue;
         };
-        if let Some(previous) = previous_marker.get(&identity) {
-            seen_marker.insert(identity.clone());
-            if owned_payload(previous).is_some_and(|payload| payload == &entry) {
-                continue;
-            }
-            blocked.insert(identity.clone());
-            next_marker.insert(identity.clone(), external_marker());
+        if managed.contains(&identity) {
+            continue;
         }
         occupied.insert(identity);
         reconciled.push(entry);
-    }
-    for identity in previous_marker.keys().filter(|identity| !seen_marker.contains(*identity)) {
-        blocked.insert(identity.clone());
-        next_marker.insert(identity.clone(), external_marker());
     }
 
     for entry in desired {
@@ -536,7 +586,7 @@ fn reconcile_array_cache(
         else {
             continue;
         };
-        if !blocked.contains(&identity) && occupied.insert(identity.clone()) {
+        if occupied.insert(identity.clone()) {
             next_marker.insert(identity, owned_marker(&entry));
             reconciled.push(entry);
         }
@@ -556,21 +606,13 @@ fn reconcile_object_cache(
         marker.get(cache_key).and_then(Value::as_object).cloned().unwrap_or_default();
     let mut reconciled =
         object.get(cache_key).and_then(Value::as_object).cloned().unwrap_or_default();
-    let mut blocked = HashSet::new();
     let mut next_marker = serde_json::Map::new();
-    for (key, previous) in previous_marker {
-        if owned_payload(&previous)
-            .is_some_and(|payload| reconciled.get(&key).is_some_and(|current| current == payload))
-        {
-            reconciled.remove(&key);
-        } else {
-            blocked.insert(key.clone());
-            next_marker.insert(key, external_marker());
-        }
+    for key in previous_marker.keys() {
+        reconciled.remove(key);
     }
 
     for (key, payload) in desired {
-        if !blocked.contains(key) && !reconciled.contains_key(key) {
+        if !reconciled.contains_key(key) {
             reconciled.insert(key.clone(), payload.clone());
             next_marker.insert(key.clone(), owned_marker(payload));
         }
@@ -580,19 +622,8 @@ fn reconcile_object_cache(
     marker.insert(cache_key.to_string(), Value::Object(next_marker));
 }
 
-fn owned_payload(marker: &Value) -> Option<&Value> {
-    let marker = marker.as_object()?;
-    (marker.get("state").and_then(Value::as_str) == Some("owned"))
-        .then(|| marker.get("payload"))
-        .flatten()
-}
-
 fn owned_marker(payload: &Value) -> Value {
     json!({ "state": "owned", "payload": payload })
-}
-
-fn external_marker() -> Value {
-    json!({ "state": "external" })
 }
 
 fn string_array(value: Option<&Value>) -> Vec<String> {

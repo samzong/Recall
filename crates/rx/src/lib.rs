@@ -6,13 +6,14 @@ mod install;
 mod launch;
 mod opencode;
 mod pi;
+mod pick;
 mod provider;
 mod providers;
 mod update;
 
 use anyhow::Result;
 
-use args::{Command, argv0_harness, parse, rewrite_argv0};
+use args::{Command, LaunchRequest, argv0_harness, parse, rewrite_argv0};
 pub use config::Paths;
 use launch::{EnvLookup, plan};
 
@@ -28,13 +29,6 @@ pub fn run_with(raw_args: Vec<String>, paths: &Paths, env: &EnvLookup) -> Result
     } else {
         parse(&raw_args)?
     };
-    if matches!(command, Command::Launch(_)) {
-        // Updating is incidental to launching: a broken state file, an
-        // unwritable config dir, or a failed install must not stop the harness.
-        if let Err(error) = update::maybe_before_launch(paths, env, &raw_args) {
-            eprintln!("[rx] update skipped: {error:#}");
-        }
-    }
     match command {
         Command::Help => {
             print!("{}", help_text());
@@ -46,16 +40,39 @@ pub fn run_with(raw_args: Vec<String>, paths: &Paths, env: &EnvLookup) -> Result
         }
         Command::Providers(command) => providers::run(command, paths, env),
         Command::Update { yes } => update::run(yes),
-        Command::Launch(request) => {
-            let program = install::ensure(request.harness, env)?;
-            let mut plan = plan(&request, paths, env)?;
-            plan.program = program.to_string_lossy().into_owned();
-            if let Some(note) = &plan.stderr_note {
-                eprintln!("{note}");
-            }
-            launch::exec(&plan)
+        Command::PickHarness { provider } => {
+            let Some(harness) = pick::harness(env)? else {
+                return Ok(());
+            };
+            launch_request(
+                LaunchRequest { harness, provider, passthrough: Vec::new() },
+                paths,
+                env,
+                &raw_args,
+            )
         }
+        Command::Launch(request) => launch_request(request, paths, env, &raw_args),
     }
+}
+
+fn launch_request(
+    request: LaunchRequest,
+    paths: &Paths,
+    env: &EnvLookup,
+    raw_args: &[String],
+) -> Result<()> {
+    // Updating is incidental to launching: a broken state file, an
+    // unwritable config dir, or a failed install must not stop the harness.
+    if let Err(error) = update::maybe_before_launch(paths, env, raw_args) {
+        eprintln!("[rx] update skipped: {error:#}");
+    }
+    let program = install::ensure(request.harness, env)?;
+    let mut plan = plan(&request, paths, env)?;
+    plan.program = program.to_string_lossy().into_owned();
+    if let Some(note) = &plan.stderr_note {
+        eprintln!("{note}");
+    }
+    launch::exec(&plan)
 }
 
 pub fn help_text() -> &'static str {
@@ -63,10 +80,15 @@ pub fn help_text() -> &'static str {
 rx — launch agent harnesses through a configured AI provider
 
 Usage:
+  rx
+  rx --provider <provider>
   rx <harness> [args...]
   rx --provider <provider> <harness> [args...]
   rx providers <list|login|logout|use>
+  rx providers models update [provider]
   rx update [--yes]
+
+A TTY `rx` with no harness opens a picker. Scripts must pass a harness.
 
 Environment:
   RX_NO_UPDATE=1     skip launch-time update checks

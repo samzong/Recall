@@ -45,6 +45,13 @@ pub(crate) enum ProvidersCommand {
     Login { provider: Option<String> },
     Logout { provider: Option<String> },
     Use { provider: Option<String> },
+    Models(ModelsCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelsCommand {
+    Help,
+    Update { provider: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +59,7 @@ pub(crate) enum Command {
     Help,
     Version,
     Launch(LaunchRequest),
+    PickHarness { provider: Option<String> },
     Providers(ProvidersCommand),
     Update { yes: bool },
 }
@@ -83,7 +91,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command> {
     let rest = args.get(1..).unwrap_or(&[]);
     let (provider, rest) = extract_provider(rest)?;
     match rest.first().map(String::as_str) {
-        None => bail!("missing harness name\n\n{}", crate::help_text().trim_end()),
+        None => Ok(Command::PickHarness { provider }),
         Some("-h" | "--help") => Ok(Command::Help),
         Some("-V" | "--version") => Ok(Command::Version),
         Some("providers") => {
@@ -115,6 +123,7 @@ fn parse_providers(args: &[String]) -> Result<ProvidersCommand> {
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") if args.len() <= 1 => Ok(ProvidersCommand::Help),
         Some("list") if args.len() == 1 => Ok(ProvidersCommand::List),
+        Some("models") => Ok(ProvidersCommand::Models(parse_models(&args[1..])?)),
         Some(command @ ("login" | "logout" | "use")) => {
             let provider = parse_provider_argument(command, &args[1..])?;
             Ok(match command {
@@ -126,6 +135,22 @@ fn parse_providers(args: &[String]) -> Result<ProvidersCommand> {
         }
         Some(command) => {
             bail!("unknown providers command: {command}\n\n{}", crate::providers::help())
+        }
+        None => unreachable!(),
+    }
+}
+
+fn parse_models(args: &[String]) -> Result<ModelsCommand> {
+    match args.first().map(String::as_str) {
+        None | Some("-h" | "--help" | "help") if args.len() <= 1 => Ok(ModelsCommand::Help),
+        Some("update") => Ok(ModelsCommand::Update {
+            provider: parse_provider_argument("models update", &args[1..])?,
+        }),
+        Some(command) => {
+            bail!(
+                "unknown providers models command: {command}\n\n{}",
+                crate::providers::models_help()
+            )
         }
         None => unreachable!(),
     }
