@@ -2,7 +2,7 @@
 
 `rx` launches Claude Code, Codex, OpenCode, Pi, and DeepSeek Harness with one provider configuration. It prepares each harness and runs its native CLI.
 
-![rx architecture](assets/rx-architecture.png)
+[![rx architecture](assets/rx-architecture.png)](assets/rx-architecture.png)
 
 ## Install
 
