@@ -1,8 +1,9 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde_json::{Value, json};
 
 use crate::args;
@@ -143,6 +144,7 @@ fn generated_provider(
 }
 
 pub(crate) fn merge_provider(models_path: &Path, provider_id: &str, provider: Value) -> Result<()> {
+    let _lock = exclusive_sidecar(models_path)?;
     let mut document = if models_path.is_file() {
         let body = fs::read_to_string(models_path)
             .with_context(|| format!("failed to read {}", models_path.display()))?;
@@ -164,6 +166,23 @@ pub(crate) fn merge_provider(models_path: &Path, provider_id: &str, provider: Va
         root.insert("providers".to_string(), json!({ provider_id: provider }));
     }
     write_json_atomic(models_path, &document)
+}
+
+fn exclusive_sidecar(path: &Path) -> Result<fs::File> {
+    let parent = path.parent().context("json file has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".rx.lock");
+    let lock_path = PathBuf::from(lock_path);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    Ok(lock)
 }
 
 fn write_json_atomic(path: &Path, document: &Value) -> Result<()> {

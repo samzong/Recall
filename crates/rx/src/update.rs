@@ -1,12 +1,13 @@
 use std::cmp::Ordering;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::args::UpdateCommand;
@@ -80,20 +81,22 @@ pub(crate) fn maybe_before_launch(
     if env.get("RX_NO_UPDATE").is_some_and(|value| !value.is_empty() && value != "0") {
         return Ok(());
     }
-    let mut state = load_state(paths)?;
-    if !should_check(&state) {
-        return Ok(());
+    {
+        let _lock = lock_state(paths)?;
+        if !should_check(&load_state(paths)?) {
+            return Ok(());
+        }
     }
     let current = crate::RELEASE_VERSION;
     let release = match fetch_latest_release() {
         Ok(release) => release,
         Err(error) => {
             eprintln!("[rx] update check failed: {error:#}");
+            stamp_last_check(paths)?;
             return Ok(());
         }
     };
-    state.last_check = Some(now_unix_seconds());
-    save_state(paths, &state)?;
+    let state = stamp_last_check(paths)?;
     if !update_pending(current, &release) {
         return Ok(());
     }
@@ -111,8 +114,7 @@ pub(crate) fn maybe_before_launch(
     } else {
         match prompt(&release.version)? {
             PromptChoice::Always => {
-                state.auto_update = true;
-                save_state(paths, &state)?;
+                enable_auto_update(paths)?;
                 eprintln!("Updating rx to {}...", release.version);
                 install_release(&release)?;
                 relaunch(raw_args)?;
@@ -406,6 +408,42 @@ fn state_path(paths: &Paths) -> PathBuf {
     paths.dir.join("rx-update.toml")
 }
 
+fn lock_state(paths: &Paths) -> Result<fs::File> {
+    exclusive_sidecar(&state_path(paths))
+}
+
+fn stamp_last_check(paths: &Paths) -> Result<UpdateState> {
+    let _lock = lock_state(paths)?;
+    let mut state = load_state(paths)?;
+    state.last_check = Some(now_unix_seconds());
+    save_state(paths, &state)?;
+    Ok(state)
+}
+
+fn enable_auto_update(paths: &Paths) -> Result<()> {
+    let _lock = lock_state(paths)?;
+    let mut state = load_state(paths)?;
+    state.auto_update = true;
+    save_state(paths, &state)
+}
+
+fn exclusive_sidecar(path: &Path) -> Result<fs::File> {
+    let parent = path.parent().context("state file has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".rx.lock");
+    let lock_path = PathBuf::from(lock_path);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    Ok(lock)
+}
+
 fn load_state(paths: &Paths) -> Result<UpdateState> {
     let path = state_path(paths);
     if !path.is_file() {
@@ -416,10 +454,19 @@ fn load_state(paths: &Paths) -> Result<UpdateState> {
 }
 
 fn save_state(paths: &Paths, state: &UpdateState) -> Result<()> {
-    fs::create_dir_all(&paths.dir).with_context(|| format!("create {}", paths.dir.display()))?;
-    let body = toml::to_string_pretty(state).context("serialize rx-update.toml")?;
     let path = state_path(paths);
-    fs::write(&path, body).with_context(|| format!("write {}", path.display()))
+    let parent = path.parent().context("state file has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let body = toml::to_string_pretty(state).context("serialize rx-update.toml")?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary {}", path.display()))?;
+    temp.write_all(body.as_bytes())
+        .with_context(|| format!("write temporary {}", path.display()))?;
+    temp.as_file().sync_all().with_context(|| format!("sync temporary {}", path.display()))?;
+    temp.persist(&path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace {}", path.display()))?;
+    Ok(())
 }
 
 fn should_check(state: &UpdateState) -> bool {
