@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Result, bail};
 
-use crate::args::{Harness, LaunchRequest};
+use crate::args::{self, Harness, LaunchRequest};
 use crate::catalog;
 use crate::claude_catalog::{self, SeedOutcome};
 use crate::config::{AuthMode, Paths};
@@ -486,12 +486,13 @@ fn auth_override(env_key: &str) -> String {
 }
 
 fn user_sets_opencode_model(passthrough: &[String]) -> bool {
-    passthrough.iter().any(|arg| {
+    args::before_double_dash(passthrough).iter().any(|arg| {
         arg == "-m" || arg.starts_with("-m=") || arg == "--model" || arg.starts_with("--model=")
     })
 }
 
 fn user_sets_model(passthrough: &[String]) -> bool {
+    let passthrough = args::before_double_dash(passthrough);
     let mut i = 0;
     while i < passthrough.len() {
         let arg = &passthrough[i];

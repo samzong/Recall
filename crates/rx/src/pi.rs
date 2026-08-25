@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::args;
 use crate::catalog;
 use crate::config::Paths;
 use crate::launch::{EnvLookup, openai_base};
@@ -105,11 +106,15 @@ pub(crate) fn args(provider_id: &str, model: Option<&str>, passthrough: &[String
 }
 
 fn user_sets_models_flag(passthrough: &[String]) -> bool {
-    passthrough.iter().any(|arg| arg == "--models" || arg.starts_with("--models="))
+    args::before_double_dash(passthrough)
+        .iter()
+        .any(|arg| arg == "--models" || arg.starts_with("--models="))
 }
 
 fn user_sets_provider(passthrough: &[String]) -> bool {
-    passthrough.iter().any(|arg| arg == "--provider" || arg.starts_with("--provider="))
+    args::before_double_dash(passthrough)
+        .iter()
+        .any(|arg| arg == "--provider" || arg.starts_with("--provider="))
 }
 
 fn generated_provider(
@@ -179,5 +184,7 @@ fn write_json_atomic(path: &Path, document: &Value) -> Result<()> {
 }
 
 fn user_sets_model(passthrough: &[String]) -> bool {
-    passthrough.iter().any(|arg| arg == "-m" || arg == "--model" || arg.starts_with("--model="))
+    args::before_double_dash(passthrough)
+        .iter()
+        .any(|arg| arg == "-m" || arg == "--model" || arg.starts_with("--model="))
 }

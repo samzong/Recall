@@ -173,6 +173,13 @@ fn parse_provider_argument(command: &str, args: &[String]) -> Result<Option<Stri
     Ok(args.first().cloned())
 }
 
+pub(crate) fn before_double_dash(args: &[String]) -> &[String] {
+    match args.iter().position(|arg| arg == "--") {
+        Some(index) => &args[..index],
+        None => args,
+    }
+}
+
 fn extract_provider(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
     let mut provider = None;
     let mut rest = Vec::new();

@@ -9,6 +9,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::args;
 use crate::catalog::{self, ListedModel};
 use crate::config::Paths;
 use crate::launch::EnvLookup;
@@ -304,7 +305,7 @@ pub(crate) fn claude_settings_json(base_url: &str, seeded: bool, api_key_env: &s
 }
 
 pub(crate) fn user_passes_settings(passthrough: &[String]) -> bool {
-    passthrough.iter().any(|arg| {
+    args::before_double_dash(passthrough).iter().any(|arg| {
         arg == "--settings"
             || arg == "--setting-sources"
             || arg.starts_with("--settings=")
