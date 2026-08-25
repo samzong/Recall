@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Result, bail};
@@ -41,8 +43,8 @@ impl EnvLookup {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
-    pub program: String,
-    pub args: Vec<String>,
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
     pub env_set: Vec<(String, String)>,
     pub stderr_note: Option<String>,
 }
@@ -140,7 +142,7 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
 
 fn passthrough(request: &LaunchRequest) -> LaunchPlan {
     LaunchPlan {
-        program: request.harness.as_str().to_string(),
+        program: PathBuf::from(request.harness.as_str()),
         args: match request.harness {
             Harness::Dsh => crate::dsh::args(&request.passthrough, None),
             _ => request.passthrough.clone(),
@@ -217,8 +219,15 @@ fn inject_claude_openrouter_impl(
     let seeded = matches!(seed, SeedOutcome::Seeded { .. });
     let mut args = request.passthrough.clone();
     if seeded && !claude_catalog::user_passes_settings(&request.passthrough) {
-        args.insert(0, claude_catalog::claude_settings_json(base_url, true, "OPENROUTER_API_KEY"));
-        args.insert(0, "--settings".to_string());
+        args.insert(
+            0,
+            OsString::from(claude_catalog::claude_settings_json(
+                base_url,
+                true,
+                "OPENROUTER_API_KEY",
+            )),
+        );
+        args.insert(0, OsString::from("--settings"));
     }
     let stderr_note = match seed {
         SeedOutcome::Fallback => Some(
@@ -228,7 +237,7 @@ fn inject_claude_openrouter_impl(
         SeedOutcome::Seeded { .. } => None,
     };
     LaunchPlan {
-        program: "claude".to_string(),
+        program: PathBuf::from("claude"),
         args,
         env_set: claude_openrouter_env(base_url, key, model, seeded),
         stderr_note,
@@ -293,11 +302,14 @@ fn inject_claude_generated_seeded(
 ) -> LaunchPlan {
     let mut args = request.passthrough.clone();
     if !claude_catalog::user_passes_settings(&request.passthrough) {
-        args.insert(0, claude_catalog::claude_settings_json(base_url, true, env_key));
-        args.insert(0, "--settings".to_string());
+        args.insert(
+            0,
+            OsString::from(claude_catalog::claude_settings_json(base_url, true, env_key)),
+        );
+        args.insert(0, OsString::from("--settings"));
     }
     LaunchPlan {
-        program: "claude".to_string(),
+        program: PathBuf::from("claude"),
         args,
         env_set: claude_generated_seeded_env(env_key, base_url, key, model),
         stderr_note: None,
@@ -374,7 +386,7 @@ fn inject(
     let key = target.key.as_str();
     match request.harness {
         Harness::Claude => Ok(LaunchPlan {
-            program: "claude".to_string(),
+            program: PathBuf::from("claude"),
             args: request.passthrough.clone(),
             env_set: claude_env(&provider.env, &target.claude_url, key, model),
             stderr_note: None,
@@ -382,16 +394,19 @@ fn inject(
         Harness::Codex => {
             let openai_base = openai_base(base_url);
             let mut args = vec![
-                "-c".to_string(),
-                format!("model_provider=\"{provider_id}\""),
-                "-c".to_string(),
-                codex_provider_override(provider_id, provider, &openai_base),
+                OsString::from("-c"),
+                OsString::from(format!("model_provider=\"{provider_id}\"")),
+                OsString::from("-c"),
+                OsString::from(codex_provider_override(provider_id, provider, &openai_base)),
             ];
             if env.is_real() {
                 match catalog::prepare_codex_catalog(paths, provider_id, base_url, key) {
                     Ok(Some(path)) => {
-                        args.push("-c".to_string());
-                        args.push(format!("model_catalog_json=\"{}\"", path.display()));
+                        args.push(OsString::from("-c"));
+                        args.push(OsString::from(format!(
+                            "model_catalog_json=\"{}\"",
+                            path.display()
+                        )));
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -400,12 +415,12 @@ fn inject(
                 }
             }
             if let Some(model) = model.filter(|_| !user_sets_model(&request.passthrough)) {
-                args.push("-c".to_string());
-                args.push(format!("model=\"{model}\""));
+                args.push(OsString::from("-c"));
+                args.push(OsString::from(format!("model=\"{model}\"")));
             }
             args.extend(request.passthrough.iter().cloned());
             Ok(LaunchPlan {
-                program: "codex".to_string(),
+                program: PathBuf::from("codex"),
                 args,
                 env_set: vec![(provider.env.clone(), key.to_string())],
                 stderr_note: None,
@@ -428,11 +443,11 @@ fn inject(
             ));
             let mut args = request.passthrough.clone();
             if let Some(model) = model.filter(|_| !user_sets_opencode_model(&request.passthrough)) {
-                args.insert(0, crate::opencode::prefixed_model(provider_id, model));
-                args.insert(0, "-m".to_string());
+                args.insert(0, OsString::from(crate::opencode::prefixed_model(provider_id, model)));
+                args.insert(0, OsString::from("-m"));
             }
             Ok(LaunchPlan {
-                program: "opencode".to_string(),
+                program: PathBuf::from("opencode"),
                 args,
                 env_set,
                 stderr_note: crate::opencode::auth_conflict_note(provider, key, env),
@@ -443,7 +458,7 @@ fn inject(
                 if provider.setup == Setup::Generated { provider_id } else { provider.id.as_str() };
             crate::pi::prepare(provider_id, provider, base_url, key, paths, env)?;
             Ok(LaunchPlan {
-                program: "pi".to_string(),
+                program: PathBuf::from("pi"),
                 args: crate::pi::args(provider_id, model, &request.passthrough),
                 env_set: crate::pi::env_set(&provider.env, key),
                 stderr_note: None,
@@ -453,7 +468,7 @@ fn inject(
             let patch =
                 crate::dsh::prepare(provider_id, provider, base_url, key, model, paths, env)?;
             Ok(LaunchPlan {
-                program: "dsh".to_string(),
+                program: PathBuf::from("dsh"),
                 args: crate::dsh::args(&request.passthrough, Some(&patch)),
                 env_set: crate::dsh::env_set(provider_id, provider, key),
                 stderr_note: None,
@@ -485,13 +500,16 @@ fn auth_override(env_key: &str) -> String {
     }
 }
 
-fn user_sets_opencode_model(passthrough: &[String]) -> bool {
+fn user_sets_opencode_model(passthrough: &[OsString]) -> bool {
     args::before_double_dash(passthrough).iter().any(|arg| {
-        arg == "-m" || arg.starts_with("-m=") || arg == "--model" || arg.starts_with("--model=")
+        arg == "-m"
+            || args::os_prefix(arg, "-m=")
+            || arg == "--model"
+            || args::os_prefix(arg, "--model=")
     })
 }
 
-fn user_sets_model(passthrough: &[String]) -> bool {
+fn user_sets_model(passthrough: &[OsString]) -> bool {
     let passthrough = args::before_double_dash(passthrough);
     let mut i = 0;
     while i < passthrough.len() {
@@ -499,11 +517,11 @@ fn user_sets_model(passthrough: &[String]) -> bool {
         if arg == "-m" || arg == "--model" {
             return true;
         }
-        if arg.starts_with("--model=") {
+        if args::os_prefix(arg, "--model=") {
             return true;
         }
         if arg == "-c" || arg == "--config" {
-            if passthrough.get(i + 1).is_some_and(|value| value.starts_with("model=")) {
+            if passthrough.get(i + 1).is_some_and(|value| args::os_prefix(value, "model=")) {
                 return true;
             }
             i += 1;
@@ -525,14 +543,15 @@ pub(crate) fn exec(plan: &LaunchPlan) -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
         let error = cmd.exec();
-        Err(anyhow::Error::from(error).context(format!("failed to exec {}", plan.program)))
+        Err(anyhow::Error::from(error)
+            .context(format!("failed to exec {}", plan.program.display())))
     }
 
     #[cfg(not(unix))]
     {
         let status = cmd.status()?;
         if !status.success() {
-            anyhow::bail!("{} exited with status {status}", plan.program);
+            anyhow::bail!("{} exited with status {status}", plan.program.display());
         }
         Ok(())
     }

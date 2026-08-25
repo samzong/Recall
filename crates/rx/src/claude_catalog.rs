@@ -304,12 +304,12 @@ pub(crate) fn claude_settings_json(base_url: &str, seeded: bool, api_key_env: &s
     .expect("settings json serializes")
 }
 
-pub(crate) fn user_passes_settings(passthrough: &[String]) -> bool {
+pub(crate) fn user_passes_settings(passthrough: &[std::ffi::OsString]) -> bool {
     args::before_double_dash(passthrough).iter().any(|arg| {
         arg == "--settings"
             || arg == "--setting-sources"
-            || arg.starts_with("--settings=")
-            || arg.starts_with("--setting-sources=")
+            || args::os_prefix(arg, "--settings=")
+            || args::os_prefix(arg, "--setting-sources=")
     })
 }
 

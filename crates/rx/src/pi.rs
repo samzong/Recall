@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -89,33 +90,37 @@ pub(crate) fn env_set(env_key: &str, key: &str) -> Vec<(String, String)> {
     env_set
 }
 
-pub(crate) fn args(provider_id: &str, model: Option<&str>, passthrough: &[String]) -> Vec<String> {
+pub(crate) fn args(
+    provider_id: &str,
+    model: Option<&str>,
+    passthrough: &[OsString],
+) -> Vec<OsString> {
     let mut args = Vec::new();
     if !user_sets_models_flag(passthrough) {
-        args.push("--models".to_string());
-        args.push(format!("{provider_id}/*"));
+        args.push(OsString::from("--models"));
+        args.push(OsString::from(format!("{provider_id}/*")));
     }
     if let Some(model) = model.filter(|_| !user_sets_model(passthrough)) {
-        args.push("--model".to_string());
-        args.push(opencode::prefixed_model(provider_id, model));
+        args.push(OsString::from("--model"));
+        args.push(OsString::from(opencode::prefixed_model(provider_id, model)));
     } else if !user_sets_provider(passthrough) {
-        args.push("--provider".to_string());
-        args.push(provider_id.to_string());
+        args.push(OsString::from("--provider"));
+        args.push(OsString::from(provider_id));
     }
     args.extend(passthrough.iter().cloned());
     args
 }
 
-fn user_sets_models_flag(passthrough: &[String]) -> bool {
+fn user_sets_models_flag(passthrough: &[OsString]) -> bool {
     args::before_double_dash(passthrough)
         .iter()
-        .any(|arg| arg == "--models" || arg.starts_with("--models="))
+        .any(|arg| arg == "--models" || args::os_prefix(arg, "--models="))
 }
 
-fn user_sets_provider(passthrough: &[String]) -> bool {
+fn user_sets_provider(passthrough: &[OsString]) -> bool {
     args::before_double_dash(passthrough)
         .iter()
-        .any(|arg| arg == "--provider" || arg.starts_with("--provider="))
+        .any(|arg| arg == "--provider" || args::os_prefix(arg, "--provider="))
 }
 
 fn generated_provider(
@@ -202,8 +207,8 @@ fn write_json_atomic(path: &Path, document: &Value) -> Result<()> {
     Ok(())
 }
 
-fn user_sets_model(passthrough: &[String]) -> bool {
+fn user_sets_model(passthrough: &[OsString]) -> bool {
     args::before_double_dash(passthrough)
         .iter()
-        .any(|arg| arg == "-m" || arg == "--model" || arg.starts_with("--model="))
+        .any(|arg| arg == "-m" || arg == "--model" || args::os_prefix(arg, "--model="))
 }

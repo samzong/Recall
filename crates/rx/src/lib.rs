@@ -12,6 +12,8 @@ mod provider;
 mod providers;
 mod update;
 
+use std::ffi::OsString;
+
 use anyhow::Result;
 
 use args::{Command, LaunchRequest, argv0_harness, parse, rewrite_argv0};
@@ -20,11 +22,11 @@ use launch::{EnvLookup, plan};
 
 pub(crate) const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub fn run(raw_args: impl IntoIterator<Item = String>) -> Result<()> {
-    run_with(raw_args.into_iter().collect(), &Paths::user()?, &EnvLookup::real())
+pub fn run(raw_args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<()> {
+    run_with(raw_args.into_iter().map(Into::into).collect(), &Paths::user()?, &EnvLookup::real())
 }
 
-pub fn run_with(raw_args: Vec<String>, paths: &Paths, env: &EnvLookup) -> Result<()> {
+pub fn run_with(raw_args: Vec<OsString>, paths: &Paths, env: &EnvLookup) -> Result<()> {
     let command = if raw_args.first().and_then(|argv0| argv0_harness(argv0)).is_some() {
         parse(&rewrite_argv0(raw_args.clone()))?
     } else {
@@ -60,7 +62,7 @@ fn launch_request(
     request: LaunchRequest,
     paths: &Paths,
     env: &EnvLookup,
-    raw_args: &[String],
+    raw_args: &[OsString],
 ) -> Result<()> {
     // Updating is incidental to launching: a broken state file, an
     // unwritable config dir, or a failed install must not stop the harness.
@@ -69,7 +71,7 @@ fn launch_request(
     }
     let program = install::ensure(request.harness, env)?;
     let mut plan = plan(&request, paths, env)?;
-    plan.program = program.to_string_lossy().into_owned();
+    plan.program = program;
     if let Some(note) = &plan.stderr_note {
         eprintln!("{note}");
     }

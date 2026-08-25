@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -13,8 +14,16 @@ use crate::args::{
 use crate::config::{self, Paths};
 use crate::launch::{self, EnvLookup};
 
-fn args(argv: &[&str]) -> Vec<String> {
-    argv.iter().map(|arg| (*arg).to_string()).collect()
+fn args(argv: &[&str]) -> Vec<OsString> {
+    argv.iter().map(|arg| OsString::from(*arg)).collect()
+}
+
+fn os(argv: &[&str]) -> Vec<OsString> {
+    args(argv)
+}
+
+fn arg_str(arg: &OsString) -> &str {
+    arg.to_str().expect("test args are utf-8")
 }
 
 fn parse_line(argv: &[&str]) -> Command {
@@ -105,7 +114,7 @@ fn rxc_inserts_claude() {
         Command::Launch(LaunchRequest {
             harness: Harness::Claude,
             provider: None,
-            passthrough: vec!["fix login".to_string()],
+            passthrough: os(&["fix login"]),
         })
     );
 }
@@ -118,7 +127,7 @@ fn rxx_inserts_codex() {
         Command::Launch(LaunchRequest {
             harness: Harness::Codex,
             provider: None,
-            passthrough: vec!["exec".to_string(), "cargo test".to_string()],
+            passthrough: os(&["exec", "cargo test"]),
         })
     );
 }
@@ -143,7 +152,7 @@ fn provider_flag_before_or_after_harness() {
     let expected = Command::Launch(LaunchRequest {
         harness: Harness::Claude,
         provider: Some("openrouter".to_string()),
-        passthrough: vec!["--resume".to_string(), "abc".to_string()],
+        passthrough: os(&["--resume", "abc"]),
     });
     assert_eq!(before, expected);
     assert_eq!(after, expected);
@@ -157,7 +166,7 @@ fn provider_after_double_dash_is_passthrough() {
         Command::Launch(LaunchRequest {
             harness: Harness::Claude,
             provider: None,
-            passthrough: vec!["--".to_string(), "--provider".to_string(), "openrouter".to_string()],
+            passthrough: os(&["--", "--provider", "openrouter"]),
         })
     );
 }
@@ -170,7 +179,7 @@ fn claude_help_is_passthrough() {
         Command::Launch(LaunchRequest {
             harness: Harness::Claude,
             provider: None,
-            passthrough: vec!["--help".to_string()],
+            passthrough: os(&["--help"]),
         })
     );
 }
@@ -330,7 +339,7 @@ fn rxo_inserts_opencode() {
         Command::Launch(LaunchRequest {
             harness: Harness::OpenCode,
             provider: None,
-            passthrough: vec!["run".to_string(), "hello".to_string()],
+            passthrough: os(&["run", "hello"]),
         })
     );
 }
@@ -343,7 +352,7 @@ fn rxp_inserts_pi() {
         Command::Launch(LaunchRequest {
             harness: Harness::Pi,
             provider: None,
-            passthrough: vec!["--print".to_string(), "hi".to_string()],
+            passthrough: os(&["--print", "hi"]),
         })
     );
 }
@@ -356,7 +365,7 @@ fn rxd_inserts_dsh() {
         Command::Launch(LaunchRequest {
             harness: Harness::Dsh,
             provider: None,
-            passthrough: vec!["--resume".to_string()],
+            passthrough: os(&["--resume"]),
         })
     );
 }
@@ -369,7 +378,7 @@ fn rx_dsh_is_a_harness() {
         Command::Launch(LaunchRequest {
             harness: Harness::Dsh,
             provider: None,
-            passthrough: vec!["--resume".to_string()],
+            passthrough: os(&["--resume"]),
         })
     );
 }
@@ -547,14 +556,14 @@ fn unconfigured_launch_is_passthrough() {
         &LaunchRequest {
             harness: Harness::Claude,
             provider: None,
-            passthrough: vec!["--resume".to_string(), "abc".to_string()],
+            passthrough: os(&["--resume", "abc"]),
         },
         &paths,
         &EnvLookup::isolated(HashMap::new()),
     )
     .unwrap();
-    assert_eq!(plan.program, "claude");
-    assert_eq!(plan.args, vec!["--resume", "abc"]);
+    assert_eq!(plan.program, PathBuf::from("claude"));
+    assert_eq!(plan.args, os(&["--resume", "abc"]));
     assert!(plan.env_set.is_empty());
     assert!(plan.stderr_note.as_deref().unwrap().contains("no provider configured"));
 }
@@ -563,17 +572,13 @@ fn unconfigured_launch_is_passthrough() {
 fn unconfigured_dsh_still_boots_tui_profile() {
     let (_dir, paths) = temp_paths();
     let plan = launch::plan(
-        &LaunchRequest {
-            harness: Harness::Dsh,
-            provider: None,
-            passthrough: vec!["--resume".to_string()],
-        },
+        &LaunchRequest { harness: Harness::Dsh, provider: None, passthrough: os(&["--resume"]) },
         &paths,
         &EnvLookup::isolated(HashMap::new()),
     )
     .unwrap();
-    assert_eq!(plan.program, "dsh");
-    assert_eq!(plan.args, vec!["--profile", "dsh-tui", "--resume"]);
+    assert_eq!(plan.program, PathBuf::from("dsh"));
+    assert_eq!(plan.args, os(&["--profile", "dsh-tui", "--resume"]));
     assert!(plan.env_set.is_empty());
 }
 
@@ -588,14 +593,14 @@ fn claude_openrouter_uses_api_key_and_discovery_fallback_without_seed() {
         &LaunchRequest {
             harness: Harness::Claude,
             provider: Some("openrouter".to_string()),
-            passthrough: vec!["fix it".to_string()],
+            passthrough: os(&["fix it"]),
         },
         &paths,
         &env,
     )
     .unwrap();
-    assert_eq!(plan.program, "claude");
-    assert_eq!(plan.args, vec!["fix it"]);
+    assert_eq!(plan.program, PathBuf::from("claude"));
+    assert_eq!(plan.args, os(&["fix it"]));
     assert!(
         plan.env_set
             .iter()
@@ -648,7 +653,7 @@ fn claude_injection_tokener_still_uses_auth_token() {
         &LaunchRequest {
             harness: Harness::Claude,
             provider: Some("tokener".to_string()),
-            passthrough: vec!["fix it".to_string()],
+            passthrough: os(&["fix it"]),
         },
         &paths,
         &env,
@@ -675,14 +680,14 @@ fn codex_openrouter_overrides_model_and_uses_command_auth() {
         &env,
     )
     .unwrap();
-    assert_eq!(plan.program, "codex");
+    assert_eq!(plan.program, PathBuf::from("codex"));
     assert_eq!(plan.args[0], "-c");
     assert_eq!(plan.args[1], "model_provider=\"openrouter\"");
-    assert!(plan.args[3].contains("base_url=\"https://openrouter.ai/api/v1\""));
-    assert!(plan.args[3].contains("wire_api=\"responses\""));
-    assert!(plan.args[3].contains("supports_websockets=false"));
-    assert!(plan.args[3].contains("auth={command=\"sh\""));
-    assert!(!plan.args[3].contains("env_key="));
+    assert!(arg_str(&plan.args[3]).contains("base_url=\"https://openrouter.ai/api/v1\""));
+    assert!(arg_str(&plan.args[3]).contains("wire_api=\"responses\""));
+    assert!(arg_str(&plan.args[3]).contains("supports_websockets=false"));
+    assert!(arg_str(&plan.args[3]).contains("auth={command=\"sh\""));
+    assert!(!arg_str(&plan.args[3]).contains("env_key="));
     assert_eq!(plan.args[5], "model=\"~openai/gpt-latest\"");
     assert_eq!(plan.env_set, vec![("OPENROUTER_API_KEY".to_string(), "sk-or-test".to_string())]);
 }
@@ -698,14 +703,14 @@ fn opencode_openrouter_injects_config_and_model() {
         &LaunchRequest {
             harness: Harness::OpenCode,
             provider: Some("openrouter".to_string()),
-            passthrough: vec!["run".to_string(), "hello".to_string()],
+            passthrough: os(&["run", "hello"]),
         },
         &paths,
         &env,
     )
     .unwrap();
-    assert_eq!(plan.program, "opencode");
-    assert_eq!(plan.args, vec!["run".to_string(), "hello".to_string()]);
+    assert_eq!(plan.program, PathBuf::from("opencode"));
+    assert_eq!(plan.args, os(&["run", "hello"]));
     assert!(plan.env_set.iter().any(|(k, v)| k == "OPENROUTER_API_KEY" && v == "sk-or-test"));
     let config = plan
         .env_set
@@ -748,11 +753,11 @@ fn dsh_deepseek_uses_official_adapter_and_clears_pi_ai_routes() {
         &env,
     )
     .unwrap();
-    assert_eq!(plan.program, "dsh");
+    assert_eq!(plan.program, PathBuf::from("dsh"));
     assert_eq!(plan.args[0], "--profile");
     assert_eq!(plan.args[1], "dsh-tui");
     assert_eq!(plan.args[2], "--patch");
-    assert_eq!(plan.args[3], paths.dir.join("dsh").join("launch.cordis.yml").to_string_lossy());
+    assert_eq!(Path::new(&plan.args[3]), paths.dir.join("dsh").join("launch.cordis.yml"));
     assert_eq!(plan.env_set, vec![("DEEPSEEK_API_KEY".to_string(), "sk-ds-test".to_string())]);
     let patch = fs::read_to_string(paths.dir.join("dsh").join("launch.cordis.yml")).unwrap();
     assert!(patch.contains("id: settings"));
@@ -845,7 +850,7 @@ agent-default-model:
     .unwrap();
     server.join().unwrap();
     assert_eq!(plan.env_set, vec![("TOKENER_API_KEY".to_string(), "sk-tokener".to_string())]);
-    let patch = fs::read_to_string(&plan.args[3]).unwrap();
+    let patch = fs::read_to_string(Path::new(&plan.args[3])).unwrap();
     assert!(patch.contains("id: settings"));
     assert!(patch.contains("id: llm-deepseek"));
     assert!(patch.contains("disabled: true"));
@@ -881,13 +886,13 @@ fn pi_openrouter_injects_provider_without_extension() {
         &LaunchRequest {
             harness: Harness::Pi,
             provider: Some("openrouter".to_string()),
-            passthrough: vec!["--print".to_string(), "hi".to_string()],
+            passthrough: os(&["--print", "hi"]),
         },
         &paths,
         &env,
     )
     .unwrap();
-    assert_eq!(plan.program, "pi");
+    assert_eq!(plan.program, PathBuf::from("pi"));
     assert_eq!(plan.args[0], "--models");
     assert_eq!(plan.args[1], "openrouter/*");
     assert_eq!(plan.args[2], "--provider");
@@ -975,13 +980,13 @@ fn codex_passthrough_model_flag_wins() {
         &LaunchRequest {
             harness: Harness::Codex,
             provider: Some("openrouter".to_string()),
-            passthrough: vec!["--model".to_string(), "anthropic/claude-sonnet-4.6".to_string()],
+            passthrough: os(&["--model", "anthropic/claude-sonnet-4.6"]),
         },
         &paths,
         &env,
     )
     .unwrap();
-    assert!(!plan.args.iter().any(|arg| arg.starts_with("model=")));
+    assert!(!plan.args.iter().any(|arg| arg_str(arg).starts_with("model=")));
     assert_eq!(plan.args[plan.args.len() - 2], "--model");
     assert_eq!(plan.args[plan.args.len() - 1], "anthropic/claude-sonnet-4.6");
 }
@@ -997,16 +1002,16 @@ fn codex_tokener_does_not_invent_a_model() {
         &LaunchRequest {
             harness: Harness::Codex,
             provider: Some("tokener".to_string()),
-            passthrough: vec!["exec".to_string(), "cargo test".to_string()],
+            passthrough: os(&["exec", "cargo test"]),
         },
         &paths,
         &env,
     )
     .unwrap();
     assert_eq!(plan.args[1], "model_provider=\"tokener\"");
-    assert!(plan.args[3].contains("base_url=\"https://api.tokener.dev/v1\""));
-    assert!(!plan.args.iter().any(|arg| arg.starts_with("model=")));
-    assert_eq!(plan.args[4..], ["exec", "cargo test"]);
+    assert!(arg_str(&plan.args[3]).contains("base_url=\"https://api.tokener.dev/v1\""));
+    assert!(!plan.args.iter().any(|arg| arg_str(arg).starts_with("model=")));
+    assert_eq!(&plan.args[4..], os(&["exec", "cargo test"]));
 }
 
 #[test]
@@ -1222,8 +1227,8 @@ model = "gpt-prod"
     )
     .unwrap();
     assert_eq!(codex.args[1], "model_provider=\"tokener-dev\"");
-    assert!(codex.args[3].contains("model_providers.tokener-dev="));
-    assert!(codex.args[3].contains(&format!("base_url=\"{dev_base_url}/v1\"")));
+    assert!(arg_str(&codex.args[3]).contains("model_providers.tokener-dev="));
+    assert!(arg_str(&codex.args[3]).contains(&format!("base_url=\"{dev_base_url}/v1\"")));
     assert_eq!(codex.env_set, vec![("TOKENER_DEV_API_KEY".to_string(), "sk-dev".to_string())]);
 
     let server = thread::spawn(move || {
@@ -1389,7 +1394,7 @@ anthropic_base = "https://api.moonshot.ai/anthropic"
         &EnvLookup::isolated(HashMap::new()),
     )
     .unwrap();
-    assert!(codex.args[3].contains("base_url=\"https://api.moonshot.ai/v1\""));
+    assert!(arg_str(&codex.args[3]).contains("base_url=\"https://api.moonshot.ai/v1\""));
 }
 
 #[test]
@@ -1483,13 +1488,13 @@ fn isolated_codex_plan_does_not_write_model_catalog_json() {
         &LaunchRequest {
             harness: Harness::Codex,
             provider: Some("tokener".to_string()),
-            passthrough: vec!["exec".to_string()],
+            passthrough: os(&["exec"]),
         },
         &paths,
         &env,
     )
     .unwrap();
-    assert!(!plan.args.iter().any(|arg| arg.contains("model_catalog_json")));
+    assert!(!plan.args.iter().any(|arg| arg_str(arg).contains("model_catalog_json")));
     assert!(!paths.dir.join("catalogs").exists());
 }
 
@@ -1729,7 +1734,7 @@ fn generated_provider_seeded_plan_uses_auth_token_and_settings() {
         &LaunchRequest {
             harness: Harness::Claude,
             provider: Some("tokener".to_string()),
-            passthrough: vec!["fix it".to_string()],
+            passthrough: os(&["fix it"]),
         },
         "TOKENER_API_KEY",
         "http://localhost:8080",
@@ -1737,7 +1742,7 @@ fn generated_provider_seeded_plan_uses_auth_token_and_settings() {
         None,
     );
     assert_eq!(plan.args[0], "--settings");
-    assert!(plan.args[1].contains("TOKENER_API_KEY"));
+    assert!(arg_str(&plan.args[1]).contains("TOKENER_API_KEY"));
     assert_eq!(plan.args[2], "fix it");
     assert!(plan.env_set.iter().any(|(k, v)| k == "ANTHROPIC_AUTH_TOKEN" && v == "sk-tokener"));
     assert!(plan.env_set.iter().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_empty()));
@@ -2273,7 +2278,7 @@ fn openrouter_seeded_plan_injects_settings() {
         &LaunchRequest {
             harness: Harness::Claude,
             provider: Some("openrouter".to_string()),
-            passthrough: vec!["fix it".to_string()],
+            passthrough: os(&["fix it"]),
         },
         "https://openrouter.ai/api",
         "sk-or-test",
@@ -2281,7 +2286,7 @@ fn openrouter_seeded_plan_injects_settings() {
         crate::claude_catalog::SeedOutcome::Seeded { model_count: 2 },
     );
     assert_eq!(plan.args[0], "--settings");
-    assert!(plan.args[1].contains("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"));
+    assert!(arg_str(&plan.args[1]).contains("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"));
     assert_eq!(plan.args[2], "fix it");
     assert!(plan.env_set.iter().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-or-test"));
     assert!(

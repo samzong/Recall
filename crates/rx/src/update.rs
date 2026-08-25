@@ -76,7 +76,7 @@ pub(crate) fn update_pending(current: &str, release: &ReleaseInfo) -> bool {
 pub(crate) fn maybe_before_launch(
     paths: &Paths,
     env: &EnvLookup,
-    raw_args: &[String],
+    raw_args: &[std::ffi::OsString],
 ) -> Result<()> {
     if env.get("RX_NO_UPDATE").is_some_and(|value| !value.is_empty() && value != "0") {
         return Ok(());
@@ -163,7 +163,7 @@ fn confirm(message: &str) -> Result<bool> {
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-fn relaunch(raw_args: &[String]) -> Result<()> {
+fn relaunch(raw_args: &[std::ffi::OsString]) -> Result<()> {
     let exe = std::env::current_exe().context("cannot resolve rx executable path")?;
     let mut command = Command::new(&exe);
     // current_exe() resolves aliases (rxc/rxx/rxo/rxp/rxd) to the plain rx binary,

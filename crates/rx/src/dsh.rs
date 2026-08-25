@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -52,20 +53,20 @@ pub(crate) fn official_deepseek(provider_id: &str) -> bool {
     provider_id == "deepseek"
 }
 
-pub(crate) fn args(passthrough: &[String], patch: Option<&Path>) -> Vec<String> {
+pub(crate) fn args(passthrough: &[OsString], patch: Option<&Path>) -> Vec<OsString> {
     if passthrough.first().is_some_and(|arg| arg == "plugin") {
         return passthrough.to_vec();
     }
     let mut args = Vec::new();
     if passthrough.first().is_some_and(|arg| arg == "web") {
-        args.push("web".to_string());
+        args.push(OsString::from("web"));
         push_patch(&mut args, patch);
         args.extend(passthrough.iter().skip(1).cloned());
         return args;
     }
     if !has_profile(passthrough) {
-        args.push("--profile".to_string());
-        args.push(PROFILE.to_string());
+        args.push(OsString::from("--profile"));
+        args.push(OsString::from(PROFILE));
     }
     push_patch(&mut args, patch);
     args.extend(passthrough.iter().cloned());
@@ -256,21 +257,21 @@ fn write_bytes_atomic(path: &Path, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn push_patch(args: &mut Vec<String>, patch: Option<&Path>) {
+fn push_patch(args: &mut Vec<OsString>, patch: Option<&Path>) {
     if let Some(path) = patch {
-        args.push("--patch".to_string());
-        args.push(path.display().to_string());
+        args.push(OsString::from("--patch"));
+        args.push(path.as_os_str().to_os_string());
     }
 }
 
-fn has_profile(args: &[String]) -> bool {
+fn has_profile(args: &[OsString]) -> bool {
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         if arg == "--" || arg == "web" || arg == "plugin" {
             return false;
         }
-        if arg == "--profile" || arg.starts_with("--profile=") {
+        if arg == "--profile" || crate::args::os_prefix(arg, "--profile=") {
             return true;
         }
         if arg == "--patch" {
@@ -317,25 +318,26 @@ mod tests {
         );
     }
 
+    fn os(argv: &[&str]) -> Vec<OsString> {
+        argv.iter().map(|arg| OsString::from(*arg)).collect()
+    }
+
     #[test]
     fn default_args_boot_tui_profile() {
-        assert_eq!(args(&[], None), vec!["--profile", PROFILE]);
-        assert_eq!(args(&["--resume".to_string()], None), vec!["--profile", PROFILE, "--resume"]);
+        assert_eq!(args(&[], None), os(&["--profile", PROFILE]));
+        assert_eq!(args(&os(&["--resume"]), None), os(&["--profile", PROFILE, "--resume"]));
     }
 
     #[test]
     fn keeps_explicit_profile_and_web() {
         assert_eq!(
-            args(&["--profile".to_string(), "headless".to_string(), "job".to_string()], None),
-            vec!["--profile", "headless", "job"]
+            args(&os(&["--profile", "headless", "job"]), None),
+            os(&["--profile", "headless", "job"])
         );
+        assert_eq!(args(&os(&["web", "--port", "8080"]), None), os(&["web", "--port", "8080"]));
         assert_eq!(
-            args(&["web".to_string(), "--port".to_string(), "8080".to_string()], None),
-            vec!["web", "--port", "8080"]
-        );
-        assert_eq!(
-            args(&["plugin".to_string(), "--profile".to_string(), PROFILE.to_string()], None),
-            vec!["plugin", "--profile", PROFILE]
+            args(&os(&["plugin", "--profile", PROFILE]), None),
+            os(&["plugin", "--profile", PROFILE])
         );
     }
 
@@ -343,12 +345,12 @@ mod tests {
     fn patch_follows_web_subcommand() {
         let patch = PathBuf::from("/tmp/rx.cordis.yml");
         assert_eq!(
-            args(&["web".to_string()], Some(&patch)),
-            vec!["web", "--patch", "/tmp/rx.cordis.yml"]
+            args(&os(&["web"]), Some(&patch)),
+            os(&["web", "--patch", "/tmp/rx.cordis.yml"])
         );
         assert_eq!(
             args(&[], Some(&patch)),
-            vec!["--profile", PROFILE, "--patch", "/tmp/rx.cordis.yml"]
+            os(&["--profile", PROFILE, "--patch", "/tmp/rx.cordis.yml"])
         );
     }
 }
