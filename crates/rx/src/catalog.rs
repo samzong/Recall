@@ -179,7 +179,10 @@ fn ensure(
 
 fn refresh(paths: &Paths, provider_id: &str, key: &str, endpoint: &str) -> Result<usize> {
     let url = format!("{endpoint}/models");
-    let body = fetch_get(&url, &[("Authorization", format!("Bearer {key}"))])?;
+    let body = match fetch_get(&url, &[("Authorization", format!("Bearer {key}"))]) {
+        Ok(body) => body,
+        Err(error) => bail!("{provider_id}: {error:#}"),
+    };
     let models = fill_missing_context(provider_id, &parse_openai_models(&body)?);
     if models.is_empty() {
         bail!("{} returned no models from {endpoint}", provider_id);
