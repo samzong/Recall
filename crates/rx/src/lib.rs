@@ -96,6 +96,7 @@ A TTY `rx` with no harness opens a picker. Scripts must pass a harness.
 Environment:
   RX_NO_UPDATE=1     skip launch-time update checks
   RX_NO_INSTALL=1    skip offering to install a missing harness
+  RX_NO_YOLO=1       skip injecting max-permission flags into harnesses
 "
 }
 

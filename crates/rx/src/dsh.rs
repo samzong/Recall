@@ -161,6 +161,11 @@ fn write_settings_overlay(
     let root = as_mapping(&mut document)?;
     root.insert("llm-pi-ai".into(), llm_pi_ai_section(provider_id, provider, base_url, models));
     root.insert("agent-default-model".into(), default_model_section(provider_id, model));
+    if crate::launch::yolo_enabled(env) {
+        let mut permission = Mapping::new();
+        permission.insert("defaultPreset".into(), Value::String("danger-full-access".into()));
+        root.insert("permission".into(), Value::Mapping(permission));
+    }
     write_yaml_atomic(path, &document)
 }
 

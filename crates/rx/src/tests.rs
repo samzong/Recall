@@ -600,7 +600,7 @@ fn claude_openrouter_uses_api_key_and_discovery_fallback_without_seed() {
     )
     .unwrap();
     assert_eq!(plan.program, PathBuf::from("claude"));
-    assert_eq!(plan.args, os(&["fix it"]));
+    assert_eq!(plan.args, os(&["--dangerously-skip-permissions", "fix it"]));
     assert!(
         plan.env_set
             .iter()
@@ -710,7 +710,7 @@ fn opencode_openrouter_injects_config_and_model() {
     )
     .unwrap();
     assert_eq!(plan.program, PathBuf::from("opencode"));
-    assert_eq!(plan.args, os(&["run", "hello"]));
+    assert_eq!(plan.args, os(&["--auto", "run", "hello"]));
     assert!(plan.env_set.iter().any(|(k, v)| k == "OPENROUTER_API_KEY" && v == "sk-or-test"));
     let config = plan
         .env_set
@@ -876,6 +876,98 @@ agent-default-model:
 }
 
 #[test]
+fn yolo_forces_dsh_preset_over_user_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsh_home = dir.path().join("dsh-home");
+    fs::create_dir_all(&dsh_home).unwrap();
+    fs::write(dsh_home.join("settings.yaml"), "permission:\n  defaultPreset: read-only\n").unwrap();
+    let (_recall, paths) = temp_paths();
+    let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"kimi-k3"}]}"#);
+    fs::write(&paths.config, format!("[provider.tokener]\nbase_url = \"{base_url}\"\n")).unwrap();
+    let env = EnvLookup::isolated(HashMap::from([
+        ("TOKENER_API_KEY".to_string(), "sk-tokener".to_string()),
+        ("DSH_HOME".to_string(), dsh_home.display().to_string()),
+    ]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Dsh,
+            provider: Some("tokener".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    server.join().unwrap();
+    let overlay = paths.dir.join("dsh").join("settings.yaml");
+    let settings: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&overlay).unwrap()).unwrap();
+    assert_eq!(settings["permission"]["defaultPreset"], "danger-full-access");
+    assert!(plan.stderr_note.as_deref().unwrap().contains("yolo"));
+}
+
+#[test]
+fn yolo_respects_user_permission_flag() {
+    let (_dir, paths) = temp_paths();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "OPENROUTER_API_KEY".to_string(),
+        "sk-or-test".to_string(),
+    )]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Claude,
+            provider: Some("openrouter".to_string()),
+            passthrough: os(&["--permission-mode=acceptEdits", "fix it"]),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(plan.args, os(&["--permission-mode=acceptEdits", "fix it"]));
+    assert!(!plan.stderr_note.as_deref().unwrap_or_default().contains("yolo"));
+
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Codex,
+            provider: Some("openrouter".to_string()),
+            passthrough: os(&[
+                "--sandbox=read-only",
+                "--ask-for-approval=on-request",
+                "exec",
+                "cargo test",
+            ]),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert!(!plan.args.iter().any(|arg| arg == "--sandbox"));
+    assert!(!plan.args.iter().any(|arg| arg == "--ask-for-approval"));
+    assert!(!plan.stderr_note.as_deref().unwrap_or_default().contains("yolo"));
+}
+
+#[test]
+fn rx_no_yolo_disables_injection() {
+    let (_dir, paths) = temp_paths();
+    let env = EnvLookup::isolated(HashMap::from([
+        ("OPENROUTER_API_KEY".to_string(), "sk-or-test".to_string()),
+        ("RX_NO_YOLO".to_string(), "1".to_string()),
+    ]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Claude,
+            provider: Some("openrouter".to_string()),
+            passthrough: os(&["fix it"]),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(plan.args, os(&["fix it"]));
+    assert!(!plan.stderr_note.as_deref().unwrap_or_default().contains("yolo"));
+}
+
+#[test]
 fn pi_openrouter_injects_provider_without_extension() {
     let (_dir, paths) = temp_paths();
     let env = EnvLookup::isolated(HashMap::from([(
@@ -897,6 +989,7 @@ fn pi_openrouter_injects_provider_without_extension() {
     assert_eq!(plan.args[1], "openrouter/*");
     assert_eq!(plan.args[2], "--provider");
     assert_eq!(plan.args[3], "openrouter");
+    assert!(!plan.args.iter().any(|arg| arg == "--approve"));
     assert!(!plan.args.iter().any(|arg| arg == "--extension"));
     assert!(!plan.env_set.iter().any(|(k, _)| k == "PI_CODING_AGENT_DIR"));
     assert!(plan.env_set.iter().any(|(k, v)| k == "OPENROUTER_API_KEY" && v == "sk-or-test"));
@@ -1011,7 +1104,11 @@ fn codex_tokener_does_not_invent_a_model() {
     assert_eq!(plan.args[1], "model_provider=\"tokener\"");
     assert!(arg_str(&plan.args[3]).contains("base_url=\"https://api.tokener.dev/v1\""));
     assert!(!plan.args.iter().any(|arg| arg_str(arg).starts_with("model=")));
-    assert_eq!(&plan.args[4..], os(&["exec", "cargo test"]));
+    assert_eq!(
+        &plan.args[4..8],
+        os(&["--sandbox", "danger-full-access", "--ask-for-approval", "never"])
+    );
+    assert_eq!(&plan.args[8..], os(&["exec", "cargo test"]));
 }
 
 #[test]
@@ -1256,7 +1353,7 @@ model = "gpt-prod"
         &env,
     )
     .unwrap();
-    assert_eq!(opencode.args, ["-m", "tokener-dev/gpt-dev"]);
+    assert_eq!(opencode.args, ["--auto", "-m", "tokener-dev/gpt-dev"]);
     let opencode_config = opencode
         .env_set
         .iter()

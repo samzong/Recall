@@ -119,25 +119,107 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
             SeedOutcome::Fallback
         };
         if target.provider.setup == Setup::OpenRouter {
-            return Ok(inject_claude_openrouter(
-                request,
-                &target.claude_url,
-                &target.key,
-                model,
-                seed,
-            ));
+            let mut plan =
+                inject_claude_openrouter(request, &target.claude_url, &target.key, model, seed);
+            apply_yolo(request, &mut plan, env);
+            return Ok(plan);
         }
         if matches!(seed, SeedOutcome::Seeded { .. }) {
-            return Ok(inject_claude_generated_seeded(
+            let mut plan = inject_claude_generated_seeded(
                 request,
                 &target.provider.env,
                 &target.claude_url,
                 &target.key,
                 model,
-            ));
+            );
+            apply_yolo(request, &mut plan, env);
+            return Ok(plan);
         }
     }
-    inject(request, paths, env, &target, model)
+    let mut plan = inject(request, paths, env, &target, model)?;
+    apply_yolo(request, &mut plan, env);
+    Ok(plan)
+}
+
+pub(crate) fn yolo_enabled(env: &EnvLookup) -> bool {
+    env.get("RX_NO_YOLO").is_none()
+}
+
+fn apply_yolo(request: &LaunchRequest, plan: &mut LaunchPlan, env: &EnvLookup) {
+    if env.get("RX_NO_YOLO").is_some() {
+        return;
+    }
+    let passthrough = args::before_double_dash(&request.passthrough);
+    let user_flag = |flags: &[&str]| {
+        passthrough.iter().any(|arg| {
+            flags.iter().any(|flag| arg == *flag || args::os_prefix(arg, &format!("{flag}=")))
+        })
+    };
+    let note = |flag: &str| {
+        format!(
+            "[rx] yolo: max permissions for {} via {flag} (RX_NO_YOLO=1 disables)",
+            request.harness.as_str()
+        )
+    };
+    match request.harness {
+        Harness::Claude => {
+            if user_flag(&["--dangerously-skip-permissions", "--permission-mode"]) {
+                return;
+            }
+            plan.args.insert(0, OsString::from("--dangerously-skip-permissions"));
+            push_note(plan, &note("--dangerously-skip-permissions"));
+        }
+        Harness::Codex => {
+            if user_flag(&["--sandbox", "--ask-for-approval"])
+                || codex_user_sets_sandbox(passthrough)
+            {
+                return;
+            }
+            let flags = [
+                OsString::from("--sandbox"),
+                OsString::from("danger-full-access"),
+                OsString::from("--ask-for-approval"),
+                OsString::from("never"),
+            ];
+            let at = plan.args.len().saturating_sub(request.passthrough.len());
+            plan.args.splice(at..at, flags);
+            push_note(plan, &note("--sandbox danger-full-access --ask-for-approval never"));
+        }
+        Harness::OpenCode => {
+            if user_flag(&["--auto"]) {
+                return;
+            }
+            plan.args.insert(0, OsString::from("--auto"));
+            push_note(plan, &note("--auto"));
+        }
+        Harness::Pi => {}
+        Harness::Dsh => {}
+    }
+}
+
+fn codex_user_sets_sandbox(passthrough: &[OsString]) -> bool {
+    let mut i = 0;
+    while i < passthrough.len() {
+        if passthrough[i] == "-c" || passthrough[i] == "--config" {
+            if passthrough.get(i + 1).is_some_and(|value| {
+                value.to_str().is_some_and(|text| {
+                    text.starts_with("sandbox_mode=") || text.starts_with("approval_policy=")
+                })
+            }) {
+                return true;
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn push_note(plan: &mut LaunchPlan, note: &str) {
+    plan.stderr_note = Some(match plan.stderr_note.take() {
+        Some(existing) => format!("{existing}\n{note}"),
+        None => note.to_string(),
+    });
 }
 
 fn passthrough(request: &LaunchRequest) -> LaunchPlan {
@@ -471,7 +553,14 @@ fn inject(
                 program: PathBuf::from("dsh"),
                 args: crate::dsh::args(&request.passthrough, Some(&patch)),
                 env_set: crate::dsh::env_set(provider_id, provider, key),
-                stderr_note: None,
+                stderr_note: if yolo_enabled(env) {
+                    Some(
+                        "[rx] yolo: dsh permission preset danger-full-access (RX_NO_YOLO=1 disables)"
+                            .to_string(),
+                    )
+                } else {
+                    None
+                },
             })
         }
     }
