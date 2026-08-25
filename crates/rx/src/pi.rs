@@ -147,12 +147,17 @@ pub(crate) fn merge_provider(models_path: &Path, provider_id: &str, provider: Va
     } else {
         json!({ "providers": {} })
     };
-    let Some(providers) = document.get_mut("providers").and_then(Value::as_object_mut) else {
-        document["providers"] = json!({});
-        document["providers"][provider_id] = provider;
-        return write_json_atomic(models_path, &document);
+    let Some(root) = document.as_object_mut() else {
+        bail!(
+            "{} root is not a JSON object; fix or remove the file and retry",
+            models_path.display()
+        );
     };
-    providers.insert(provider_id.to_string(), provider);
+    if let Some(providers) = root.get_mut("providers").and_then(Value::as_object_mut) {
+        providers.insert(provider_id.to_string(), provider);
+    } else {
+        root.insert("providers".to_string(), json!({ provider_id: provider }));
+    }
     write_json_atomic(models_path, &document)
 }
 
