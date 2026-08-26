@@ -73,6 +73,8 @@ install: ## Install binaries to ~/.cargo/bin
 	@if [ -d "$(HOME)/.zsh/completions" ]; then \
 		"$(HOME)/.cargo/bin/recall" completions zsh > "$(HOME)/.zsh/completions/_recall"; \
 		printf '$(GREEN)  ✓ Updated ~/.zsh/completions/_recall$(RESET)\n'; \
+		"$(HOME)/.cargo/bin/rx" completions zsh > "$(HOME)/.zsh/completions/_rx"; \
+		printf '$(GREEN)  ✓ Updated ~/.zsh/completions/_rx$(RESET)\n'; \
 	fi
 
 uninstall: ## Remove installed binaries

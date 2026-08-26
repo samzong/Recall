@@ -8,8 +8,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use crate::args::{
-    Command, Harness, LaunchRequest, ModelsCommand, ProvidersCommand, UpdateCommand, parse,
-    rewrite_argv0,
+    Command, CompletionShell, CompletionsCommand, Harness, LaunchRequest, ModelsCommand,
+    ProvidersCommand, UpdateCommand, parse, rewrite_argv0,
 };
 use crate::config::{self, Paths};
 use crate::launch::{self, EnvLookup};
@@ -209,8 +209,93 @@ fn rx_help_and_version() {
     assert!(crate::help_text().contains("rx --provider <provider> <harness>"));
     assert!(crate::help_text().contains("rx providers <list|login|logout|use>"));
     assert!(crate::help_text().contains("rx providers models update [provider]"));
+    assert!(crate::help_text().contains("rx completions <bash|zsh|fish>"));
     assert!(!crate::help_text().contains("rx providers list\n"));
+    assert!(!crate::help_text().contains("rx completions --providers"));
     assert!(!crate::help_text().contains("rx debug"));
+}
+
+#[test]
+fn completions_parses_shells_and_id_lists() {
+    assert_eq!(parse_line(&["rx", "completions"]), Command::Completions(CompletionsCommand::Help));
+    assert_eq!(
+        parse_line(&["rx", "completions", "zsh"]),
+        Command::Completions(CompletionsCommand::Generate { shell: CompletionShell::Zsh })
+    );
+    assert_eq!(
+        parse_line(&["rx", "completions", "bash"]),
+        Command::Completions(CompletionsCommand::Generate { shell: CompletionShell::Bash })
+    );
+    assert_eq!(
+        parse_line(&["rx", "completions", "fish"]),
+        Command::Completions(CompletionsCommand::Generate { shell: CompletionShell::Fish })
+    );
+    assert_eq!(
+        parse_line(&["rx", "completions", "--providers"]),
+        Command::Completions(CompletionsCommand::ListProviders { configured: false })
+    );
+    assert_eq!(
+        parse_line(&["rx", "completions", "--configured"]),
+        Command::Completions(CompletionsCommand::ListProviders { configured: true })
+    );
+}
+
+#[test]
+fn completions_rejects_provider_flag_and_extra_args() {
+    let error =
+        parse(&args(&["rx", "--provider", "openrouter", "completions", "zsh"])).unwrap_err();
+    assert!(error.to_string().contains("--provider is not valid with rx completions"), "{error}");
+
+    let extra = parse(&args(&["rx", "completions", "zsh", "extra"])).unwrap_err();
+    assert!(extra.to_string().contains("unexpected argument: extra"), "{extra}");
+
+    let unknown = parse(&args(&["rx", "completions", "powershell"])).unwrap_err();
+    assert!(unknown.to_string().contains("unknown completions command: powershell"), "{unknown}");
+}
+
+#[test]
+fn completions_scripts_cover_rx_surface() {
+    for shell in [CompletionShell::Bash, CompletionShell::Zsh, CompletionShell::Fish] {
+        let script = crate::completions::script(shell);
+        for needle in [
+            "claude",
+            "codex",
+            "opencode",
+            "pi",
+            "dsh",
+            "providers",
+            "update",
+            "completions",
+            "--provider",
+            "--configured",
+            "--providers",
+            "rxc",
+            "rxx",
+            "rxo",
+            "rxp",
+            "rxd",
+        ] {
+            assert!(script.contains(needle), "{shell:?} missing {needle}");
+        }
+        assert!(!script.contains("search"), "{shell:?} leaked recall commands");
+    }
+    assert!(crate::completions::script(CompletionShell::Zsh).contains("#compdef rx"));
+}
+
+#[test]
+fn completion_ids_list_configured_and_known() {
+    let (_dir, paths) = temp_paths();
+    let env = EnvLookup::isolated(HashMap::new());
+    let known = crate::providers::completion_ids(&paths, &env, false).unwrap();
+    assert!(known.contains(&"openrouter".to_string()), "{known:?}");
+    assert!(known.contains(&"tokener".to_string()), "{known:?}");
+    assert!(crate::providers::completion_ids(&paths, &env, true).unwrap().is_empty());
+
+    config::login(&paths, "openrouter", "sk-secret".to_string()).unwrap();
+    assert_eq!(
+        crate::providers::completion_ids(&paths, &env, true).unwrap(),
+        vec!["openrouter".to_string()]
+    );
 }
 
 #[test]

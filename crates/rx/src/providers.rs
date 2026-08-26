@@ -445,6 +445,18 @@ fn set_default_provider(paths: &Paths, state: &ProviderState) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn completion_ids(
+    paths: &Paths,
+    env: &EnvLookup,
+    configured_only: bool,
+) -> Result<Vec<String>> {
+    Ok(provider_states(paths, env)?
+        .into_iter()
+        .filter(|state| !configured_only || state.configured())
+        .map(|state| state.provider.id)
+        .collect())
+}
+
 fn provider_index(states: &[ProviderState], id: &str, configured: bool) -> Result<usize> {
     let index = states
         .iter()

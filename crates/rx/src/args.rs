@@ -64,6 +64,20 @@ pub(crate) enum UpdateCommand {
     Run { yes: bool },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompletionsCommand {
+    Help,
+    Generate { shell: CompletionShell },
+    ListProviders { configured: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
     Help,
@@ -72,6 +86,7 @@ pub(crate) enum Command {
     PickHarness { provider: Option<String> },
     Providers(ProvidersCommand),
     Update(UpdateCommand),
+    Completions(CompletionsCommand),
 }
 
 pub(crate) fn rewrite_argv0(mut args: Vec<OsString>) -> Vec<OsString> {
@@ -126,6 +141,12 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Command> {
                 bail!("--provider is not valid with rx update");
             }
             Ok(Command::Update(parse_update(&rest[1..])?))
+        }
+        Some("completions") => {
+            if provider.is_some() {
+                bail!("--provider is not valid with rx completions");
+            }
+            Ok(Command::Completions(parse_completions(&rest[1..])?))
         }
         Some(name) => {
             let Some(harness) = Harness::parse(name) else {
@@ -249,6 +270,45 @@ fn extract_provider(args: &[OsString]) -> Result<(Option<String>, Vec<OsString>)
         i += 1;
     }
     Ok((provider, rest))
+}
+
+fn parse_completions(args: &[OsString]) -> Result<CompletionsCommand> {
+    match args.first().and_then(|arg| arg.to_str()) {
+        None if args.is_empty() => Ok(CompletionsCommand::Help),
+        Some("-h" | "--help" | "help") if args.len() == 1 => Ok(CompletionsCommand::Help),
+        Some("--providers") if args.len() == 1 => {
+            Ok(CompletionsCommand::ListProviders { configured: false })
+        }
+        Some("--configured") if args.len() == 1 => {
+            Ok(CompletionsCommand::ListProviders { configured: true })
+        }
+        Some("bash") if args.len() == 1 => {
+            Ok(CompletionsCommand::Generate { shell: CompletionShell::Bash })
+        }
+        Some("zsh") if args.len() == 1 => {
+            Ok(CompletionsCommand::Generate { shell: CompletionShell::Zsh })
+        }
+        Some("fish") if args.len() == 1 => {
+            Ok(CompletionsCommand::Generate { shell: CompletionShell::Fish })
+        }
+        Some("bash" | "zsh" | "fish" | "--providers" | "--configured") => {
+            bail!(
+                "unexpected argument: {}\n\n{}",
+                args[1].to_string_lossy(),
+                crate::completions::help()
+            )
+        }
+        Some(command) => {
+            bail!("unknown completions command: {command}\n\n{}", crate::completions::help())
+        }
+        None => {
+            bail!(
+                "unknown completions command: {}\n\n{}",
+                args[0].to_string_lossy(),
+                crate::completions::help()
+            )
+        }
+    }
 }
 
 fn parse_update(args: &[OsString]) -> Result<UpdateCommand> {
