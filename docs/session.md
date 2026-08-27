@@ -307,7 +307,9 @@ If the source does not support resume, exit non-zero with an actionable error.
 ### `recall session open`
 
 Open a selected session in its source app when an adapter supports app-open.
-Today this is expected to be useful for Codex desktop threads.
+Today this is expected to be useful for Codex desktop threads
+(`codex://threads/<id>`) and GitHub Copilot desktop sessions
+(`ghapp://sessions/<id>`).
 
 ```bash
 recall session open --id <id>

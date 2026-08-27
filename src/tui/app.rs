@@ -3430,6 +3430,35 @@ mod tests {
         assert_eq!(summary.tokens.total_tokens, 31);
     }
 
+    fn copilot_search_result() -> SearchResult {
+        let mut result = codex_search_result();
+        result.session.source = "copilot-cli".to_string();
+        result.session.source_id = "7d5c993a-0966-4e3e-9622-7a39ba9576ba".to_string();
+        result.session.title = "Copilot session".to_string();
+        result
+    }
+
+    #[test]
+    fn ctrl_o_from_search_confirms_copilot_app_open() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.results = vec![copilot_search_result()];
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), &store);
+
+        assert!(matches!(app.mode, AppMode::ConfirmResume));
+        let pending = app.pending_resume.as_ref().unwrap();
+        assert!(matches!(pending.action, PendingCommandAction::OpenApp));
+        assert!(
+            pending
+                .command
+                .args
+                .iter()
+                .any(|arg| arg == "ghapp://sessions/7d5c993a-0966-4e3e-9622-7a39ba9576ba")
+        );
+    }
+
     #[test]
     fn ctrl_o_from_search_confirms_codex_app_open() {
         crate::db::schema::register_sqlite_vec();

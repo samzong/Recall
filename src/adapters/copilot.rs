@@ -36,6 +36,10 @@ impl SourceAdapter for CopilotAdapter {
         })
     }
 
+    fn app_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        Some(open_url_command(copilot_session_url(source_id)))
+    }
+
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let Some(sessions_dir) = resolve_copilot_dir()? else {
             return Ok(vec![]);
@@ -65,6 +69,28 @@ impl SourceAdapter for CopilotAdapter {
         let result = scan_for_sync_impl(&sessions_dir, store, since_ts, include_events)?;
         Ok(Some(result))
     }
+}
+
+fn copilot_session_url(source_id: &str) -> String {
+    format!("ghapp://sessions/{source_id}")
+}
+
+#[cfg(target_os = "macos")]
+fn open_url_command(url: String) -> ResumeCommand {
+    ResumeCommand { program: "open".to_string(), args: vec![url] }
+}
+
+#[cfg(target_os = "windows")]
+fn open_url_command(url: String) -> ResumeCommand {
+    ResumeCommand {
+        program: "cmd".to_string(),
+        args: vec!["/C".to_string(), "start".to_string(), String::new(), url],
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn open_url_command(url: String) -> ResumeCommand {
+    ResumeCommand { program: "xdg-open".to_string(), args: vec![url] }
 }
 
 fn resolve_copilot_dir() -> anyhow::Result<Option<PathBuf>> {
@@ -478,6 +504,18 @@ mod tests {
             source_file_path: None,
             is_import: false,
         }
+    }
+
+    #[test]
+    fn copilot_app_command_opens_session_deeplink() {
+        let command = CopilotAdapter.app_command("7d5c993a-0966-4e3e-9622-7a39ba9576ba").unwrap();
+
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg == "ghapp://sessions/7d5c993a-0966-4e3e-9622-7a39ba9576ba")
+        );
     }
 
     #[test]
