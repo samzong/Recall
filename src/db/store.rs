@@ -132,7 +132,8 @@ impl Store {
              PRAGMA busy_timeout=5000;
              PRAGMA foreign_keys=ON;",
         )?;
-        Ok(Store { conn })
+        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
+        Ok(Store { conn, trigram_message_flag })
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -156,7 +157,8 @@ impl Store {
              PRAGMA foreign_keys=ON;",
         )?;
         crate::db::schema::init(&conn)?;
-        Ok(Store { conn })
+        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
+        Ok(Store { conn, trigram_message_flag })
     }
 }
 
