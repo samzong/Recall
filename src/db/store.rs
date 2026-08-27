@@ -1,5 +1,7 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::types::{ParentLink, Session, ThreadRole};
 
@@ -99,12 +101,18 @@ pub(crate) struct SkillAuditEventRow {
 }
 
 impl Store {
-    pub(crate) fn open() -> Result<Self> {
+    pub(crate) fn default_db_path() -> Result<PathBuf> {
         let data_dir = dirs::data_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?
             .join("recall");
-        std::fs::create_dir_all(&data_dir)?;
-        let db_path = data_dir.join("recall.db");
+        Ok(data_dir.join("recall.db"))
+    }
+
+    pub(crate) fn open() -> Result<Self> {
+        let db_path = Self::default_db_path()?;
+        if let Some(data_dir) = db_path.parent() {
+            std::fs::create_dir_all(data_dir)?;
+        }
         let conn = Connection::open(&db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -115,10 +123,35 @@ impl Store {
         Ok(Store { conn })
     }
 
+    pub(crate) fn open_read_only_at(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA busy_timeout=5000;
+             PRAGMA foreign_keys=ON;",
+        )?;
+        Ok(Store { conn })
+    }
+
     #[cfg(any(test, feature = "bench"))]
     pub(crate) fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
+        crate::db::schema::init(&conn)?;
+        Ok(Store { conn })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_at(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;
+             PRAGMA foreign_keys=ON;",
+        )?;
         crate::db::schema::init(&conn)?;
         Ok(Store { conn })
     }
@@ -269,5 +302,20 @@ mod exclusion_tests {
         assert_eq!(sessions[0].custom_title.as_deref(), Some("New title"));
         assert_eq!(sessions[0].summary.as_deref(), Some("Keep summary"));
         assert_eq!(sessions[0].duration_minutes, Some(9));
+    }
+
+    #[test]
+    fn open_read_only_at_opens_path_with_uri_characters() {
+        crate::db::schema::register_sqlite_vec();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recall?.db");
+        {
+            let store = Store::open_at(&path).unwrap();
+            store.insert_session(&sess("a", None)).unwrap();
+        }
+        let store = Store::open_read_only_at(&path).unwrap();
+        let loaded = store.get_session_by_id("a").unwrap().unwrap();
+        assert_eq!(loaded.title, "t");
+        assert!(store.insert_session(&sess("b", None)).is_err());
     }
 }

@@ -116,6 +116,11 @@ enum Commands {
         #[arg(help = "Target shell")]
         shell: Shell,
     },
+    #[command(about = "Serve a read-only MCP server over stdio")]
+    Mcp {
+        #[arg(long, help = "Read this Recall database instead of the default index")]
+        db: Option<PathBuf>,
+    },
     #[command(hide = true, name = "__background-worker")]
     BackgroundWorker {
         #[arg(long)]
@@ -259,6 +264,7 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "recall", &mut std::io::stdout());
         }
+        Some(Commands::Mcp { db }) => crate::mcp::run(db)?,
         Some(Commands::External(args)) => {
             let status = crate::extension::run_external(args)?;
             if !status.success() {
@@ -495,6 +501,24 @@ mod tests {
         assert!(compact_help.contains("extension Manage Recall extensions"));
         assert!(compact_help.contains("session Operate on indexed sessions"));
         assert!(compact_help.contains("completions Generate shell completion script"));
+        assert!(compact_help.contains("mcp Serve a read-only MCP server over stdio"));
+    }
+
+    #[test]
+    fn mcp_parses_optional_db_path() {
+        let cli = Cli::try_parse_from(["recall", "mcp"]).unwrap();
+        match cli.command {
+            Some(Commands::Mcp { db }) => assert!(db.is_none()),
+            _ => panic!("expected mcp command"),
+        }
+
+        let cli = Cli::try_parse_from(["recall", "mcp", "--db", "/tmp/recall-fixture.db"]).unwrap();
+        match cli.command {
+            Some(Commands::Mcp { db }) => {
+                assert_eq!(db.unwrap().to_string_lossy(), "/tmp/recall-fixture.db");
+            }
+            _ => panic!("expected mcp command"),
+        }
     }
 
     #[test]

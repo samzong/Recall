@@ -18,7 +18,14 @@ version = "0.5.3"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+rmcp = { version = "3.1.4", default-features = false, features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-io",
+] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "time"] }
 sqlite-vec = "0.1"
 hf-hub = { version = "0.5", features = ["ureq"] }
 ureq = "3"
