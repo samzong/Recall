@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 use crate::config::{ProviderConfig, RxConfig};
 
+pub(crate) const NONE: &str = "none";
+
 const SNAPSHOT: &str = include_str!("../data/providers.json");
 
 #[derive(Debug, Deserialize)]
@@ -114,7 +116,14 @@ pub(crate) fn available(config: &RxConfig) -> Result<Vec<Provider>> {
     Ok(providers)
 }
 
+pub(crate) fn is_none(id: &str) -> bool {
+    id == NONE
+}
+
 pub(crate) fn validate_id(id: &str) -> Result<()> {
+    if is_none(id) {
+        bail!("'{NONE}' is reserved; pass --provider none or run: rx providers use none");
+    }
     if !id.is_empty()
         && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {

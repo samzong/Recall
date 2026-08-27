@@ -59,16 +59,29 @@ pub(crate) struct ProviderTarget {
     pub model: Option<String>,
 }
 
+#[derive(Debug)]
+pub(crate) enum ProviderResolution {
+    SkipInjection,
+    Unconfigured,
+    Target(Box<ProviderTarget>),
+}
+
 pub(crate) fn configured_provider(
     override_id: Option<&str>,
     paths: &Paths,
     env: &EnvLookup,
-) -> Result<Option<ProviderTarget>> {
+) -> Result<ProviderResolution> {
+    if override_id.is_some_and(crate::provider::is_none) {
+        return Ok(ProviderResolution::SkipInjection);
+    }
     let config = crate::config::load(paths)?;
     let configured_id = override_id
         .map(str::to_string)
         .or_else(|| config.as_ref().and_then(|config| config.default_provider.clone()));
     let provider_id = match configured_id {
+        Some(provider_id) if crate::provider::is_none(&provider_id) => {
+            return Ok(ProviderResolution::SkipInjection);
+        }
         Some(provider_id) => provider_id,
         None => {
             let entry = config.as_ref().and_then(|config| config.provider.get("openrouter"));
@@ -78,7 +91,7 @@ pub(crate) fn configured_provider(
             {
                 "openrouter".to_string()
             } else {
-                return Ok(None);
+                return Ok(ProviderResolution::Unconfigured);
             }
         }
     };
@@ -87,19 +100,34 @@ pub(crate) fn configured_provider(
     let auth = entry.map(|entry| entry.auth).unwrap_or(AuthMode::ApiKey);
     let key = resolve_key(&provider, auth, paths, env)?;
     let model = entry.and_then(|entry| entry.model.clone());
-    Ok(Some(ProviderTarget {
+    Ok(ProviderResolution::Target(Box::new(ProviderTarget {
         provider_id,
         base_url: provider.endpoint.clone(),
         claude_url: crate::provider::claude_base(&provider),
         provider,
         key,
         model,
-    }))
+    })))
 }
 
 pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> Result<LaunchPlan> {
-    let Some(target) = configured_provider(request.provider.as_deref(), paths, env)? else {
-        return Ok(passthrough(request));
+    let target = match configured_provider(request.provider.as_deref(), paths, env)? {
+        ProviderResolution::SkipInjection => {
+            return Ok(passthrough(
+                request,
+                format!("[rx] provider 'none': launching {} as-is", request.harness.as_str()),
+            ));
+        }
+        ProviderResolution::Unconfigured => {
+            return Ok(passthrough(
+                request,
+                format!(
+                    "[rx] no provider configured; launching {} as-is (configure: rx providers login)",
+                    request.harness.as_str()
+                ),
+            ));
+        }
+        ProviderResolution::Target(target) => target,
     };
     let model = target.model.as_deref().or(match request.harness {
         Harness::Claude => target.provider.claude_default_model,
@@ -222,7 +250,7 @@ fn push_note(plan: &mut LaunchPlan, note: &str) {
     });
 }
 
-fn passthrough(request: &LaunchRequest) -> LaunchPlan {
+fn passthrough(request: &LaunchRequest, note: String) -> LaunchPlan {
     LaunchPlan {
         program: PathBuf::from(request.harness.as_str()),
         args: match request.harness {
@@ -230,10 +258,7 @@ fn passthrough(request: &LaunchRequest) -> LaunchPlan {
             _ => request.passthrough.clone(),
         },
         env_set: Vec::new(),
-        stderr_note: Some(format!(
-            "[rx] no provider configured; launching {} as-is (configure: rx providers login)",
-            request.harness.as_str()
-        )),
+        stderr_note: Some(note),
     }
 }
 

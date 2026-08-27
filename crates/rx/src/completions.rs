@@ -67,11 +67,11 @@ _rx() {
   COMPREPLY=()
 
   if [[ $cur == --provider=* ]]; then
-    _rx_ids --configured
+    _rx_ids --targets
     return
   fi
   if [[ $prev == --provider ]]; then
-    _rx_ids --configured
+    _rx_ids --targets
     return
   fi
 
@@ -112,8 +112,11 @@ _rx() {
         login)
           ((${#pos[@]} == 2)) && _rx_ids --providers
           ;;
-        logout|use)
+        logout)
           ((${#pos[@]} == 2)) && _rx_ids --configured
+          ;;
+        use)
+          ((${#pos[@]} == 2)) && _rx_ids --targets
           ;;
         models)
           case ${pos[2]-} in
@@ -209,11 +212,11 @@ _rx() {
   local cmd=${words[1]:t}
 
   if [[ $cur == --provider=* ]]; then
-    _rx_ids --configured
+    _rx_ids --targets
     return
   fi
   if [[ $prev == --provider ]]; then
-    _rx_ids --configured
+    _rx_ids --targets
     return
   fi
 
@@ -254,8 +257,11 @@ _rx() {
         login)
           (( $#pos == 2 )) && _rx_ids --providers
           ;;
-        logout|use)
+        logout)
           (( $#pos == 2 )) && _rx_ids --configured
+          ;;
+        use)
+          (( $#pos == 2 )) && _rx_ids --targets
           ;;
         models)
           case ${pos[3]:-} in
@@ -379,12 +385,12 @@ complete -c rx -n '__rx_n 0; and not __rx_has_provider' -a 'completions' -d 'Gen
 complete -c rx -n '__rx_n 0; and __rx_has_provider' -a 'claude codex opencode pi dsh'
 complete -c rx -n '__rx_n 0' -s h -l help
 complete -c rx -n '__rx_n 0' -s V -l version
-complete -c rx -n 'not __rx_has_provider; and __rx_n 0' -l provider -xa '(__rx_ids --configured)'
-complete -c rx -n 'not __rx_has_provider; and __rx_has_harness' -l provider -xa '(__rx_ids --configured)'
+complete -c rx -n 'not __rx_has_provider; and __rx_n 0' -l provider -xa '(__rx_ids --targets)'
+complete -c rx -n 'not __rx_has_provider; and __rx_has_harness' -l provider -xa '(__rx_ids --targets)'
 complete -c rx -n '__rx_is providers; and __rx_n 1' -a 'list login logout use models'
 complete -c rx -n '__rx_is providers login; and __rx_n 2' -a '(__rx_ids --providers)'
 complete -c rx -n '__rx_is providers logout; and __rx_n 2' -a '(__rx_ids --configured)'
-complete -c rx -n '__rx_is providers use; and __rx_n 2' -a '(__rx_ids --configured)'
+complete -c rx -n '__rx_is providers use; and __rx_n 2' -a '(__rx_ids --targets)'
 complete -c rx -n '__rx_is providers models; and __rx_n 2' -a 'update'
 complete -c rx -n '__rx_is providers models update; and __rx_n 3' -a '(__rx_ids --configured)'
 complete -c rx -n '__rx_is update; and __rx_n 1' -l yes -s y
@@ -392,7 +398,7 @@ complete -c rx -n '__rx_is completions; and __rx_n 1' -a 'bash zsh fish'
 
 for cmd in rxc rxx rxo rxp rxd
     complete -c $cmd -f
-    complete -c $cmd -l provider -xa '(__rx_ids --configured)'
+    complete -c $cmd -l provider -xa '(__rx_ids --targets)'
 end
 "#;
 
@@ -421,8 +427,8 @@ pub(crate) fn run(command: CompletionsCommand, paths: &Paths, env: &EnvLookup) -
             print!("{}", script(shell));
             Ok(())
         }
-        CompletionsCommand::ListProviders { configured } => {
-            for id in providers::completion_ids(paths, env, configured)? {
+        CompletionsCommand::ListProviders(filter) => {
+            for id in providers::completion_ids(paths, env, filter)? {
                 println!("{id}");
             }
             Ok(())

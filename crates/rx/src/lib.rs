@@ -87,6 +87,7 @@ rx — launch agent harnesses through a configured AI provider
 Usage:
   rx
   rx --provider <provider>
+  rx --provider none <harness> [args...]
   rx <harness> [args...]
   rx --provider <provider> <harness> [args...]
   rx providers <list|login|logout|use>

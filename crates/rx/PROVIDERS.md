@@ -13,7 +13,9 @@ OpenAI roots that already end in `/vN` (Z.AI `/paas/v4`) are left as-is.
 Users manage providers with `rx providers list`, `login [provider]`,
 `logout [provider]`, `use [provider]`, and `models update [provider]`. Passing a
 provider ID skips the picker; `use` persistently selects the default provider. The one-launch form
-`rx --provider <provider> <harness>` overrides it. Custom providers are configured
+`rx --provider <provider> <harness>` overrides it. `none` skips injection for one
+launch (`rx --provider none <harness>`) or persistently (`rx providers use none`)
+and overrides the implicit OpenRouter default. Custom providers are configured
 with `default_provider` plus `[provider.<id>]` entries in `~/.recall/rx.toml`.
 Stored API keys live in `~/.recall/rx.keys`; `auth = "env"` reads the provider's
 configured environment variable instead.

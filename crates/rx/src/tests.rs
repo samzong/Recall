@@ -9,7 +9,7 @@ use std::thread;
 
 use crate::args::{
     Command, CompletionShell, CompletionsCommand, Harness, LaunchRequest, ModelsCommand,
-    ProvidersCommand, UpdateCommand, parse, rewrite_argv0,
+    ProviderIdFilter, ProvidersCommand, UpdateCommand, parse, rewrite_argv0,
 };
 use crate::config::{self, Paths};
 use crate::launch::{self, EnvLookup};
@@ -207,6 +207,7 @@ fn rx_help_and_version() {
     assert_eq!(parse_line(&["rx", "-V"]), Command::Version);
     assert!(!crate::help_text().contains("rx config"));
     assert!(crate::help_text().contains("rx --provider <provider> <harness>"));
+    assert!(crate::help_text().contains("rx --provider none <harness>"));
     assert!(crate::help_text().contains("rx providers <list|login|logout|use>"));
     assert!(crate::help_text().contains("rx providers models update [provider]"));
     assert!(crate::help_text().contains("rx completions <bash|zsh|fish>"));
@@ -232,11 +233,15 @@ fn completions_parses_shells_and_id_lists() {
     );
     assert_eq!(
         parse_line(&["rx", "completions", "--providers"]),
-        Command::Completions(CompletionsCommand::ListProviders { configured: false })
+        Command::Completions(CompletionsCommand::ListProviders(ProviderIdFilter::All))
     );
     assert_eq!(
         parse_line(&["rx", "completions", "--configured"]),
-        Command::Completions(CompletionsCommand::ListProviders { configured: true })
+        Command::Completions(CompletionsCommand::ListProviders(ProviderIdFilter::Configured))
+    );
+    assert_eq!(
+        parse_line(&["rx", "completions", "--targets"]),
+        Command::Completions(CompletionsCommand::ListProviders(ProviderIdFilter::Targets))
     );
 }
 
@@ -269,6 +274,7 @@ fn completions_scripts_cover_rx_surface() {
             "--provider",
             "--configured",
             "--providers",
+            "--targets",
             "rxc",
             "rxx",
             "rxo",
@@ -286,16 +292,27 @@ fn completions_scripts_cover_rx_surface() {
 fn completion_ids_list_configured_and_known() {
     let (_dir, paths) = temp_paths();
     let env = EnvLookup::isolated(HashMap::new());
-    let known = crate::providers::completion_ids(&paths, &env, false).unwrap();
+    let known = crate::providers::completion_ids(&paths, &env, ProviderIdFilter::All).unwrap();
     assert!(known.contains(&"openrouter".to_string()), "{known:?}");
     assert!(known.contains(&"tokener".to_string()), "{known:?}");
-    assert!(crate::providers::completion_ids(&paths, &env, true).unwrap().is_empty());
+    assert!(
+        crate::providers::completion_ids(&paths, &env, ProviderIdFilter::Configured)
+            .unwrap()
+            .is_empty()
+    );
 
     config::login(&paths, "openrouter", "sk-secret".to_string()).unwrap();
     assert_eq!(
-        crate::providers::completion_ids(&paths, &env, true).unwrap(),
+        crate::providers::completion_ids(&paths, &env, ProviderIdFilter::Configured).unwrap(),
         vec!["openrouter".to_string()]
     );
+    let mut targets =
+        crate::providers::completion_ids(&paths, &env, ProviderIdFilter::Targets).unwrap();
+    assert_eq!(targets.pop(), Some("none".to_string()));
+    assert_eq!(targets, vec!["openrouter".to_string()]);
+    for id in known {
+        assert_ne!(id, "none");
+    }
 }
 
 #[test]
@@ -725,6 +742,102 @@ fn configured_openrouter_credential_is_the_implicit_default() {
     )
     .unwrap();
     assert_eq!(plan.args[1], "model_provider=\"openrouter\"");
+}
+
+#[test]
+fn provider_none_skips_injection() {
+    let (_dir, paths) = temp_paths();
+    config::login(&paths, "openrouter", "sk-secret".to_string()).unwrap();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "OPENROUTER_API_KEY".to_string(),
+        "sk-or-test".to_string(),
+    )]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Claude,
+            provider: Some("none".to_string()),
+            passthrough: os(&["--resume", "abc"]),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(plan.args, os(&["--resume", "abc"]));
+    assert!(plan.env_set.is_empty());
+    let note = plan.stderr_note.unwrap();
+    assert!(note.contains("'none'"), "{note}");
+    assert!(!note.contains("no provider configured"), "{note}");
+}
+
+#[test]
+fn use_none_skips_implicit_openrouter() {
+    let (_dir, paths) = temp_paths();
+    config::login(&paths, "openrouter", "sk-secret".to_string()).unwrap();
+    crate::providers::run(
+        ProvidersCommand::Use { provider: Some("none".to_string()) },
+        &paths,
+        &EnvLookup::isolated(HashMap::new()),
+    )
+    .unwrap();
+    assert_eq!(config::load(&paths).unwrap().unwrap().default_provider.as_deref(), Some("none"));
+    assert!(config::stored_providers(&paths).unwrap().contains("openrouter"));
+
+    let env = EnvLookup::isolated(HashMap::from([(
+        "OPENROUTER_API_KEY".to_string(),
+        "sk-or-test".to_string(),
+    )]));
+    let plan = launch::plan(
+        &LaunchRequest { harness: Harness::Codex, provider: None, passthrough: Vec::new() },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert!(plan.env_set.is_empty());
+    assert!(plan.args.iter().all(|arg| arg != "model_provider=\"openrouter\""));
+    let note = plan.stderr_note.unwrap();
+    assert!(note.contains("'none'"), "{note}");
+    assert!(!note.contains("no provider configured"), "{note}");
+}
+
+#[test]
+fn models_update_rejects_none_provider() {
+    let (_dir, paths) = temp_paths();
+    let error = crate::providers::run(
+        ProvidersCommand::Models(ModelsCommand::Update { provider: Some("none".to_string()) }),
+        &paths,
+        &EnvLookup::isolated(HashMap::new()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("skips provider injection"), "{error}");
+}
+
+#[test]
+fn provider_override_wins_over_use_none() {
+    let (_dir, paths) = temp_paths();
+    config::set_none(&paths).unwrap();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "OPENROUTER_API_KEY".to_string(),
+        "sk-or-test".to_string(),
+    )]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Codex,
+            provider: Some("openrouter".to_string()),
+            passthrough: Vec::new(),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(plan.args[1], "model_provider=\"openrouter\"");
+}
+
+#[test]
+fn none_is_reserved_provider_id() {
+    let error = crate::provider::validate_id("none").unwrap_err();
+    assert!(error.to_string().contains("reserved"), "{error}");
+    let error = crate::provider::resolve("none", None).unwrap_err();
+    assert!(error.to_string().contains("reserved"), "{error}");
 }
 
 #[test]

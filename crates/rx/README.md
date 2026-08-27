@@ -16,6 +16,7 @@ brew install samzong/tap/recall
 rx providers login
 rx codex
 rx --provider openrouter opencode
+rx --provider none claude
 ```
 
 Running `rx` without a harness opens the picker. Arguments after the harness name are passed to that harness.

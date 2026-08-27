@@ -71,11 +71,18 @@ pub(crate) enum CompletionShell {
     Fish,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderIdFilter {
+    All,
+    Configured,
+    Targets,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompletionsCommand {
     Help,
     Generate { shell: CompletionShell },
-    ListProviders { configured: bool },
+    ListProviders(ProviderIdFilter),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,10 +284,13 @@ fn parse_completions(args: &[OsString]) -> Result<CompletionsCommand> {
         None if args.is_empty() => Ok(CompletionsCommand::Help),
         Some("-h" | "--help" | "help") if args.len() == 1 => Ok(CompletionsCommand::Help),
         Some("--providers") if args.len() == 1 => {
-            Ok(CompletionsCommand::ListProviders { configured: false })
+            Ok(CompletionsCommand::ListProviders(ProviderIdFilter::All))
         }
         Some("--configured") if args.len() == 1 => {
-            Ok(CompletionsCommand::ListProviders { configured: true })
+            Ok(CompletionsCommand::ListProviders(ProviderIdFilter::Configured))
+        }
+        Some("--targets") if args.len() == 1 => {
+            Ok(CompletionsCommand::ListProviders(ProviderIdFilter::Targets))
         }
         Some("bash") if args.len() == 1 => {
             Ok(CompletionsCommand::Generate { shell: CompletionShell::Bash })
@@ -291,7 +301,7 @@ fn parse_completions(args: &[OsString]) -> Result<CompletionsCommand> {
         Some("fish") if args.len() == 1 => {
             Ok(CompletionsCommand::Generate { shell: CompletionShell::Fish })
         }
-        Some("bash" | "zsh" | "fish" | "--providers" | "--configured") => {
+        Some("bash" | "zsh" | "fish" | "--providers" | "--configured" | "--targets") => {
             bail!(
                 "unexpected argument: {}\n\n{}",
                 args[1].to_string_lossy(),

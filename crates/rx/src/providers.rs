@@ -312,7 +312,7 @@ pub(crate) fn help() -> &'static str {
         "  rx providers list\n",
         "  rx providers login [provider]\n",
         "  rx providers logout [provider]\n",
-        "  rx providers use [provider]\n",
+        "  rx providers use [provider|none]\n",
         "  rx providers models update [provider]\n\n",
     )
 }
@@ -351,8 +351,14 @@ fn update_models(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Res
         }
     }
     for id in ids {
-        let Some(target) = launch::configured_provider(Some(&id), paths, env)? else {
-            bail!("no API key for provider '{id}'; run: rx providers login {id}");
+        let target = match launch::configured_provider(Some(&id), paths, env)? {
+            launch::ProviderResolution::Target(target) => target,
+            launch::ProviderResolution::SkipInjection => {
+                bail!("'{id}' skips provider injection; there is no catalog to update")
+            }
+            launch::ProviderResolution::Unconfigured => {
+                bail!("no API key for provider '{id}'; run: rx providers login {id}")
+            }
         };
         let count =
             catalog::update_models(paths, &target.provider_id, &target.base_url, &target.key)?;
@@ -422,6 +428,11 @@ fn logout_provider(paths: &Paths, state: &ProviderState) -> Result<()> {
 }
 
 fn use_provider(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Result<()> {
+    if requested.is_some_and(crate::provider::is_none) {
+        crate::config::set_none(paths)?;
+        println!("* none\n  launch harnesses as-is");
+        return Ok(());
+    }
     let states = provider_states(paths, env)?;
     if let Some(id) = requested {
         let index = provider_index(&states, id, true)?;
@@ -448,13 +459,22 @@ fn set_default_provider(paths: &Paths, state: &ProviderState) -> Result<()> {
 pub(crate) fn completion_ids(
     paths: &Paths,
     env: &EnvLookup,
-    configured_only: bool,
+    filter: crate::args::ProviderIdFilter,
 ) -> Result<Vec<String>> {
-    Ok(provider_states(paths, env)?
+    let mut ids = provider_states(paths, env)?
         .into_iter()
-        .filter(|state| !configured_only || state.configured())
+        .filter(|state| match filter {
+            crate::args::ProviderIdFilter::All => true,
+            crate::args::ProviderIdFilter::Configured | crate::args::ProviderIdFilter::Targets => {
+                state.configured()
+            }
+        })
         .map(|state| state.provider.id)
-        .collect())
+        .collect::<Vec<_>>();
+    if matches!(filter, crate::args::ProviderIdFilter::Targets) {
+        ids.push(crate::provider::NONE.to_string());
+    }
+    Ok(ids)
 }
 
 fn provider_index(states: &[ProviderState], id: &str, configured: bool) -> Result<usize> {

@@ -100,6 +100,12 @@ pub(crate) fn set_default(paths: &Paths, provider: &str) -> Result<()> {
     save_config(paths, &config)
 }
 
+pub(crate) fn set_none(paths: &Paths) -> Result<()> {
+    let mut config = load_or_default(paths)?;
+    config.default_provider = Some(crate::provider::NONE.to_string());
+    save_config(paths, &config)
+}
+
 pub(crate) fn login(paths: &Paths, provider: &str, key: String) -> Result<()> {
     let mut config = load_or_default(paths)?;
     crate::provider::resolve(provider, config.provider.get(provider))?;
