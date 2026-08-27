@@ -14,11 +14,12 @@ use crate::provider::{Provider, Setup};
 pub(crate) const PROFILE: &str = "dsh-tui";
 pub(crate) const CLI_PACKAGE: &str = "@deepseek-ai/dsh";
 pub(crate) const PLUGIN_PACKAGE: &str = "@deepseek-harness-tui/dsh-tui";
+pub(crate) const PLUGIN_SPEC: &str = "@deepseek-harness-tui/dsh-tui@latest";
 const OFFICIAL_DEEPSEEK: &str = "https://api.deepseek.com";
 const OFFICIAL_DEEPSEEK_ROUTE: &str = "deepseek-official";
 
 pub(crate) fn npm_install_cmd() -> String {
-    format!("npm install -g {CLI_PACKAGE} {PLUGIN_PACKAGE}")
+    format!("npm install -g --legacy-peer-deps {CLI_PACKAGE} {PLUGIN_PACKAGE}")
 }
 
 pub(crate) fn install_hint() -> String {
@@ -26,7 +27,7 @@ pub(crate) fn install_hint() -> String {
 }
 
 pub(crate) fn profile_hint() -> String {
-    format!("dsh plugin --profile {PROFILE} add {PLUGIN_PACKAGE}")
+    format!("dsh plugin --profile {PROFILE} add -w {PLUGIN_SPEC}")
 }
 
 pub(crate) fn home(env: &EnvLookup) -> Option<PathBuf> {
@@ -319,7 +320,10 @@ mod tests {
     fn install_hint_uses_official_npm_then_profile() {
         assert_eq!(
             install_hint(),
-            format!("npm install -g {CLI_PACKAGE} {PLUGIN_PACKAGE}\n  {}", profile_hint())
+            format!(
+                "npm install -g --legacy-peer-deps {CLI_PACKAGE} {PLUGIN_PACKAGE}\n  {}",
+                profile_hint()
+            )
         );
     }
 
