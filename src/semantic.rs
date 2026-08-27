@@ -1,12 +1,10 @@
-use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
-use fs2::FileExt;
 
 use crate::db::store::Store;
 use crate::embedding::EmbeddingProvider;
+use crate::utils::try_acquire_worker_lock;
 
 const SESSION_EMBED_BATCH: usize = 8;
 const BACKGROUND_JOB: &str = "pipeline";
@@ -115,26 +113,4 @@ fn process_session(
 pub(crate) fn build_embedding_text(title: &str, content: &str) -> String {
     let text = format!("{title}: {content}");
     if text.chars().count() > 500 { text.chars().take(500).collect() } else { text }
-}
-
-fn try_acquire_worker_lock() -> Result<Option<File>> {
-    let path = worker_lock_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file =
-        OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            file.set_len(0)?;
-            writeln!(file, "{}", std::process::id())?;
-            Ok(Some(file))
-        }
-        Err(_) => Ok(None),
-    }
-}
-
-fn worker_lock_path() -> Result<std::path::PathBuf> {
-    let dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
-    Ok(dir.join("recall").join("background-worker.lock"))
 }

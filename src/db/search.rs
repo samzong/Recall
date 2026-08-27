@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Local, TimeZone};
 use rusqlite::Connection;
@@ -249,17 +249,50 @@ impl<'a> SearchEngine<'a> {
         filters: &SearchFilters,
         limit: Option<usize>,
     ) -> anyhow::Result<Vec<Hit>> {
-        let match_query = fts5_query(query);
-        if match_query.is_empty() {
+        let tokens = tokenize_query(query);
+        if tokens.is_empty() {
             return Ok(vec![]);
         }
-        let mut sql = String::from(
+        let queries = if crate::db::schema::has_trigram_fts(self.conn)? {
+            vec![
+                ("messages_fts_trigram", trigram_fts5_query(&tokens)),
+                ("messages_fts", unicode61_fts5_query(&tokens, true)),
+            ]
+        } else {
+            vec![("messages_fts", unicode61_fts5_query(&tokens, false))]
+        };
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
+        for (table, match_query) in queries {
+            if match_query.is_empty() {
+                continue;
+            }
+            for hit in self.fts_table_search(table, match_query, filters, limit)? {
+                if seen.insert(hit.session_id.clone()) {
+                    hits.push(hit);
+                }
+            }
+        }
+        if let Some(limit) = limit {
+            hits.truncate(limit);
+        }
+        Ok(hits)
+    }
+
+    fn fts_table_search(
+        &self,
+        table: &'static str,
+        match_query: String,
+        filters: &SearchFilters,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<Hit>> {
+        let mut sql = format!(
             "SELECT m.session_id, SUBSTR(m.content, 1, 200) AS snip,
-                    MIN(messages_fts.rank) AS best_rank
-             FROM messages_fts
-             JOIN messages m ON m.id = messages_fts.rowid
+                    MIN({table}.rank) AS best_rank
+             FROM {table}
+             JOIN messages m ON m.id = {table}.rowid
              JOIN sessions s ON s.id = m.session_id
-             WHERE messages_fts MATCH ?1",
+             WHERE {table} MATCH ?1",
         );
 
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(match_query)];
@@ -434,7 +467,7 @@ fn rrf_merge(fts_hits: &[Hit], vec_hits: &[Hit], k: u32) -> Vec<(String, f64, Ma
     results
 }
 
-const FTS_PREFIX_MIN_CHARS: usize = 2;
+const FTS_TRIGRAM_MIN_CHARS: usize = 3;
 
 fn tokenize_query(query: &str) -> Vec<String> {
     query
@@ -460,14 +493,23 @@ fn fts5_term(token: &str, prefix: bool) -> String {
     term
 }
 
-fn fts5_query(query: &str) -> String {
-    let tokens = tokenize_query(query);
+fn trigram_fts5_query(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .filter(|token| token.chars().count() >= FTS_TRIGRAM_MIN_CHARS)
+        .map(|token| fts5_term(token, false))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn unicode61_fts5_query(tokens: &[String], short_only: bool) -> String {
     let last = tokens.len().saturating_sub(1);
     tokens
         .iter()
         .enumerate()
+        .filter(|(_, token)| !short_only || token.chars().count() < FTS_TRIGRAM_MIN_CHARS)
         .map(|(index, token)| {
-            let prefix = index == last && token.chars().count() >= FTS_PREFIX_MIN_CHARS;
+            let prefix = index == last && token.chars().count() >= 2;
             fts5_term(token, prefix)
         })
         .collect::<Vec<_>>()
@@ -476,7 +518,10 @@ fn fts5_query(query: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchEngine, SessionEventQuery, fts5_query, tokenize_query};
+    use super::{
+        SearchEngine, SearchFilters, SessionEventQuery, TimeRange, tokenize_query,
+        trigram_fts5_query, unicode61_fts5_query,
+    };
     use crate::db::schema;
     use crate::db::store::Store;
     use crate::project_scope::ProjectScope;
@@ -492,13 +537,73 @@ mod tests {
     }
 
     #[test]
-    fn fts5_query_quotes_terms_and_prefixes_last_token() {
+    fn fts5_queries_split_trigram_and_short_tokens() {
+        let tokens = tokenize_query("context power café Codex ");
+        assert_eq!(trigram_fts5_query(&tokens), r#""context" OR "power" OR "café" OR "codex""#);
+        let short = tokenize_query("rx \u{77e9}\u{9635}");
+        assert_eq!(trigram_fts5_query(&short), "");
         assert_eq!(
-            fts5_query("context power café Codex "),
-            r#""context" OR "power" OR "café" OR "codex"*"#
+            unicode61_fts5_query(&short, true),
+            format!(r#""rx" OR "{}"*"#, "\u{77e9}\u{9635}")
         );
-        assert_eq!(fts5_query("a"), r#""a""#);
-        assert_eq!(fts5_query("AND OR NOT"), r#""and" OR "or" OR "not"*"#);
+        let keywords = tokenize_query("AND OR NOT");
+        assert_eq!(trigram_fts5_query(&keywords), r#""and" OR "not""#);
+        assert_eq!(unicode61_fts5_query(&keywords, true), r#""or""#);
+        let phrase_text = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
+        let phrase = tokenize_query(phrase_text);
+        assert_eq!(trigram_fts5_query(&phrase), format!("\"{phrase_text}\""));
+    }
+
+    #[test]
+    fn search_keeps_short_mixed_and_deferred_legacy_terms_without_embeddings() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO sessions (id, source, source_id, title, started_at)
+                 VALUES
+                    ('short', 'test', 'short', 'Short', 1),
+                    ('cjk', 'test', 'cjk', 'CJK', 2),
+                    ('long', 'test', 'long', 'Long', 3);
+                 INSERT INTO messages (session_id, role, content, seq)
+                 VALUES
+                    ('short', 'user', 'rx routing', 0),
+                    ('long', 'user', 'context cache enables powercontext', 0);",
+            )
+            .unwrap();
+        let cjk = "\u{77e9}\u{9635}\u{8fd0}\u{7b97}";
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages (session_id, role, content, seq) VALUES ('cjk', 'user', ?1, 0)",
+                [cjk],
+            )
+            .unwrap();
+        let filters = SearchFilters {
+            sources: None,
+            time_range: TimeRange::All,
+            scope: ProjectScope::Global,
+            thread_role: None,
+        };
+        let engine = SearchEngine::new(&store.conn);
+
+        let short = engine.hybrid_search("rx", None, &filters, 10, 3).unwrap();
+        assert_eq!(short[0].session.id, "short");
+        let cjk = engine.hybrid_search("\u{77e9}\u{9635}", None, &filters, 10, 3).unwrap();
+        assert_eq!(cjk[0].session.id, "cjk");
+        let mut mixed: Vec<_> = engine
+            .hybrid_search("context rx", None, &filters, 10, 3)
+            .unwrap()
+            .into_iter()
+            .map(|result| result.session.id)
+            .collect();
+        mixed.sort();
+        assert_eq!(mixed, vec!["long".to_string(), "short".to_string()]);
+
+        store.conn.execute_batch("DROP TABLE messages_fts_trigram;").unwrap();
+        let legacy = engine.hybrid_search("powercon", None, &filters, 10, 3).unwrap();
+        assert_eq!(legacy[0].session.id, "long");
     }
 
     fn setup_store() -> Store {

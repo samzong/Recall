@@ -1,5 +1,30 @@
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+
+use fs2::FileExt;
+
+pub(crate) fn try_acquire_worker_lock() -> anyhow::Result<Option<File>> {
+    let path = worker_lock_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file =
+        OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            file.set_len(0)?;
+            writeln!(file, "{}", std::process::id())?;
+            Ok(Some(file))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn worker_lock_path() -> anyhow::Result<std::path::PathBuf> {
+    let dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
+    Ok(dir.join("recall").join("background-worker.lock"))
+}
 
 pub(crate) fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
