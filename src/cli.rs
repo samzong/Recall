@@ -65,6 +65,13 @@ enum Commands {
         #[arg(long, value_parser = crate::query::parse_time_range_arg, help = "Filter by time range")]
         time: Option<String>,
     },
+    #[command(about = "Print a shareable usage stats card")]
+    Wrapped {
+        #[arg(long, value_enum, default_value_t = crate::wrapped::WrappedPeriod::Week)]
+        period: crate::wrapped::WrappedPeriod,
+        #[arg(long, value_enum, default_value_t = crate::wrapped::WrappedFormat::Text)]
+        format: crate::wrapped::WrappedFormat,
+    },
     #[command(about = "Export session records as JSON Lines")]
     Export {
         #[arg(long, help = "Filter by source id or label")]
@@ -225,6 +232,7 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Usage { json, source, time }) => {
             crate::usage::run_cli(json, source.as_deref(), time.as_deref())?
         }
+        Some(Commands::Wrapped { period, format }) => crate::wrapped::run_cli(period, format)?,
         Some(Commands::Export { source, time, project, repo, thread_role, limit, include }) => {
             crate::export::run_cli(
                 source.as_deref(),
@@ -409,6 +417,31 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_accepts_period_and_format() {
+        let cli = Cli::try_parse_from(["recall", "wrapped"]).unwrap();
+        match cli.command {
+            Some(Commands::Wrapped { period, format }) => {
+                assert_eq!(period, crate::wrapped::WrappedPeriod::Week);
+                assert_eq!(format, crate::wrapped::WrappedFormat::Text);
+            }
+            _ => panic!("expected wrapped command"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["recall", "wrapped", "--period", "year", "--format", "json"])
+                .unwrap();
+        match cli.command {
+            Some(Commands::Wrapped { period, format }) => {
+                assert_eq!(period, crate::wrapped::WrappedPeriod::Year);
+                assert_eq!(format, crate::wrapped::WrappedFormat::Json);
+            }
+            _ => panic!("expected wrapped command"),
+        }
+
+        assert!(Cli::try_parse_from(["recall", "wrapped", "--period", "today"]).is_err());
+    }
+
+    #[test]
     fn info_accepts_json_format() {
         let cli = Cli::try_parse_from(["recall", "info", "--format", "json"]).unwrap();
         match cli.command {
@@ -488,6 +521,7 @@ mod tests {
         assert!(compact_help.contains("sync Scan configured AI coding session sources"));
         assert!(compact_help.contains("search Search indexed coding sessions"));
         assert!(compact_help.contains("usage Show token usage reports"));
+        assert!(compact_help.contains("wrapped Print a shareable usage stats card"));
         assert!(compact_help.contains("export Export session records as JSON Lines"));
         assert!(compact_help.contains("import Import session records from JSON Lines"));
         assert!(compact_help.contains("share Share session pages"));
@@ -521,11 +555,12 @@ mod tests {
         let script = String::from_utf8(output).unwrap();
         assert!(script.contains("#compdef recall"));
         assert!(script.contains("search"));
+        assert!(script.contains("wrapped"));
     }
 
     #[test]
     fn public_subcommand_help_describes_arguments_and_options() {
-        for subcommand in ["search", "usage", "export", "import"] {
+        for subcommand in ["search", "usage", "wrapped", "export", "import"] {
             let mut command = Cli::command();
             let command = command.find_subcommand_mut(subcommand).unwrap();
             let help = command.render_long_help().to_string();

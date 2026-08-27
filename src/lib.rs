@@ -26,6 +26,7 @@ pub(crate) mod tui;
 pub(crate) mod types;
 pub(crate) mod usage;
 pub(crate) mod utils;
+pub(crate) mod wrapped;
 
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
 

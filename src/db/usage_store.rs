@@ -126,6 +126,16 @@ impl Store {
         &self,
         sources: Option<&[String]>,
         time_range: TimeRange,
+        state: T,
+        fold: impl FnMut(&mut T, UsageEventRecord),
+    ) -> Result<T> {
+        self.fold_usage_events_after(sources, time_range.millis_ago(), state, fold)
+    }
+
+    pub(crate) fn fold_usage_events_after<T>(
+        &self,
+        sources: Option<&[String]>,
+        after_millis: Option<i64>,
         mut state: T,
         mut fold: impl FnMut(&mut T, UsageEventRecord),
     ) -> Result<T> {
@@ -140,7 +150,7 @@ impl Store {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
 
-        if let Some(cutoff) = time_range.millis_ago() {
+        if let Some(cutoff) = after_millis {
             sql.push_str(&format!(" AND timestamp >= ?{param_idx}"));
             params.push(Box::new(cutoff));
             param_idx += 1;

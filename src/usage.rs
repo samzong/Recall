@@ -50,7 +50,7 @@ fn usage_source_labels() -> Vec<(String, String)> {
         .collect()
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub(crate) struct TokenTotals {
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
@@ -58,6 +58,53 @@ pub(crate) struct TokenTotals {
     pub(crate) cache_write_tokens: i64,
     pub(crate) reasoning_tokens: i64,
     pub(crate) total_tokens: i64,
+}
+
+impl TokenTotals {
+    pub(crate) fn add_event(&mut self, event: &UsageEventRecord) {
+        self.input_tokens += event.input_tokens.max(0);
+        self.output_tokens += event.output_tokens.max(0);
+        self.cache_read_tokens += event.cache_read_tokens.max(0);
+        self.cache_write_tokens += event.cache_write_tokens.max(0);
+        self.reasoning_tokens += event.reasoning_tokens.max(0);
+        self.total_tokens = self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+            + self.reasoning_tokens;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct UsageDedup {
+    codex_seen: HashSet<String>,
+    claude_seen: HashSet<String>,
+}
+
+impl UsageDedup {
+    pub(crate) fn accept(&mut self, event: &UsageEventRecord) -> bool {
+        if event.source == "codex" {
+            let key = format!(
+                "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
+                event.timestamp,
+                event.provider,
+                event.model,
+                event.input_tokens,
+                event.output_tokens,
+                event.cache_read_tokens,
+                event.cache_write_tokens,
+                event.reasoning_tokens
+            );
+            return self.codex_seen.insert(key);
+        }
+        if event.source == "claude-code"
+            && event.event_key.starts_with("assistant:")
+            && !event.event_key.contains(":line:")
+        {
+            return self.claude_seen.insert(event.event_key.clone());
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,16 +162,7 @@ struct Accumulator {
 
 impl Accumulator {
     fn add(&mut self, event: &UsageEventRecord) {
-        self.tokens.input_tokens += event.input_tokens.max(0);
-        self.tokens.output_tokens += event.output_tokens.max(0);
-        self.tokens.cache_read_tokens += event.cache_read_tokens.max(0);
-        self.tokens.cache_write_tokens += event.cache_write_tokens.max(0);
-        self.tokens.reasoning_tokens += event.reasoning_tokens.max(0);
-        self.tokens.total_tokens = self.tokens.input_tokens
-            + self.tokens.output_tokens
-            + self.tokens.cache_read_tokens
-            + self.tokens.cache_write_tokens
-            + self.tokens.reasoning_tokens;
+        self.tokens.add_event(event);
         self.sessions.insert(event.session_id.clone());
         self.events += 1;
     }
@@ -139,32 +177,12 @@ struct UsageReportAccumulator {
     weekly: BTreeMap<String, Accumulator>,
     monthly: BTreeMap<String, Accumulator>,
     token_source_events: BTreeMap<String, usize>,
-    codex_seen: HashSet<String>,
-    claude_seen: HashSet<String>,
+    dedup: UsageDedup,
 }
 
 impl UsageReportAccumulator {
     fn add(&mut self, event: &UsageEventRecord) {
-        if event.source == "codex" {
-            let key = format!(
-                "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
-                event.timestamp,
-                event.provider,
-                event.model,
-                event.input_tokens,
-                event.output_tokens,
-                event.cache_read_tokens,
-                event.cache_write_tokens,
-                event.reasoning_tokens
-            );
-            if !self.codex_seen.insert(key) {
-                return;
-            }
-        } else if event.source == "claude-code"
-            && event.event_key.starts_with("assistant:")
-            && !event.event_key.contains(":line:")
-            && !self.claude_seen.insert(event.event_key.clone())
-        {
+        if !self.dedup.accept(event) {
             return;
         }
 

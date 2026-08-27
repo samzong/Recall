@@ -79,7 +79,7 @@ impl TimeRange {
         self.cutoff_millis_at(Local::now())
     }
 
-    fn cutoff_millis_at(&self, now: chrono::DateTime<Local>) -> Option<i64> {
+    pub(crate) fn cutoff_millis_at(&self, now: chrono::DateTime<Local>) -> Option<i64> {
         match self {
             TimeRange::Today => now
                 .date_naive()

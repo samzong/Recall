@@ -52,8 +52,8 @@ pub(crate) fn run_cli(
     Ok(())
 }
 
-pub(crate) fn run_usage_sync_job() -> Result<()> {
-    run_sync_job_inner(SyncRunOptions {
+fn usage_sync_options() -> SyncRunOptions {
+    SyncRunOptions {
         force: false,
         verbose: false,
         emit: false,
@@ -61,7 +61,15 @@ pub(crate) fn run_usage_sync_job() -> Result<()> {
         backfill_events: false,
         sources: None,
         scope: ProjectScope::Global,
-    })
+    }
+}
+
+pub(crate) fn run_usage_sync_job() -> Result<()> {
+    run_sync_job_inner(usage_sync_options())
+}
+
+pub(crate) fn run_usage_sync_job_with_progress(on_source: &mut dyn FnMut(&str)) -> Result<()> {
+    run_sync_job_with(usage_sync_options(), Some(on_source))
 }
 
 pub(crate) fn run_dashboard_sync_job() -> Result<()> {
@@ -196,9 +204,17 @@ impl ExistingState {
 }
 
 pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
+    run_sync_job_with(options, None)
+}
+
+fn run_sync_job_with(
+    options: SyncRunOptions,
+    on_source: Option<&mut dyn FnMut(&str)>,
+) -> Result<()> {
     let available_adapters = adapters::all_adapters();
     let config = AppConfig::load()?;
-    SyncJob::new(options, Store::open()?, config, &available_adapters)?.run(&available_adapters)
+    SyncJob::new(options, Store::open()?, config, &available_adapters)?
+        .run_with(&available_adapters, on_source)
 }
 
 struct SyncJob {
@@ -240,14 +256,22 @@ impl SyncJob {
         })
     }
 
-    fn run(&mut self, available_adapters: &[Box<dyn adapters::SourceAdapter>]) -> Result<()> {
+    fn run_with(
+        &mut self,
+        available_adapters: &[Box<dyn adapters::SourceAdapter>],
+        mut on_source: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<()> {
         for adapter in available_adapters {
-            self.sync_adapter(adapter.as_ref())?;
+            self.sync_adapter(adapter.as_ref(), &mut on_source)?;
         }
         self.report_progress()
     }
 
-    fn sync_adapter(&mut self, adapter: &dyn adapters::SourceAdapter) -> Result<()> {
+    fn sync_adapter(
+        &mut self,
+        adapter: &dyn adapters::SourceAdapter,
+        on_source: &mut Option<&mut dyn FnMut(&str)>,
+    ) -> Result<()> {
         let source_id = adapter.id();
         let label = adapter.label();
 
@@ -268,6 +292,10 @@ impl SyncJob {
                 println!("Skipping {label} (filtered)");
             }
             return Ok(());
+        }
+
+        if let Some(on_source) = on_source.as_mut() {
+            on_source(source_id);
         }
 
         let started = std::time::Instant::now();
@@ -1233,7 +1261,7 @@ mod tests {
     fn scoped_sync_writes_only_sessions_inside_the_scope() {
         let (mut job, adapters) = scoped_job(ProjectScope::Directory("/repo/root".to_string()));
 
-        job.run(&adapters).unwrap();
+        job.run_with(&adapters, None).unwrap();
 
         assert_eq!(synced_source_ids(&job), vec!["inside".to_string()]);
         assert_eq!(job.stats.out_of_scope, 1);
@@ -1247,7 +1275,7 @@ mod tests {
         existing.message_count = 7;
         job.store.insert_session(&existing).unwrap();
 
-        job.run(&adapters).unwrap();
+        job.run_with(&adapters, None).unwrap();
 
         assert_eq!(job.store.session_meta("test", "outside").unwrap(), Some((Some(1), 7)));
     }
@@ -1259,7 +1287,7 @@ mod tests {
             local_root: Some("/repo/root".to_string()),
         });
 
-        job.run(&adapters).unwrap();
+        job.run_with(&adapters, None).unwrap();
 
         assert_eq!(synced_source_ids(&job), vec!["inside".to_string()]);
     }
@@ -1289,7 +1317,7 @@ mod tests {
         )
         .unwrap();
 
-        job.run(&initial).unwrap();
+        job.run_with(&initial, None).unwrap();
         assert_eq!(job.store.session_meta("test", "raw1").unwrap(), Some((Some(2_000), 1)));
 
         let updated: Vec<Box<dyn SourceAdapter>> = vec![Box::new(StaticAdapter {
@@ -1298,7 +1326,7 @@ mod tests {
             source_file_path: None,
             optimized: false,
         })];
-        job.run(&updated).unwrap();
+        job.run_with(&updated, None).unwrap();
 
         assert_eq!(job.store.session_meta("test", "raw1").unwrap(), Some((Some(3_000), 2)));
         let session = job.store.list_recent_sessions(1).unwrap().pop().unwrap();
@@ -1337,7 +1365,7 @@ mod tests {
         .unwrap();
         global_job.store.insert_session(&session("global", "test", "raw1")).unwrap();
 
-        global_job.run(&adapters).unwrap();
+        global_job.run_with(&adapters, None).unwrap();
 
         assert_eq!(
             global_job.store.session_paths_for_source("test").unwrap()[0]
@@ -1363,7 +1391,7 @@ mod tests {
         .unwrap();
         scoped_job.store.insert_session(&session("scoped", "test", "raw1")).unwrap();
 
-        scoped_job.run(&adapters).unwrap();
+        scoped_job.run_with(&adapters, None).unwrap();
 
         assert_eq!(
             scoped_job.store.session_paths_for_source("test").unwrap()[0].source_file_path,
@@ -1431,10 +1459,27 @@ mod tests {
             )
             .unwrap();
 
-            job.run(&adapters).unwrap();
+            job.run_with(&adapters, None).unwrap();
 
             assert!(job.store.session_paths_for_source("test").unwrap().is_empty());
             assert_eq!(job.stats.excluded_out, 1);
         }
+    }
+
+    #[test]
+    fn source_progress_reports_ids_that_are_actually_scanned() {
+        let (mut job, adapters) = scoped_job(ProjectScope::Global);
+        let mut seen = Vec::new();
+        job.run_with(&adapters, Some(&mut |source| seen.push(source.to_string()))).unwrap();
+        assert_eq!(seen, ["test"]);
+    }
+
+    #[test]
+    fn source_progress_skips_adapters_without_usage_during_usage_sync() {
+        let (mut job, adapters) = scoped_job(ProjectScope::Global);
+        job.options.usage_only = true;
+        let mut seen = Vec::new();
+        job.run_with(&adapters, Some(&mut |label| seen.push(label.to_string()))).unwrap();
+        assert!(seen.is_empty());
     }
 }
