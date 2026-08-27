@@ -179,23 +179,21 @@ fn apply_host(host: Host, dry_run: bool, action: &HostAction) -> Result<()> {
 }
 
 fn install_host(host: Host, bin: &str) -> Result<()> {
+    install_host_with_runner(host, bin, &mut run_host)
+}
+
+fn install_host_with_runner(
+    host: Host,
+    bin: &str,
+    run: &mut impl FnMut(&str, &[String]) -> Result<HostOutput>,
+) -> Result<()> {
     let args = add_args(host, bin);
-    let add = run_host(host.binary(), &args)?;
+    let add = run(host.binary(), &args)?;
     if add.success {
         println!("installed {}", host.id());
         return Ok(());
     }
-    if !looks_like_already_exists(&add.combined()) {
-        bail!("{}: {}", display_command(host.binary(), &args), add.summary());
-    }
-
-    remove_host(host)?;
-    let retry = run_host(host.binary(), &args)?;
-    if retry.success {
-        println!("installed {}", host.id());
-        return Ok(());
-    }
-    bail!("{}: {}", display_command(host.binary(), &args), retry.summary())
+    bail!("{}: {}", display_command(host.binary(), &args), add.summary())
 }
 
 fn uninstall_host(host: Host) -> Result<()> {
@@ -205,8 +203,15 @@ fn uninstall_host(host: Host) -> Result<()> {
 }
 
 fn remove_host(host: Host) -> Result<()> {
+    remove_host_with_runner(host, &mut run_host)
+}
+
+fn remove_host_with_runner(
+    host: Host,
+    run: &mut impl FnMut(&str, &[String]) -> Result<HostOutput>,
+) -> Result<()> {
     let args = remove_args(host);
-    let output = run_host(host.binary(), &args)?;
+    let output = run(host.binary(), &args)?;
     if output.success || looks_like_not_found(&output.combined()) {
         return Ok(());
     }
@@ -257,13 +262,6 @@ fn run_host(program: &str, args: &[String]) -> Result<HostOutput> {
         }
     }
     Ok(result)
-}
-
-fn looks_like_already_exists(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("duplicate")
-        || (lower.contains("already")
-            && (lower.contains("exist") || lower.contains("registered") || lower.contains("added")))
 }
 
 fn looks_like_not_found(text: &str) -> bool {
@@ -323,8 +321,8 @@ fn is_unix_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Host, add_args, display_command, looks_like_already_exists, looks_like_not_found,
-        quote_arg, remove_args, resolve_bin, resolve_hosts,
+        Host, HostOutput, add_args, display_command, install_host_with_runner,
+        looks_like_not_found, quote_arg, remove_args, resolve_bin, resolve_hosts,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -401,11 +399,35 @@ mod tests {
     }
 
     #[test]
-    fn host_error_text_classifies_upsert_and_missing() {
-        assert!(looks_like_already_exists("MCP server recall already exists"));
-        assert!(looks_like_already_exists("duplicate server name"));
-        assert!(!looks_like_already_exists("permission denied"));
+    fn host_error_text_classifies_missing() {
         assert!(looks_like_not_found("MCP server recall not found"));
         assert!(!looks_like_not_found("connection refused"));
+    }
+
+    #[test]
+    fn failed_install_keeps_existing_registration() {
+        let mut registered = true;
+        let error = install_host_with_runner(Host::Claude, "recall", &mut |_, args| match args[1]
+            .as_str()
+        {
+            "add" if registered => Ok(HostOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "MCP server recall already exists".into(),
+            }),
+            "add" => Ok(HostOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "simulated transient add failure".into(),
+            }),
+            "remove" => {
+                registered = false;
+                Ok(HostOutput { success: true, stdout: String::new(), stderr: String::new() })
+            }
+            action => panic!("unexpected host action: {action}"),
+        })
+        .unwrap_err();
+
+        assert!(registered, "existing registration was removed: {error}");
     }
 }
