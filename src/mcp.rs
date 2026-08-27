@@ -5,14 +5,12 @@ use anyhow::Result;
 use chrono::SecondsFormat;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
-};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{
     ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router, transport::stdio,
 };
-use serde::Deserialize;
 use serde::de::{self, Deserializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::adapters;
@@ -39,29 +37,44 @@ const SESSION_NOT_FOUND: &str = "Session not found.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchSessionsArgs {
+    /// Required free-text query.
     query: String,
+    /// Optional absolute indexed directory path, or a repo name/owner-repo
+    /// slug/remote URL derived from git identity. A worktree's own directory
+    /// name alone (e.g. "myrepo--feature") does not match.
     #[serde(default)]
     project: Option<String>,
+    /// Optional tool id or label such as claude-code or CUR.
     #[serde(default)]
     source: Option<String>,
+    /// Maximum hits to return. Defaults to 10, capped at 50.
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
+    #[schemars(range(min = 1, max = 50))]
     limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetSessionArgs {
+    /// Recall session id from search_sessions or list_recent_sessions.
     session_id: String,
+    /// Maximum messages to return from the start of the session. Defaults to 50.
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
     max_messages: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListRecentSessionsArgs {
+    /// Optional absolute indexed directory path, or a repo name/owner-repo
+    /// slug/remote URL derived from git identity. A worktree's own directory
+    /// name alone (e.g. "myrepo--feature") does not match.
     #[serde(default)]
     project: Option<String>,
+    /// Optional tool id or label such as claude-code or CUR.
     #[serde(default)]
     source: Option<String>,
+    /// Maximum hits to return. Defaults to 10, capped at 50.
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
+    #[schemars(range(min = 1, max = 50))]
     limit: Option<u32>,
 }
 
@@ -168,7 +181,13 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Search past AI coding sessions across Claude Code, Codex, OpenCode, Cursor, and other indexed tools. Use when the user asks whether they have seen an error, made a decision, or solved a similar problem before. query is required free text. project is an optional project path or name as stored in the index. source is an optional tool id or label such as claude-code or CUR. limit defaults to 10 and is capped at 50. Returns session id, source, project, title, matched excerpt, and ISO-8601 timestamp."
+        description = "Search past AI coding sessions across Claude Code, Codex, OpenCode, Cursor, and other indexed tools. Use when the user asks whether they have seen an error, made a decision, or solved a similar problem before. Returns session id, source, project, title, matched excerpt, and ISO-8601 timestamp.",
+        annotations(
+            title = "Search sessions",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     fn search_sessions(
         &self,
@@ -178,17 +197,32 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Load one indexed session by Recall session_id. Use after search_sessions or list_recent_sessions when you need the conversation itself. max_messages defaults to 50 and counts from the start of the session. Each message is truncated at 2000 characters; the combined message text is capped at 32000 characters. Returns metadata plus messages as plain text in sequence order."
+        description = "Load one indexed session by Recall session_id. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 characters. Returns metadata plus messages as plain text in sequence order.",
+        annotations(
+            title = "Get session",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     fn get_session(
         &self,
         Parameters(args): Parameters<GetSessionArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        Ok(json_result(get_session(&lock_index(&self.index), &args)))
+        Ok(json_result(
+            get_session(&lock_index(&self.index), &args)
+                .map_err(|message| empty_detail(Some(message))),
+        ))
     }
 
     #[tool(
-        description = "List the most recently active indexed sessions, newest first. Use to browse what the user has been working on when there is no search query. project is an optional project path or name as stored in the index. source is an optional tool id or label. limit defaults to 10 and is capped at 50. Each hit has the same shape as search_sessions: session id, source, project, title, excerpt (summary when present), and ISO-8601 timestamp."
+        description = "List the most recently active indexed sessions, newest first. Use to browse what the user has been working on when there is no search query. Each hit has the same shape as search_sessions: session id, source, project, title, excerpt (summary when present), and ISO-8601 timestamp.",
+        annotations(
+            title = "List recent sessions",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     fn list_recent_sessions(
         &self,
@@ -203,7 +237,6 @@ impl ServerHandler for RecallMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("recall", env!("CARGO_PKG_VERSION")))
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
                 "Read-only memory over the local Recall session index. Search or list past coding sessions, then fetch a session when you need the transcript. This server never writes, syncs, or mutates the index.",
             )
@@ -216,24 +249,28 @@ fn lock_index(index: &Mutex<IndexState>) -> std::sync::MutexGuard<'_, IndexState
     guard
 }
 
-fn json_result(value: Value) -> CallToolResult {
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-    result.structured_content = Some(value);
-    result
+fn json_result(result: std::result::Result<impl Serialize, impl Serialize>) -> CallToolResult {
+    match result {
+        Ok(value) => CallToolResult::structured(to_json(value)),
+        Err(value) => CallToolResult::structured_error(to_json(value)),
+    }
 }
 
-fn search_sessions(index: &IndexState, args: &SearchSessionsArgs) -> Value {
+fn to_json(value: impl Serialize) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+fn empty_hits(message: impl Into<String>) -> HitList {
+    HitList { message: Some(message.into()), hits: Vec::new() }
+}
+
+fn search_sessions(
+    index: &IndexState,
+    args: &SearchSessionsArgs,
+) -> std::result::Result<HitList, HitList> {
     match index {
-        IndexState::Unavailable { message, .. } => {
-            serde_json::to_value(HitList { message: Some(message.clone()), hits: Vec::new() })
-                .unwrap_or(Value::Null)
-        }
-        IndexState::Ready(store) => match search_ready(store, args) {
-            Ok(list) => serde_json::to_value(list).unwrap_or(Value::Null),
-            Err(error) => serde_json::to_value(HitList { message: Some(error), hits: Vec::new() })
-                .unwrap_or(Value::Null),
-        },
+        IndexState::Unavailable { message, .. } => Err(empty_hits(message.clone())),
+        IndexState::Ready(store) => search_ready(store, args).map_err(empty_hits),
     }
 }
 
@@ -261,17 +298,13 @@ fn search_ready(store: &Store, args: &SearchSessionsArgs) -> std::result::Result
     })
 }
 
-fn list_recent_sessions(index: &IndexState, args: &ListRecentSessionsArgs) -> Value {
+fn list_recent_sessions(
+    index: &IndexState,
+    args: &ListRecentSessionsArgs,
+) -> std::result::Result<HitList, HitList> {
     match index {
-        IndexState::Unavailable { message, .. } => {
-            serde_json::to_value(HitList { message: Some(message.clone()), hits: Vec::new() })
-                .unwrap_or(Value::Null)
-        }
-        IndexState::Ready(store) => match list_ready(store, args) {
-            Ok(list) => serde_json::to_value(list).unwrap_or(Value::Null),
-            Err(error) => serde_json::to_value(HitList { message: Some(error), hits: Vec::new() })
-                .unwrap_or(Value::Null),
-        },
+        IndexState::Unavailable { message, .. } => Err(empty_hits(message.clone())),
+        IndexState::Ready(store) => list_ready(store, args).map_err(empty_hits),
     }
 }
 
@@ -301,15 +334,13 @@ fn list_ready(
     })
 }
 
-fn get_session(index: &IndexState, args: &GetSessionArgs) -> Value {
+fn get_session(
+    index: &IndexState,
+    args: &GetSessionArgs,
+) -> std::result::Result<SessionDetail, String> {
     match index {
-        IndexState::Unavailable { message, .. } => {
-            serde_json::to_value(empty_detail(Some(message.clone()))).unwrap_or(Value::Null)
-        }
-        IndexState::Ready(store) => match get_ready(store, args) {
-            Ok(detail) => serde_json::to_value(detail).unwrap_or(Value::Null),
-            Err(error) => serde_json::to_value(empty_detail(Some(error))).unwrap_or(Value::Null),
-        },
+        IndexState::Unavailable { message, .. } => Err(message.clone()),
+        IndexState::Ready(store) => get_ready(store, args),
     }
 }
 
@@ -322,7 +353,7 @@ fn get_ready(store: &Store, args: &GetSessionArgs) -> std::result::Result<Sessio
         } else {
             format!("{SESSION_NOT_FOUND} {}", args.session_id)
         };
-        return Ok(empty_detail(Some(message)));
+        return Err(message);
     };
     let max_messages = clamp_limit(args.max_messages, GET_MAX_MESSAGES_DEFAULT, u32::MAX);
     let messages = store.get_messages(&session.id).map_err(|error| error.to_string())?;
@@ -537,41 +568,36 @@ mod tests {
     }
 
     #[test]
-    fn missing_index_returns_empty_hits_with_message() {
+    fn missing_index_is_a_tool_error() {
         let index = IndexState::Unavailable { path: None, message: MISSING_INDEX.to_string() };
-        let value = search_sessions(
-            &index,
-            &SearchSessionsArgs { query: "error".into(), project: None, source: None, limit: None },
-        );
-        let list: HitList = serde_json::from_value(value).unwrap();
+        let args =
+            SearchSessionsArgs { query: "error".into(), project: None, source: None, limit: None };
+        let list = search_sessions(&index, &args).expect_err("missing index");
         assert!(list.hits.is_empty());
         assert_eq!(list.message.as_deref(), Some(MISSING_INDEX));
+        assert_eq!(json_result(search_sessions(&index, &args)).is_error, Some(true));
     }
 
     #[test]
     fn empty_index_search_and_list_explain_the_gap() {
         let store = setup();
         let index = ready(store);
-        let search = search_sessions(
-            &index,
-            &SearchSessionsArgs {
-                query: "anything".into(),
-                project: None,
-                source: None,
-                limit: None,
-            },
-        );
-        let search: HitList = serde_json::from_value(search).unwrap();
+        let search_args = SearchSessionsArgs {
+            query: "anything".into(),
+            project: None,
+            source: None,
+            limit: None,
+        };
+        let search = search_sessions(&index, &search_args).unwrap();
         assert!(search.hits.is_empty());
         assert_eq!(search.message.as_deref(), Some(EMPTY_INDEX));
+        assert_eq!(json_result(search_sessions(&index, &search_args)).is_error, Some(false));
 
-        let listed = list_recent_sessions(
-            &index,
-            &ListRecentSessionsArgs { project: None, source: None, limit: None },
-        );
-        let listed: HitList = serde_json::from_value(listed).unwrap();
+        let list_args = ListRecentSessionsArgs { project: None, source: None, limit: None };
+        let listed = list_recent_sessions(&index, &list_args).unwrap();
         assert!(listed.hits.is_empty());
         assert_eq!(listed.message.as_deref(), Some(EMPTY_INDEX));
+        assert_eq!(json_result(list_recent_sessions(&index, &list_args)).is_error, Some(false));
     }
 
     #[test]
@@ -583,7 +609,7 @@ mod tests {
             .unwrap();
         let index = ready(store);
 
-        let value = search_sessions(
+        let list = search_sessions(
             &index,
             &SearchSessionsArgs {
                 query: "iterators".into(),
@@ -591,8 +617,8 @@ mod tests {
                 source: None,
                 limit: Some(80),
             },
-        );
-        let list: HitList = serde_json::from_value(value).unwrap();
+        )
+        .unwrap();
         assert_eq!(list.hits.len(), 1);
         assert_eq!(list.hits[0].session_id, "s1");
         assert_eq!(list.hits[0].source, "codex");
@@ -610,11 +636,11 @@ mod tests {
         store.insert_session(&session("new", "claude-code", "newer", 9_000)).unwrap();
         let index = ready(store);
 
-        let value = list_recent_sessions(
+        let list = list_recent_sessions(
             &index,
             &ListRecentSessionsArgs { project: None, source: None, limit: Some(10) },
-        );
-        let list: HitList = serde_json::from_value(value).unwrap();
+        )
+        .unwrap();
         assert_eq!(list.hits.len(), 2);
         assert_eq!(list.hits[0].session_id, "new");
         assert_eq!(list.hits[0].excerpt.as_deref(), Some("newer summary"));
@@ -627,18 +653,16 @@ mod tests {
         store.insert_session(&session("s1", "codex", "title", 1_000)).unwrap();
         store.insert_messages(&[message("s1", Role::User, "hello", 0)]).unwrap();
         let index = ready(store);
-        let value = search_sessions(
-            &index,
-            &SearchSessionsArgs {
-                query: "hello".into(),
-                project: None,
-                source: Some("not-a-source".into()),
-                limit: None,
-            },
-        );
-        let list: HitList = serde_json::from_value(value).unwrap();
+        let args = SearchSessionsArgs {
+            query: "hello".into(),
+            project: None,
+            source: Some("not-a-source".into()),
+            limit: None,
+        };
+        let list = search_sessions(&index, &args).expect_err("unknown source");
         assert!(list.hits.is_empty());
         assert!(list.message.unwrap().contains("unknown source"));
+        assert_eq!(json_result(search_sessions(&index, &args)).is_error, Some(true));
     }
 
     #[test]
@@ -656,9 +680,9 @@ mod tests {
             .unwrap();
         let index = ready(store);
 
-        let value =
-            get_session(&index, &GetSessionArgs { session_id: "s1".into(), max_messages: Some(1) });
-        let detail: SessionDetail = serde_json::from_value(value).unwrap();
+        let detail =
+            get_session(&index, &GetSessionArgs { session_id: "s1".into(), max_messages: Some(1) })
+                .unwrap();
         assert_eq!(detail.session_id.as_deref(), Some("s1"));
         assert_eq!(detail.returned_messages, 1);
         assert!(detail.truncated);
@@ -671,17 +695,18 @@ mod tests {
     }
 
     #[test]
-    fn get_session_missing_id_is_empty_with_message() {
+    fn get_session_missing_id_is_a_tool_error() {
         let store = setup();
         store.insert_session(&session("s1", "codex", "title", 1_000)).unwrap();
         let index = ready(store);
-        let value = get_session(
-            &index,
-            &GetSessionArgs { session_id: "missing".into(), max_messages: None },
+        let args = GetSessionArgs { session_id: "missing".into(), max_messages: None };
+        let error = get_session(&index, &args).expect_err("missing session");
+        assert!(error.contains(SESSION_NOT_FOUND));
+        assert_eq!(
+            json_result(get_session(&index, &args).map_err(|message| empty_detail(Some(message))))
+                .is_error,
+            Some(true)
         );
-        let detail: SessionDetail = serde_json::from_value(value).unwrap();
-        assert!(detail.session_id.is_none());
-        assert!(detail.message.unwrap().contains(SESSION_NOT_FOUND));
     }
 
     #[test]
@@ -736,8 +761,8 @@ mod tests {
         let listed = list_recent_sessions(
             &index,
             &ListRecentSessionsArgs { project: None, source: None, limit: None },
-        );
-        let listed: HitList = serde_json::from_value(listed).unwrap();
+        )
+        .unwrap();
         assert_eq!(listed.hits.len(), 1);
         assert_eq!(listed.hits[0].session_id, "s1");
         assert!(listed.message.is_none());
@@ -750,11 +775,11 @@ mod tests {
         long.summary = Some("y".repeat(EXCERPT_CHAR_CAP + 40));
         store.insert_session(&long).unwrap();
         let index = ready(store);
-        let value = list_recent_sessions(
+        let list = list_recent_sessions(
             &index,
             &ListRecentSessionsArgs { project: None, source: None, limit: None },
-        );
-        let list: HitList = serde_json::from_value(value).unwrap();
+        )
+        .unwrap();
         let excerpt = list.hits[0].excerpt.as_deref().unwrap();
         assert_eq!(excerpt.chars().count(), EXCERPT_CHAR_CAP);
         assert!(excerpt.ends_with('…'));
@@ -769,9 +794,9 @@ mod tests {
         let content = "x".repeat(GET_MESSAGE_CHAR_CAP + 1);
         store.insert_messages(&[message("s1", Role::User, &content, 0)]).unwrap();
         let index = ready(store);
-        let value =
-            get_session(&index, &GetSessionArgs { session_id: "s1".into(), max_messages: None });
-        let detail: SessionDetail = serde_json::from_value(value).unwrap();
+        let detail =
+            get_session(&index, &GetSessionArgs { session_id: "s1".into(), max_messages: None })
+                .unwrap();
         assert!(detail.truncated);
         assert!(detail.messages.ends_with('…'));
         assert_eq!(
@@ -787,5 +812,13 @@ mod tests {
         assert_eq!(args.limit, Some(12));
         assert_eq!(clamp_limit(Some(80), 10, 50), 50);
         assert_eq!(clamp_limit(None, 10, 50), 10);
+    }
+
+    #[test]
+    fn tools_advertise_read_only_closed_world() {
+        let notes = RecallMcp::search_sessions_tool_attr().annotations.unwrap();
+        assert_eq!(notes.read_only_hint, Some(true));
+        assert_eq!(notes.idempotent_hint, Some(true));
+        assert_eq!(notes.open_world_hint, Some(false));
     }
 }
