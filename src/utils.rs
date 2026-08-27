@@ -4,6 +4,27 @@ use std::process::{Command, Stdio};
 
 use fs2::FileExt;
 
+pub(crate) fn text_needs_trigram(text: &str) -> bool {
+    if text.is_ascii() {
+        return false;
+    }
+    text.chars().any(|c| {
+        matches!(
+            c,
+            '\u{3400}'..='\u{9fff}'
+                | '\u{f900}'..='\u{faff}'
+                | '\u{3040}'..='\u{30ff}'
+                | '\u{3100}'..='\u{318f}'
+                | '\u{31a0}'..='\u{31bf}'
+                | '\u{31f0}'..='\u{31ff}'
+                | '\u{a960}'..='\u{a97f}'
+                | '\u{ac00}'..='\u{d7ff}'
+                | '\u{ff66}'..='\u{ff9f}'
+                | '\u{20000}'..='\u{323af}'
+        )
+    })
+}
+
 pub(crate) fn try_acquire_worker_lock() -> anyhow::Result<Option<File>> {
     let path = worker_lock_path()?;
     if let Some(parent) = path.parent() {

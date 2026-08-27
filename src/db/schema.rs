@@ -369,7 +369,27 @@ fn fts_needs_trigram_rebuild(conn: &Connection) -> anyhow::Result<bool> {
     if has_messages == 0 {
         return Ok(false);
     }
-    Ok(!has_trigram_fts(conn)?)
+    let has_flag = has_trigram_message_flag(conn)?;
+    let trigger_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger'
+           AND name IN ('messages_trigram_ai', 'messages_trigram_ad')
+           AND instr(sql, 'trigram_indexed IS NULL') > 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!has_flag || trigger_count != 2 || !has_trigram_fts(conn)?)
+}
+
+pub(crate) fn has_trigram_message_flag(conn: &Connection) -> anyhow::Result<bool> {
+    let has_flag: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('messages') WHERE name = 'trigram_indexed'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(has_flag != 0)
 }
 
 pub(crate) fn has_trigram_fts(conn: &Connection) -> anyhow::Result<bool> {
@@ -423,6 +443,11 @@ fn migrate_v12_with_lock<T>(
     let started = std::time::Instant::now();
     let version = read_schema_version(conn)?;
     let version_update = if version < SCHEMA_VERSION { "PRAGMA user_version = 12;" } else { "" };
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE messages ADD COLUMN trigram_indexed INTEGER
+         CHECK (trigram_indexed IN (0, 1))",
+    )?;
     conn.execute_batch(&format!(
         "
         BEGIN IMMEDIATE;
@@ -438,16 +463,22 @@ fn migrate_v12_with_lock<T>(
             tokenize='trigram remove_diacritics 1'
         );
 
-        CREATE TRIGGER messages_trigram_ai AFTER INSERT ON messages BEGIN
+        CREATE TRIGGER messages_trigram_ai AFTER INSERT ON messages
+        WHEN new.trigram_indexed = 1
+          OR new.trigram_indexed IS NULL BEGIN
             INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, new.content);
         END;
 
-        CREATE TRIGGER messages_trigram_ad AFTER DELETE ON messages BEGIN
+        CREATE TRIGGER messages_trigram_ad AFTER DELETE ON messages
+        WHEN old.trigram_indexed = 1
+          OR old.trigram_indexed IS NULL BEGIN
             INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content)
             VALUES('delete', old.id, old.content);
         END;
 
-        INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES('rebuild');
+        INSERT INTO messages_fts_trigram(rowid, content)
+        SELECT id, content FROM messages
+        WHERE trigram_indexed = 1 OR trigram_indexed IS NULL;
 
         {version_update}
 
@@ -487,6 +518,8 @@ pub(crate) const fn current_schema_version() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::store::Store;
+    use crate::types::{Message, Role};
 
     #[test]
     fn migrate_v6_adds_metadata_columns_to_existing_v5_db() {
@@ -773,7 +806,9 @@ mod tests {
         init(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO sessions (id, source, source_id, title, started_at)
-             VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);",
+             VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);
+             INSERT INTO messages (session_id, role, content, seq)
+             VALUES ('s1', 'assistant', 'context cache', 1);",
         )
         .unwrap();
         let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
@@ -783,6 +818,24 @@ mod tests {
             [content],
         )
         .unwrap();
+        let old_write_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_write_hits, 1, "pre-v12 inserts must remain trigram searchable");
+        let old_latin_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH 'context'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_latin_hits, 1, "pre-v12 Latin inserts must remain trigram searchable");
         conn.execute_batch("DROP TABLE messages_fts_trigram;").unwrap();
 
         init(&conn).unwrap();
@@ -795,6 +848,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 1, "a missing FTS table must be recreated and reindexed on open");
+        let latin_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH 'context'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(latin_hits, 1, "rebuild must preserve pre-v12 Latin messages");
     }
 
     #[test]
@@ -818,9 +880,38 @@ mod tests {
         assert_eq!(schema_version(&conn).unwrap(), 11);
         assert!(!has_trigram_fts(&conn).unwrap());
 
-        migrate_v12_with_lock(&conn, true, || Ok::<Option<()>, anyhow::Error>(Some(()))).unwrap();
-        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert!(has_trigram_fts(&conn).unwrap());
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);",
+        )
+        .unwrap();
+        let store = Store { trigram_message_flag: has_trigram_message_flag(&conn).unwrap(), conn };
+        let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
+        let query = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
+        store
+            .insert_messages(&[Message {
+                session_id: "s1".to_string(),
+                role: Role::User,
+                content: content.to_string(),
+                timestamp: None,
+                seq: 0,
+            }])
+            .unwrap();
+
+        migrate_v12_with_lock(&store.conn, true, || Ok::<Option<()>, anyhow::Error>(Some(())))
+            .unwrap();
+        assert_eq!(schema_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        assert!(has_trigram_fts(&store.conn).unwrap());
+        let hits: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "messages written during deferral must join the rebuilt index");
     }
 
     #[test]

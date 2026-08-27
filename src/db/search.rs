@@ -496,24 +496,28 @@ fn fts5_term(token: &str, prefix: bool) -> String {
 fn trigram_fts5_query(tokens: &[String]) -> String {
     tokens
         .iter()
-        .filter(|token| token.chars().count() >= FTS_TRIGRAM_MIN_CHARS)
+        .filter(|token| token_uses_trigram(token))
         .map(|token| fts5_term(token, false))
         .collect::<Vec<_>>()
         .join(" OR ")
 }
 
-fn unicode61_fts5_query(tokens: &[String], short_only: bool) -> String {
+fn unicode61_fts5_query(tokens: &[String], trigram_available: bool) -> String {
     let last = tokens.len().saturating_sub(1);
     tokens
         .iter()
         .enumerate()
-        .filter(|(_, token)| !short_only || token.chars().count() < FTS_TRIGRAM_MIN_CHARS)
+        .filter(|(_, token)| !trigram_available || !token_uses_trigram(token))
         .map(|(index, token)| {
             let prefix = index == last && token.chars().count() >= 2;
             fts5_term(token, prefix)
         })
         .collect::<Vec<_>>()
         .join(" OR ")
+}
+
+fn token_uses_trigram(token: &str) -> bool {
+    token.chars().count() >= FTS_TRIGRAM_MIN_CHARS && crate::utils::text_needs_trigram(token)
 }
 
 #[cfg(test)]
@@ -539,7 +543,11 @@ mod tests {
     #[test]
     fn fts5_queries_split_trigram_and_short_tokens() {
         let tokens = tokenize_query("context power café Codex ");
-        assert_eq!(trigram_fts5_query(&tokens), r#""context" OR "power" OR "café" OR "codex""#);
+        assert_eq!(trigram_fts5_query(&tokens), "");
+        assert_eq!(
+            unicode61_fts5_query(&tokens, true),
+            r#""context" OR "power" OR "café" OR "codex"*"#
+        );
         let short = tokenize_query("rx \u{77e9}\u{9635}");
         assert_eq!(trigram_fts5_query(&short), "");
         assert_eq!(
@@ -547,8 +555,8 @@ mod tests {
             format!(r#""rx" OR "{}"*"#, "\u{77e9}\u{9635}")
         );
         let keywords = tokenize_query("AND OR NOT");
-        assert_eq!(trigram_fts5_query(&keywords), r#""and" OR "not""#);
-        assert_eq!(unicode61_fts5_query(&keywords, true), r#""or""#);
+        assert_eq!(trigram_fts5_query(&keywords), "");
+        assert_eq!(unicode61_fts5_query(&keywords, true), r#""and" OR "or" OR "not"*"#);
         let phrase_text = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
         let phrase = tokenize_query(phrase_text);
         assert_eq!(trigram_fts5_query(&phrase), format!("\"{phrase_text}\""));
@@ -576,8 +584,9 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO messages (session_id, role, content, seq) VALUES ('cjk', 'user', ?1, 0)",
-                [cjk],
+                "INSERT INTO messages (session_id, role, content, seq, trigram_indexed)
+                 VALUES ('cjk', 'user', ?1, 0, ?2)",
+                rusqlite::params![cjk, crate::utils::text_needs_trigram(cjk)],
             )
             .unwrap();
         let filters = SearchFilters {
