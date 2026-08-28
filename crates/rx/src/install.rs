@@ -241,7 +241,15 @@ fn install_dsh_profile(dsh: &Path, env: &EnvLookup) -> Result<()> {
     eprintln!("[rx] {cmd}");
     run_command(
         dsh,
-        &["plugin", "--profile", crate::dsh::PROFILE, "add", "-w", crate::dsh::PLUGIN_SPEC],
+        &[
+            "plugin",
+            "--profile",
+            crate::dsh::PROFILE,
+            "add",
+            "-w",
+            "--ignore-scripts",
+            crate::dsh::PLUGIN_SPEC,
+        ],
         "dsh plugin",
     )?;
     if crate::dsh::profile_ready(env) {

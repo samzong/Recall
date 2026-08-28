@@ -65,23 +65,11 @@ pub(crate) fn run(passthrough: Vec<OsString>, env: &EnvLookup) -> Result<()> {
         return Ok(());
     };
     let request = parse_request(&raw)?;
-    let mut overrides = state_env(&request.state_dir)?;
-    prepare_state(&overrides)?;
-    overrides.insert("RX_NO_YOLO".to_string(), "1".to_string());
-    overrides.insert(
-        "RX_NO_INSTALL".to_string(),
-        match request.install_policy {
-            InstallPolicy::Prompt => "0",
-            InstallPolicy::Deny => "1",
-        }
-        .to_string(),
-    );
-    let hosted_env = EnvLookup::real_with(overrides.clone());
     let harness = match request.harness.as_deref() {
         Some(name) => {
             Harness::parse(name).ok_or_else(|| anyhow::anyhow!("unknown harness: {name}"))?
         }
-        None => match crate::pick::harness(&hosted_env)? {
+        None => match crate::pick::harness(env)? {
             Some(harness) => harness,
             None => return Ok(()),
         },
@@ -99,10 +87,14 @@ pub(crate) fn run(passthrough: Vec<OsString>, env: &EnvLookup) -> Result<()> {
     let target = target(&request.gateway, key)?;
     let paths = Paths::in_dir(request.state_dir);
     let launch_request = LaunchRequest { harness, provider: None, passthrough };
-    let program = crate::install::ensure(harness, &hosted_env)?;
-    let mut plan = crate::launch::plan_target(&launch_request, &paths, &hosted_env, &target)?;
+    let install_env = EnvLookup::real_with(install_overrides(request.install_policy));
+    let program = crate::install::ensure(harness, &install_env)?;
+    let runtime = runtime_overrides(harness, &paths.dir)?;
+    prepare_state(&runtime)?;
+    let planning_env = EnvLookup::real_with(planning_overrides(&runtime));
+    let mut plan = crate::launch::plan_target(&launch_request, &paths, &planning_env, &target)?;
     plan.program = program;
-    plan.env_set.extend(overrides);
+    plan.env_set.extend(runtime);
     if let Some(note) = &plan.stderr_note {
         eprintln!("{note}");
     }
@@ -163,22 +155,40 @@ fn validate_env_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn state_env(state_dir: &Path) -> Result<HashMap<String, String>> {
-    let path = |suffix: &str| {
-        state_dir
-            .join(suffix)
-            .to_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("host state_dir must be UTF-8"))
+fn install_overrides(policy: InstallPolicy) -> HashMap<String, String> {
+    HashMap::from([(
+        "RX_NO_INSTALL".to_string(),
+        match policy {
+            InstallPolicy::Prompt => "0",
+            InstallPolicy::Deny => "1",
+        }
+        .to_string(),
+    )])
+}
+
+fn runtime_overrides(harness: Harness, state_dir: &Path) -> Result<HashMap<String, String>> {
+    let Some((key, suffix)) = (match harness {
+        Harness::Claude => Some(("CLAUDE_CONFIG_DIR", "claude")),
+        Harness::Codex => Some(("CODEX_HOME", "codex")),
+        Harness::OpenCode => Some(("XDG_DATA_HOME", "data")),
+        Harness::Pi => Some(("PI_CODING_AGENT_DIR", "pi-agent")),
+        Harness::Dsh => None,
+        Harness::Kimi => Some(("KIMI_CODE_HOME", "kimi-code")),
+    }) else {
+        return Ok(HashMap::new());
     };
-    Ok(HashMap::from([
-        ("CLAUDE_CONFIG_DIR".to_string(), path("claude")?),
-        ("CODEX_HOME".to_string(), path("codex")?),
-        ("DSH_HOME".to_string(), path("dsh-home")?),
-        ("KIMI_CODE_HOME".to_string(), path("kimi-code")?),
-        ("PI_CODING_AGENT_DIR".to_string(), path("pi-agent")?),
-        ("XDG_DATA_HOME".to_string(), path("data")?),
-    ]))
+    let path = state_dir
+        .join(suffix)
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("host state_dir must be UTF-8"))?;
+    Ok(HashMap::from([(key.to_string(), path)]))
+}
+
+fn planning_overrides(runtime: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut environment = runtime.clone();
+    environment.insert("RX_NO_YOLO".to_string(), "1".to_string());
+    environment
 }
 
 fn prepare_state(environment: &HashMap<String, String>) -> Result<()> {
@@ -395,16 +405,44 @@ mod tests {
     }
 
     #[test]
-    fn hosted_state_isolated_from_standalone_paths() {
+    fn hosted_environment_scopes_are_harness_specific() {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("tokener-agent");
-        let env = state_env(&state).unwrap();
-        assert_eq!(env["CLAUDE_CONFIG_DIR"], state.join("claude").to_str().unwrap());
-        assert_eq!(env["CODEX_HOME"], state.join("codex").to_str().unwrap());
-        assert_eq!(env["PI_CODING_AGENT_DIR"], state.join("pi-agent").to_str().unwrap());
-        assert_eq!(env["DSH_HOME"], state.join("dsh-home").to_str().unwrap());
-        assert_eq!(env["KIMI_CODE_HOME"], state.join("kimi-code").to_str().unwrap());
-        prepare_state(&env).unwrap();
-        assert!(env.values().all(|path| Path::new(path).is_dir()));
+        let cases = [
+            (Harness::Claude, Some(("CLAUDE_CONFIG_DIR", "claude"))),
+            (Harness::Codex, Some(("CODEX_HOME", "codex"))),
+            (Harness::OpenCode, Some(("XDG_DATA_HOME", "data"))),
+            (Harness::Pi, Some(("PI_CODING_AGENT_DIR", "pi-agent"))),
+            (Harness::Dsh, None),
+            (Harness::Kimi, Some(("KIMI_CODE_HOME", "kimi-code"))),
+        ];
+        for (harness, expected) in cases {
+            let environment = runtime_overrides(harness, &state).unwrap();
+            assert_eq!(environment.len(), usize::from(expected.is_some()));
+            if let Some((key, suffix)) = expected {
+                assert_eq!(environment[key], state.join(suffix).to_str().unwrap());
+            }
+            prepare_state(&environment).unwrap();
+            assert!(environment.values().all(|path| Path::new(path).is_dir()));
+        }
+        assert!(!state.join("dsh-home").exists());
+    }
+
+    #[test]
+    fn hosted_control_environment_does_not_reach_runtime() {
+        assert_eq!(
+            install_overrides(InstallPolicy::Prompt),
+            HashMap::from([("RX_NO_INSTALL".to_string(), "0".to_string())])
+        );
+        assert_eq!(
+            install_overrides(InstallPolicy::Deny),
+            HashMap::from([("RX_NO_INSTALL".to_string(), "1".to_string())])
+        );
+        let runtime = runtime_overrides(Harness::Codex, Path::new("/tmp/tokener-agent")).unwrap();
+        assert!(!runtime.contains_key("RX_NO_INSTALL"));
+        assert!(!runtime.contains_key("RX_NO_YOLO"));
+        let planning = planning_overrides(&runtime);
+        assert_eq!(planning["RX_NO_YOLO"], "1");
+        assert!(!planning.contains_key("RX_NO_INSTALL"));
     }
 }

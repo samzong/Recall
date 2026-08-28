@@ -27,7 +27,7 @@ pub(crate) fn install_hint() -> String {
 }
 
 pub(crate) fn profile_hint() -> String {
-    format!("dsh plugin --profile {PROFILE} add -w {PLUGIN_SPEC}")
+    format!("dsh plugin --profile {PROFILE} add -w --ignore-scripts {PLUGIN_SPEC}")
 }
 
 pub(crate) fn home(env: &EnvLookup) -> Option<PathBuf> {
@@ -46,8 +46,23 @@ pub(crate) fn profile_ready(env: &EnvLookup) -> bool {
     let Some(root) = home(env) else {
         return false;
     };
-    let path = root.join("profiles").join(PROFILE).join("package.json");
-    fs::read_to_string(path).is_ok_and(|body| body.contains(PLUGIN_PACKAGE))
+    let profile = root.join("profiles").join(PROFILE);
+    let Ok(body) = fs::read_to_string(profile.join("package.json")) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    let dependency = manifest["dependencies"].get(PLUGIN_PACKAGE).is_some();
+    let bundle = manifest["dsh"]["profile"]["bundles"]
+        .as_array()
+        .is_some_and(|bundles| bundles.iter().any(|bundle| bundle == PLUGIN_PACKAGE));
+    let package = profile.join("node_modules").join(PLUGIN_PACKAGE).join("package.json");
+    let installed = fs::read_to_string(package)
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .is_some_and(|manifest| manifest["name"] == PLUGIN_PACKAGE);
+    dependency && bundle && installed
 }
 
 pub(crate) fn official_deepseek(provider_id: &str) -> bool {
@@ -361,5 +376,35 @@ mod tests {
             args(&[], Some(&patch)),
             os(&["--profile", PROFILE, "--patch", "/tmp/rx.cordis.yml"])
         );
+    }
+
+    #[test]
+    fn profile_readiness_requires_activated_installed_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profiles").join(PROFILE);
+        let package = profile.join("node_modules").join(PLUGIN_PACKAGE);
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"), format!(r#"{{"name":"{PLUGIN_PACKAGE}"}}"#))
+            .unwrap();
+        fs::write(
+            profile.join("package.json"),
+            format!(
+                r#"{{"dependencies":{{"{PLUGIN_PACKAGE}":"^0.9.3"}},"dsh":{{"profile":{{"bundles":["@deepseek-ai/dsh-base"]}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let env = EnvLookup::isolated(std::collections::HashMap::from([(
+            "DSH_HOME".to_string(),
+            root.path().display().to_string(),
+        )]));
+        assert!(!profile_ready(&env));
+        fs::write(
+            profile.join("package.json"),
+            format!(
+                r#"{{"dependencies":{{"{PLUGIN_PACKAGE}":"^0.9.3"}},"dsh":{{"profile":{{"bundles":["@deepseek-ai/dsh-base","{PLUGIN_PACKAGE}"]}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert!(profile_ready(&env));
     }
 }
