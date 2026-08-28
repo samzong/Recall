@@ -4,6 +4,7 @@ mod claude_catalog;
 mod completions;
 mod config;
 mod dsh;
+mod host;
 mod install;
 mod kimi;
 mod launch;
@@ -46,6 +47,7 @@ pub fn run_with(raw_args: Vec<OsString>, paths: &Paths, env: &EnvLookup) -> Resu
         Command::Providers(command) => providers::run(command, paths, env),
         Command::Update(command) => update::run(command),
         Command::Completions(command) => completions::run(command, paths, env),
+        Command::Host { passthrough } => host::run(passthrough, env),
         Command::PickHarness { provider } => {
             let Some(harness) = pick::harness(env)? else {
                 return Ok(());
@@ -95,6 +97,7 @@ Usage:
   rx providers models update [provider]
   rx update [--yes]
   rx completions <bash|zsh|fish>
+  rx host [-- native harness args...]
 
 A TTY `rx` with no harness opens a picker. Scripts must pass a harness.
 

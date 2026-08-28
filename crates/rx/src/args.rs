@@ -14,6 +14,9 @@ pub(crate) enum Harness {
 }
 
 impl Harness {
+    pub(crate) const ALL: [Self; 6] =
+        [Self::Claude, Self::Codex, Self::OpenCode, Self::Pi, Self::Dsh, Self::Kimi];
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -25,7 +28,7 @@ impl Harness {
         }
     }
 
-    fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         match name {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
@@ -97,6 +100,7 @@ pub(crate) enum Command {
     Providers(ProvidersCommand),
     Update(UpdateCommand),
     Completions(CompletionsCommand),
+    Host { passthrough: Vec<OsString> },
 }
 
 pub(crate) fn rewrite_argv0(mut args: Vec<OsString>) -> Vec<OsString> {
@@ -158,6 +162,22 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Command> {
                 bail!("--provider is not valid with rx completions");
             }
             Ok(Command::Completions(parse_completions(&rest[1..])?))
+        }
+        Some("host") => {
+            if provider.is_some() {
+                bail!("--provider is not valid with rx host");
+            }
+            let args = &rest[1..];
+            if args.is_empty() {
+                return Ok(Command::Host { passthrough: Vec::new() });
+            }
+            if args.first().is_some_and(|arg| arg == "--") {
+                return Ok(Command::Host { passthrough: args[1..].to_vec() });
+            }
+            bail!(
+                "unexpected argument: {}\n\nusage: rx host [-- native harness args...]",
+                args[0].to_string_lossy()
+            )
         }
         Some(name) => {
             let Some(harness) = Harness::parse(name) else {

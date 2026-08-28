@@ -24,6 +24,10 @@ impl EnvLookup {
         Self { overrides: HashMap::new(), real: true }
     }
 
+    pub(crate) fn real_with(overrides: HashMap<String, String>) -> Self {
+        Self { overrides, real: true }
+    }
+
     #[cfg(test)]
     pub(crate) fn isolated(overrides: HashMap<String, String>) -> Self {
         Self { overrides, real: false }
@@ -129,6 +133,15 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
         }
         ProviderResolution::Target(target) => target,
     };
+    plan_target(request, paths, env, &target)
+}
+
+pub(crate) fn plan_target(
+    request: &LaunchRequest,
+    paths: &Paths,
+    env: &EnvLookup,
+    target: &ProviderTarget,
+) -> Result<LaunchPlan> {
     let model = target.model.as_deref().or(match request.harness {
         Harness::Claude => target.provider.claude_default_model,
         Harness::Codex => target.provider.default_model,
@@ -164,7 +177,7 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
             return Ok(plan);
         }
     }
-    let mut plan = inject(request, paths, env, &target, model)?;
+    let mut plan = inject(request, paths, env, target, model)?;
     apply_yolo(request, &mut plan, env);
     Ok(plan)
 }
