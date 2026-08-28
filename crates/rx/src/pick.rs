@@ -2,13 +2,13 @@ use std::io::{self, IsTerminal};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::disable_raw_mode;
 use ratatui::{
     DefaultTerminal, Frame, TerminalOptions, Viewport,
     backend::{Backend, ClearType},
     layout::Position,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
@@ -40,20 +40,60 @@ impl Palette {
 #[derive(Clone, Copy)]
 struct Choice {
     harness: Harness,
-    alias: &'static str,
+    shortcut: char,
 }
 
 const CHOICES: [Choice; 6] = [
-    Choice { harness: Harness::Claude, alias: "rxc" },
-    Choice { harness: Harness::Codex, alias: "rxx" },
-    Choice { harness: Harness::OpenCode, alias: "rxo" },
-    Choice { harness: Harness::Pi, alias: "rxp" },
-    Choice { harness: Harness::Dsh, alias: "rxd" },
-    Choice { harness: Harness::Kimi, alias: "rxk" },
+    Choice { harness: Harness::Claude, shortcut: 'c' },
+    Choice { harness: Harness::Codex, shortcut: 'x' },
+    Choice { harness: Harness::OpenCode, shortcut: 'o' },
+    Choice { harness: Harness::Pi, shortcut: 'p' },
+    Choice { harness: Harness::Dsh, shortcut: 'd' },
+    Choice { harness: Harness::Kimi, shortcut: 'k' },
 ];
 
 struct App {
     selected: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PickerAction {
+    Continue,
+    Cancel,
+    Launch(Harness),
+}
+
+impl App {
+    fn handle_key(&mut self, key: KeyEvent) -> PickerAction {
+        match key.code {
+            KeyCode::Esc => PickerAction::Cancel,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                PickerAction::Cancel
+            }
+            KeyCode::Up => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                }
+                PickerAction::Continue
+            }
+            KeyCode::Down => {
+                if self.selected + 1 < CHOICES.len() {
+                    self.selected += 1;
+                }
+                PickerAction::Continue
+            }
+            KeyCode::Enter => PickerAction::Launch(CHOICES[self.selected].harness),
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                CHOICES
+                    .iter()
+                    .find(|choice| choice.shortcut.eq_ignore_ascii_case(&character))
+                    .map_or(PickerAction::Continue, |choice| PickerAction::Launch(choice.harness))
+            }
+            _ => PickerAction::Continue,
+        }
+    }
 }
 
 pub(crate) fn harness(env: &EnvLookup) -> Result<Option<Harness>> {
@@ -114,23 +154,10 @@ fn run(terminal: &mut DefaultTerminal, env: &EnvLookup) -> Result<Option<Harness
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        match key.code {
-            KeyCode::Esc => return Ok(None),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Ok(None);
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if app.selected > 0 {
-                    app.selected -= 1;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if app.selected + 1 < CHOICES.len() {
-                    app.selected += 1;
-                }
-            }
-            KeyCode::Enter => return Ok(Some(CHOICES[app.selected].harness)),
-            _ => {}
+        match app.handle_key(key) {
+            PickerAction::Continue => {}
+            PickerAction::Cancel => return Ok(None),
+            PickerAction::Launch(harness) => return Ok(Some(harness)),
         }
     }
 }
@@ -142,11 +169,18 @@ fn render(frame: &mut Frame<'_>, app: &App, palette: &Palette) {
         let selected = index == app.selected;
         let marker = if selected { "→ " } else { "  " };
         lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(palette.accent)),
+            Span::styled("[", Style::default().fg(palette.muted)),
             Span::styled(
-                format!("{marker}{:<10}", choice.harness.as_str()),
+                choice.shortcut.to_string(),
+                Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("] ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{:<10}", choice.harness.as_str()),
                 Style::default().fg(if selected { palette.accent } else { palette.primary }),
             ),
-            Span::styled(choice.alias, Style::default().fg(palette.muted)),
+            Span::styled(format!("rx{}", choice.shortcut), Style::default().fg(palette.muted)),
         ]));
     }
     lines.push(Line::from(Span::styled(
@@ -166,5 +200,42 @@ mod tests {
     fn harness_picker_requires_tty() {
         let error = pick(false, &EnvLookup::isolated(HashMap::new())).unwrap_err();
         assert!(error.to_string().contains("missing harness name"));
+    }
+
+    #[test]
+    fn shortcuts_launch_matching_harnesses() {
+        let mut app = App { selected: 0 };
+        for choice in CHOICES {
+            let key = KeyEvent::new(KeyCode::Char(choice.shortcut), KeyModifiers::NONE);
+            assert_eq!(app.handle_key(key), PickerAction::Launch(choice.harness));
+
+            let key = KeyEvent::new(
+                KeyCode::Char(choice.shortcut.to_ascii_uppercase()),
+                KeyModifiers::SHIFT,
+            );
+            assert_eq!(app.handle_key(key), PickerAction::Launch(choice.harness));
+        }
+    }
+
+    #[test]
+    fn arrows_and_enter_still_select_harnesses() {
+        let mut app = App { selected: 0 };
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            PickerAction::Continue
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            PickerAction::Launch(Harness::Codex)
+        );
+    }
+
+    #[test]
+    fn control_c_still_cancels() {
+        let mut app = App { selected: 0 };
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            PickerAction::Cancel
+        );
     }
 }
