@@ -2,9 +2,9 @@
 
 This file provides guidance to AI coding agents (Claude Code, Codex, OpenCode,
 etc.) when working with code in this repository. Module-level rules live in
-nested AGENTS.md files: `src/adapters/`, `src/db/`, `src/tui/`, `extensions/`,
-and `website/` — read the one for the directory you are changing. Provider
-admission for `crates/rx/` is in `crates/rx/PROVIDERS.md`.
+nested AGENTS.md files: `crates/rx/`, `src/adapters/`, `src/db/`, `src/tui/`,
+`extensions/`, and `website/` — read the one for the directory you are
+changing. Provider admission is in `crates/rx/PROVIDERS.md`.
 
 ## Overview
 
@@ -74,9 +74,9 @@ Data flow: source adapters → sync → SQLite → search → CLI/TUI.
 - `src/cli.rs` — clap subcommands dispatching to the modules above; unknown
   subcommands fall through to extension dispatch.
 - `crates/rx/` — independent `rx` binary (workspace member, not an extension).
-  Gateway launcher for Claude Code, Codex, OpenCode, and Pi. Does not depend on
-  the `recall` crate or read `recall.db`. Install also creates `rxc` / `rxx` /
-  `rxo` / `rxp` / `rxd` symlinks. Bundled providers are generated from
+  Gateway launcher for native agent harnesses. Does not depend on the `recall`
+  crate or read `recall.db`. Install also creates harness aliases.
+  Bundled providers are generated from
   `crates/rx/data/provider-admission.json` into `crates/rx/data/providers.json`;
   both files are committed. See `crates/rx/PROVIDERS.md`.
 - `src/extension.rs` — extension host: `recall <name>` runs the managed
