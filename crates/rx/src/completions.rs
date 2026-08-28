@@ -9,7 +9,7 @@ const BASH: &str = r#"_rx_bin() {
   local invoked=${COMP_WORDS[0]}
   local name=${invoked##*/}
   case $name in
-    rxc|rxx|rxo|rxp|rxd)
+    rxc|rxx|rxo|rxp|rxd|rxk)
       if [[ $invoked == */* ]]; then
         printf '%s' "${invoked%/*}/rx"
       else
@@ -82,7 +82,7 @@ _rx() {
   done < <(_rx_positionals)
 
   case $cmd in
-    rxc|rxx|rxo|rxp|rxd)
+    rxc|rxx|rxo|rxp|rxd|rxk)
       if [[ $cur == -* ]] && ! _rx_has_provider; then
         COMPREPLY=($(compgen -W '--provider' -- "$cur"))
       fi
@@ -96,9 +96,9 @@ _rx() {
       _rx_has_provider || flags+=' --provider'
       COMPREPLY=($(compgen -W "$flags" -- "$cur"))
     elif _rx_has_provider; then
-      COMPREPLY=($(compgen -W 'claude codex opencode pi dsh' -- "$cur"))
+      COMPREPLY=($(compgen -W 'claude codex opencode pi dsh kimi' -- "$cur"))
     else
-      COMPREPLY=($(compgen -W 'claude codex opencode pi dsh providers update completions' -- "$cur"))
+      COMPREPLY=($(compgen -W 'claude codex opencode pi dsh kimi providers update completions' -- "$cur"))
     fi
     return
   fi
@@ -136,7 +136,7 @@ _rx() {
     completions)
       ((${#pos[@]} == 1)) && COMPREPLY=($(compgen -W 'bash zsh fish' -- "$cur"))
       ;;
-    claude|codex|opencode|pi|dsh)
+    claude|codex|opencode|pi|dsh|kimi)
       if [[ $cur == -* ]] && ! _rx_has_provider; then
         COMPREPLY=($(compgen -W '--provider' -- "$cur"))
       fi
@@ -144,16 +144,16 @@ _rx() {
   esac
 }
 
-complete -F _rx rx rxc rxx rxo rxp rxd
+complete -F _rx rx rxc rxx rxo rxp rxd rxk
 "#;
 
-const ZSH: &str = r#"#compdef rx rxc rxx rxo rxp rxd
+const ZSH: &str = r#"#compdef rx rxc rxx rxo rxp rxd rxk
 
 _rx_bin() {
   local invoked=$words[1]
   local name=${invoked:t}
   case $name in
-    rxc|rxx|rxo|rxp|rxd)
+    rxc|rxx|rxo|rxp|rxd|rxk)
       if [[ $invoked == */* ]]; then
         print -rn -- ${invoked:h}/rx
       else
@@ -226,7 +226,7 @@ _rx() {
   [[ -n $output ]] && pos=(${(f)output})
 
   case $cmd in
-    rxc|rxx|rxo|rxp|rxd)
+    rxc|rxx|rxo|rxp|rxd|rxk)
       if [[ $cur == -* ]] && ! _rx_has_provider; then
         compadd -- --provider
       fi
@@ -241,9 +241,9 @@ _rx() {
       _rx_has_provider || flags+=(--provider)
       compadd -- $flags
     elif _rx_has_provider; then
-      compadd -- claude codex opencode pi dsh
+      compadd -- claude codex opencode pi dsh kimi
     else
-      compadd -- claude codex opencode pi dsh providers update completions
+      compadd -- claude codex opencode pi dsh kimi providers update completions
     fi
     return
   fi
@@ -281,7 +281,7 @@ _rx() {
     completions)
       (( $#pos == 1 )) && compadd -- bash zsh fish
       ;;
-    claude|codex|opencode|pi|dsh)
+    claude|codex|opencode|pi|dsh|kimi)
       if [[ $cur == -* ]] && ! _rx_has_provider; then
         compadd -- --provider
       fi
@@ -289,14 +289,14 @@ _rx() {
   esac
 }
 
-compdef _rx rx rxc rxx rxo rxp rxd
+compdef _rx rx rxc rxx rxo rxp rxd rxk
 "#;
 
 const FISH: &str = r#"function __rx_bin
     set -l invoked (commandline -opc)[1]
     set -l name (basename $invoked)
     switch $name
-        case rxc rxx rxo rxp rxd
+        case rxc rxx rxo rxp rxd rxk
             if string match -q '*/*' -- $invoked
                 echo (dirname $invoked)/rx
             else
@@ -370,7 +370,7 @@ end
 function __rx_has_harness
     set -l pos (__rx_pos)
     test (count $pos) -ge 1
-    and contains -- $pos[1] claude codex opencode pi dsh
+    and contains -- $pos[1] claude codex opencode pi dsh kimi
 end
 
 complete -c rx -f
@@ -379,10 +379,11 @@ complete -c rx -n '__rx_n 0; and not __rx_has_provider' -a 'codex' -d 'Codex'
 complete -c rx -n '__rx_n 0; and not __rx_has_provider' -a 'opencode' -d 'OpenCode'
 complete -c rx -n '__rx_n 0; and not __rx_has_provider' -a 'pi' -d 'Pi'
 complete -c rx -n '__rx_n 0; and not __rx_has_provider' -a 'dsh' -d 'DeepSeek Harness'
+complete -c rx -n '__rx_n 0; and not __rx_has_provider' -a 'kimi' -d 'Kimi Code'
 complete -c rx -n '__rx_n 0; and not __rx_has_provider' -a 'providers' -d 'Manage providers'
 complete -c rx -n '__rx_n 0; and not __rx_has_provider' -a 'update' -d 'Update rx'
 complete -c rx -n '__rx_n 0; and not __rx_has_provider' -a 'completions' -d 'Generate shell completion script'
-complete -c rx -n '__rx_n 0; and __rx_has_provider' -a 'claude codex opencode pi dsh'
+complete -c rx -n '__rx_n 0; and __rx_has_provider' -a 'claude codex opencode pi dsh kimi'
 complete -c rx -n '__rx_n 0' -s h -l help
 complete -c rx -n '__rx_n 0' -s V -l version
 complete -c rx -n 'not __rx_has_provider; and __rx_n 0' -l provider -xa '(__rx_ids --targets)'
@@ -396,7 +397,7 @@ complete -c rx -n '__rx_is providers models update; and __rx_n 3' -a '(__rx_ids 
 complete -c rx -n '__rx_is update; and __rx_n 1' -l yes -s y
 complete -c rx -n '__rx_is completions; and __rx_n 1' -a 'bash zsh fish'
 
-for cmd in rxc rxx rxo rxp rxd
+for cmd in rxc rxx rxo rxp rxd rxk
     complete -c $cmd -f
     complete -c $cmd -l provider -xa '(__rx_ids --targets)'
 end

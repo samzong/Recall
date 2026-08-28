@@ -268,6 +268,7 @@ fn completions_scripts_cover_rx_surface() {
             "opencode",
             "pi",
             "dsh",
+            "kimi",
             "providers",
             "update",
             "completions",
@@ -280,6 +281,7 @@ fn completions_scripts_cover_rx_surface() {
             "rxo",
             "rxp",
             "rxd",
+            "rxk",
         ] {
             assert!(script.contains(needle), "{shell:?} missing {needle}");
         }
@@ -406,6 +408,7 @@ fn argv0_harness_resolves_aliases() {
     assert_eq!(crate::args::argv0_harness("rxo.exe"), Some("opencode"));
     assert_eq!(crate::args::argv0_harness("rxp"), Some("pi"));
     assert_eq!(crate::args::argv0_harness("rxd"), Some("dsh"));
+    assert_eq!(crate::args::argv0_harness("rxk"), Some("kimi"));
     assert_eq!(crate::args::argv0_harness("/home/u/.cargo/bin/rx"), None);
 }
 
@@ -481,6 +484,32 @@ fn rx_dsh_is_a_harness() {
             harness: Harness::Dsh,
             provider: None,
             passthrough: os(&["--resume"]),
+        })
+    );
+}
+
+#[test]
+fn rxk_inserts_kimi() {
+    let command = parse_line(&["rxk", "--continue"]);
+    assert_eq!(
+        command,
+        Command::Launch(LaunchRequest {
+            harness: Harness::Kimi,
+            provider: None,
+            passthrough: os(&["--continue"]),
+        })
+    );
+}
+
+#[test]
+fn rx_kimi_is_a_harness() {
+    let command = parse_line(&["rx", "kimi", "web", "--port", "58627"]);
+    assert_eq!(
+        command,
+        Command::Launch(LaunchRequest {
+            harness: Harness::Kimi,
+            provider: None,
+            passthrough: os(&["web", "--port", "58627"]),
         })
     );
 }
@@ -682,6 +711,121 @@ fn unconfigured_dsh_still_boots_tui_profile() {
     assert_eq!(plan.program, PathBuf::from("dsh"));
     assert_eq!(plan.args, os(&["--profile", "dsh-tui", "--resume"]));
     assert!(plan.env_set.is_empty());
+}
+
+#[test]
+fn unconfigured_kimi_launches_as_is() {
+    let (_dir, paths) = temp_paths();
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Kimi,
+            provider: None,
+            passthrough: os(&["web", "--no-open"]),
+        },
+        &paths,
+        &EnvLookup::isolated(HashMap::new()),
+    )
+    .unwrap();
+    assert_eq!(plan.program, PathBuf::from("kimi"));
+    assert_eq!(plan.args, os(&["web", "--no-open"]));
+    assert!(plan.env_set.is_empty());
+}
+
+#[test]
+fn kimi_explicit_model_seeds_selected_alias_when_catalog_is_unavailable() {
+    let (_dir, paths) = temp_paths();
+    fs::write(&paths.config, "[provider.tokener]\nbase_url = \"http://127.0.0.1:9\"\n").unwrap();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "TOKENER_API_KEY".to_string(),
+        "sk-tokener".to_string(),
+    )]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Kimi,
+            provider: Some("tokener".to_string()),
+            passthrough: os(&["--model", "rx-tokener/kimi-k3", "--plan"]),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(plan.program, PathBuf::from("kimi"));
+    assert_eq!(plan.args, os(&["--auto", "--model", "rx-tokener/kimi-k3", "--plan"]));
+    assert_eq!(plan.env_set, vec![("KIMI_MODEL_NAME".to_string(), String::new())]);
+    let config: toml::Value = toml::from_str(
+        &fs::read_to_string(paths.dir.join("kimi-code").join("config.toml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["providers"]["rx-tokener"]["type"].as_str(), Some("openai"));
+    assert_eq!(
+        config["providers"]["rx-tokener"]["base_url"].as_str(),
+        Some("http://127.0.0.1:9/v1")
+    );
+    assert_eq!(config["models"]["rx-tokener/kimi-k3"]["model"].as_str(), Some("kimi-k3"));
+    assert!(plan.stderr_note.as_deref().unwrap().contains("seeding only the selected model"));
+    assert!(plan.stderr_note.as_deref().unwrap().contains("yolo"));
+}
+
+#[test]
+fn kimi_fallback_uses_first_provider_model_and_reports_it() {
+    let (_dir, paths) = temp_paths();
+    let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"glm-5"},{"id":"kimi-k3"}]}"#);
+    fs::write(&paths.config, format!("[provider.tokener]\nbase_url = \"{base_url}\"\n")).unwrap();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "TOKENER_API_KEY".to_string(),
+        "sk-tokener".to_string(),
+    )]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Kimi,
+            provider: Some("tokener".to_string()),
+            passthrough: os(&["--auto"]),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(plan.args, os(&["--model", "rx-tokener/glm-5", "--auto"]));
+    assert_eq!(plan.env_set, vec![("KIMI_MODEL_NAME".to_string(), String::new())]);
+    let config: toml::Value = toml::from_str(
+        &fs::read_to_string(paths.dir.join("kimi-code").join("config.toml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["models"].as_table().unwrap().len(), 2);
+    assert_eq!(config["models"]["rx-tokener/glm-5"]["model"].as_str(), Some("glm-5"));
+    assert_eq!(config["models"]["rx-tokener/kimi-k3"]["model"].as_str(), Some("kimi-k3"));
+    assert!(plan.stderr_note.as_deref().unwrap().contains("using first provider model 'glm-5'"));
+    assert!(!plan.stderr_note.as_deref().unwrap().contains("yolo"));
+}
+
+#[test]
+fn kimi_skips_yolo_when_prompt_or_hidden_yolo_alias_is_set() {
+    let (_dir, paths) = temp_paths();
+    fs::write(&paths.config, "[provider.tokener]\nbase_url = \"http://127.0.0.1:9\"\n").unwrap();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "TOKENER_API_KEY".to_string(),
+        "sk-tokener".to_string(),
+    )]));
+    for passthrough in [
+        os(&["--model", "kimi-k3", "-p", "hello"]),
+        os(&["--model", "kimi-k3", "--prompt", "hello"]),
+        os(&["--model", "kimi-k3", "--yes"]),
+        os(&["--model", "kimi-k3", "--auto-approve"]),
+    ] {
+        let plan = launch::plan(
+            &LaunchRequest {
+                harness: Harness::Kimi,
+                provider: Some("tokener".to_string()),
+                passthrough,
+            },
+            &paths,
+            &env,
+        )
+        .unwrap();
+        assert!(!plan.args.iter().any(|arg| arg == "--auto"), "{:?}", plan.args);
+        assert!(!plan.stderr_note.as_deref().is_some_and(|note| note.contains("yolo")));
+    }
 }
 
 #[test]
@@ -893,6 +1037,7 @@ fn codex_openrouter_overrides_model_and_uses_command_auth() {
 #[test]
 fn opencode_openrouter_injects_config_and_model() {
     let (_dir, paths) = temp_paths();
+    fs::write(&paths.config, "[provider.openrouter]\nmodel = \"openai/gpt-5\"\n").unwrap();
     let env = EnvLookup::isolated(HashMap::from([(
         "OPENROUTER_API_KEY".to_string(),
         "sk-or-test".to_string(),
@@ -908,7 +1053,7 @@ fn opencode_openrouter_injects_config_and_model() {
     )
     .unwrap();
     assert_eq!(plan.program, PathBuf::from("opencode"));
-    assert_eq!(plan.args, os(&["--auto", "run", "hello"]));
+    assert_eq!(plan.args, os(&["run", "--auto", "-m", "openrouter/openai/gpt-5", "hello"]));
     assert!(plan.env_set.iter().any(|(k, v)| k == "OPENROUTER_API_KEY" && v == "sk-or-test"));
     let config = plan
         .env_set
@@ -918,6 +1063,31 @@ fn opencode_openrouter_injects_config_and_model() {
         .unwrap();
     assert!(config.contains("openrouter"));
     assert!(config.contains("OPENROUTER_API_KEY"));
+}
+
+#[test]
+fn opencode_server_commands_preserve_native_arguments() {
+    let (_dir, paths) = temp_paths();
+    fs::write(&paths.config, "[provider.openrouter]\nmodel = \"openai/gpt-5\"\n").unwrap();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "OPENROUTER_API_KEY".to_string(),
+        "sk-or-test".to_string(),
+    )]));
+    for passthrough in [os(&["web", "--port", "4096"]), os(&["serve", "--hostname", "127.0.0.1"])] {
+        let plan = launch::plan(
+            &LaunchRequest {
+                harness: Harness::OpenCode,
+                provider: Some("openrouter".to_string()),
+                passthrough: passthrough.clone(),
+            },
+            &paths,
+            &env,
+        )
+        .unwrap();
+        assert_eq!(plan.args, passthrough);
+        assert!(plan.env_set.iter().any(|(key, _)| key == "OPENCODE_CONFIG_CONTENT"));
+        assert!(!plan.stderr_note.as_deref().is_some_and(|note| note.contains("yolo")));
+    }
 }
 
 #[test]
@@ -2654,6 +2824,12 @@ fn install_specs_use_official_urls() {
     let dsh = crate::install::spec(Harness::Dsh);
     assert_eq!(dsh.program, "dsh");
     assert_eq!(dsh.display, "DeepSeek Harness");
+
+    let kimi = crate::install::spec(Harness::Kimi);
+    assert_eq!(kimi.program, "kimi");
+    assert_eq!(kimi.display, "Kimi Code");
+    assert_eq!(kimi.url, "https://code.kimi.com/kimi-code/install.sh");
+    assert_eq!(kimi.shell, "bash");
 }
 
 #[test]
@@ -2699,4 +2875,6 @@ fn isolated_env_skips_install_offer() {
     assert_eq!(path, std::path::PathBuf::from("pi"));
     let dsh = crate::install::ensure(Harness::Dsh, &EnvLookup::isolated(HashMap::new())).unwrap();
     assert_eq!(dsh, std::path::PathBuf::from("dsh"));
+    let kimi = crate::install::ensure(Harness::Kimi, &EnvLookup::isolated(HashMap::new())).unwrap();
+    assert_eq!(kimi, std::path::PathBuf::from("kimi"));
 }

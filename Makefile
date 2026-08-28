@@ -70,6 +70,7 @@ install: ## Install binaries to ~/.cargo/bin
 	ln -sfn rx "$(HOME)/.cargo/bin/rxo"
 	ln -sfn rx "$(HOME)/.cargo/bin/rxp"
 	ln -sfn rx "$(HOME)/.cargo/bin/rxd"
+	ln -sfn rx "$(HOME)/.cargo/bin/rxk"
 	@if [ -d "$(HOME)/.zsh/completions" ]; then \
 		"$(HOME)/.cargo/bin/recall" completions zsh > "$(HOME)/.zsh/completions/_recall"; \
 		printf '$(GREEN)  ✓ Updated ~/.zsh/completions/_recall$(RESET)\n'; \
@@ -80,7 +81,7 @@ install: ## Install binaries to ~/.cargo/bin
 uninstall: ## Remove installed binaries
 	$(CARGO) uninstall recall
 	$(CARGO) uninstall rx
-	rm -f "$(HOME)/.cargo/bin/rxc" "$(HOME)/.cargo/bin/rxx" "$(HOME)/.cargo/bin/rxo" "$(HOME)/.cargo/bin/rxp" "$(HOME)/.cargo/bin/rxd"
+	rm -f "$(HOME)/.cargo/bin/rxc" "$(HOME)/.cargo/bin/rxx" "$(HOME)/.cargo/bin/rxo" "$(HOME)/.cargo/bin/rxp" "$(HOME)/.cargo/bin/rxd" "$(HOME)/.cargo/bin/rxk"
 
 # ── Run ──────────────────────────────────────────────────────────────────────
 

@@ -1,6 +1,6 @@
 # rx
 
-`rx` launches Claude Code, Codex, OpenCode, Pi, and DeepSeek Harness with one provider configuration. It prepares each harness and runs its native CLI.
+`rx` launches Claude Code, Codex, OpenCode, Pi, DeepSeek Harness, and Kimi Code with one provider configuration. It prepares each harness and runs its native CLI.
 
 [![rx architecture](assets/rx-architecture.png)](assets/rx-architecture.png)
 
@@ -17,9 +17,12 @@ rx providers login
 rx codex
 rx --provider openrouter opencode
 rx --provider none claude
+rx dsh web
+rx kimi
 ```
 
 Running `rx` without a harness opens the picker. Arguments after the harness name are passed to that harness.
+For Kimi Code, `rx` seeds the selected provider and its cached models as `rx-<provider>/<model>` aliases in Kimi's native catalog. `--model <id>` selects one of those models. Without it or a provider-level `model` in `rx.toml`, `rx` uses the first cached provider model and reports that choice on stderr. RX-owned entries are refreshed only while their payload remains unchanged; native and user-edited entries are preserved. Kimi requires catalog credentials in its config, so the selected provider key is also stored in Kimi's local `config.toml` with secret-only file permissions.
 
 | Harness | Commands |
 | --- | --- |
@@ -28,6 +31,7 @@ Running `rx` without a harness opens the picker. Arguments after the harness nam
 | OpenCode | `rx opencode`, `rxo` |
 | Pi | `rx pi`, `rxp` |
 | DeepSeek Harness | `rx dsh`, `rxd` |
+| Kimi Code | `rx kimi`, `rxk` |
 
 Provider commands:
 

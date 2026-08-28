@@ -51,6 +51,12 @@ pub(crate) fn spec(harness: Harness) -> InstallSpec {
             url: "https://www.npmjs.com/package/@deepseek-ai/dsh",
             shell: "sh",
         },
+        Harness::Kimi => InstallSpec {
+            program: "kimi",
+            display: "Kimi Code",
+            url: "https://code.kimi.com/kimi-code/install.sh",
+            shell: "bash",
+        },
     }
 }
 
@@ -144,7 +150,12 @@ pub(crate) fn extra_bin_dirs() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
-    vec![home.join(".local/bin"), home.join(".opencode/bin"), home.join(".claude/local/bin")]
+    vec![
+        home.join(".local/bin"),
+        home.join(".opencode/bin"),
+        home.join(".claude/local/bin"),
+        home.join(".kimi-code/bin"),
+    ]
 }
 
 fn run_official_installer(spec: &InstallSpec) -> Result<()> {

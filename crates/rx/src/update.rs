@@ -166,8 +166,6 @@ fn confirm(message: &str) -> Result<bool> {
 fn relaunch(raw_args: &[std::ffi::OsString]) -> Result<()> {
     let exe = std::env::current_exe().context("cannot resolve rx executable path")?;
     let mut command = Command::new(&exe);
-    // current_exe() resolves aliases (rxc/rxx/rxo/rxp/rxd) to the plain rx binary,
-    // so the relaunched process would lose the argv0-selected harness.
     if let Some(harness) = raw_args.first().and_then(|argv0| crate::args::argv0_harness(argv0)) {
         command.arg(harness);
     }

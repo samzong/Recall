@@ -3269,9 +3269,11 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tar",
  "tempfile",
  "toml",
+ "toml_edit 0.22.27",
  "ureq",
  "zip",
 ]

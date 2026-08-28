@@ -43,12 +43,13 @@ struct Choice {
     alias: &'static str,
 }
 
-const CHOICES: [Choice; 5] = [
+const CHOICES: [Choice; 6] = [
     Choice { harness: Harness::Claude, alias: "rxc" },
     Choice { harness: Harness::Codex, alias: "rxx" },
     Choice { harness: Harness::OpenCode, alias: "rxo" },
     Choice { harness: Harness::Pi, alias: "rxp" },
     Choice { harness: Harness::Dsh, alias: "rxd" },
+    Choice { harness: Harness::Kimi, alias: "rxk" },
 ];
 
 struct App {

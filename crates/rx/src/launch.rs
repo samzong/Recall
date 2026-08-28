@@ -132,7 +132,7 @@ pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> R
     let model = target.model.as_deref().or(match request.harness {
         Harness::Claude => target.provider.claude_default_model,
         Harness::Codex => target.provider.default_model,
-        Harness::OpenCode | Harness::Pi | Harness::Dsh => None,
+        Harness::OpenCode | Harness::Pi | Harness::Dsh | Harness::Kimi => None,
     });
     if matches!(request.harness, Harness::Claude) {
         let seed = if env.is_real() {
@@ -217,11 +217,21 @@ fn apply_yolo(request: &LaunchRequest, plan: &mut LaunchPlan, env: &EnvLookup) {
             if user_flag(&["--auto"]) {
                 return;
             }
-            plan.args.insert(0, OsString::from("--auto"));
+            let Some(at) = opencode_flag_index(&plan.args) else {
+                return;
+            };
+            plan.args.insert(at, OsString::from("--auto"));
             push_note(plan, &note("--auto"));
         }
         Harness::Pi => {}
         Harness::Dsh => {}
+        Harness::Kimi => {
+            if user_flag(&["--auto", "--yolo", "-y", "--yes", "--auto-approve", "--prompt", "-p"]) {
+                return;
+            }
+            plan.args.insert(0, OsString::from("--auto"));
+            push_note(plan, &note("--auto"));
+        }
     }
 }
 
@@ -549,9 +559,16 @@ fn inject(
                 )?,
             ));
             let mut args = request.passthrough.clone();
-            if let Some(model) = model.filter(|_| !user_sets_opencode_model(&request.passthrough)) {
-                args.insert(0, OsString::from(crate::opencode::prefixed_model(provider_id, model)));
-                args.insert(0, OsString::from("-m"));
+            if let Some(model) = model.filter(|_| !user_sets_opencode_model(&request.passthrough))
+                && let Some(at) = opencode_flag_index(&args)
+            {
+                args.splice(
+                    at..at,
+                    [
+                        OsString::from("-m"),
+                        OsString::from(crate::opencode::prefixed_model(provider_id, model)),
+                    ],
+                );
             }
             Ok(LaunchPlan {
                 program: PathBuf::from("opencode"),
@@ -588,6 +605,7 @@ fn inject(
                 },
             })
         }
+        Harness::Kimi => crate::kimi::prepare(target, model, paths, env, &request.passthrough),
     }
 }
 
@@ -621,6 +639,18 @@ fn user_sets_opencode_model(passthrough: &[OsString]) -> bool {
             || arg == "--model"
             || args::os_prefix(arg, "--model=")
     })
+}
+
+fn opencode_flag_index(passthrough: &[OsString]) -> Option<usize> {
+    match args::before_double_dash(passthrough).first().and_then(|arg| arg.to_str()) {
+        Some("run") => Some(1),
+        Some(
+            "completion" | "acp" | "mcp" | "attach" | "debug" | "providers" | "auth" | "agent"
+            | "upgrade" | "uninstall" | "serve" | "web" | "models" | "stats" | "export" | "import"
+            | "github" | "pr" | "session" | "plugin" | "plug" | "db",
+        ) => None,
+        _ => Some(0),
+    }
 }
 
 fn user_sets_model(passthrough: &[OsString]) -> bool {

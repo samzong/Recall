@@ -5,6 +5,7 @@ mod completions;
 mod config;
 mod dsh;
 mod install;
+mod kimi;
 mod launch;
 mod opencode;
 mod pi;
