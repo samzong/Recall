@@ -20,7 +20,7 @@ use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, R
 pub(crate) struct CodexAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 4;
-const EVENT_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 2;
 const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for CodexAdapter {
@@ -543,6 +543,29 @@ fn collect_codex_response_item_event(
 
     if payload_type.ends_with("_call") {
         let name = codex_call_name(payload_type, payload);
+        let status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
+        if let Some(Value::String(text)) = codex_call_args(payload) {
+            let patch_targets = events::patch_file_targets(text);
+            if !patch_targets.is_empty() {
+                for target in patch_targets {
+                    let mut event = events::file_write_event(
+                        events::EventContext {
+                            event_seq: events_out.len() as u32,
+                            timestamp,
+                            source_path: Some(source_path.to_string()),
+                            source_event_id: Some(source_event_id.clone()),
+                            message_seq: None,
+                            parser_version: EVENT_PARSER_VERSION,
+                        },
+                        name.clone(),
+                        target,
+                    );
+                    event.status = status.clone();
+                    events_out.push(event);
+                }
+                return;
+            }
+        }
         let mut event = match codex_call_args(payload) {
             Some(Value::String(text)) => events::tool_call_event_from_text(
                 events::EventContext {
@@ -569,7 +592,7 @@ fn collect_codex_response_item_event(
                 args,
             ),
         };
-        event.status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
+        event.status = status;
         events_out.push(event);
     }
 }
@@ -1056,7 +1079,7 @@ mod tests {
                 "status": "completed",
                 "call_id": "call_patch",
                 "name": "apply_patch",
-                "input": "*** Begin Patch\n*** End Patch"
+                "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** Add File: docs/new.md\n*** End Patch"
             }
         });
         let custom_result = serde_json::json!({
@@ -1077,19 +1100,24 @@ mod tests {
 
         let raw = parse_codex_session(&path).unwrap().unwrap();
 
-        assert_eq!(raw.events.len(), 4);
+        assert_eq!(raw.events.len(), 5);
         assert_eq!(raw.events[0].kind, "command");
         assert_eq!(raw.events[0].name.as_deref(), Some("exec_command"));
         assert_eq!(raw.events[0].target.as_deref(), Some("sed -n '1,220p' CLAUDE.md"));
         assert_eq!(raw.events[0].source_event_id.as_deref(), Some("call_123"));
         assert_eq!(raw.events[1].kind, "tool_result");
         assert_eq!(raw.events[1].source_event_id.as_deref(), Some("call_123"));
-        assert_eq!(raw.events[2].kind, "tool_call");
+        assert_eq!(raw.events[2].kind, "file_write");
         assert_eq!(raw.events[2].name.as_deref(), Some("apply_patch"));
         assert_eq!(raw.events[2].status.as_deref(), Some("completed"));
+        assert_eq!(raw.events[2].target.as_deref(), Some("src/lib.rs"));
         assert_eq!(raw.events[2].source_event_id.as_deref(), Some("call_patch"));
-        assert_eq!(raw.events[3].kind, "tool_result");
-        assert_eq!(raw.events[3].source_event_id.as_deref(), Some("call_patch"));
+        assert_eq!(raw.events[3].kind, "file_write");
+        assert_eq!(raw.events[3].name.as_deref(), Some("apply_patch"));
+        assert_eq!(raw.events[3].target.as_deref(), Some("docs/new.md"));
+        assert_eq!(raw.events[3].event_seq, 3);
+        assert_eq!(raw.events[4].kind, "tool_result");
+        assert_eq!(raw.events[4].source_event_id.as_deref(), Some("call_patch"));
 
         let _ = fs::remove_dir_all(&root);
     }

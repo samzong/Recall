@@ -91,6 +91,48 @@ pub(crate) fn tool_result_event(
     }
 }
 
+pub(crate) fn file_write_event(
+    context: EventContext,
+    name: String,
+    target: String,
+) -> RawSessionEvent {
+    let summary = format!("[{name}] {target}");
+    RawSessionEvent {
+        event_seq: context.event_seq,
+        timestamp: context.timestamp,
+        kind: "file_write".to_string(),
+        actor: "assistant".to_string(),
+        name: Some(name),
+        status: None,
+        target: Some(target),
+        message_seq: context.message_seq,
+        summary: Some(summary),
+        source_path: context.source_path,
+        source_event_id: context.source_event_id,
+        attrs_json: None,
+        parser_version: context.parser_version,
+    }
+}
+
+const PATCH_FILE_PREFIXES: [&str; 4] =
+    ["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "];
+
+pub(crate) fn patch_file_targets(text: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in text.lines() {
+        let path = PATCH_FILE_PREFIXES
+            .iter()
+            .find_map(|prefix| line.trim_start().strip_prefix(prefix))
+            .and_then(non_empty);
+        if let Some(path) = path
+            && !targets.contains(&path)
+        {
+            targets.push(path);
+        }
+    }
+    targets
+}
+
 pub(crate) fn target_from_value(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => non_empty(text),

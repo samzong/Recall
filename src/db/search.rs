@@ -23,6 +23,26 @@ pub(crate) struct SearchFilters {
     pub(crate) thread_role: Option<ThreadRoleFilter>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SessionEventQuery<'a> {
+    pub(crate) kinds: Option<&'a [String]>,
+    pub(crate) target: &'a str,
+    pub(crate) sources: Option<&'a [String]>,
+    pub(crate) scope: &'a ProjectScope,
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionEventHit {
+    pub(crate) session: Session,
+    pub(crate) kind: String,
+    pub(crate) name: Option<String>,
+    pub(crate) target: Option<String>,
+    pub(crate) event_seq: u32,
+    pub(crate) summary: Option<String>,
+    pub(crate) timestamp: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RepoFilter {
     Remote(String),
@@ -118,6 +138,64 @@ impl<'a> SearchEngine<'a> {
             None => vec![],
         };
         self.search_results(fts_hits, vec_hits, 0, Some(limit))
+    }
+
+    pub(crate) fn list_session_events(
+        &self,
+        query: &SessionEventQuery<'_>,
+    ) -> anyhow::Result<Vec<SessionEventHit>> {
+        let session_cols = qualified_session_columns();
+        let mut sql = format!(
+            "SELECT {session_cols}, e.kind, e.name, e.target, e.event_seq, e.summary, e.timestamp
+             FROM session_events e
+             JOIN sessions s ON s.id = e.session_id
+             WHERE 1=1"
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+
+        if let Some(kinds) = query.kinds
+            && !kinds.is_empty()
+        {
+            let placeholders: Vec<String> =
+                (0..kinds.len()).map(|offset| format!("?{}", param_idx + offset)).collect();
+            sql.push_str(&format!(" AND e.kind IN ({})", placeholders.join(", ")));
+            for kind in kinds {
+                params.push(Box::new(kind.clone()));
+            }
+            param_idx += kinds.len();
+        }
+        apply_target_path_match(&mut sql, &mut params, &mut param_idx, query.target);
+
+        let filters = SearchFilters {
+            sources: query.sources.map(<[String]>::to_vec),
+            time_range: TimeRange::All,
+            scope: query.scope.clone(),
+            thread_role: None,
+        };
+        apply_filters(&mut sql, &mut params, &mut param_idx, &filters);
+
+        sql.push_str(&format!(
+            " ORDER BY COALESCE(e.timestamp, s.updated_at, s.started_at) DESC, e.event_seq DESC
+              LIMIT ?{param_idx}"
+        ));
+        params.push(Box::new(i64::try_from(query.limit).unwrap_or(i64::MAX)));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|param| param.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(SessionEventHit {
+                session: session_from_row(row)?,
+                kind: row.get(17)?,
+                name: row.get(18)?,
+                target: row.get(19)?,
+                event_seq: row.get(20)?,
+                summary: row.get(21)?,
+                timestamp: row.get(22)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub(crate) fn hybrid_search_page(
@@ -274,6 +352,28 @@ impl<'a> SearchEngine<'a> {
     }
 }
 
+fn qualified_session_columns() -> String {
+    SESSION_COLUMNS.split(", ").map(|name| format!("s.{name}")).collect::<Vec<_>>().join(", ")
+}
+
+fn apply_target_path_match(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    param_idx: &mut usize,
+    target: &str,
+) {
+    sql.push_str(&format!(
+        " AND e.target IS NOT NULL AND (
+            e.target = ?{p}
+            OR substr(e.target, -length(?{p}) - 1) IN ('/' || ?{p}, char(92) || ?{p})
+            OR substr(?{p}, -length(e.target) - 1) IN ('/' || e.target, char(92) || e.target)
+         )",
+        p = *param_idx
+    ));
+    params.push(Box::new(target.to_string()));
+    *param_idx += 1;
+}
+
 fn apply_filters(
     sql: &mut String,
     params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
@@ -376,7 +476,11 @@ fn fts5_query(query: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fts5_query, tokenize_query};
+    use super::{SearchEngine, SessionEventQuery, fts5_query, tokenize_query};
+    use crate::db::schema;
+    use crate::db::store::Store;
+    use crate::project_scope::ProjectScope;
+    use crate::types::{RawSessionEvent, Session};
 
     #[test]
     fn tokenize_query_strips_punctuation_and_case() {
@@ -395,5 +499,166 @@ mod tests {
         );
         assert_eq!(fts5_query("a"), r#""a""#);
         assert_eq!(fts5_query("AND OR NOT"), r#""and" OR "or" OR "not"*"#);
+    }
+
+    fn setup_store() -> Store {
+        schema::register_sqlite_vec();
+        Store::open_in_memory().unwrap()
+    }
+
+    fn session(id: &str, source: &str, directory: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            source: source.to_string(),
+            source_id: format!("src-{id}"),
+            title: id.to_string(),
+            directory: Some(directory.to_string()),
+            repo_remote: None,
+            repo_slug: None,
+            repo_name: None,
+            started_at: 1_000,
+            updated_at: Some(1_000),
+            message_count: 0,
+            entrypoint: None,
+            custom_title: None,
+            summary: None,
+            duration_minutes: None,
+            source_file_path: None,
+            is_import: false,
+        }
+    }
+
+    fn event(seq: u32, kind: &str, target: &str, timestamp: i64) -> RawSessionEvent {
+        RawSessionEvent {
+            event_seq: seq,
+            timestamp: Some(timestamp),
+            kind: kind.to_string(),
+            actor: "assistant".to_string(),
+            name: Some(kind.to_string()),
+            status: None,
+            target: Some(target.to_string()),
+            message_seq: Some(1),
+            summary: Some(format!("{kind} {target}")),
+            source_path: None,
+            source_event_id: None,
+            attrs_json: Some(r#"{"secret":"nope"}"#.to_string()),
+            parser_version: 1,
+        }
+    }
+
+    fn seed_events() -> Store {
+        let store = setup_store();
+        store.insert_session(&session("s1", "codex", "/tmp/demo")).unwrap();
+        store.insert_session(&session("s2", "claude-code", "/tmp/demo")).unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "codex",
+                "src-s1",
+                &[
+                    event(0, "file_write", "/tmp/demo/src/db/schema.rs", 5_000),
+                    event(1, "command", "/tmp/demo/src/db/schema.rs", 6_000),
+                    event(2, "file_write", "old_schema.rs", 4_000),
+                ],
+                1,
+                None,
+            )
+            .unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "claude-code",
+                "src-s2",
+                &[event(0, "file_read", "src/db/schema.rs", 8_000)],
+                1,
+                None,
+            )
+            .unwrap();
+        store
+    }
+
+    fn query_events(
+        store: &Store,
+        target: &str,
+        kinds: Option<&[String]>,
+    ) -> Vec<super::SessionEventHit> {
+        SearchEngine::new(&store.conn)
+            .list_session_events(&SessionEventQuery {
+                kinds,
+                target,
+                sources: None,
+                scope: &ProjectScope::Global,
+                limit: 50,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn list_session_events_matches_exact_or_separator_suffix() {
+        let store = seed_events();
+        let kinds = vec!["file_write".to_string(), "file_read".to_string()];
+        let hits = query_events(&store, "src/db/schema.rs", Some(&kinds));
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].session.id, "s2");
+        assert_eq!(hits[0].target.as_deref(), Some("src/db/schema.rs"));
+        assert_eq!(hits[1].session.id, "s1");
+        assert_eq!(hits[1].target.as_deref(), Some("/tmp/demo/src/db/schema.rs"));
+        assert!(hits.iter().all(|hit| hit.kind != "command"));
+
+        let bare = query_events(&store, "schema.rs", Some(&kinds));
+        assert_eq!(bare.len(), 2);
+        assert!(bare.iter().all(|hit| {
+            hit.target.as_deref().is_some_and(|target| {
+                target == "schema.rs"
+                    || target.ends_with("/schema.rs")
+                    || target.ends_with("\\schema.rs")
+            })
+        }));
+
+        let no_substring = query_events(&store, "schema.rs", None);
+        assert!(no_substring.iter().all(|hit| hit.target.as_deref() != Some("old_schema.rs")));
+    }
+
+    #[test]
+    fn list_session_events_matches_relative_target_from_absolute_path() {
+        let store = seed_events();
+        let hits = query_events(&store, "/abs/elsewhere/src/db/schema.rs", None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session.id, "s2");
+        assert_eq!(hits[0].target.as_deref(), Some("src/db/schema.rs"));
+    }
+
+    #[test]
+    fn list_session_events_orders_newest_event_first() {
+        let store = seed_events();
+        let hits = query_events(&store, "schema.rs", None);
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].timestamp, Some(8_000));
+        assert_eq!(hits[1].timestamp, Some(6_000));
+        assert_eq!(hits[1].kind, "command");
+        assert_eq!(hits[2].timestamp, Some(5_000));
+    }
+
+    #[test]
+    fn list_session_events_ranks_timestampless_events_by_session_activity() {
+        let store = seed_events();
+        let mut recent = session("s3", "cursor", "/tmp/demo");
+        recent.updated_at = Some(9_000);
+        store.insert_session(&recent).unwrap();
+        let mut no_timestamp = event(0, "file_write", "src/db/schema.rs", 0);
+        no_timestamp.timestamp = None;
+        store
+            .persist_session_events_for_existing_session(
+                "cursor",
+                "src-s3",
+                &[no_timestamp],
+                1,
+                None,
+            )
+            .unwrap();
+
+        let hits = query_events(&store, "schema.rs", None);
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].session.id, "s3");
+        assert_eq!(hits[0].timestamp, None);
+        assert_eq!(hits[1].timestamp, Some(8_000));
     }
 }

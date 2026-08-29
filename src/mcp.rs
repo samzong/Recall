@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::adapters;
-use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
+use crate::db::search::{SearchEngine, SearchFilters, SessionEventQuery, TimeRange};
 use crate::db::store::Store;
 use crate::project_scope::ProjectScope;
 use crate::query::{query_embedding, resolve_source_filter};
@@ -24,6 +24,9 @@ const SEARCH_LIMIT_DEFAULT: u32 = 10;
 const SEARCH_LIMIT_MAX: u32 = 50;
 const LIST_LIMIT_DEFAULT: u32 = 10;
 const LIST_LIMIT_MAX: u32 = 50;
+const EVENT_LIMIT_DEFAULT: u32 = 20;
+const EVENT_LIMIT_MAX: u32 = 50;
+const FILE_HISTORY_KINDS: [&str; 2] = ["file_write", "file_read"];
 const GET_MAX_MESSAGES_DEFAULT: u32 = 50;
 const GET_MESSAGE_CHAR_CAP: usize = 2_000;
 const GET_RESPONSE_CHAR_CAP: usize = 32_000;
@@ -34,6 +37,7 @@ const MISSING_INDEX: &str =
 const EMPTY_INDEX: &str = "No sessions in the Recall index. Run `recall sync` in a terminal after using a supported coding agent.";
 const SEARCH_EMPTY: &str = "No matching sessions.";
 const SESSION_NOT_FOUND: &str = "Session not found.";
+const PATH_REQUIRED: &str = "path is required.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchSessionsArgs {
@@ -78,6 +82,29 @@ struct ListRecentSessionsArgs {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FileHistoryArgs {
+    /// File path, relative or absolute. Matches an event when the shorter of
+    /// the two is a whole path suffix of the other, so an absolute path also
+    /// finds events indexed under a project-relative path and vice versa.
+    path: String,
+    /// Optional absolute indexed directory path, or a repo name/owner-repo
+    /// slug/remote URL derived from git identity. A worktree's own directory
+    /// name alone (e.g. "myrepo--feature") does not match.
+    #[serde(default)]
+    project: Option<String>,
+    /// Optional tool id or label such as claude-code or CUR.
+    #[serde(default)]
+    source: Option<String>,
+    /// Optional event kind. When omitted, only file_write and file_read.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Maximum events to return. Defaults to 20, capped at 50.
+    #[serde(default, deserialize_with = "deserialize_opt_u32")]
+    #[schemars(range(min = 1, max = 50))]
+    limit: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 struct SessionHit {
     session_id: String,
@@ -92,6 +119,26 @@ struct SessionHit {
 struct HitList {
     message: Option<String>,
     hits: Vec<SessionHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+struct EventHit {
+    session_id: String,
+    source: String,
+    project: Option<String>,
+    title: String,
+    timestamp: Option<String>,
+    kind: String,
+    name: Option<String>,
+    target: Option<String>,
+    event_seq: u32,
+    summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+struct EventList {
+    message: Option<String>,
+    events: Vec<EventHit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -230,6 +277,22 @@ impl RecallMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(json_result(list_recent_sessions(&lock_index(&self.index), &args)))
     }
+
+    #[tool(
+        description = "Which indexed sessions touched a file. An event matches when its target equals the given path, or when either one ends with `/` or `\\` followed by the other, so relative and absolute forms of the same path find each other. Defaults to file_write and file_read events. Returns session id, source, project, title, kind, name, target, event_seq, truncated summary, and event timestamp.",
+        annotations(
+            title = "File history",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn file_history(
+        &self,
+        Parameters(args): Parameters<FileHistoryArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(json_result(file_history(&lock_index(&self.index), &args)))
+    }
 }
 
 #[tool_handler]
@@ -238,7 +301,7 @@ impl ServerHandler for RecallMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("recall", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Read-only memory over the local Recall session index. Search or list past coding sessions, then fetch a session when you need the transcript. This server never writes, syncs, or mutates the index.",
+                "Read-only memory over the local Recall session index. Search or list past coding sessions, look up which sessions touched a file, then fetch a session when you need the transcript. This server never writes, syncs, or mutates the index.",
             )
     }
 }
@@ -262,6 +325,10 @@ fn to_json(value: impl Serialize) -> Value {
 
 fn empty_hits(message: impl Into<String>) -> HitList {
     HitList { message: Some(message.into()), hits: Vec::new() }
+}
+
+fn empty_events(message: impl Into<String>) -> EventList {
+    EventList { message: Some(message.into()), events: Vec::new() }
 }
 
 fn search_sessions(
@@ -332,6 +399,64 @@ fn list_ready(
             })
             .collect(),
     })
+}
+
+fn file_history(
+    index: &IndexState,
+    args: &FileHistoryArgs,
+) -> std::result::Result<EventList, EventList> {
+    match index {
+        IndexState::Unavailable { message, .. } => Err(empty_events(message.clone())),
+        IndexState::Ready(store) => file_history_ready(store, args).map_err(empty_events),
+    }
+}
+
+fn file_history_ready(
+    store: &Store,
+    args: &FileHistoryArgs,
+) -> std::result::Result<EventList, String> {
+    let path = args.path.trim();
+    if path.is_empty() {
+        return Err(PATH_REQUIRED.to_string());
+    }
+    let kinds = match opt_trimmed(args.kind.as_deref()) {
+        Some(kind) => vec![kind.to_string()],
+        None => FILE_HISTORY_KINDS.iter().map(|kind| (*kind).to_string()).collect(),
+    };
+    let (scope, sources) = resolve_filters(store, args.project.as_deref(), args.source.as_deref())?;
+    let hits = SearchEngine::new(&store.conn)
+        .list_session_events(&SessionEventQuery {
+            kinds: Some(kinds.as_slice()),
+            target: path,
+            sources: sources.as_deref(),
+            scope: &scope,
+            limit: clamp_limit(args.limit, EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX),
+        })
+        .map_err(|error| error.to_string())?;
+    if hits.is_empty() {
+        let message = if store_is_empty(store) { EMPTY_INDEX } else { SEARCH_EMPTY };
+        return Ok(EventList { message: Some(message.to_string()), events: Vec::new() });
+    }
+    Ok(EventList { message: None, events: hits.into_iter().map(event_hit).collect() })
+}
+
+fn opt_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn event_hit(hit: crate::db::search::SessionEventHit) -> EventHit {
+    EventHit {
+        session_id: hit.session.id.clone(),
+        source: hit.session.source.clone(),
+        project: hit.session.directory.clone(),
+        title: session_title(&hit.session),
+        timestamp: hit.timestamp.map(iso8601),
+        kind: hit.kind,
+        name: hit.name,
+        target: hit.target,
+        event_seq: hit.event_seq,
+        summary: hit.summary.map(|text| truncate_chars(&text, EXCERPT_CHAR_CAP).0),
+    }
 }
 
 fn get_session(
@@ -524,7 +649,7 @@ where
 mod tests {
     use super::*;
     use crate::db::schema;
-    use crate::types::Session;
+    use crate::types::{RawSessionEvent, Session};
 
     fn setup() -> Store {
         schema::register_sqlite_vec();
@@ -598,6 +723,14 @@ mod tests {
         assert!(listed.hits.is_empty());
         assert_eq!(listed.message.as_deref(), Some(EMPTY_INDEX));
         assert_eq!(json_result(list_recent_sessions(&index, &list_args)).is_error, Some(false));
+
+        let history = file_history(&index, &file_history_args("src/db/schema.rs")).unwrap();
+        assert!(history.events.is_empty());
+        assert_eq!(history.message.as_deref(), Some(EMPTY_INDEX));
+        assert_eq!(
+            json_result(file_history(&index, &file_history_args("src/db/schema.rs"))).is_error,
+            Some(false)
+        );
     }
 
     #[test]
@@ -812,13 +945,342 @@ mod tests {
         assert_eq!(args.limit, Some(12));
         assert_eq!(clamp_limit(Some(80), 10, 50), 50);
         assert_eq!(clamp_limit(None, 10, 50), 10);
+        assert_eq!(clamp_limit(Some(80), EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX), 50);
+        assert_eq!(clamp_limit(None, EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX), 20);
     }
 
     #[test]
     fn tools_advertise_read_only_closed_world() {
-        let notes = RecallMcp::search_sessions_tool_attr().annotations.unwrap();
-        assert_eq!(notes.read_only_hint, Some(true));
-        assert_eq!(notes.idempotent_hint, Some(true));
-        assert_eq!(notes.open_world_hint, Some(false));
+        for notes in [
+            RecallMcp::search_sessions_tool_attr().annotations.unwrap(),
+            RecallMcp::get_session_tool_attr().annotations.unwrap(),
+            RecallMcp::list_recent_sessions_tool_attr().annotations.unwrap(),
+            RecallMcp::file_history_tool_attr().annotations.unwrap(),
+        ] {
+            assert_eq!(notes.read_only_hint, Some(true));
+            assert_eq!(notes.idempotent_hint, Some(true));
+            assert_eq!(notes.open_world_hint, Some(false));
+        }
+    }
+
+    fn event(
+        seq: u32,
+        kind: &str,
+        target: Option<&str>,
+        timestamp: Option<i64>,
+        summary: Option<&str>,
+        name: Option<&str>,
+    ) -> RawSessionEvent {
+        RawSessionEvent {
+            event_seq: seq,
+            timestamp,
+            kind: kind.to_string(),
+            actor: "assistant".to_string(),
+            name: name.map(str::to_string),
+            status: None,
+            target: target.map(str::to_string),
+            message_seq: Some(1),
+            summary: summary.map(str::to_string),
+            source_path: None,
+            source_event_id: None,
+            attrs_json: Some(r#"{"token":"secret-value"}"#.to_string()),
+            parser_version: 1,
+        }
+    }
+
+    fn persist_events(store: &Store, source: &str, session_id: &str, events: &[RawSessionEvent]) {
+        assert!(
+            store
+                .persist_session_events_for_existing_session(
+                    source,
+                    &format!("src-{session_id}"),
+                    events,
+                    1,
+                    None,
+                )
+                .unwrap()
+        );
+    }
+
+    fn seed_agent_events() -> Store {
+        let store = setup();
+        store.insert_session(&session("codex-demo", "codex", "codex demo", 2_000)).unwrap();
+        store.insert_session(&session("claude-demo", "claude-code", "claude demo", 3_000)).unwrap();
+        let mut other = session("codex-other", "codex", "other project", 1_500);
+        other.directory = Some("/tmp/other".to_string());
+        store.insert_session(&other).unwrap();
+        persist_events(
+            &store,
+            "codex",
+            "codex-demo",
+            &[
+                event(
+                    0,
+                    "file_write",
+                    Some("/tmp/demo/src/db/schema.rs"),
+                    Some(5_000),
+                    Some("wrote schema"),
+                    Some("Edit"),
+                ),
+                event(
+                    1,
+                    "command",
+                    Some("/tmp/demo/src/db/schema.rs"),
+                    Some(6_000),
+                    Some("ran cargo test"),
+                    Some("Bash"),
+                ),
+                event(
+                    2,
+                    "file_write",
+                    Some("old_schema.rs"),
+                    Some(4_000),
+                    Some("renamed"),
+                    Some("Edit"),
+                ),
+                event(
+                    3,
+                    "file_read",
+                    Some(r"src\db\schema.rs"),
+                    Some(7_000),
+                    Some("win path"),
+                    Some("Read"),
+                ),
+            ],
+        );
+        persist_events(
+            &store,
+            "claude-code",
+            "claude-demo",
+            &[event(
+                0,
+                "file_read",
+                Some("src/db/schema.rs"),
+                Some(8_000),
+                Some("read schema"),
+                Some("Read"),
+            )],
+        );
+        persist_events(
+            &store,
+            "codex",
+            "codex-other",
+            &[event(
+                0,
+                "file_write",
+                Some("/tmp/other/src/db/schema.rs"),
+                Some(9_000),
+                Some("other schema"),
+                Some("Edit"),
+            )],
+        );
+        store
+    }
+
+    fn file_history_args(path: &str) -> FileHistoryArgs {
+        FileHistoryArgs {
+            path: path.to_string(),
+            project: None,
+            source: None,
+            kind: None,
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn missing_index_is_a_tool_error_for_file_history() {
+        let index = IndexState::Unavailable { path: None, message: MISSING_INDEX.to_string() };
+        let history = file_history(&index, &file_history_args("src/db/schema.rs"))
+            .expect_err("missing index");
+        assert!(history.events.is_empty());
+        assert_eq!(history.message.as_deref(), Some(MISSING_INDEX));
+        assert_eq!(
+            json_result(file_history(&index, &file_history_args("src/db/schema.rs"))).is_error,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn file_history_defaults_to_file_kinds_and_suffix_match() {
+        let index = ready(seed_agent_events());
+        let list = file_history(&index, &file_history_args("src/db/schema.rs")).unwrap();
+        assert!(list.message.is_none());
+        let targets: Vec<_> = list.events.iter().map(|event| event.target.clone()).collect();
+        assert!(targets.contains(&Some("/tmp/demo/src/db/schema.rs".into())));
+        assert!(targets.contains(&Some("src/db/schema.rs".into())));
+        assert!(targets.contains(&Some("/tmp/other/src/db/schema.rs".into())));
+        assert!(!targets.contains(&Some("old_schema.rs".into())));
+        assert!(list.events.iter().all(|event| event.kind != "command"));
+        assert_eq!(list.events[0].timestamp.as_deref(), Some(iso8601(9_000).as_str()));
+
+        let payload = to_json(&list);
+        assert!(
+            payload.to_string().contains("wrote schema")
+                || payload.to_string().contains("read schema")
+        );
+        assert!(!payload.to_string().contains("secret-value"));
+        assert!(
+            payload
+                .get("events")
+                .and_then(|events| events.get(0))
+                .and_then(|event| event.get("attrs_json"))
+                .is_none()
+        );
+
+        let bare = file_history(&index, &file_history_args("schema.rs")).unwrap();
+        assert!(
+            bare.events.iter().any(|event| event.target.as_deref() == Some(r"src\db\schema.rs"))
+        );
+        assert!(bare.events.iter().all(|event| {
+            event.target.as_deref().is_some_and(|target| {
+                target == "schema.rs"
+                    || target.ends_with("/schema.rs")
+                    || target.ends_with(r"\schema.rs")
+            })
+        }));
+        assert!(bare.events.iter().all(|event| event.target.as_deref() != Some("old_schema.rs")));
+
+        let absolute =
+            file_history(&index, &file_history_args("/abs/elsewhere/src/db/schema.rs")).unwrap();
+        assert!(
+            absolute.events.iter().any(|event| event.target.as_deref() == Some("src/db/schema.rs"))
+        );
+
+        let commands = file_history(
+            &index,
+            &FileHistoryArgs {
+                path: "src/db/schema.rs".into(),
+                project: None,
+                source: None,
+                kind: Some("command".into()),
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(commands.events.len(), 1);
+        assert_eq!(commands.events[0].kind, "command");
+        assert_eq!(commands.events[0].session_id, "codex-demo");
+    }
+
+    #[test]
+    fn file_history_honors_project_source_and_unknown_source() {
+        let index = ready(seed_agent_events());
+        let scoped = file_history(
+            &index,
+            &FileHistoryArgs {
+                path: "src/db/schema.rs".into(),
+                project: Some("/tmp/demo".into()),
+                source: None,
+                kind: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(scoped.events.len(), 2);
+        assert!(scoped.events.iter().all(|event| event.project.as_deref() == Some("/tmp/demo")));
+
+        let by_source = file_history(
+            &index,
+            &FileHistoryArgs {
+                path: "src/db/schema.rs".into(),
+                project: Some("/tmp/demo".into()),
+                source: Some("claude-code".into()),
+                kind: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(by_source.events.len(), 1);
+        assert_eq!(by_source.events[0].source, "claude-code");
+
+        let unknown = file_history(
+            &index,
+            &FileHistoryArgs {
+                path: "src/db/schema.rs".into(),
+                project: None,
+                source: Some("not-a-source".into()),
+                kind: None,
+                limit: None,
+            },
+        )
+        .expect_err("unknown source");
+        assert!(unknown.events.is_empty());
+        assert!(unknown.message.unwrap().contains("unknown source"));
+        assert_eq!(
+            json_result(file_history(&index, &file_history_args("src/db/schema.rs"))).is_error,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn file_history_clamps_limit_and_rejects_blank_path() {
+        let store = setup();
+        store.insert_session(&session("s1", "codex", "many", 1_000)).unwrap();
+        let events: Vec<_> = (0..51)
+            .map(|seq| {
+                event(
+                    seq,
+                    "file_read",
+                    Some("src/db/schema.rs"),
+                    Some(10_000 + i64::from(seq)),
+                    Some("read"),
+                    Some("Read"),
+                )
+            })
+            .collect();
+        persist_events(&store, "codex", "s1", &events);
+        let index = ready(store);
+        let list = file_history(
+            &index,
+            &FileHistoryArgs {
+                path: "src/db/schema.rs".into(),
+                project: None,
+                source: None,
+                kind: None,
+                limit: Some(80),
+            },
+        )
+        .unwrap();
+        assert_eq!(list.events.len(), 50);
+
+        let blank = file_history(&index, &file_history_args("   ")).expect_err("blank path");
+        assert_eq!(blank.message.as_deref(), Some(PATH_REQUIRED));
+        assert_eq!(
+            json_result(file_history(&index, &file_history_args("   "))).is_error,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn file_history_truncates_long_summaries() {
+        let store = setup();
+        store.insert_session(&session("s1", "codex", "long", 1_000)).unwrap();
+        persist_events(
+            &store,
+            "codex",
+            "s1",
+            &[event(
+                0,
+                "tool_call",
+                Some("src/db/schema.rs"),
+                Some(1_000),
+                Some(&"z".repeat(EXCERPT_CHAR_CAP + 20)),
+                Some("Tool"),
+            )],
+        );
+        let list = file_history(
+            &ready(store),
+            &FileHistoryArgs {
+                path: "src/db/schema.rs".into(),
+                project: None,
+                source: None,
+                kind: Some("tool_call".into()),
+                limit: None,
+            },
+        )
+        .unwrap();
+        let summary = list.events[0].summary.as_deref().unwrap();
+        assert_eq!(summary.chars().count(), EXCERPT_CHAR_CAP);
+        assert!(summary.ends_with('…'));
     }
 }

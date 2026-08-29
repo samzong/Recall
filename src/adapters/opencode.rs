@@ -13,7 +13,7 @@ use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
 const USAGE_PARSER_VERSION: u32 = 1;
-const EVENT_PARSER_VERSION: u32 = 2;
+const EVENT_PARSER_VERSION: u32 = 3;
 const PARSED_PART_FILTER_SQL: &str = "
     json_valid(m.data)
     AND json_valid(p.data)
@@ -325,24 +325,42 @@ fn parse_part_events(
         }
         Some("patch") => {
             let files = patch_files(&part);
-            let target = files.first().cloned();
-            let summary =
-                if files.is_empty() { None } else { Some(format!("[patch] {}", files.join(", "))) };
-            vec![RawSessionEvent {
-                event_seq,
-                timestamp,
-                kind: "file_write".to_string(),
-                actor: "assistant".to_string(),
-                name: Some("patch".to_string()),
-                status: None,
-                target,
-                message_seq: None,
-                summary,
-                source_path: None,
-                source_event_id: Some(part_id.to_string()),
-                attrs_json: Some(part.to_string()),
-                parser_version: EVENT_PARSER_VERSION,
-            }]
+            if files.is_empty() {
+                return vec![RawSessionEvent {
+                    event_seq,
+                    timestamp,
+                    kind: "file_write".to_string(),
+                    actor: "assistant".to_string(),
+                    name: Some("patch".to_string()),
+                    status: None,
+                    target: None,
+                    message_seq: None,
+                    summary: None,
+                    source_path: None,
+                    source_event_id: Some(part_id.to_string()),
+                    attrs_json: Some(part.to_string()),
+                    parser_version: EVENT_PARSER_VERSION,
+                }];
+            }
+            files
+                .into_iter()
+                .enumerate()
+                .map(|(offset, file)| RawSessionEvent {
+                    event_seq: event_seq + offset as u32,
+                    timestamp,
+                    kind: "file_write".to_string(),
+                    actor: "assistant".to_string(),
+                    name: Some("patch".to_string()),
+                    status: None,
+                    summary: Some(format!("[patch] {file}")),
+                    target: Some(file),
+                    message_seq: None,
+                    source_path: None,
+                    source_event_id: Some(part_id.to_string()),
+                    attrs_json: Some(part.to_string()),
+                    parser_version: EVENT_PARSER_VERSION,
+                })
+                .collect()
         }
         _ => Vec::new(),
     }
@@ -1005,7 +1023,7 @@ mod tests {
 
         assert_eq!(raw.len(), 1);
         assert_eq!(raw[0].messages.len(), 2);
-        assert_eq!(raw[0].events.len(), 3);
+        assert_eq!(raw[0].events.len(), 4);
         assert_eq!(raw[0].events[0].kind, "file_read");
         assert_eq!(raw[0].events[0].name.as_deref(), Some("read"));
         assert_eq!(raw[0].events[0].status.as_deref(), Some("completed"));
@@ -1017,6 +1035,10 @@ mod tests {
         assert_eq!(raw[0].events[2].kind, "file_write");
         assert_eq!(raw[0].events[2].name.as_deref(), Some("patch"));
         assert_eq!(raw[0].events[2].target.as_deref(), Some("src/main.rs"));
+        assert_eq!(raw[0].events[3].kind, "file_write");
+        assert_eq!(raw[0].events[3].name.as_deref(), Some("patch"));
+        assert_eq!(raw[0].events[3].target.as_deref(), Some("README.md"));
+        assert_eq!(raw[0].events[3].event_seq, raw[0].events[2].event_seq + 1);
         drop(conn);
         let _ = std::fs::remove_file(path);
     }
