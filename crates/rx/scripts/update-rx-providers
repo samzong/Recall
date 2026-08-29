@@ -16,6 +16,8 @@ jq --slurpfile admission "$admission" --arg source "$source_url" --arg updated_a
   ($admission[0].models_dev_ids) as $ids
   | ($admission[0].endpoint // {}) as $ends
   | ($admission[0].anthropic_base // {}) as $claude
+  | ($admission[0].dsh_protocol // {}) as $dsh
+  | ($admission[0].model_capabilities // {}) as $capabilities
   | ([
       $ids[] as $id
       | .[$id] as $provider
@@ -56,6 +58,10 @@ jq --slurpfile admission "$admission" --arg source "$source_url" --arg updated_a
             end
           else {} end)
         + (if ($claude[.id] | type) == "string" then {anthropic_base: $claude[.id]} else {} end)
+        + (if ($dsh[.id] | type) == "string" then {dsh_protocol: $dsh[.id]} else {} end)
+        + (if ($capabilities[.id] | type) == "object" then
+            {model_capabilities: $capabilities[.id]}
+          else {} end)
     )
   | {
       source: $source,

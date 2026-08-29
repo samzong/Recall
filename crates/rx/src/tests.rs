@@ -1165,9 +1165,12 @@ fn dsh_tokener_injects_provider_catalog() {
     )
     .unwrap();
     let models = settings["llm-pi-ai"]["providers"]["tokener"]["models"].as_sequence().unwrap();
+    assert_eq!(settings["llm-pi-ai"]["providers"]["tokener"]["api"], "openai-completions");
     assert_eq!(models.len(), 2);
     assert_eq!(models[0]["id"], "kimi-k3");
     assert_eq!(models[1]["id"], "gpt-5.6-sol");
+    assert!(models[0].get("reasoningEfforts").is_none());
+    assert!(models[1].get("reasoningEfforts").is_none());
     assert_eq!(settings["agent-default-model"]["provider"], "tokener");
     assert!(settings["agent-default-model"].get("model").is_none());
 }

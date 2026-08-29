@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
@@ -8,7 +8,7 @@ use crate::config::{ProviderConfig, RxConfig};
 
 pub(crate) const NONE: &str = "none";
 
-const SNAPSHOT: &str = include_str!("../data/providers.json");
+const SNAPSHOT_JSON: &str = include_str!("../data/providers.json");
 
 #[derive(Debug, Deserialize)]
 struct Snapshot {
@@ -25,6 +25,67 @@ struct SnapshotProvider {
     anthropic_base: Option<String>,
     #[serde(default)]
     default_context: Option<i64>,
+    #[serde(default)]
+    dsh_protocol: Option<ModelProtocol>,
+    #[serde(default)]
+    model_capabilities: BTreeMap<String, BTreeMap<ModelProtocol, ProtocolCapabilities>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+pub(crate) enum ModelProtocol {
+    #[serde(rename = "openai-completions")]
+    OpenAiCompletions,
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
+}
+
+impl ModelProtocol {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiCompletions => "openai-completions",
+            Self::OpenAiResponses => "openai-responses",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReasoningLevel {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningLevel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ReasoningControl {
+    Fixed,
+    Effort { levels: BTreeMap<ReasoningLevel, Option<String>> },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtocolCapabilities {
+    #[serde(default)]
+    reasoning: Option<ReasoningControl>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,15 +109,37 @@ pub(crate) struct Provider {
 
 pub(crate) fn catalog() -> &'static [Provider] {
     static CATALOG: OnceLock<Vec<Provider>> = OnceLock::new();
-    CATALOG.get_or_init(|| {
-        let snapshot: Snapshot =
-            serde_json::from_str(SNAPSHOT).expect("bundled provider catalog must be valid JSON");
-        snapshot.providers.into_iter().map(from_snapshot).collect()
-    })
+    CATALOG.get_or_init(|| snapshot().providers.iter().cloned().map(from_snapshot).collect())
 }
 
 pub(crate) fn find(id: &str) -> Option<&'static Provider> {
     catalog().iter().find(|provider| provider.id == id)
+}
+
+pub(crate) fn reasoning_control(
+    provider_id: &str,
+    endpoint: &str,
+    model_id: &str,
+    protocol: ModelProtocol,
+) -> Option<&'static ReasoningControl> {
+    let provider = snapshot().providers.iter().find(|provider| provider.id == provider_id)?;
+    if crate::catalog::openai_base(&provider.endpoint) != crate::catalog::openai_base(endpoint) {
+        return None;
+    }
+    provider.model_capabilities.get(model_id)?.get(&protocol)?.reasoning.as_ref()
+}
+
+pub(crate) fn dsh_protocol(provider_id: &str, endpoint: &str) -> ModelProtocol {
+    snapshot()
+        .providers
+        .iter()
+        .find(|provider| {
+            provider.id == provider_id
+                && crate::catalog::openai_base(&provider.endpoint)
+                    == crate::catalog::openai_base(endpoint)
+        })
+        .and_then(|provider| provider.dsh_protocol)
+        .unwrap_or(ModelProtocol::OpenAiCompletions)
 }
 
 pub(crate) fn resolve(id: &str, entry: Option<&ProviderConfig>) -> Result<Provider> {
@@ -150,6 +233,46 @@ fn from_snapshot(provider: SnapshotProvider) -> Provider {
         setup,
         default_model,
         claude_default_model,
+    }
+}
+
+fn snapshot() -> &'static Snapshot {
+    static SNAPSHOT: OnceLock<Snapshot> = OnceLock::new();
+    SNAPSHOT.get_or_init(|| {
+        let snapshot: Snapshot = serde_json::from_str(SNAPSHOT_JSON)
+            .expect("bundled provider catalog must be valid JSON");
+        validate_snapshot(&snapshot);
+        snapshot
+    })
+}
+
+fn validate_snapshot(snapshot: &Snapshot) {
+    for provider in &snapshot.providers {
+        for (model_id, protocols) in &provider.model_capabilities {
+            assert!(!model_id.trim().is_empty(), "bundled model capability ID must not be empty");
+            for capabilities in protocols.values() {
+                let Some(ReasoningControl::Effort { levels }) = &capabilities.reasoning else {
+                    continue;
+                };
+                assert!(
+                    levels.keys().any(|level| *level != ReasoningLevel::Off),
+                    "bundled effort control must offer a thinking level"
+                );
+                for (level, wire) in levels {
+                    match wire {
+                        Some(wire) => assert!(
+                            !wire.trim().is_empty(),
+                            "bundled reasoning wire value must not be empty"
+                        ),
+                        None => assert_eq!(
+                            *level,
+                            ReasoningLevel::Off,
+                            "only the off reasoning level may omit a wire value"
+                        ),
+                    }
+                }
+            }
+        }
     }
 }
 

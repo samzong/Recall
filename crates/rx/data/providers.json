@@ -12,7 +12,97 @@
       "id": "tokener",
       "name": "Tokener",
       "endpoint": "https://api.tokener.dev/v1",
-      "env": "TOKENER_API_KEY"
+      "env": "TOKENER_API_KEY",
+      "dsh_protocol": "openai-responses",
+      "model_capabilities": {
+        "gpt-5.6-luna": {
+          "openai-responses": {
+            "reasoning": {
+              "kind": "effort",
+              "levels": {
+                "off": "none",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              }
+            }
+          }
+        },
+        "gpt-5.6-sol": {
+          "openai-responses": {
+            "reasoning": {
+              "kind": "effort",
+              "levels": {
+                "off": "none",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              }
+            }
+          }
+        },
+        "gpt-5.6-terra": {
+          "openai-responses": {
+            "reasoning": {
+              "kind": "effort",
+              "levels": {
+                "off": "none",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              }
+            }
+          }
+        },
+        "glm-5.2": {
+          "openai-responses": {
+            "reasoning": {
+              "kind": "effort",
+              "levels": {
+                "off": "none",
+                "low": "low",
+                "medium": "medium"
+              }
+            }
+          }
+        },
+        "deepseek-v4-flash": {
+          "openai-responses": {
+            "reasoning": {
+              "kind": "effort",
+              "levels": {
+                "off": "none",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              }
+            }
+          }
+        },
+        "deepseek-v4-pro": {
+          "openai-responses": {
+            "reasoning": {
+              "kind": "effort",
+              "levels": {
+                "off": "none",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              }
+            }
+          }
+        }
+      }
     },
     {
       "id": "abacus",
@@ -312,7 +402,55 @@
       "id": "tokener-dev",
       "name": "Tokener Dev",
       "endpoint": "https://api-dev.tokener.dev/v1",
-      "env": "TOKENER_DEV_API_KEY"
+      "env": "TOKENER_DEV_API_KEY",
+      "dsh_protocol": "openai-responses",
+      "model_capabilities": {
+        "gpt-5.6-luna": {
+          "openai-responses": {
+            "reasoning": {
+              "kind": "effort",
+              "levels": {
+                "off": "none",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              }
+            }
+          }
+        },
+        "gpt-5.6-sol": {
+          "openai-responses": {
+            "reasoning": {
+              "kind": "effort",
+              "levels": {
+                "off": "none",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              }
+            }
+          }
+        },
+        "gpt-5.6-terra": {
+          "openai-responses": {
+            "reasoning": {
+              "kind": "effort",
+              "levels": {
+                "off": "none",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              }
+            }
+          }
+        }
+      }
     }
   ]
 }

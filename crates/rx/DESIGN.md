@@ -27,6 +27,7 @@ read `recall.db`.
 | RX-ARGS-001 | Preserve argv and executable paths as OS strings. Treat everything after `--` as literal. |
 | RX-ROUTE-001 | `--provider none` or no provider means native passthrough without provider or model injection. |
 | RX-ROUTE-002 | Inject only the selected route, credential reference, model, and permission policy; preserve unrelated native behavior. |
+| RX-CATALOG-001 | Runtime model discovery decides availability only. Protocol-scoped model capabilities come from the bundled provider snapshot and apply only to the matching provider endpoint; unknown capabilities are never inferred. |
 | RX-OWN-001 | Mutate only explicitly rx-owned identities, preserve unowned data, follow each surface's owned-edit rule, lock, write atomically, and fail closed on malformed input. |
 | RX-SECRET-001 | Never put credentials in argv, logs, or broad-permission files. Persist only when unavoidable and owner-approved. |
 | RX-LIFECYCLE-001 | Install policy, planning controls, and child environment are separate scopes; rx-only controls never reach the child. |
@@ -39,6 +40,7 @@ read `recall.db`.
 | Surface | Owner | Rule |
 | --- | --- | --- |
 | `~/.recall/rx.toml`, `rx.keys`, `catalogs/` | rx | Provider config, secret store, and endpoint-scoped catalog cache. |
+| Bundled provider and model capability snapshot | rx release | Stable provider, endpoint, model, and protocol semantics; runtime discovery intersects but never rewrites them. |
 | Claude catalog caches | shared | Marker identity stays rx-owned even if changed or deleted; preserve unmarked entries. |
 | Codex config | launch | Prefer `-c` and environment injection. |
 | OpenCode config | launch | Prefer `OPENCODE_CONFIG_CONTENT`; only warn about native auth conflicts. |
