@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 970" role="img" aria-labelledby="title desc" font-family="Comic Sans MS, Chalkboard SE, Bradley Hand, Segoe Print, cursive" text-rendering="geometricPrecision">
+  <title id="title">Recall architecture</title>
+  <desc id="desc">Local session data flows through adapters and sync into SQLite. Recall exposes indexed reads through MCP, TUI, and CLI, publishes share assets to Cloudflare Pages, launches official extensions, and embeds its bundled skill. The independent rx launcher never reads the Recall index.</desc>
+  <defs>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#363b42"/>
+    </marker>
+    <marker id="arwB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#4d7eb7"/>
+    </marker>
+    <style>
+      .title { font-size: 34px; font-weight: 700; fill: #18191c; letter-spacing: 0.2px; }
+      .footer { font-size: 15px; font-weight: 700; fill: #18191c; }
+      .t { font-size: 13.5px; font-weight: 700; fill: #18191c; }
+      .t2 { font-size: 12.5px; font-weight: 700; fill: #18191c; }
+      .p { font-size: 9.5px; fill: #626976; font-family: ui-monospace, SF Mono, Menlo, monospace; }
+      .d { font-size: 10px; fill: #30343a; }
+      .dm { font-size: 9.5px; fill: #30343a; font-family: ui-monospace, SF Mono, Menlo, monospace; }
+      .lbl { font-size: 9px; fill: #59616c; font-family: ui-monospace, SF Mono, Menlo, monospace; }
+      .lblB { font-size: 9.5px; fill: #4d7eb7; font-family: ui-monospace, SF Mono, Menlo, monospace; }
+      .grp { font-size: 12px; font-weight: 700; fill: #34383f; }
+      .box { stroke-width: 1.8; rx: 12; }
+      .ln { stroke: #363636; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; fill: none; }
+    </style>
+  </defs>
+  <rect width="980" height="970" fill="#fff9e9"/>
+  <text x="490" y="58" class="title" text-anchor="middle">One local index for every AI coding session</text>
+
+  <g transform="translate(0 90)">
+
+  <rect x="24" y="16" width="636" height="114" class="box" fill="#e9f4fb" stroke="#287bb5"/>
+  <text x="40" y="42" class="t">Local AI-coding session data</text>
+  <text x="40" y="68" class="d">Claude Code · OpenCode · Codex · Pi · Antigravity · Gemini · Grok</text>
+  <text x="40" y="88" class="d">Kiro · Copilot · Cursor · Cline · DeepSeek Harness · Kimi Code</text>
+  <text x="40" y="110" class="p">local files · external databases opened read-only</text>
+  <g fill="#fff9e9" stroke="#287bb5" stroke-width="1.8" stroke-linejoin="round">
+    <rect x="574" y="46" width="42" height="34" rx="5"/>
+    <rect x="582" y="54" width="42" height="34" rx="5"/>
+    <path d="M591 65 H615 M591 72 H610 M591 79 H615" fill="none" stroke-linecap="round"/>
+  </g>
+
+  <rect x="680" y="148" width="276" height="114" class="box" fill="#edf7ef" stroke="#319760"/>
+  <text x="694" y="174" class="t">rx launcher</text>
+  <text x="694" y="191" class="p">crates/rx/ · independent binary</text>
+  <text x="694" y="212" class="d">native harness launch · hosted mode</text>
+  <text x="694" y="230" class="d">provider routing · credential injection</text>
+  <text x="694" y="248" class="p">picker + aliases · never reads recall.db</text>
+
+  <rect x="24" y="148" width="636" height="680" rx="16" fill="#fffdf6" stroke="#287bb5" stroke-width="2"/>
+  <text x="40" y="172" class="grp">recall core · workspace root crate · publish = false</text>
+
+  <path d="M352 130 L352 192" class="ln" marker-end="url(#arw)"/>
+
+  <rect x="162" y="192" width="380" height="68" class="box" fill="#edf7ef" stroke="#319760"/>
+  <text x="178" y="215" class="t">Source Adapters</text>
+  <text x="178" y="230" class="p">src/adapters/ · all_adapters()</text>
+  <text x="178" y="247" class="d">one registered source per harness</text>
+  <path d="M352 260 L352 286" class="ln" marker-end="url(#arw)"/>
+  <text x="364" y="280" class="lbl">RawSession</text>
+
+  <rect x="162" y="286" width="380" height="62" class="box" fill="#edf7ef" stroke="#319760"/>
+  <text x="178" y="308" class="t">Sync</text>
+  <text x="178" y="323" class="p">src/sync.rs</text>
+  <text x="178" y="338" class="d">incremental write · FORCE=1 full reprocess</text>
+  <path d="M352 348 L352 376" class="ln" marker-end="url(#arw)"/>
+
+  <rect x="44" y="376" width="390" height="150" class="box" fill="#f6edf8" stroke="#8d58c7"/>
+  <text x="60" y="398" class="t">SQLite · recall.db</text>
+  <text x="60" y="414" class="p">src/db/ · rusqlite</text>
+  <text x="60" y="440" class="d">sessions · messages · events · usage</text>
+  <text x="60" y="457" class="d">projects · embeddings · skill audit · schema</text>
+  <text x="60" y="500" class="lbl">schema is not a public contract</text>
+  <g fill="none" stroke="#8d58c7" stroke-width="1.8">
+    <ellipse cx="382" cy="422" rx="22" ry="7" fill="#fff9e9"/>
+    <path d="M360 422 V458 C360 468 404 468 404 458 V422 M360 440 C360 450 404 450 404 440 M360 456 C360 466 404 466 404 456"/>
+  </g>
+
+  <rect x="472" y="376" width="180" height="92" class="box" fill="#f6edf8" stroke="#8d58c7"/>
+  <text x="486" y="398" class="t">Embedding</text>
+  <text x="486" y="414" class="p">src/embedding.rs</text>
+  <text x="486" y="428" class="p">src/semantic.rs</text>
+  <text x="486" y="447" class="d">multilingual-e5-small · candle</text>
+  <text x="486" y="461" class="d">Metal / optional cuda</text>
+  <path d="M472 422 L434 422" class="ln" marker-end="url(#arw)"/>
+
+  <rect x="472" y="478" width="180" height="70" class="box" fill="#e9f4fb" stroke="#287bb5"/>
+  <text x="486" y="500" class="t">Share</text>
+  <text x="486" y="516" class="p">src/share/</text>
+  <text x="486" y="536" class="d">session → HTML</text>
+  <path d="M434 513 L472 513" class="ln" marker-end="url(#arw)"/>
+
+  <rect x="740" y="478" width="216" height="70" class="box" fill="#fff2dd" stroke="#d98619"/>
+  <text x="754" y="500" class="t">Cloudflare Pages</text>
+  <text x="754" y="516" class="p">external publishing target</text>
+  <text x="754" y="536" class="d">static share assets</text>
+  <path d="M652 513 L740 513" class="ln" marker-end="url(#arw)"/>
+  <text x="696" y="505" class="lbl" text-anchor="middle">deploy</text>
+
+  <rect x="44" y="572" width="608" height="52" class="box" fill="#e9f4fb" stroke="#287bb5"/>
+  <text x="60" y="594" class="t2">Search &amp; read plane</text>
+  <text x="196" y="594" class="p">src/db/search.rs · domain stores</text>
+  <text x="60" y="613" class="d">FTS5 + sqlite-vec · session and event reads</text>
+  <g fill="none" stroke="#287bb5" stroke-width="1.8" stroke-linecap="round">
+    <circle cx="612" cy="593" r="10"/>
+    <path d="M619 601 L630 612"/>
+  </g>
+  <path d="M239 526 L239 572" class="ln" marker-end="url(#arw)"/>
+
+  <path d="M136 624 L136 656" class="ln" marker-end="url(#arw)"/>
+  <path d="M344 624 L344 656" class="ln" marker-end="url(#arw)"/>
+  <path d="M552 624 L552 656" class="ln" marker-end="url(#arw)"/>
+
+  <rect x="44" y="656" width="184" height="60" class="box" fill="#e9f4fb" stroke="#287bb5"/>
+  <text x="60" y="678" class="t">MCP</text>
+  <text x="60" y="694" class="p">src/mcp.rs</text>
+  <text x="60" y="708" class="d">read-only stdio server</text>
+
+  <rect x="252" y="656" width="184" height="60" class="box" fill="#e9f4fb" stroke="#287bb5"/>
+  <text x="268" y="678" class="t">TUI</text>
+  <text x="268" y="694" class="p">src/tui/ · ratatui</text>
+  <text x="268" y="708" class="d">background search worker</text>
+
+  <rect x="460" y="656" width="184" height="60" class="box" fill="#e9f4fb" stroke="#287bb5"/>
+  <text x="476" y="678" class="t">CLI</text>
+  <text x="476" y="694" class="p">src/cli.rs</text>
+  <text x="476" y="708" class="d">public command surface</text>
+
+  <rect x="236" y="748" width="200" height="70" class="box" fill="#edf7ef" stroke="#319760"/>
+  <text x="252" y="770" class="t2">Bundled skill</text>
+  <text x="252" y="786" class="p">skills/recall</text>
+  <text x="252" y="806" class="d">include_bytes! · recall skill install</text>
+
+  <path d="M552 716 L552 748" class="ln" marker-end="url(#arw)"/>
+  <rect x="460" y="748" width="184" height="70" class="box" fill="#f6edf8" stroke="#8d58c7"/>
+  <text x="476" y="770" class="t2">Extension Host</text>
+  <text x="476" y="786" class="p">src/extension.rs</text>
+  <text x="476" y="806" class="d">managed binary dispatch</text>
+
+  <rect x="740" y="632" width="216" height="186" class="box" fill="#fff2dd" stroke="#d98619" stroke-dasharray="7 5"/>
+  <text x="754" y="654" class="t">Official extensions</text>
+  <text x="754" y="670" class="p">extensions/ · own versioning</text>
+  <text x="754" y="694" class="dm">recall-powercontext</text>
+  <text x="754" y="708" class="dm">recall-probe</text>
+  <text x="754" y="722" class="dm">recall-reflect</text>
+  <text x="754" y="750" class="d">no SQLite / Rust internals</text>
+  <text x="754" y="766" class="d">breaking changes bump protocol_version</text>
+
+  <path d="M740 686 L644 686" stroke="#2b5fc7" stroke-width="1.4" stroke-dasharray="6 4" fill="none" marker-end="url(#arwB)"/>
+  <text x="700" y="678" class="lblB" text-anchor="middle">JSON/JSONL</text>
+  <path d="M644 783 L740 783" class="ln" marker-end="url(#arw)"/>
+  <text x="700" y="776" class="lbl" text-anchor="middle">exec</text>
+  </g>
+  <text x="490" y="954" class="footer" text-anchor="middle">Local session data stays local; extensions cross only the public CLI protocol.</text>
+</svg>

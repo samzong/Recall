@@ -10,6 +10,10 @@
 
 Jump between Claude Code, Codex, and whatever comes next; Recall pulls those scattered local sessions into one searchable index, tracks usage when token metadata is available, and drops you back into the original CLI.
 
+## Architecture
+
+![Recall architecture](docs/recall-architecture.svg)
+
 ## Install
 
 ```bash
