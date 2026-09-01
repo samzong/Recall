@@ -21,6 +21,7 @@ pub(crate) mod pi;
 pub(crate) mod qwen;
 pub(crate) mod sync_state;
 pub(crate) mod usage;
+pub(crate) mod zcode;
 
 use crate::db::store::Store;
 use crate::types::{ParentLink, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
@@ -200,6 +201,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(kilo::KiloCodeAdapter),
         Box::new(crush::CrushAdapter),
         Box::new(mimo_code::MimoCodeAdapter),
+        Box::new(zcode::ZcodeAdapter),
     ]
 }
 
@@ -226,6 +228,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "kilo-code"
             | "crush"
             | "mimo-code"
+            | "zcode"
     )
 }
 

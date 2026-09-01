@@ -23,6 +23,29 @@ const PARSED_PART_FILTER_SQL: &str = "
     AND json_extract(p.data, '$.type') = 'text'
     AND NULLIF(TRIM(CAST(json_extract(p.data, '$.text') AS TEXT)), '') IS NOT NULL
 ";
+const HIDDEN_TRANSCRIPT_FILTER_SQL: &str =
+    "AND json_extract(m.data, '$.semantics.transcriptVisibility') IS NOT 'hidden'";
+const TIMELINE_USAGE_FILTER_SQL: &str =
+    "AND json_extract(data, '$.semantics.kind') IS NOT 'timeline_event'";
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ScanOptions {
+    pub exclude_hidden_transcript: bool,
+    pub exclude_timeline_usage: bool,
+}
+
+impl ScanOptions {
+    pub(crate) const ZCODE: Self =
+        Self { exclude_hidden_transcript: true, exclude_timeline_usage: true };
+
+    fn transcript_sql(self) -> &'static str {
+        if self.exclude_hidden_transcript { HIDDEN_TRANSCRIPT_FILTER_SQL } else { "" }
+    }
+
+    fn usage_sql(self) -> &'static str {
+        if self.exclude_timeline_usage { TIMELINE_USAGE_FILTER_SQL } else { "" }
+    }
+}
 
 pub(crate) struct OpenCodeAdapter;
 
@@ -94,8 +117,16 @@ pub(crate) fn open_readonly(db_path: &Path) -> anyhow::Result<Option<Connection>
 }
 
 pub(crate) fn scan(conn: &Connection, include_events: bool) -> anyhow::Result<Vec<RawSession>> {
+    scan_with_options(conn, include_events, ScanOptions::default())
+}
+
+pub(crate) fn scan_with_options(
+    conn: &Connection,
+    include_events: bool,
+    options: ScanOptions,
+) -> anyhow::Result<Vec<RawSession>> {
     let sessions = load_session_rows(conn, None)?;
-    scan_session_messages(conn, sessions, include_events)
+    scan_session_messages(conn, sessions, include_events, options)
 }
 
 fn count_filtered_sessions(conn: &Connection, since_ts: Option<i64>) -> anyhow::Result<u32> {
@@ -154,6 +185,7 @@ fn scan_session_messages(
     conn: &Connection,
     sessions: Vec<SessionRow>,
     include_events: bool,
+    options: ScanOptions,
 ) -> anyhow::Result<Vec<RawSession>> {
     if sessions.is_empty() {
         return Ok(vec![]);
@@ -165,8 +197,8 @@ fn scan_session_messages(
     let mut session_events: HashMap<String, Vec<RawSessionEvent>> = HashMap::new();
 
     for chunk in session_ids.chunks(MAX_SQL_VARS_PER_BATCH) {
-        load_message_chunk(conn, chunk, &mut session_messages)?;
-        load_usage_chunk(conn, chunk, &mut session_usage_events)?;
+        load_message_chunk(conn, chunk, &mut session_messages, options)?;
+        load_usage_chunk(conn, chunk, &mut session_usage_events, options)?;
         if include_events {
             load_event_chunk(conn, chunk, &mut session_events)?;
         }
@@ -373,14 +405,17 @@ fn load_message_chunk(
     conn: &Connection,
     session_ids: &[String],
     session_messages: &mut HashMap<String, Vec<RawMessage>>,
+    options: ScanOptions,
 ) -> anyhow::Result<()> {
     let placeholders = std::iter::repeat_n("?", session_ids.len()).collect::<Vec<_>>().join(", ");
+    let transcript_sql = options.transcript_sql();
     let sql = format!(
         "SELECT m.session_id, json_extract(m.data, '$.role') AS role, p.data, m.time_created
          FROM message m
          JOIN part p ON p.message_id = m.id
          WHERE m.session_id IN ({placeholders})
            AND {PARSED_PART_FILTER_SQL}
+           {transcript_sql}
          ORDER BY m.time_created, p.id"
     );
 
@@ -416,8 +451,10 @@ fn load_usage_chunk(
     conn: &Connection,
     session_ids: &[String],
     session_usage_events: &mut HashMap<String, Vec<RawUsageEvent>>,
+    options: ScanOptions,
 ) -> anyhow::Result<()> {
     let placeholders = std::iter::repeat_n("?", session_ids.len()).collect::<Vec<_>>().join(", ");
+    let usage_sql = options.usage_sql();
     let sql = format!(
         "SELECT CAST(id AS TEXT), session_id, data, time_created
          FROM message
@@ -425,6 +462,7 @@ fn load_usage_chunk(
            AND json_valid(data)
            AND json_extract(data, '$.role') = 'assistant'
            AND json_type(data, '$.tokens') = 'object'
+           {usage_sql}
          ORDER BY time_created, id"
     );
 
@@ -509,17 +547,20 @@ fn cache_token_count(tokens: &Value, key: &str) -> i64 {
 fn load_message_counts(
     conn: &Connection,
     session_ids: &[String],
+    options: ScanOptions,
 ) -> anyhow::Result<HashMap<String, u32>> {
     let mut counts = HashMap::new();
 
     for chunk in session_ids.chunks(MAX_SQL_VARS_PER_BATCH) {
         let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+        let transcript_sql = options.transcript_sql();
         let sql = format!(
             "SELECT m.session_id, COUNT(*)
              FROM message m
              JOIN part p ON p.message_id = m.id
              WHERE m.session_id IN ({placeholders})
                AND {PARSED_PART_FILTER_SQL}
+               {transcript_sql}
              GROUP BY m.session_id"
         );
 
@@ -591,6 +632,24 @@ pub(crate) fn scan_for_sync_conn(
     source_id: &str,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
+    scan_for_sync_conn_with_options(
+        conn,
+        store,
+        since_ts,
+        source_id,
+        include_events,
+        ScanOptions::default(),
+    )
+}
+
+pub(crate) fn scan_for_sync_conn_with_options(
+    conn: &Connection,
+    store: &Store,
+    since_ts: Option<i64>,
+    source_id: &str,
+    include_events: bool,
+    options: ScanOptions,
+) -> anyhow::Result<SyncScanResult> {
     let filtered_sessions = count_filtered_sessions(conn, since_ts)?;
     let sessions = load_session_rows(conn, since_ts)?;
     let existing = store.session_meta_map(source_id)?;
@@ -601,6 +660,7 @@ pub(crate) fn scan_for_sync_conn(
     let current_counts = load_message_counts(
         conn,
         &sessions.iter().map(|session| session.id.clone()).collect::<Vec<_>>(),
+        options,
     )?;
 
     let mut stats = SyncScanStats { filtered_sessions, ..Default::default() };
@@ -632,7 +692,7 @@ pub(crate) fn scan_for_sync_conn(
         candidates.push(session);
     }
 
-    let sessions = scan_session_messages(conn, candidates, include_events)?;
+    let sessions = scan_session_messages(conn, candidates, include_events, options)?;
     Ok(SyncScanResult { sessions, stats })
 }
 
@@ -978,7 +1038,7 @@ mod tests {
         .unwrap();
 
         let sessions = load_session_rows(&conn, None).unwrap();
-        let raw = scan_session_messages(&conn, sessions, false).unwrap();
+        let raw = scan_session_messages(&conn, sessions, false, ScanOptions::default()).unwrap();
         let titled = raw.iter().find(|session| session.source_id == "s1").unwrap();
         let blank = raw.iter().find(|session| session.source_id == "s2").unwrap();
         assert_eq!(titled.custom_title.as_deref(), Some("Test"));
@@ -1024,7 +1084,7 @@ mod tests {
         .unwrap();
 
         let sessions = load_session_rows(&conn, None).unwrap();
-        let raw = scan_session_messages(&conn, sessions, true).unwrap();
+        let raw = scan_session_messages(&conn, sessions, true, ScanOptions::default()).unwrap();
 
         assert_eq!(raw.len(), 1);
         assert!(raw[0].messages.is_empty());
@@ -1074,7 +1134,7 @@ mod tests {
         .unwrap();
 
         let sessions = load_session_rows(&conn, None).unwrap();
-        let raw = scan_session_messages(&conn, sessions, true).unwrap();
+        let raw = scan_session_messages(&conn, sessions, true, ScanOptions::default()).unwrap();
 
         assert_eq!(raw.len(), 1);
         assert!(raw[0].messages.is_empty());
