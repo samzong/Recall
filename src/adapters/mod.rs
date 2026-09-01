@@ -15,6 +15,7 @@ pub(crate) mod kilo;
 pub(crate) mod kimi_code;
 pub(crate) mod kiro;
 pub(crate) mod mimo_code;
+pub(crate) mod omp;
 pub(crate) mod opencode;
 pub(crate) mod paths;
 pub(crate) mod pi;
@@ -188,6 +189,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(opencode::OpenCodeAdapter),
         Box::new(codex::CodexAdapter),
         Box::new(pi::PiAdapter),
+        Box::new(omp::OmpAdapter),
         Box::new(antigravity::AntigravityAdapter),
         Box::new(gemini::GeminiAdapter),
         Box::new(grok::GrokAdapter),
