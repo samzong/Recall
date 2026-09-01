@@ -1,7 +1,9 @@
 use crate::adapters::copilot::parse_copilot_events;
 use crate::adapters::gemini::parse_gemini_session;
 use crate::adapters::kimi_code::parse_kimi_session;
-use crate::adapters::kiro::parse_kiro_conversation;
+use crate::adapters::kiro::{
+    parse_kiro_conversation, parse_kiro_v2_session, parse_kiro_v3_session,
+};
 use crate::config::AppConfig;
 use crate::db::schema;
 use crate::db::search::{RepoFilter, SearchEngine, SearchFilters, TimeRange};
@@ -1749,6 +1751,89 @@ fn kiro_parser_tool_use_results_text_and_json() {
 fn kiro_parser_empty_history_returns_none() {
     let json = r#"{"history": []}"#;
     assert!(parse_kiro_conversation("c", "/proj", json, 0, 0).unwrap().is_none());
+}
+
+#[test]
+fn kiro_v2_parser_prompt_and_assistant_text() {
+    let sidecar = r#"{
+        "session_id": "790bb539-44be-40bd-85ac-0bb1a3fc6b47",
+        "cwd": "/Users/x/proj",
+        "created_at": "2026-09-01T17:51:14.500361Z",
+        "updated_at": "2026-09-01T17:52:01.874564Z",
+        "title": "hello, analyze this project"
+    }"#;
+    let jsonl = r#"{"version":"v1","kind":"Prompt","data":{"message_id":"p1","content":[{"kind":"text","data":"hello, analyze this project"}],"meta":{"timestamp":1788285089}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"a1","content":[{"kind":"thinking","data":{"text":"plan"}},{"kind":"text","data":"This is Recall."},{"kind":"toolUse","data":{"toolUseId":"t1","name":"read","input":{"path":"/src"}}}]}}
+{"version":"v1","kind":"ToolResults","data":{"message_id":"t1","content":[{"kind":"toolResult","data":{"content":[{"kind":"text","data":"secret dump"}]}}]}}
+{"version":"v1","kind":"Prompt","data":{"message_id":"p2","content":[{"kind":"text","data":"find a bug"}],"meta":{"timestamp":1788285145}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"a2","content":[{"kind":"text","data":"No bug found."}]}}"#;
+
+    let session =
+        parse_kiro_v2_session(jsonl, Some(sidecar), "fallback", 9_000, Some("/tmp/s.jsonl".into()))
+            .unwrap()
+            .unwrap();
+    assert_eq!(session.source_id, "790bb539-44be-40bd-85ac-0bb1a3fc6b47");
+    assert_eq!(session.directory.as_deref(), Some("/Users/x/proj"));
+    assert_eq!(session.custom_title.as_deref(), Some("hello, analyze this project"));
+    assert_eq!(session.source_file_path.as_deref(), Some("/tmp/s.jsonl"));
+    assert_eq!(session.updated_at, Some(9_000));
+    assert_eq!(session.messages.len(), 4);
+    assert_eq!(session.messages[0].content, "hello, analyze this project");
+    assert_eq!(session.messages[0].timestamp, Some(1_788_285_089_000));
+    assert_eq!(session.messages[1].content, "This is Recall.");
+    assert!(!session.messages.iter().any(|message| message.content.contains("secret dump")));
+    assert!(!session.messages.iter().any(|message| message.content.contains("[read]")));
+    assert_eq!(session.messages[2].content, "find a bug");
+    assert_eq!(session.messages[3].content, "No bug found.");
+}
+
+#[test]
+fn kiro_v2_parser_empty_jsonl_returns_none() {
+    assert!(parse_kiro_v2_session("", None, "id", 1, None).unwrap().is_none());
+}
+
+#[test]
+fn kiro_v3_parser_user_and_say_skips_reasoning() {
+    let sidecar = r#"{
+        "id": "sess_90e28400-458e-47f0-8793-70137f0c92c5",
+        "title": "Analyze Recall architecture",
+        "createdAt": "2026-09-01T17:52:52.430Z",
+        "lastModifiedAt": "2026-09-01T17:56:06.507Z",
+        "workspacePaths": ["/Users/x/proj"],
+        "rootPaths": ["/Users/x/proj"],
+        "modelId": "auto"
+    }"#;
+    let jsonl = r#"{"id":"u1","timestamp":"2026-09-01T17:52:55.268Z","payload":{"type":"user","content":"analyze the current project","images":[],"documents":[]}}
+{"id":"r1","timestamp":"2026-09-01T17:53:01.908Z","payload":{"type":"assistant","content":"...","operationType":"Reasoning"}}
+{"id":"t1","timestamp":"2026-09-01T17:53:02.000Z","payload":{"type":"tool_call","toolName":"read","args":{"path":"/src"}}}
+{"id":"t2","timestamp":"2026-09-01T17:53:03.000Z","payload":{"type":"tool_result","content":"file dump"}}
+{"id":"a1","timestamp":"2026-09-01T17:56:06.468Z","payload":{"type":"assistant","content":"Recall indexes local sessions.","operationType":"Say"}}
+{"id":"s1","timestamp":"2026-09-01T17:56:06.506Z","payload":{"type":"session_start","content":"You are Kiro CLI"}}"#;
+
+    let session = parse_kiro_v3_session(
+        jsonl,
+        Some(sidecar),
+        "sess_fallback",
+        9_000,
+        Some("/tmp/messages.jsonl".into()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(session.source_id, "sess_90e28400-458e-47f0-8793-70137f0c92c5");
+    assert_eq!(session.directory.as_deref(), Some("/Users/x/proj"));
+    assert_eq!(session.custom_title.as_deref(), Some("Analyze Recall architecture"));
+    assert_eq!(session.updated_at, Some(9_000));
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].content, "analyze the current project");
+    assert_eq!(session.messages[1].content, "Recall indexes local sessions.");
+    assert!(!session.messages.iter().any(|message| message.content.contains("You are Kiro")));
+    assert!(!session.messages.iter().any(|message| message.content.contains("file dump")));
+}
+
+#[test]
+fn kiro_v3_parser_empty_returns_none() {
+    let jsonl = r#"{"id":"r1","timestamp":"2026-09-01T17:53:01.908Z","payload":{"type":"assistant","content":"...","operationType":"Reasoning"}}"#;
+    assert!(parse_kiro_v3_session(jsonl, None, "id", 1, None).unwrap().is_none());
 }
 
 #[test]
