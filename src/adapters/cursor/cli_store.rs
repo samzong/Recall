@@ -11,7 +11,9 @@ use crate::adapters::json_util::json_i64;
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SyncScanResult};
 use crate::db::store::Store;
-use crate::types::Role;
+use crate::types::{ParentLink, ParentRelation, Role, ThreadRole};
+
+const METADATA_PARSER_VERSION: u32 = 1;
 
 pub(super) fn resume_command(source_id: &str) -> Option<ResumeCommand> {
     find_store_db(source_id)?;
@@ -30,7 +32,7 @@ pub(super) fn scan_uncovered(
     };
     let mut sessions = Vec::new();
     for entry in collect_store_entries(&chats_dir, covered) {
-        let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+        let Some(mtime_ms) = scan_timestamp_ms(&entry.stat_target) else {
             continue;
         };
         match parse_store_entry(&entry, mtime_ms, usage_parser_version) {
@@ -54,14 +56,29 @@ pub(super) fn scan_for_sync(
         return Ok(SyncScanResult { sessions: vec![], stats: Default::default() });
     };
     let entries = collect_store_entries(&chats_dir, covered);
-    file_scan::run_file_scan_with_options(
+    file_scan::run_file_scan_with_options_and_mtime(
         store,
         "cursor",
         since_ts,
-        FileScanOptions { usage_parser_version: Some(usage_parser_version), ..Default::default() },
+        FileScanOptions {
+            usage_parser_version: Some(usage_parser_version),
+            metadata_parser_version: Some(METADATA_PARSER_VERSION),
+            ..Default::default()
+        },
         entries,
+        |entry| scan_timestamp_ms(&entry.stat_target),
         |entry, mtime_ms| parse_store_entry(&entry, mtime_ms, usage_parser_version),
     )
+}
+
+fn scan_timestamp_ms(store_db: &Path) -> Option<i64> {
+    let mtime = file_scan::stat_mtime_ms(store_db);
+    let sidecar_updated =
+        read_sidecar_meta(store_db).and_then(|value| json_i64(value.get("updatedAtMs")));
+    match (mtime, sidecar_updated) {
+        (Some(mtime), Some(sidecar)) => Some(mtime.max(sidecar)),
+        (mtime, sidecar) => mtime.or(sidecar),
+    }
 }
 
 fn resolve_chats_dir() -> anyhow::Result<Option<PathBuf>> {
@@ -189,11 +206,6 @@ fn parse_store_db(
         .or_else(|| sidecar.as_ref().and_then(|value| json_i64(value.get("createdAtMs"))))
         .or_else(|| first_varint_field(&root_fields, 26))
         .unwrap_or(mtime_ms);
-    let updated_at = sidecar
-        .as_ref()
-        .and_then(|value| json_i64(value.get("updatedAtMs")))
-        .or_else(|| first_varint_field(&root_fields, 26))
-        .or(Some(mtime_ms));
     let directory = first_len_field(&root_fields, 9).and_then(|uri| directory_from_file_uri(&uri));
     let entrypoint = first_len_field(&root_fields, 22).filter(|value| !value.is_empty());
 
@@ -201,13 +213,53 @@ fn parse_store_db(
         session_id.to_string(),
         directory,
         started_at,
-        updated_at,
+        Some(mtime_ms),
         entrypoint,
         messages,
     )
     .with_usage(Vec::new(), usage_parser_version);
     session.source_file_path = path.to_str().map(str::to_string);
+    session.custom_title = sidecar
+        .as_ref()
+        .and_then(|value| value.get("title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string);
+    apply_topology(&mut session, &store_meta, &sidecar, session_id);
+    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
     Ok(Some(session))
+}
+
+fn apply_topology(
+    session: &mut RawSession,
+    store_meta: &Value,
+    sidecar: &Option<Value>,
+    session_id: &str,
+) {
+    let subagent_info = store_meta.get("subagentInfo").filter(|info| !info.is_null());
+    let sidecar_is_subagent = sidecar
+        .as_ref()
+        .and_then(|value| value.get("isSubagent"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if subagent_info.is_none() && !sidecar_is_subagent {
+        session.thread_role = Some(ThreadRole::Primary);
+        return;
+    }
+    session.thread_role = Some(ThreadRole::Subagent);
+    session.parent_links = subagent_info
+        .and_then(|info| info.get("parentAgentId"))
+        .and_then(Value::as_str)
+        .filter(|parent| !parent.is_empty() && *parent != session_id)
+        .map(|parent| {
+            vec![ParentLink {
+                relation: ParentRelation::Spawn,
+                source: "cursor".to_string(),
+                source_id: parent.to_string(),
+            }]
+        })
+        .unwrap_or_default();
 }
 
 fn read_store_meta(conn: &Connection) -> Option<Value> {
@@ -281,6 +333,7 @@ fn extract_visible_text(text: &str, is_user: bool) -> Option<String> {
         }
         let trimmed = text.trim();
         if trimmed.starts_with("<user_info>")
+            || trimmed.starts_with("<system_reminder>")
             || trimmed.starts_with("<agent_skill")
             || trimmed.starts_with("<available_skills>")
             || trimmed.starts_with("<manually_attached")
@@ -420,7 +473,7 @@ fn decode_hex(input: &str) -> Option<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(input.len() / 2);
     let bytes = input.as_bytes();
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         out.push((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?);
     }
     Some(out)
@@ -495,6 +548,17 @@ mod tests {
         assistant: &str,
         directory: &str,
     ) -> PathBuf {
+        write_store_with_parent(path, session_id, user, assistant, directory, None)
+    }
+
+    fn write_store_with_parent(
+        path: &Path,
+        session_id: &str,
+        user: &str,
+        assistant: &str,
+        directory: &str,
+        subagent_parent: Option<&str>,
+    ) -> PathBuf {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let user_id = [0x11u8; 32];
         let assistant_id = [0x22u8; 32];
@@ -527,29 +591,31 @@ mod tests {
             rusqlite::params![to_hex(&root_id), root],
         )
         .unwrap();
-        let meta = serde_json::json!({
+        let mut meta = serde_json::json!({
             "agentId": session_id,
             "latestRootBlobId": to_hex(&root_id),
             "createdAt": 1_700_000_000_000_i64,
             "name": "New Agent",
             "mode": "default"
         });
+        let mut sidecar = serde_json::json!({
+            "schemaVersion": 1,
+            "createdAtMs": 1_700_000_000_000_i64,
+            "updatedAtMs": 1_700_000_100_000_i64,
+            "hasConversation": true,
+            "title": "Store Session"
+        });
+        if let Some(parent) = subagent_parent {
+            meta["subagentInfo"] = serde_json::json!({ "parentAgentId": parent });
+            sidecar["isSubagent"] = serde_json::json!(true);
+            sidecar.as_object_mut().unwrap().remove("title");
+        }
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('0', ?1)",
             [to_hex(meta.to_string().as_bytes())],
         )
         .unwrap();
-        fs::write(
-            path.parent().unwrap().join("meta.json"),
-            serde_json::json!({
-                "schemaVersion": 1,
-                "createdAtMs": 1_700_000_000_000_i64,
-                "updatedAtMs": 1_700_000_100_000_i64,
-                "hasConversation": true
-            })
-            .to_string(),
-        )
-        .unwrap();
+        fs::write(path.parent().unwrap().join("meta.json"), sidecar.to_string()).unwrap();
         path.to_path_buf()
     }
 
@@ -573,9 +639,61 @@ mod tests {
         assert_eq!(raw.directory.as_deref(), Some("/tmp/cursor-cli-project"));
         assert_eq!(raw.entrypoint.as_deref(), Some("cli"));
         assert_eq!(raw.started_at, 1_700_000_000_000);
-        assert_eq!(raw.updated_at, Some(1_700_000_100_000));
+        assert_eq!(raw.updated_at, Some(9));
         assert_eq!(raw.source_file_path.as_deref(), store_db.to_str());
         assert_eq!(raw.usage_parser_version, Some(2));
+        assert_eq!(raw.custom_title.as_deref(), Some("Store Session"));
+        assert_eq!(raw.thread_role, Some(ThreadRole::Primary));
+        assert!(raw.parent_links.is_empty());
+        assert_eq!(raw.metadata_parser_version, Some(METADATA_PARSER_VERSION));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_store_db_marks_subagent_and_strips_system_reminder() {
+        let root = temp_root("subagent");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        let store_db = root.join("ws").join(&session_id).join("store.db");
+        write_store_with_parent(
+            &store_db,
+            &session_id,
+            r#"{"role":"user","content":[{"type":"text","text":"<system_reminder>\nYou are running as a subagent.\n</system_reminder>"},{"type":"text","text":"<user_query>\nreal task\n</user_query>"}]}"#,
+            r#"{"role":"assistant","content":[{"type":"text","text":"done"}]}"#,
+            "/tmp/cursor-cli-sub",
+            Some(&parent_id),
+        );
+        let raw = parse_store_db(&store_db, &session_id, 9, 2).unwrap().unwrap();
+        assert_eq!(raw.messages[0].content, "real task");
+        assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));
+        assert_eq!(raw.parent_links.len(), 1);
+        assert_eq!(raw.parent_links[0].source_id, parent_id);
+        assert_eq!(raw.parent_links[0].source, "cursor");
+        assert!(raw.custom_title.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_timestamp_uses_newest_of_mtime_and_sidecar() {
+        let root = temp_root("timestamp");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let store_db = root.join("ws").join(&session_id).join("store.db");
+        write_store(
+            &store_db,
+            &session_id,
+            r#"{"role":"user","content":"<user_query>hi</user_query>"}"#,
+            r#"{"role":"assistant","content":[{"type":"text","text":"ok"}]}"#,
+            "/tmp/ts",
+        );
+        let mtime = file_scan::stat_mtime_ms(&store_db).unwrap();
+        assert_eq!(scan_timestamp_ms(&store_db), Some(mtime.max(1_700_000_100_000)));
+        let future = mtime + 86_400_000;
+        fs::write(
+            store_db.parent().unwrap().join("meta.json"),
+            serde_json::json!({ "updatedAtMs": future }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(scan_timestamp_ms(&store_db), Some(future));
         let _ = fs::remove_dir_all(root);
     }
 
