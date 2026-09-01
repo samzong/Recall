@@ -1,4 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+mod cli_store;
+
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -60,8 +62,8 @@ impl SourceAdapter for CursorAdapter {
         "CUR"
     }
 
-    fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
-        None
+    fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        cli_store::resume_command(source_id)
     }
 
     fn usage_parser_version(&self) -> Option<u32> {
@@ -78,12 +80,17 @@ impl SourceAdapter for CursorAdapter {
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let Some(conn) = open_global_db()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
-        };
-
         let transcript_paths = collect_agent_transcript_paths();
-        Ok(Some(scan_for_sync_conn(&conn, store, since_ts, include_events, &transcript_paths)?))
+        let mut result = if let Some(conn) = open_global_db()? {
+            scan_for_sync_conn(&conn, store, since_ts, include_events, &transcript_paths)?
+        } else {
+            SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }
+        };
+        let covered = ids_covered_by_ide(store, &result.sessions);
+        let store_result =
+            cli_store::scan_for_sync(store, since_ts, &covered, USAGE_PARSER_VERSION)?;
+        merge_scan_results(&mut result, store_result);
+        Ok(Some(result))
     }
 }
 
@@ -180,7 +187,7 @@ fn scan_cursor_sessions(
             sessions.push(raw);
         }
     }
-    Ok(sessions)
+    append_cli_store_sessions(sessions)
 }
 
 fn scan_transcript_only_sessions(
@@ -188,7 +195,7 @@ fn scan_transcript_only_sessions(
     include_events: bool,
 ) -> anyhow::Result<Vec<RawSession>> {
     let Some(projects_dir) = resolve_projects_dir()? else {
-        return Ok(vec![]);
+        return append_cli_store_sessions(Vec::new());
     };
     let cwd_map = build_agent_cwd_map(resolve_global_state_db_path().as_deref());
     let mut sessions = Vec::new();
@@ -213,7 +220,7 @@ fn scan_transcript_only_sessions(
         raw.updated_at = Some(mtime_ms);
         sessions.push(raw);
     }
-    Ok(sessions)
+    append_cli_store_sessions(sessions)
 }
 
 fn build_raw_session(
@@ -1070,6 +1077,35 @@ fn collect_cursor_project_key_matches(
             collect_cursor_project_key_matches(&next, parts, end, matches);
         }
     }
+}
+
+fn append_cli_store_sessions(mut sessions: Vec<RawSession>) -> anyhow::Result<Vec<RawSession>> {
+    let covered = sessions.iter().map(|session| session.source_id.clone()).collect();
+    sessions.extend(cli_store::scan_uncovered(&covered, USAGE_PARSER_VERSION)?);
+    Ok(sessions)
+}
+
+fn ids_covered_by_ide(store: &Store, emitted: &[RawSession]) -> HashSet<String> {
+    let mut ids = emitted.iter().map(|session| session.source_id.clone()).collect::<HashSet<_>>();
+    if let Ok(paths) = store.session_paths_for_source("cursor") {
+        for path in paths {
+            let store_owned =
+                path.source_file_path.as_deref().is_some_and(|value| value.ends_with("store.db"));
+            if !store_owned {
+                ids.insert(path.source_id);
+            }
+        }
+    }
+    ids
+}
+
+fn merge_scan_results(into: &mut SyncScanResult, extra: SyncScanResult) {
+    into.sessions.extend(extra.sessions);
+    into.stats.skipped_sessions += extra.stats.skipped_sessions;
+    into.stats.filtered_sessions += extra.stats.filtered_sessions;
+    into.stats.candidates += extra.stats.candidates;
+    into.stats.rejected_before_parse += extra.stats.rejected_before_parse;
+    into.stats.parsed += extra.stats.parsed;
 }
 
 fn resolve_projects_dir() -> anyhow::Result<Option<PathBuf>> {
