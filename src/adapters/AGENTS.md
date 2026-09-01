@@ -21,8 +21,10 @@ apply when working here.
   `json_util::rfc3339_ms` and `json_util::json_i64` for timestamp/number
   coercion, `paths::resolve_home_dir` for `~/…` directory resolution,
   `paths::vscode_extension_task_dirs` for VS Code-family `globalStorage`
-  extension task roots, and `first_timestamp`/`last_timestamp` (`mod.rs`)
-  for started_at/updated_at fallback chains.
+  extension task roots, `cline/cli_store.rs` for Cline CLI sessions under
+  `CLINE_DATA_DIR` / `CLINE_DIR/data` / `~/.cline/data/sessions` (merged into
+  the `cline` adapter like Cursor's CLI store), and `first_timestamp` /
+  `last_timestamp` (`mod.rs`) for started_at/updated_at fallback chains.
 - Usage and session events are extensions on the same `RawSession`
   (`with_usage`, `with_events`), each with its own parser version. Bump the
   parser version when parsing changes — that is what triggers backfill for

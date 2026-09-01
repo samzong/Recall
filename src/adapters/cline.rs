@@ -1,3 +1,6 @@
+mod cli_store;
+
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -23,12 +26,12 @@ impl SourceAdapter for ClineAdapter {
         "CL"
     }
 
-    fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
-        None
+    fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        cli_store::resume_command(source_id)
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        scan_task_dirs(&resolve_tasks_dirs())
+        append_cli_store_sessions(scan_task_dirs(&resolve_tasks_dirs())?)
     }
 
     fn scan_for_sync(
@@ -37,7 +40,10 @@ impl SourceAdapter for ClineAdapter {
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        Ok(Some(scan_task_dirs_for_sync(&resolve_tasks_dirs(), store, since_ts, "cline")?))
+        let mut result = scan_task_dirs_for_sync(&resolve_tasks_dirs(), store, since_ts, "cline")?;
+        let covered = ids_covered_by_plugin(store, &result.sessions);
+        merge_scan_results(&mut result, cli_store::scan_for_sync(store, since_ts, &covered)?);
+        Ok(Some(result))
     }
 }
 
@@ -324,6 +330,39 @@ fn extract_directory_from_metadata(metadata_path: &Path) -> Option<String> {
         return Some(parent.to_string_lossy().to_string());
     }
     None
+}
+
+fn append_cli_store_sessions(mut sessions: Vec<RawSession>) -> anyhow::Result<Vec<RawSession>> {
+    let covered = sessions.iter().map(|session| session.source_id.clone()).collect();
+    sessions.extend(cli_store::scan_uncovered(&covered)?);
+    Ok(sessions)
+}
+
+fn ids_covered_by_plugin(store: &Store, emitted: &[RawSession]) -> HashSet<String> {
+    let mut ids = emitted.iter().map(|session| session.source_id.clone()).collect::<HashSet<_>>();
+    if let Ok(paths) = store.session_paths_for_source("cline") {
+        for path in paths {
+            if !is_cli_source_path(path.source_file_path.as_deref()) {
+                ids.insert(path.source_id);
+            }
+        }
+    }
+    ids
+}
+
+fn is_cli_source_path(path: Option<&str>) -> bool {
+    path.is_some_and(|value| {
+        value.ends_with(".messages.json") && !value.ends_with("ui_messages.json")
+    })
+}
+
+fn merge_scan_results(into: &mut SyncScanResult, extra: SyncScanResult) {
+    into.sessions.extend(extra.sessions);
+    into.stats.skipped_sessions += extra.stats.skipped_sessions;
+    into.stats.filtered_sessions += extra.stats.filtered_sessions;
+    into.stats.candidates += extra.stats.candidates;
+    into.stats.rejected_before_parse += extra.stats.rejected_before_parse;
+    into.stats.parsed += extra.stats.parsed;
 }
 
 #[cfg(test)]
@@ -758,5 +797,16 @@ mod tests {
         assert_eq!(result.sessions[0].directory.as_deref(), Some("/work/roo-project"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_cli_source_path_distinguishes_plugin_and_cli() {
+        assert!(!is_cli_source_path(Some(
+            "/host/User/globalStorage/saoudrizwan.claude-dev/tasks/1/ui_messages.json"
+        )));
+        assert!(is_cli_source_path(Some(
+            "/Users/x/.cline/data/sessions/1788285868712_2wszo/1788285868712_2wszo.messages.json"
+        )));
+        assert!(!is_cli_source_path(None));
     }
 }
