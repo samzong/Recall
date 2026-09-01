@@ -3,6 +3,7 @@ pub(crate) mod claude_code;
 pub(crate) mod cline;
 pub(crate) mod codex;
 pub(crate) mod copilot;
+pub(crate) mod copilot_chat;
 pub(crate) mod crush;
 pub(crate) mod cursor;
 pub(crate) mod deepseek_harness;
@@ -196,6 +197,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(grok::GrokAdapter),
         Box::new(kiro::KiroAdapter),
         Box::new(copilot::CopilotAdapter),
+        Box::new(copilot_chat::CopilotChatAdapter),
         Box::new(cursor::CursorAdapter),
         Box::new(cline::ClineAdapter),
         Box::new(roo::RooAdapter),

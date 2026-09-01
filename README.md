@@ -54,7 +54,8 @@ One index across every AI coding CLI. Sync once, search everywhere, resume right
 | Antigravity |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
 | Gemini          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Kiro            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
-| Copilot     |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
+| Copilot     |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| Copilot Chat |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |      |
 | Cursor          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |   ✅   |
 | Cline           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
 | Roo             |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |

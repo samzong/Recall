@@ -98,7 +98,7 @@ recall-reflect --project /absolute/project/path --format json
 
 Supported time filters are `today`, `7d` or `week`, and `30d` or `month`. Unknown time values fall back to all history.
 
-Supported source ids include `claude-code`, `opencode`, `codex`, `pi`, `antigravity-cli`, `gemini-cli`, `grok`, `kiro-cli`, `copilot-cli`, `cursor`, and `cline`.
+Supported source ids include `claude-code`, `opencode`, `codex`, `pi`, `antigravity-cli`, `gemini-cli`, `grok`, `kiro-cli`, `copilot-cli`, `copilot-chat`, `cursor`, and `cline`.
 
 ## Guardrails
 

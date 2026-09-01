@@ -6,20 +6,24 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tracing::debug;
 
+use rusqlite::params;
+
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
+use crate::adapters::opencode;
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
 };
 use crate::db::store::Store;
-use crate::types::{RawSessionEvent, Role};
+use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 pub(crate) struct CopilotAdapter;
 
 const EVENT_PARSER_VERSION: u32 = 1;
+const USAGE_PARSER_VERSION: u32 = 2;
 
 impl SourceAdapter for CopilotAdapter {
     fn id(&self) -> &str {
@@ -40,17 +44,22 @@ impl SourceAdapter for CopilotAdapter {
         Some(open_url_command(copilot_session_url(source_id)))
     }
 
+    fn usage_parser_version(&self) -> Option<u32> {
+        Some(USAGE_PARSER_VERSION)
+    }
+
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let Some(sessions_dir) = resolve_copilot_dir()? else {
             return Ok(vec![]);
         };
 
+        let usage = load_copilot_usage_index(resolve_session_store_db().as_deref());
         let mut sessions = Vec::new();
         for entry in collect_copilot_entries(&sessions_dir) {
-            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+            let Some(mtime_ms) = entry_mtime(&entry, &usage) else {
                 continue;
             };
-            if let Some(raw) = parse_copilot_session_for_entry(entry, mtime_ms, true)? {
+            if let Some(raw) = parse_copilot_session_for_entry(entry, mtime_ms, true, &usage)? {
                 sessions.push(raw);
             }
         }
@@ -66,7 +75,13 @@ impl SourceAdapter for CopilotAdapter {
         let Some(sessions_dir) = resolve_copilot_dir()? else {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
         };
-        let result = scan_for_sync_impl(&sessions_dir, store, since_ts, include_events)?;
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            store,
+            since_ts,
+            include_events,
+            resolve_session_store_db().as_deref(),
+        )?;
         Ok(Some(result))
     }
 }
@@ -100,24 +115,181 @@ fn resolve_copilot_dir() -> anyhow::Result<Option<PathBuf>> {
     )
 }
 
+fn resolve_session_store_db() -> Option<PathBuf> {
+    let path = dirs::home_dir()?.join(".copilot").join("session-store.db");
+    path.is_file().then_some(path)
+}
+
+enum CopilotUsageIndex {
+    Unavailable,
+    Available { events: HashMap<String, Vec<RawUsageEvent>>, latest_ts: HashMap<String, i64> },
+}
+
+impl CopilotUsageIndex {
+    fn is_available(&self) -> bool {
+        matches!(self, Self::Available { .. })
+    }
+
+    fn latest_ts(&self, session_id: &str) -> i64 {
+        match self {
+            Self::Unavailable => 0,
+            Self::Available { latest_ts, .. } => latest_ts.get(session_id).copied().unwrap_or(0),
+        }
+    }
+
+    fn events_for(&self, session_id: &str) -> Option<Vec<RawUsageEvent>> {
+        match self {
+            Self::Unavailable => None,
+            Self::Available { events, .. } => {
+                Some(events.get(session_id).cloned().unwrap_or_default())
+            }
+        }
+    }
+}
+
+fn load_copilot_usage_index(db_path: Option<&Path>) -> CopilotUsageIndex {
+    let Some(path) = db_path else {
+        return CopilotUsageIndex::Unavailable;
+    };
+    let conn = match opencode::open_readonly(path) {
+        Ok(Some(conn)) => conn,
+        Ok(None) => return CopilotUsageIndex::Unavailable,
+        Err(error) => {
+            debug!("failed to open {}: {error}", path.display());
+            return CopilotUsageIndex::Unavailable;
+        }
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT id, session_id, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens, created_at
+         FROM assistant_usage_events
+         ORDER BY session_id, id",
+    ) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            debug!("copilot session-store usage table unavailable: {error}");
+            return CopilotUsageIndex::Unavailable;
+        }
+    };
+    let rows = match stmt.query_map(params![], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            debug!("failed to read copilot usage events: {error}");
+            return CopilotUsageIndex::Unavailable;
+        }
+    };
+
+    let mut events = HashMap::new();
+    let mut latest_ts = HashMap::new();
+    for row in rows.flatten() {
+        let (id, session_id, model, input, output, cache_read, cache_write, reasoning, created_at) =
+            row;
+        let inclusive_input = input.unwrap_or(0).max(0);
+        let output_tokens = output.unwrap_or(0).max(0);
+        let cache_read_tokens = cache_read.unwrap_or(0).max(0);
+        let cache_write_tokens = cache_write.unwrap_or(0).max(0);
+        let reasoning_tokens = reasoning.unwrap_or(0).max(0);
+        let input_tokens =
+            inclusive_input.saturating_sub(cache_read_tokens.saturating_add(cache_write_tokens));
+        if input_tokens == 0
+            && output_tokens == 0
+            && cache_read_tokens == 0
+            && cache_write_tokens == 0
+            && reasoning_tokens == 0
+        {
+            continue;
+        }
+        let timestamp = created_at
+            .as_deref()
+            .and_then(|value| rfc3339_ms(Some(&Value::String(value.to_string()))))
+            .unwrap_or(0);
+        let event_seq = events.get(&session_id).map(Vec::len).unwrap_or(0) as u32;
+        let model =
+            model.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "unknown".to_string());
+        let raw_usage_json = serde_json::json!({
+            "id": id,
+            "input_tokens": inclusive_input,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "reasoning_tokens": reasoning_tokens,
+        })
+        .to_string();
+        let event = RawUsageEvent {
+            model,
+            provider: "github".to_string(),
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            source_path: path.to_str().map(str::to_string),
+            raw_usage_json: Some(raw_usage_json),
+            ..RawUsageEvent::observed(
+                format!("usage:{id}"),
+                event_seq,
+                timestamp,
+                USAGE_PARSER_VERSION,
+            )
+        };
+        latest_ts
+            .entry(session_id.clone())
+            .and_modify(|latest| {
+                if timestamp > *latest {
+                    *latest = timestamp;
+                }
+            })
+            .or_insert(timestamp);
+        events.entry(session_id).or_default().push(event);
+    }
+    CopilotUsageIndex::Available { events, latest_ts }
+}
+
+fn entry_mtime(entry: &FileScanEntry, usage: &CopilotUsageIndex) -> Option<i64> {
+    let file_mtime = file_scan::stat_mtime_ms(&entry.stat_target)?;
+    Some(file_mtime.max(usage.latest_ts(&entry.session_id)))
+}
+
+fn attach_usage(raw: RawSession, usage: &CopilotUsageIndex) -> RawSession {
+    match usage.events_for(&raw.source_id) {
+        Some(events) => raw.with_usage(events, USAGE_PARSER_VERSION),
+        None => raw,
+    }
+}
+
 fn scan_for_sync_impl(
     sessions_dir: &Path,
     store: &Store,
     since_ts: Option<i64>,
     include_events: bool,
+    usage_db: Option<&Path>,
 ) -> anyhow::Result<SyncScanResult> {
     let entries = collect_copilot_entries(sessions_dir);
-    file_scan::run_file_scan_with_options(
+    let usage = load_copilot_usage_index(usage_db);
+    file_scan::run_file_scan_with_options_and_mtime(
         store,
         "copilot-cli",
         since_ts,
         FileScanOptions {
-            usage_parser_version: None,
+            usage_parser_version: usage.is_available().then_some(USAGE_PARSER_VERSION),
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
             metadata_parser_version: None,
         },
         entries,
-        |entry, mtime_ms| parse_copilot_session_for_entry(entry, mtime_ms, include_events),
+        |entry| entry_mtime(entry, &usage),
+        |entry, mtime_ms| parse_copilot_session_for_entry(entry, mtime_ms, include_events, &usage),
     )
 }
 
@@ -182,6 +354,7 @@ fn parse_copilot_session_for_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
     include_events: bool,
+    usage: &CopilotUsageIndex,
 ) -> anyhow::Result<Option<RawSession>> {
     let source_file_path = entry.stat_target.to_str().map(str::to_string);
     let file = match fs::File::open(&entry.stat_target) {
@@ -209,7 +382,7 @@ fn parse_copilot_session_for_entry(
     raw.source_id = entry.session_id;
     raw.updated_at = Some(mtime_ms);
     raw.source_file_path = source_file_path;
-    Ok(Some(raw))
+    Ok(Some(attach_usage(raw, usage)))
 }
 
 #[cfg(test)]
@@ -604,8 +777,17 @@ mod tests {
                 Some(mtime),
             )
             .unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "copilot-cli",
+                uuid,
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
 
-        let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 
@@ -623,7 +805,7 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, actual_mtime - 1_000, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -641,10 +823,12 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].source_file_path.as_deref(), events_path.to_str());
+        assert_eq!(result.sessions[0].usage_parser_version, None);
+        assert!(result.sessions[0].usage_events.is_empty());
         assert_eq!(result.stats.skipped_sessions, 0);
 
         let _ = fs::remove_dir_all(&root);
@@ -667,7 +851,7 @@ mod tests {
         writeln!(f, "{user}").unwrap();
 
         let store = setup_store();
-        let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, dir_name);
 
@@ -689,9 +873,148 @@ mod tests {
         f.write_all(&[0xFF, 0xFE, 0xFD, 0xFC]).unwrap();
 
         let store = setup_store();
-        let result = scan_for_sync_impl(&sessions_dir, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, good_uuid);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn write_usage_schema(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE assistant_usage_events (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT,
+                turn_index INTEGER,
+                model TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                created_at TEXT
+            );",
+        )
+        .unwrap();
+    }
+
+    fn write_usage_db(path: &Path, session_id: &str, created_at: &str) {
+        write_usage_schema(path);
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO assistant_usage_events (
+                session_id, turn_index, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens, created_at
+             ) VALUES (?1, 0, 'gpt-5.6-luna', 100, 20, 5, 0, 3, ?2)",
+            params![session_id, created_at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scan_for_sync_attaches_usage_from_session_store() {
+        let root = temp_copilot_root("usage");
+        let sessions_dir = root.join("session-state");
+        let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
+        write_copilot_session(&sessions_dir, "dir-1", uuid, "hello");
+        let usage_db = root.join("session-store.db");
+        write_usage_db(&usage_db, uuid, "2026-08-27T19:12:13.186Z");
+
+        let store = setup_store();
+        let result =
+            scan_for_sync_impl(&sessions_dir, &store, None, true, Some(&usage_db)).unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].usage_parser_version, Some(USAGE_PARSER_VERSION));
+        assert_eq!(result.sessions[0].usage_events.len(), 1);
+        assert_eq!(result.sessions[0].usage_events[0].model, "gpt-5.6-luna");
+        assert_eq!(result.sessions[0].usage_events[0].provider, "github");
+        assert_eq!(result.sessions[0].usage_events[0].input_tokens, 95);
+        assert_eq!(result.sessions[0].usage_events[0].output_tokens, 20);
+        assert_eq!(result.sessions[0].usage_events[0].cache_read_tokens, 5);
+        assert_eq!(result.sessions[0].usage_events[0].reasoning_tokens, 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn usage_subtracts_inclusive_cache_from_input() {
+        let root = temp_copilot_root("usage-cache");
+        let sessions_dir = root.join("session-state");
+        let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
+        write_copilot_session(&sessions_dir, "dir-1", uuid, "hello");
+        let usage_db = root.join("session-store.db");
+        write_usage_schema(&usage_db);
+        let conn = rusqlite::Connection::open(&usage_db).unwrap();
+        conn.execute(
+            "INSERT INTO assistant_usage_events (
+                session_id, turn_index, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens, created_at
+             ) VALUES (?1, 0, 'gpt-5.6-luna', 31734, 80, 30612, 1120, 0, '2026-08-27T19:12:13.186Z')",
+            params![uuid],
+        )
+        .unwrap();
+
+        let store = setup_store();
+        let result =
+            scan_for_sync_impl(&sessions_dir, &store, None, true, Some(&usage_db)).unwrap();
+        assert_eq!(result.sessions[0].usage_events[0].input_tokens, 2);
+        assert_eq!(result.sessions[0].usage_events[0].cache_read_tokens, 30_612);
+        assert_eq!(result.sessions[0].usage_events[0].cache_write_tokens, 1_120);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_marks_empty_usage_when_db_is_readable() {
+        let root = temp_copilot_root("usage-empty");
+        let sessions_dir = root.join("session-state");
+        let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
+        write_copilot_session(&sessions_dir, "dir-1", uuid, "hello");
+        let usage_db = root.join("session-store.db");
+        write_usage_schema(&usage_db);
+
+        let store = setup_store();
+        let result =
+            scan_for_sync_impl(&sessions_dir, &store, None, true, Some(&usage_db)).unwrap();
+        assert_eq!(result.sessions[0].usage_parser_version, Some(USAGE_PARSER_VERSION));
+        assert!(result.sessions[0].usage_events.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_imports_usage_after_missing_db_appears() {
+        let root = temp_copilot_root("usage-late");
+        let sessions_dir = root.join("session-state");
+        let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
+        let events_path = write_copilot_session(&sessions_dir, "dir-1", uuid, "hello");
+        let mtime = file_scan::stat_mtime_ms(&events_path).unwrap();
+
+        let store = setup_store();
+        store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "copilot-cli",
+                uuid,
+                &[],
+                EVENT_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+
+        let skipped = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
+        assert_eq!(skipped.sessions.len(), 0);
+        assert_eq!(skipped.stats.skipped_sessions, 1);
+
+        let usage_db = root.join("session-store.db");
+        write_usage_db(&usage_db, uuid, "2020-01-01T00:00:00.000Z");
+
+        let result =
+            scan_for_sync_impl(&sessions_dir, &store, None, true, Some(&usage_db)).unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].usage_events.len(), 1);
+        assert_eq!(result.sessions[0].usage_events[0].input_tokens, 95);
 
         let _ = fs::remove_dir_all(&root);
     }

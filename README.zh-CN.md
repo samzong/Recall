@@ -49,7 +49,8 @@ recall skill install # 自动检测 agent 并安装 skills
 | Antigravity     |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |      |
 | Gemini          |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Kiro            |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |      |
-| Copilot         |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |      |
+| Copilot         |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
+| Copilot Chat    |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |      |
 | Cursor          |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |  ✅  |
 | Cline           |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |      |
 | Roo             |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |      |
