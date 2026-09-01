@@ -200,20 +200,29 @@ mod tests {
             VALUES ('ses_123', 'seed', '/repo', 100, 200);
             INSERT INTO message (session_id, data, time_created)
             VALUES ('ses_123', '{\"role\":\"user\"}', 110);
+            INSERT INTO message (session_id, data, time_created)
+            VALUES ('ses_123', '{\"role\":\"assistant\"}', 120);
             INSERT INTO part (message_id, data)
             VALUES (1, '{\"type\":\"text\",\"text\":\"hello kilo\"}');
+            INSERT INTO part (message_id, data)
+            VALUES (2, '{\"type\":\"tool\",\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"ls\"},\"output\":\"file body\"}}');
             ",
         )
         .unwrap();
         drop(conn);
 
         let conn = opencode::open_readonly(&db_path).unwrap().unwrap();
-        let sessions = opencode::scan(&conn, false).unwrap();
+        let sessions = opencode::scan(&conn, true).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].source_id, "ses_123");
         assert_eq!(sessions[0].directory.as_deref(), Some("/repo"));
+        assert_eq!(sessions[0].custom_title.as_deref(), Some("seed"));
+        assert_eq!(sessions[0].metadata_parser_version, Some(opencode::METADATA_PARSER_VERSION));
         assert_eq!(sessions[0].messages.len(), 1);
         assert_eq!(sessions[0].messages[0].content, "hello kilo");
+        assert_eq!(sessions[0].events.len(), 2);
+        assert_eq!(sessions[0].events[0].kind, "command");
+        assert_eq!(sessions[0].events[0].name.as_deref(), Some("bash"));
     }
 
     fn fs_write_empty(path: &Path) {

@@ -15,23 +15,13 @@ use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
 pub(crate) const USAGE_PARSER_VERSION: u32 = 1;
 pub(crate) const EVENT_PARSER_VERSION: u32 = 3;
+pub(crate) const METADATA_PARSER_VERSION: u32 = 1;
 const PARSED_PART_FILTER_SQL: &str = "
     json_valid(m.data)
     AND json_valid(p.data)
     AND json_extract(m.data, '$.role') IN ('user', 'assistant')
-    AND (
-        (json_extract(p.data, '$.type') = 'text'
-            AND NULLIF(TRIM(CAST(json_extract(p.data, '$.text') AS TEXT)), '') IS NOT NULL)
-        OR (json_extract(p.data, '$.type') = 'tool-invocation'
-            AND json_type(p.data, '$.input') IS NOT NULL)
-        OR (json_extract(p.data, '$.type') = 'tool-result'
-            AND json_type(p.data, '$.result') IS NOT NULL)
-        OR (json_extract(p.data, '$.type') = 'tool'
-            AND (json_type(p.data, '$.state.input') IS NOT NULL
-                OR json_type(p.data, '$.state.output') IS NOT NULL))
-        OR (json_extract(p.data, '$.type') = 'patch'
-            AND json_type(p.data, '$.files') = 'array')
-    )
+    AND json_extract(p.data, '$.type') = 'text'
+    AND NULLIF(TRIM(CAST(json_extract(p.data, '$.text') AS TEXT)), '') IS NOT NULL
 ";
 
 pub(crate) struct OpenCodeAdapter;
@@ -41,6 +31,7 @@ struct SessionRow {
     directory: String,
     time_created: i64,
     time_updated: Option<i64>,
+    title: Option<String>,
 }
 
 impl SourceAdapter for OpenCodeAdapter {
@@ -125,11 +116,11 @@ fn count_filtered_sessions(conn: &Connection, since_ts: Option<i64>) -> anyhow::
 
 fn load_session_rows(conn: &Connection, since_ts: Option<i64>) -> anyhow::Result<Vec<SessionRow>> {
     let sql = if since_ts.is_some() {
-        "SELECT id, directory, time_created, time_updated
+        "SELECT id, directory, time_created, time_updated, title
          FROM session
          WHERE COALESCE(time_updated, time_created) >= ?1"
     } else {
-        "SELECT id, directory, time_created, time_updated FROM session"
+        "SELECT id, directory, time_created, time_updated, title FROM session"
     };
 
     let mut stmt = conn.prepare(sql)?;
@@ -155,6 +146,7 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         directory: row.get(1)?,
         time_created: row.get(2)?,
         time_updated: row.get(3)?,
+        title: row.get(4)?,
     })
 }
 
@@ -189,7 +181,7 @@ fn scan_session_messages(
             continue;
         }
 
-        let raw = RawSession::search_only(
+        let mut raw = RawSession::search_only(
             session.id,
             Some(session.directory),
             session.time_created,
@@ -198,6 +190,9 @@ fn scan_session_messages(
             messages,
         )
         .with_usage(usage_events, USAGE_PARSER_VERSION);
+        raw.custom_title =
+            session.title.map(|title| title.trim().to_string()).filter(|title| !title.is_empty());
+        raw.metadata_parser_version = Some(METADATA_PARSER_VERSION);
         raw_sessions.push(if include_events {
             raw.with_events(events, EVENT_PARSER_VERSION)
         } else {
@@ -559,32 +554,6 @@ fn parse_part_content(part_data: &str) -> Option<String> {
             .get("text")
             .and_then(|t| t.as_str())
             .and_then(|text| if text.trim().is_empty() { None } else { Some(text.to_string()) }),
-        "tool-invocation" | "tool-result" => {
-            let name = part.get("toolName").and_then(|n| n.as_str()).unwrap_or("tool");
-            if let Some(input) = part.get("input") {
-                Some(format!("[{name}] {input}"))
-            } else {
-                part.get("result").map(|result| format!("[{name}] {result}"))
-            }
-        }
-        "tool" => {
-            let name = opencode_tool_name(&part);
-            let state = part.get("state")?;
-            match (state.get("input"), state.get("output")) {
-                (Some(input), Some(output)) => Some(format!(
-                    "[{name}] input: {}\noutput: {}",
-                    display_json_value(input),
-                    display_json_value(output)
-                )),
-                (Some(input), None) => Some(format!("[{name}] {}", display_json_value(input))),
-                (None, Some(output)) => Some(format!("[{name}] {}", display_json_value(output))),
-                (None, None) => None,
-            }
-        }
-        "patch" => {
-            let files = patch_files(&part);
-            if files.is_empty() { None } else { Some(format!("[patch] {}", files.join(", "))) }
-        }
         _ => None,
     }
 }
@@ -628,6 +597,7 @@ pub(crate) fn scan_for_sync_conn(
     let usage_state = store.usage_state_meta_map(source_id)?;
     let event_state =
         if include_events { store.event_state_meta_map(source_id)? } else { Default::default() };
+    let metadata_state = store.metadata_state_meta_map(source_id)?;
     let current_counts = load_message_counts(
         conn,
         &sessions.iter().map(|session| session.id.clone()).collect::<Vec<_>>(),
@@ -649,6 +619,11 @@ pub(crate) fn scan_for_sync_conn(
                     session.time_updated,
                     include_events,
                 )
+                && crate::adapters::sync_state::metadata_state_is_current(
+                    METADATA_PARSER_VERSION,
+                    metadata_state.get(&session.id).copied(),
+                    session.time_updated,
+                )
             {
                 stats.skipped_sessions += 1;
                 continue;
@@ -666,6 +641,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::db::store::SessionTopologyWrite;
     use crate::db::{schema, store::Store};
     use crate::types::Session;
 
@@ -783,6 +759,20 @@ mod tests {
             .unwrap();
     }
 
+    fn mark_metadata_current(store: &Store, source_id: &str) {
+        store
+            .persist_topology_for_existing_session(
+                "opencode",
+                source_id,
+                &SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION),
+                },
+            )
+            .unwrap();
+    }
+
     #[test]
     fn incremental_scan_skips_sessions_with_matching_updated_at_and_message_count() {
         let (path, conn) = setup_opencode_db();
@@ -792,10 +782,30 @@ mod tests {
         store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
         mark_usage_current(&store, "s1", Some(200));
         mark_event_current(&store, "s1", Some(200));
+        mark_metadata_current(&store, "s1");
 
         let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
         assert!(result.sessions.is_empty());
         assert_eq!(result.stats.skipped_sessions, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn incremental_scan_resyncs_when_metadata_parser_is_stale() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "s1", 200, 100, "hello");
+
+        let store = setup_store();
+        store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
+        mark_usage_current(&store, "s1", Some(200));
+        mark_event_current(&store, "s1", Some(200));
+
+        let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
+        assert_eq!(result.stats.skipped_sessions, 0);
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].custom_title.as_deref(), Some("Test"));
+        assert_eq!(result.sessions[0].metadata_parser_version, Some(METADATA_PARSER_VERSION));
         drop(conn);
         let _ = std::fs::remove_file(path);
     }
@@ -808,6 +818,7 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
         mark_usage_current(&store, "s1", Some(200));
+        mark_metadata_current(&store, "s1");
 
         let result = scan_for_sync_conn(&conn, &store, None, "opencode", false).unwrap();
         assert!(result.sessions.is_empty());
@@ -848,6 +859,7 @@ mod tests {
         store.insert_session(&make_session("local-s2", "s2", Some(150), 1)).unwrap();
         mark_usage_current(&store, "s2", Some(150));
         mark_event_current(&store, "s2", Some(150));
+        mark_metadata_current(&store, "s2");
 
         let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
         assert_eq!(result.stats.skipped_sessions, 1);
@@ -933,14 +945,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_part_content_includes_current_tool_input_and_output() {
+    fn parse_part_content_skips_tool_parts() {
         let parsed = parse_part_content(
             r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"needle result"}}"#,
         );
 
-        let content = parsed.unwrap();
-        assert!(content.contains("\"filePath\":\"src/main.rs\""));
-        assert!(content.contains("needle result"));
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn scan_session_messages_sets_custom_title_from_session_title() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "s1", 200, 100, "hello");
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('s2', '   ', '/tmp/project', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (session_id, data, time_created)
+             VALUES ('s2', '{\"role\":\"user\"}', 110)",
+            [],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data)
+             VALUES (NULL, ?1, '{\"type\":\"text\",\"text\":\"blank title\"}')",
+            rusqlite::params![message_id],
+        )
+        .unwrap();
+
+        let sessions = load_session_rows(&conn, None).unwrap();
+        let raw = scan_session_messages(&conn, sessions, false).unwrap();
+        let titled = raw.iter().find(|session| session.source_id == "s1").unwrap();
+        let blank = raw.iter().find(|session| session.source_id == "s2").unwrap();
+        assert_eq!(titled.custom_title.as_deref(), Some("Test"));
+        assert_eq!(titled.metadata_parser_version, Some(METADATA_PARSER_VERSION));
+        assert_eq!(blank.custom_title, None);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -982,6 +1027,8 @@ mod tests {
         let raw = scan_session_messages(&conn, sessions, true).unwrap();
 
         assert_eq!(raw.len(), 1);
+        assert!(raw[0].messages.is_empty());
+        assert_eq!(raw[0].custom_title.as_deref(), Some("Test"));
         assert_eq!(raw[0].events.len(), 2);
         assert_eq!(raw[0].events[0].kind, "file_read");
         assert_eq!(raw[0].events[0].name.as_deref(), Some("readFile"));
@@ -1030,7 +1077,8 @@ mod tests {
         let raw = scan_session_messages(&conn, sessions, true).unwrap();
 
         assert_eq!(raw.len(), 1);
-        assert_eq!(raw[0].messages.len(), 2);
+        assert!(raw[0].messages.is_empty());
+        assert_eq!(raw[0].custom_title.as_deref(), Some("Test"));
         assert_eq!(raw[0].events.len(), 4);
         assert_eq!(raw[0].events[0].kind, "file_read");
         assert_eq!(raw[0].events[0].name.as_deref(), Some("read"));
@@ -1070,6 +1118,12 @@ mod tests {
         conn.execute(
             "INSERT INTO part (id, message_id, data)
              VALUES (NULL, ?1, ?2)",
+            rusqlite::params![message_id, r#"{"type":"text","text":"hello"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data)
+             VALUES (NULL, ?1, ?2)",
             rusqlite::params![
                 message_id,
                 r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"file body"}}"#
@@ -1082,6 +1136,7 @@ mod tests {
 
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].messages.len(), 1);
+        assert_eq!(result.sessions[0].messages[0].content, "hello");
         assert!(result.sessions[0].events.is_empty());
         assert_eq!(result.sessions[0].event_parser_version, None);
         drop(conn);
