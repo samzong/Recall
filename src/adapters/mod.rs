@@ -10,6 +10,7 @@ pub(crate) mod file_scan;
 pub(crate) mod gemini;
 pub(crate) mod grok;
 pub(crate) mod json_util;
+pub(crate) mod kilo;
 pub(crate) mod kimi_code;
 pub(crate) mod kiro;
 pub(crate) mod opencode;
@@ -194,6 +195,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(deepseek_harness::DeepSeekHarnessAdapter),
         Box::new(kimi_code::KimiCodeAdapter),
         Box::new(qwen::QwenAdapter),
+        Box::new(kilo::KiloCodeAdapter),
     ]
 }
 
@@ -210,7 +212,10 @@ pub(crate) fn source_labels() -> Vec<(String, String)> {
 }
 
 pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
-    matches!(source_id, "codex" | "claude-code" | "cursor" | "copilot-cli" | "opencode")
+    matches!(
+        source_id,
+        "codex" | "claude-code" | "cursor" | "copilot-cli" | "opencode" | "kilo-code"
+    )
 }
 
 pub(crate) fn adapter_supports_usage_dashboard(

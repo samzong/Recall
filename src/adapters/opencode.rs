@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde_json::Value;
@@ -12,8 +13,8 @@ use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
-const USAGE_PARSER_VERSION: u32 = 1;
-const EVENT_PARSER_VERSION: u32 = 3;
+pub(crate) const USAGE_PARSER_VERSION: u32 = 1;
+pub(crate) const EVENT_PARSER_VERSION: u32 = 3;
 const PARSED_PART_FILTER_SQL: &str = "
     json_valid(m.data)
     AND json_valid(p.data)
@@ -66,8 +67,7 @@ impl SourceAdapter for OpenCodeAdapter {
         let Some(conn) = open_opencode_db()? else {
             return Ok(vec![]);
         };
-        let sessions = load_session_rows(&conn, None)?;
-        scan_session_messages(&conn, sessions, true)
+        scan(&conn, true)
     }
 
     fn scan_for_sync(
@@ -88,15 +88,23 @@ fn open_opencode_db() -> anyhow::Result<Option<Connection>> {
     let db_path = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("no home dir"))?
         .join(".local/share/opencode/opencode.db");
+    open_readonly(&db_path)
+}
 
+pub(crate) fn open_readonly(db_path: &Path) -> anyhow::Result<Option<Connection>> {
     if !db_path.exists() {
-        debug!("OpenCode DB not found at {}, skipping", db_path.display());
+        debug!("session DB not found at {}, skipping", db_path.display());
         return Ok(None);
     }
 
-    Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map(Some)
         .map_err(Into::into)
+}
+
+pub(crate) fn scan(conn: &Connection, include_events: bool) -> anyhow::Result<Vec<RawSession>> {
+    let sessions = load_session_rows(conn, None)?;
+    scan_session_messages(conn, sessions, include_events)
 }
 
 fn count_filtered_sessions(conn: &Connection, since_ts: Option<i64>) -> anyhow::Result<u32> {
@@ -607,7 +615,7 @@ fn display_json_value(value: &Value) -> String {
     }
 }
 
-fn scan_for_sync_conn(
+pub(crate) fn scan_for_sync_conn(
     conn: &Connection,
     store: &Store,
     since_ts: Option<i64>,

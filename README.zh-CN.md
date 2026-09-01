@@ -55,6 +55,7 @@ recall skill install # 自动检测 agent 并安装 skills
 | Grok            |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |      |
 | Kimi Code       |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Qwen Code       |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
+| Kilo Code       |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 
 ## 致谢
 
