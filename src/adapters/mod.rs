@@ -3,6 +3,7 @@ pub(crate) mod claude_code;
 pub(crate) mod cline;
 pub(crate) mod codex;
 pub(crate) mod copilot;
+pub(crate) mod crush;
 pub(crate) mod cursor;
 pub(crate) mod deepseek_harness;
 pub(crate) mod events;
@@ -196,6 +197,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(kimi_code::KimiCodeAdapter),
         Box::new(qwen::QwenAdapter),
         Box::new(kilo::KiloCodeAdapter),
+        Box::new(crush::CrushAdapter),
     ]
 }
 
@@ -214,7 +216,7 @@ pub(crate) fn source_labels() -> Vec<(String, String)> {
 pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
     matches!(
         source_id,
-        "codex" | "claude-code" | "cursor" | "copilot-cli" | "opencode" | "kilo-code"
+        "codex" | "claude-code" | "cursor" | "copilot-cli" | "opencode" | "kilo-code" | "crush"
     )
 }
 

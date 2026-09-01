@@ -31,7 +31,7 @@
   <rect x="24" y="16" width="636" height="114" class="box" fill="#e9f4fb" stroke="#287bb5"/>
   <text x="40" y="42" class="t">Local AI-coding session data</text>
   <text x="40" y="68" class="d">Claude Code · OpenCode · Codex · Pi · Antigravity · Gemini · Grok</text>
-  <text x="40" y="88" class="d">Kiro · Copilot · Cursor · Cline · DeepSeek Harness · Kimi Code · Qwen Code · Kilo Code</text>
+  <text x="40" y="88" class="d">Kiro · Copilot · Cursor · Cline · DeepSeek Harness · Kimi Code · Qwen Code · Kilo Code · Crush</text>
   <text x="40" y="110" class="p">local files · external databases opened read-only</text>
   <g fill="#fff9e9" stroke="#287bb5" stroke-width="1.8" stroke-linejoin="round">
     <rect x="574" y="46" width="42" height="34" rx="5"/>
