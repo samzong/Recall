@@ -5,12 +5,13 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::adapters::file_scan::{self, FileScanEntry};
-use crate::adapters::paths::resolve_home_dir;
-use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-};
+use crate::adapters::json_util;
+use crate::adapters::paths;
+use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
 use crate::db::store::Store;
 use crate::types::Role;
+
+const CLINE_EXTENSION_ID: &str = "saoudrizwan.claude-dev";
 
 pub(crate) struct ClineAdapter;
 
@@ -27,19 +28,7 @@ impl SourceAdapter for ClineAdapter {
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        let Some(tasks_dir) = resolve_tasks_dir()? else {
-            return Ok(vec![]);
-        };
-        let mut sessions = Vec::new();
-        for entry in collect_cline_entries(&tasks_dir) {
-            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
-                continue;
-            };
-            if let Some(raw) = parse_cline_task(entry, mtime_ms)? {
-                sessions.push(raw);
-            }
-        }
-        Ok(sessions)
+        scan_task_dirs(&resolve_tasks_dirs())
     }
 
     fn scan_for_sync(
@@ -48,30 +37,45 @@ impl SourceAdapter for ClineAdapter {
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let Some(tasks_dir) = resolve_tasks_dir()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
-        };
-        let result = scan_for_sync_impl(&tasks_dir, store, since_ts)?;
-        Ok(Some(result))
+        Ok(Some(scan_task_dirs_for_sync(&resolve_tasks_dirs(), store, since_ts, "cline")?))
     }
 }
 
-fn scan_for_sync_impl(
-    tasks_dir: &Path,
+pub(crate) fn scan_task_dirs(tasks_dirs: &[PathBuf]) -> anyhow::Result<Vec<RawSession>> {
+    let mut sessions = Vec::new();
+    for entry in collect_all_entries(tasks_dirs) {
+        let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+            continue;
+        };
+        if let Some(raw) = parse_cline_task(entry, mtime_ms)? {
+            sessions.push(raw);
+        }
+    }
+    Ok(sessions)
+}
+
+pub(crate) fn scan_task_dirs_for_sync(
+    tasks_dirs: &[PathBuf],
     store: &Store,
     since_ts: Option<i64>,
+    source: &str,
 ) -> anyhow::Result<SyncScanResult> {
-    let entries = collect_cline_entries(tasks_dir);
-    file_scan::run_file_scan(store, "cline", since_ts, entries, |entry, mtime_ms| {
+    let entries = collect_all_entries(tasks_dirs);
+    file_scan::run_file_scan(store, source, since_ts, entries, |entry, mtime_ms| {
         parse_cline_task(entry, mtime_ms)
     })
 }
 
-fn resolve_tasks_dir() -> anyhow::Result<Option<PathBuf>> {
-    resolve_home_dir(
-        "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks",
-        "Cline tasks directory not found, skipping Cline",
-    )
+fn resolve_tasks_dirs() -> Vec<PathBuf> {
+    let dirs = paths::vscode_extension_task_dirs(CLINE_EXTENSION_ID);
+    if dirs.is_empty() {
+        debug!("Cline tasks directory not found, skipping Cline");
+    }
+    dirs
+}
+
+fn collect_all_entries(tasks_dirs: &[PathBuf]) -> Vec<FileScanEntry> {
+    tasks_dirs.iter().flat_map(|dir| collect_cline_entries(dir)).collect()
 }
 
 fn collect_cline_entries(tasks_dir: &Path) -> Vec<FileScanEntry> {
@@ -94,11 +98,6 @@ fn collect_cline_entries(tasks_dir: &Path) -> Vec<FileScanEntry> {
             Some(n) => n.to_string(),
             None => continue,
         };
-        // Directory name is a timestamp (e.g., "1765706891317")
-        let _started_at: i64 = match dir_name.parse() {
-            Ok(ts) => ts,
-            Err(_) => continue,
-        };
         let messages_path = path.join("ui_messages.json");
         if !messages_path.exists() {
             continue;
@@ -114,8 +113,6 @@ fn collect_cline_entries(tasks_dir: &Path) -> Vec<FileScanEntry> {
 }
 
 fn parse_cline_task(entry: FileScanEntry, mtime_ms: i64) -> anyhow::Result<Option<RawSession>> {
-    // Directory name is a timestamp, parse it for started_at
-    let started_at: i64 = entry.session_id.parse().unwrap_or(0);
     let messages = match load_ui_messages(&entry.stat_target) {
         Ok(m) => m,
         Err(e) => {
@@ -128,6 +125,7 @@ fn parse_cline_task(entry: FileScanEntry, mtime_ms: i64) -> anyhow::Result<Optio
         return Ok(None);
     }
 
+    let started_at = task_started_at(&entry, &messages);
     let directory = extract_directory(&entry.stat_target);
     let source_file_path = entry.stat_target.to_str().map(str::to_string);
 
@@ -276,9 +274,47 @@ fn format_tool_message(msg: &Value) -> Option<String> {
     Some(formatted)
 }
 
+fn task_started_at(entry: &FileScanEntry, messages: &[RawMessage]) -> i64 {
+    if let Ok(ts) = entry.session_id.parse::<i64>() {
+        return ts;
+    }
+    let Some(task_dir) = entry.stat_target.parent() else {
+        return messages.first().and_then(|message| message.timestamp).unwrap_or(0);
+    };
+    read_history_i64(&task_dir.join("history_item.json"), "ts")
+        .or_else(|| read_history_i64(&task_dir.join("history.json"), "ts"))
+        .or_else(|| messages.first().and_then(|message| message.timestamp))
+        .unwrap_or(0)
+}
+
+fn read_history_i64(path: &Path, field: &str) -> Option<i64> {
+    let content = fs::read_to_string(path).ok()?;
+    let meta: Value = serde_json::from_str(&content).ok()?;
+    json_util::json_i64(meta.get(field))
+}
+
 fn extract_directory(messages_path: &Path) -> Option<String> {
-    let metadata_path = messages_path.parent()?.join("task_metadata.json");
-    let content = fs::read_to_string(&metadata_path).ok()?;
+    let task_dir = messages_path.parent()?;
+    if let Some(workspace) = read_history_workspace(&task_dir.join("history_item.json"))
+        .or_else(|| read_history_workspace(&task_dir.join("history.json")))
+    {
+        return Some(workspace);
+    }
+    extract_directory_from_metadata(&task_dir.join("task_metadata.json"))
+}
+
+fn read_history_workspace(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let meta: Value = serde_json::from_str(&content).ok()?;
+    meta.get("workspace")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn extract_directory_from_metadata(metadata_path: &Path) -> Option<String> {
+    let content = fs::read_to_string(metadata_path).ok()?;
     let meta: Value = serde_json::from_str(&content).ok()?;
     let files = meta.get("files_in_context").and_then(|v| v.as_array())?;
     if let Some(first_file) = files.first()
@@ -462,19 +498,33 @@ mod tests {
     }
 
     #[test]
-    fn collect_cline_entries_skips_non_timestamp_dirs() {
+    fn collect_cline_entries_skips_dirs_without_ui_messages() {
         let root = temp_root("collect");
         let good = root.join("1765706891317");
         fs::create_dir_all(&good).unwrap();
         fs::write(good.join("ui_messages.json"), "[]").unwrap();
 
-        let bad = root.join("not-a-timestamp");
-        fs::create_dir_all(&bad).unwrap();
-        fs::write(bad.join("ui_messages.json"), "[]").unwrap();
+        let empty = root.join("019e6d8d-588b-7fd2-a326-c525469ed120");
+        fs::create_dir_all(&empty).unwrap();
 
         let entries = collect_cline_entries(&root);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id, "1765706891317");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_cline_entries_accepts_uuid_task_ids() {
+        let root = temp_root("uuid-collect");
+        let uuid = "019e6d8d-588b-7fd2-a326-c525469ed120";
+        let task = root.join(uuid);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("ui_messages.json"), "[]").unwrap();
+
+        let entries = collect_cline_entries(&root);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, uuid);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -500,6 +550,29 @@ mod tests {
         assert_eq!(raw.updated_at, Some(mtime));
         assert_eq!(raw.source_file_path.as_deref(), path.to_str());
         assert_eq!(raw.messages.len(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_cline_task_sets_started_at_from_history_item_for_uuid() {
+        let root = temp_root("uuid-startedat");
+        let uuid = "019e6d8d-588b-7fd2-a326-c525469ed120";
+        let messages_json = r#"[{"ts":1000,"type":"say","say":"text","text":"hello"}]"#;
+        let path = write_task(&root, uuid, messages_json);
+        fs::write(
+            path.parent().unwrap().join("history_item.json"),
+            r#"{"ts":1765706891317,"workspace":"/work/roo"}"#,
+        )
+        .unwrap();
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let entry =
+            FileScanEntry { session_id: uuid.to_string(), stat_target: path, directory: None };
+        let raw = parse_cline_task(entry, mtime).unwrap().unwrap();
+        assert_eq!(raw.source_id, uuid);
+        assert_eq!(raw.started_at, 1765706891317);
+        assert_eq!(raw.directory.as_deref(), Some("/work/roo"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -553,7 +626,8 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session("1765706891317", mtime, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result =
+            scan_task_dirs_for_sync(std::slice::from_ref(&root), &store, None, "cline").unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 
@@ -574,7 +648,8 @@ mod tests {
             .insert_session(&make_existing_session("1765706891317", actual_mtime - 1_000, 1))
             .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result =
+            scan_task_dirs_for_sync(std::slice::from_ref(&root), &store, None, "cline").unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "1765706891317");
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -593,10 +668,94 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result =
+            scan_task_dirs_for_sync(std::slice::from_ref(&root), &store, None, "cline").unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "1765706891317");
         assert_eq!(result.stats.skipped_sessions, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_all_entries_reads_every_host_dir() {
+        let first = temp_root("host-a");
+        let second = temp_root("host-b");
+        write_task(&first, "1765706891317", "[]");
+        write_task(&second, "1765706891318", "[]");
+
+        let entries = collect_all_entries(&[first.clone(), second.clone()]);
+        let mut ids: Vec<_> = entries.into_iter().map(|entry| entry.session_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["1765706891317", "1765706891318"]);
+
+        let _ = fs::remove_dir_all(&first);
+        let _ = fs::remove_dir_all(&second);
+    }
+
+    #[test]
+    fn extract_directory_prefers_history_item_workspace() {
+        let root = temp_root("history-workspace");
+        let path = write_task(
+            &root,
+            "1765706891317",
+            r#"[{"ts":1,"type":"say","say":"text","text":"hi"}]"#,
+        );
+        fs::write(
+            path.parent().unwrap().join("history_item.json"),
+            r#"{"workspace":"/Users/x/git/samzong/Recall"}"#,
+        )
+        .unwrap();
+        fs::write(
+            path.parent().unwrap().join("task_metadata.json"),
+            r#"{"files_in_context":[{"path":"/tmp/other/file.rs"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(extract_directory(&path).as_deref(), Some("/Users/x/git/samzong/Recall"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_directory_falls_back_to_task_metadata() {
+        let root = temp_root("metadata-workspace");
+        let path = write_task(
+            &root,
+            "1765706891317",
+            r#"[{"ts":1,"type":"say","say":"text","text":"hi"}]"#,
+        );
+        fs::write(
+            path.parent().unwrap().join("task_metadata.json"),
+            r#"{"files_in_context":[{"path":"/repo/src/main.rs"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(extract_directory(&path).as_deref(), Some("/repo/src"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_task_dirs_sets_roo_source_id_and_workspace() {
+        let root = temp_root("roo-scan");
+        let path = write_task(
+            &root,
+            "1765706891317",
+            r#"[{"ts":1000,"type":"say","say":"task","text":"fix it"}]"#,
+        );
+        fs::write(
+            path.parent().unwrap().join("history_item.json"),
+            r#"{"workspace":"/work/roo-project"}"#,
+        )
+        .unwrap();
+
+        let store = setup_store();
+        let result =
+            scan_task_dirs_for_sync(std::slice::from_ref(&root), &store, None, "roo").unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].source_id, "1765706891317");
+        assert_eq!(result.sessions[0].directory.as_deref(), Some("/work/roo-project"));
 
         let _ = fs::remove_dir_all(&root);
     }

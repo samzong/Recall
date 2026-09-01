@@ -20,6 +20,7 @@ pub(crate) mod opencode;
 pub(crate) mod paths;
 pub(crate) mod pi;
 pub(crate) mod qwen;
+pub(crate) mod roo;
 pub(crate) mod sync_state;
 pub(crate) mod usage;
 pub(crate) mod zcode;
@@ -197,6 +198,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(copilot::CopilotAdapter),
         Box::new(cursor::CursorAdapter),
         Box::new(cline::ClineAdapter),
+        Box::new(roo::RooAdapter),
         Box::new(deepseek_harness::DeepSeekHarnessAdapter),
         Box::new(kimi_code::KimiCodeAdapter),
         Box::new(qwen::QwenAdapter),

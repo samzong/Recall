@@ -273,7 +273,7 @@ recall usage --json
 
 Supported time filters are `today`, `7d` or `week`, and `30d` or `month`. Unknown time values fall back to all history.
 
-Supported source ids include `claude-code`, `opencode`, `codex`, `pi`, `omp`, `antigravity-cli`, `gemini-cli`, `grok`, `kiro-cli`, `copilot-cli`, `cursor`, `cline`, `kimi-code`, `deepseek-harness`, `qwen-code`, `kilo-code`, `crush`, `mimo-code`, and `zcode`. Source labels such as `CC`, `OC`, `CDX`, and `CUR` are also accepted by the CLI, but source ids are clearer in scripts.
+Supported source ids include `claude-code`, `opencode`, `codex`, `pi`, `omp`, `antigravity-cli`, `gemini-cli`, `grok`, `kiro-cli`, `copilot-cli`, `cursor`, `cline`, `roo`, `kimi-code`, `deepseek-harness`, `qwen-code`, `kilo-code`, `crush`, `mimo-code`, and `zcode`. Source labels such as `CC`, `OC`, `CDX`, and `CUR` are also accepted by the CLI, but source ids are clearer in scripts.
 
 ## Export Schema
 

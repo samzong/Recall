@@ -19,9 +19,10 @@ apply when working here.
   `file_scan::run_file_scan_with_options` for mtime tracking,
   `json_util::jsonl_indexed` for per-line JSONL read loops,
   `json_util::rfc3339_ms` and `json_util::json_i64` for timestamp/number
-  coercion, `paths::resolve_home_dir` for `~/…` directory resolution, and
-  `first_timestamp`/`last_timestamp` (`mod.rs`) for started_at/updated_at
-  fallback chains.
+  coercion, `paths::resolve_home_dir` for `~/…` directory resolution,
+  `paths::vscode_extension_task_dirs` for VS Code-family `globalStorage`
+  extension task roots, and `first_timestamp`/`last_timestamp` (`mod.rs`)
+  for started_at/updated_at fallback chains.
 - Usage and session events are extensions on the same `RawSession`
   (`with_usage`, `with_events`), each with its own parser version. Bump the
   parser version when parsing changes — that is what triggers backfill for

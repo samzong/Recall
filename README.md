@@ -57,6 +57,7 @@ One index across every AI coding CLI. Sync once, search everywhere, resume right
 | Copilot     |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
 | Cursor          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |   ✅   |
 | Cline           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
+| Roo             |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
 | DeepSeek Harness |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |   ✅   |
 | Grok            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Kimi Code       |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |

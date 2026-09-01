@@ -805,7 +805,7 @@ mod tests {
     fn dashboard_sync_skips_sources_without_usage_or_events() {
         for adapter in all_adapters() {
             let id = adapter.id();
-            if matches!(id, "cline" | "antigravity-cli" | "kiro-cli") {
+            if matches!(id, "cline" | "roo" | "antigravity-cli" | "kiro-cli") {
                 assert!(
                     !adapter_supports_usage_dashboard(adapter.as_ref(), true),
                     "{id} should be skipped during dashboard sync"
