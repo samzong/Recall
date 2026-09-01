@@ -15,6 +15,7 @@ pub(crate) mod kiro;
 pub(crate) mod opencode;
 pub(crate) mod paths;
 pub(crate) mod pi;
+pub(crate) mod qwen;
 pub(crate) mod sync_state;
 pub(crate) mod usage;
 
@@ -192,6 +193,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(cline::ClineAdapter),
         Box::new(deepseek_harness::DeepSeekHarnessAdapter),
         Box::new(kimi_code::KimiCodeAdapter),
+        Box::new(qwen::QwenAdapter),
     ]
 }
 
