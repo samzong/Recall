@@ -53,12 +53,13 @@ recall skill install # 自动检测 agent 并安装 skills
 | Cursor          |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |  ✅  |
 | Cline           |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |      |
 | DeepSeek Harness |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |  ✅  |
-| Grok            |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |      |
+| Grok            |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Kimi Code       |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Qwen Code       |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Kilo Code       |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Crush           |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | MiMo Code       |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
+| ZCode           |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 
 ## 致谢
 
