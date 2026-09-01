@@ -10,6 +10,7 @@ pub(crate) mod deepseek_harness;
 pub(crate) mod events;
 pub(crate) mod file_scan;
 pub(crate) mod gemini;
+pub(crate) mod goose;
 pub(crate) mod grok;
 pub(crate) mod json_util;
 pub(crate) mod kilo;
@@ -208,6 +209,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(crush::CrushAdapter),
         Box::new(mimo_code::MimoCodeAdapter),
         Box::new(zcode::ZcodeAdapter),
+        Box::new(goose::GooseAdapter),
     ]
 }
 
@@ -235,6 +237,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "crush"
             | "mimo-code"
             | "zcode"
+            | "goose"
     )
 }
 

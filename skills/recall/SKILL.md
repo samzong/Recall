@@ -100,6 +100,7 @@ When the user wants to share a session or update an existing share link, execute
    - Crush -> `crush`
    - MiMo Code -> `mimo-code`
    - ZCode -> `zcode`
+   - Goose -> `goose`
    - OMP -> `omp`
    If the source is unclear, omit `--source` and rely on project + recency.
 
@@ -273,7 +274,7 @@ recall usage --json
 
 Supported time filters are `today`, `7d` or `week`, and `30d` or `month`. Unknown time values fall back to all history.
 
-Supported source ids include `claude-code`, `opencode`, `codex`, `pi`, `omp`, `antigravity-cli`, `gemini-cli`, `grok`, `kiro-cli`, `copilot-cli`, `copilot-chat`, `cursor`, `cline`, `roo`, `kimi-code`, `deepseek-harness`, `qwen-code`, `kilo-code`, `crush`, `mimo-code`, and `zcode`. Source labels such as `CC`, `OC`, `CDX`, and `CUR` are also accepted by the CLI, but source ids are clearer in scripts.
+Supported source ids include `claude-code`, `opencode`, `codex`, `pi`, `omp`, `antigravity-cli`, `gemini-cli`, `grok`, `kiro-cli`, `copilot-cli`, `copilot-chat`, `cursor`, `cline`, `roo`, `kimi-code`, `deepseek-harness`, `qwen-code`, `kilo-code`, `crush`, `mimo-code`, `zcode`, and `goose`. Source labels such as `CC`, `OC`, `CDX`, and `CUR` are also accepted by the CLI, but source ids are clearer in scripts.
 
 ## Export Schema
 
