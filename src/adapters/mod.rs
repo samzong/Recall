@@ -14,6 +14,7 @@ pub(crate) mod json_util;
 pub(crate) mod kilo;
 pub(crate) mod kimi_code;
 pub(crate) mod kiro;
+pub(crate) mod mimo_code;
 pub(crate) mod opencode;
 pub(crate) mod paths;
 pub(crate) mod pi;
@@ -198,6 +199,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(qwen::QwenAdapter),
         Box::new(kilo::KiloCodeAdapter),
         Box::new(crush::CrushAdapter),
+        Box::new(mimo_code::MimoCodeAdapter),
     ]
 }
 
@@ -216,7 +218,14 @@ pub(crate) fn source_labels() -> Vec<(String, String)> {
 pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
     matches!(
         source_id,
-        "codex" | "claude-code" | "cursor" | "copilot-cli" | "opencode" | "kilo-code" | "crush"
+        "codex"
+            | "claude-code"
+            | "cursor"
+            | "copilot-cli"
+            | "opencode"
+            | "kilo-code"
+            | "crush"
+            | "mimo-code"
     )
 }
 
