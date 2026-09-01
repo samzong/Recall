@@ -288,10 +288,9 @@ fn path_segs(path: Option<&Value>) -> Option<Vec<PathSeg>> {
     for segment in segments {
         if let Some(key) = segment.as_str() {
             out.push(PathSeg::Key(key.to_string()));
-        } else if let Some(index) = json_i64(Some(segment)).filter(|index| *index >= 0) {
-            out.push(PathSeg::Index(index as usize));
         } else {
-            return None;
+            let index = json_i64(Some(segment)).filter(|index| *index >= 0)?;
+            out.push(PathSeg::Index(index as usize));
         }
     }
     Some(out)
