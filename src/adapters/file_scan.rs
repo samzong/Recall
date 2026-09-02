@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use tracing::warn;
 
 use crate::adapters::sync_state::{
     event_state_is_current_for_mtime, metadata_state_is_current_for_mtime,
@@ -18,10 +19,40 @@ pub(crate) struct FileScanOptions {
     pub(crate) metadata_parser_version: Option<u32>,
 }
 
+#[derive(Clone)]
 pub(crate) struct FileScanEntry {
     pub(crate) session_id: String,
     pub(crate) stat_target: PathBuf,
     pub(crate) directory: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileScanSnapshot<T> {
+    effective_mtime_ms: i64,
+    fingerprint: T,
+}
+
+impl<T> FileScanSnapshot<T> {
+    pub(crate) fn new(effective_mtime_ms: i64, fingerprint: T) -> Self {
+        Self { effective_mtime_ms, fingerprint }
+    }
+
+    pub(crate) fn effective_mtime_ms(&self) -> i64 {
+        self.effective_mtime_ms
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileMetadataSnapshot {
+    modified: SystemTime,
+    len: u64,
+}
+
+impl FileMetadataSnapshot {
+    pub(crate) fn mtime_ms(&self) -> Option<i64> {
+        let duration = self.modified.duration_since(UNIX_EPOCH).ok()?;
+        Some(duration.as_millis() as i64)
+    }
 }
 
 pub(crate) fn run_file_scan<I, F>(
@@ -82,6 +113,70 @@ where
     F: Fn(FileScanEntry, i64) -> Result<Option<RawSession>>,
     M: Fn(&FileScanEntry) -> Option<i64>,
 {
+    run_file_scan_with_observations(
+        store,
+        source_id,
+        since_ts,
+        options,
+        entries,
+        |entry| mtime_fn(entry).map(|mtime_ms| FileScanSnapshot::new(mtime_ms, ())),
+        |entry, mtime_ms, _| Ok((parse_fn(entry, mtime_ms)?, true)),
+    )
+}
+
+pub(crate) fn run_file_scan_with_options_and_snapshot<I, F, S, T>(
+    store: &Store,
+    source_id: &str,
+    since_ts: Option<i64>,
+    options: FileScanOptions,
+    entries: I,
+    snapshot_fn: S,
+    parse_fn: F,
+) -> Result<SyncScanResult>
+where
+    I: IntoIterator<Item = FileScanEntry>,
+    F: Fn(FileScanEntry, i64) -> Result<Option<RawSession>>,
+    S: Fn(&FileScanEntry) -> Option<FileScanSnapshot<T>>,
+    T: PartialEq,
+{
+    let snapshot_fn = &snapshot_fn;
+    run_file_scan_with_observations(
+        store,
+        source_id,
+        since_ts,
+        options,
+        entries,
+        |entry| snapshot_fn(entry),
+        |entry, mtime_ms, before| {
+            let revalidate_entry = entry.clone();
+            let raw = parse_fn(entry, mtime_ms)?;
+            let stable = snapshot_fn(&revalidate_entry).as_ref() == Some(&before);
+            if !stable {
+                warn!(
+                    "skipping unstable {source_id} session {}: source files changed while parsing ({})",
+                    revalidate_entry.session_id,
+                    revalidate_entry.stat_target.display()
+                );
+            }
+            Ok((raw, stable))
+        },
+    )
+}
+
+fn run_file_scan_with_observations<I, F, S, T>(
+    store: &Store,
+    source_id: &str,
+    since_ts: Option<i64>,
+    options: FileScanOptions,
+    entries: I,
+    snapshot_fn: S,
+    parse_fn: F,
+) -> Result<SyncScanResult>
+where
+    I: IntoIterator<Item = FileScanEntry>,
+    F: Fn(FileScanEntry, i64, FileScanSnapshot<T>) -> Result<(Option<RawSession>, bool)>,
+    S: Fn(&FileScanEntry) -> Option<FileScanSnapshot<T>>,
+{
     let existing = store.session_meta_map(source_id)?;
     let mut imported = store.imported_source_ids(source_id)?;
     let usage_state = match options.usage_parser_version {
@@ -101,10 +196,11 @@ where
 
     for entry in entries {
         stats.candidates += 1;
-        let Some(mtime_ms) = mtime_fn(&entry) else {
+        let Some(snapshot) = snapshot_fn(&entry) else {
             stats.rejected_before_parse += 1;
             continue;
         };
+        let mtime_ms = snapshot.effective_mtime_ms();
 
         if existing.contains_key(&entry.session_id) {
             if let Some(source_file_path) = entry.stat_target.to_str() {
@@ -154,7 +250,12 @@ where
         }
 
         stats.parsed += 1;
-        if let Some(raw) = parse_fn(entry, mtime_ms)? {
+        let (raw, stable) = parse_fn(entry, mtime_ms, snapshot)?;
+        if !stable {
+            stats.unstable_sessions += 1;
+            continue;
+        }
+        if let Some(raw) = raw {
             sessions.push(raw);
         }
     }
@@ -163,10 +264,12 @@ where
 }
 
 pub(crate) fn stat_mtime_ms(path: &Path) -> Option<i64> {
+    file_metadata_snapshot(path)?.mtime_ms()
+}
+
+pub(crate) fn file_metadata_snapshot(path: &Path) -> Option<FileMetadataSnapshot> {
     let meta = fs::metadata(path).ok()?;
-    let mtime = meta.modified().ok()?;
-    let duration = mtime.duration_since(UNIX_EPOCH).ok()?;
-    Some(duration.as_millis() as i64)
+    Some(FileMetadataSnapshot { modified: meta.modified().ok()?, len: meta.len() })
 }
 
 #[cfg(test)]
@@ -264,6 +367,60 @@ mod tests {
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "sess-new");
         assert_eq!(result.stats.skipped_sessions, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn changed_during_parse_is_rejected() {
+        let store = setup_store();
+        let path = temp_file_with_mtime("changed-during-parse");
+        let entry = FileScanEntry {
+            session_id: "sess-changing".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+
+        let result = run_file_scan_with_options_and_snapshot(
+            &store,
+            "test-source",
+            None,
+            FileScanOptions::default(),
+            vec![entry],
+            |entry| {
+                let fingerprint = file_metadata_snapshot(&entry.stat_target)?;
+                Some(FileScanSnapshot::new(fingerprint.mtime_ms()?, fingerprint))
+            },
+            |entry, mtime_ms| {
+                fs::write(&entry.stat_target, "changed while parsing with a different length")?;
+                Ok(Some(stub_raw_session(&entry.session_id, mtime_ms)))
+            },
+        )
+        .unwrap();
+
+        assert!(result.sessions.is_empty());
+        assert_eq!(result.stats.unstable_sessions, 1);
+
+        let entry = FileScanEntry {
+            session_id: "sess-changing".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+        let retry = run_file_scan_with_options_and_snapshot(
+            &store,
+            "test-source",
+            None,
+            FileScanOptions::default(),
+            vec![entry],
+            |entry| {
+                let fingerprint = file_metadata_snapshot(&entry.stat_target)?;
+                Some(FileScanSnapshot::new(fingerprint.mtime_ms()?, fingerprint))
+            },
+            |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
+        )
+        .unwrap();
+
+        assert_eq!(retry.sessions.len(), 1);
+        assert_eq!(retry.stats.unstable_sessions, 0);
         let _ = fs::remove_file(&path);
     }
 

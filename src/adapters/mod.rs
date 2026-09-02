@@ -153,6 +153,7 @@ pub(crate) fn last_timestamp(
 pub(crate) struct SyncScanStats {
     pub(crate) skipped_sessions: u32,
     pub(crate) filtered_sessions: u32,
+    pub(crate) unstable_sessions: u32,
     /// Every session the adapter considered, before any filtering. The three
     /// counters below partition it, so `candidates - skipped - filtered -
     /// parsed` is the number an adapter dropped without accounting for it.
