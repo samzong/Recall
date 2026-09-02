@@ -448,10 +448,22 @@ fn migrate_v12_with_lock<T>(
         "ALTER TABLE messages ADD COLUMN trigram_indexed INTEGER
          CHECK (trigram_indexed IN (0, 1))",
     )?;
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(err) = rebuild_trigram_fts(conn, version_update) {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(err);
+    }
+    if file_backed {
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        eprintln!("Search index upgraded in {:.0?}.", started.elapsed());
+    }
+    Ok(())
+}
+
+fn rebuild_trigram_fts(conn: &Connection, version_update: &str) -> anyhow::Result<()> {
+    backfill_trigram_flags(conn)?;
     conn.execute_batch(&format!(
         "
-        BEGIN IMMEDIATE;
-
         DROP TRIGGER IF EXISTS messages_trigram_ai;
         DROP TRIGGER IF EXISTS messages_trigram_ad;
         DROP TABLE IF EXISTS messages_fts_trigram;
@@ -478,16 +490,30 @@ fn migrate_v12_with_lock<T>(
 
         INSERT INTO messages_fts_trigram(rowid, content)
         SELECT id, content FROM messages
-        WHERE trigram_indexed = 1 OR trigram_indexed IS NULL;
+        WHERE trigram_indexed = 1;
 
         {version_update}
 
         COMMIT;
         ",
     ))?;
-    if file_backed {
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-        eprintln!("Search index upgraded in {:.0?}.", started.elapsed());
+    Ok(())
+}
+
+fn backfill_trigram_flags(conn: &Connection) -> anyhow::Result<()> {
+    let flags: Vec<(i64, bool)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, content FROM messages WHERE trigram_indexed IS NULL")?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let needs = crate::utils::text_needs_trigram(row.get_ref(1)?.as_str()?);
+            Ok((id, needs))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut update = conn.prepare("UPDATE messages SET trigram_indexed = ?2 WHERE id = ?1")?;
+    for (id, needs) in flags {
+        update.execute(rusqlite::params![id, needs])?;
     }
     Ok(())
 }
@@ -856,7 +882,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(latin_hits, 1, "rebuild must preserve pre-v12 Latin messages");
+        assert_eq!(latin_hits, 0, "rebuild must index only CJK legacy rows");
     }
 
     #[test]
