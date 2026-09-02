@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -10,7 +11,8 @@ use crate::types::{Message, Session, SessionUsageEventRecord};
 use super::assets::{HEADERS, ROBOTS};
 use super::meta::collect_session_display_meta;
 use super::render::{
-    ShareRenderOptions, render_session_html, render_session_html_with_tldr, share_id_for_session,
+    ShareRenderOptions, render_session_html_with_tldr, render_session_preview_html,
+    share_id_for_session,
 };
 
 const PROVIDER_CLOUDFLARE_PAGES: &str = "cloudflare-pages";
@@ -91,32 +93,24 @@ pub(crate) fn init_cloudflare_pages(
     config.save()
 }
 
-pub(crate) fn default_preview_dir() -> Result<PathBuf> {
-    let root = dirs::cache_dir()
-        .or_else(dirs::data_local_dir)
-        .or_else(dirs::data_dir)
-        .ok_or_else(|| anyhow!("cannot determine cache directory"))?;
-    Ok(root.join("recall").join("preview"))
-}
-
-pub(crate) fn write_preview_file(
+pub(crate) fn create_session_preview(
     session: &Session,
     messages: &[Message],
     usage_events: &[SessionUsageEventRecord],
-) -> Result<PathBuf> {
-    let preview_dir = default_preview_dir()?;
-    fs::create_dir_all(&preview_dir)
-        .with_context(|| format!("failed to create {}", preview_dir.display()))?;
-    let share_id = share_id_for_session(session);
-    let file_path = preview_dir.join(format!("{share_id}.html"));
+) -> Result<tempfile::NamedTempFile> {
     let display_meta = collect_session_display_meta(session, usage_events);
-    let html = render_session_html(session, messages, &display_meta);
-    fs::write(&file_path, html)
-        .with_context(|| format!("failed to write {}", file_path.display()))?;
-    Ok(file_path)
+    let html = render_session_preview_html(session, messages, &display_meta);
+    let mut file = tempfile::Builder::new()
+        .prefix("recall-preview-")
+        .suffix(".html")
+        .tempfile()
+        .context("failed to create temporary preview")?;
+    file.write_all(html.as_bytes()).context("failed to write temporary preview")?;
+    file.flush().context("failed to flush temporary preview")?;
+    Ok(file)
 }
 
-pub(crate) fn open_path_in_browser(path: &Path) -> Result<()> {
+pub(crate) fn open_preview_file(path: &Path) -> Result<()> {
     let path_arg = path.as_os_str();
     let status = if cfg!(target_os = "macos") {
         Command::new("open").arg(path_arg).status()
@@ -131,16 +125,6 @@ pub(crate) fn open_path_in_browser(path: &Path) -> Result<()> {
     } else {
         bail!("failed to open browser for {}", path.display());
     }
-}
-
-pub(crate) fn open_session_preview(
-    session: &Session,
-    messages: &[Message],
-    usage_events: &[SessionUsageEventRecord],
-) -> Result<PathBuf> {
-    let path = write_preview_file(session, messages, usage_events)?;
-    open_path_in_browser(&path)?;
-    Ok(path)
 }
 
 pub(crate) fn preview_session_with_options(
@@ -475,7 +459,8 @@ pub(crate) fn validate_project_name(project_name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Session;
+    use crate::share::render::render_session_html;
+    use crate::types::{Message, Role, Session};
 
     #[test]
     fn share_id_prefers_source_id() {
@@ -515,6 +500,27 @@ mod tests {
     #[test]
     fn share_id_sanitizes_path_chars() {
         assert_eq!(share_id_for_session(&session("foo/bar baz")), "foo-bar-baz");
+    }
+
+    #[test]
+    fn preview_file_is_removed_when_dropped() {
+        let file = create_session_preview(
+            &session("preview"),
+            &[Message {
+                session_id: "local-id".to_string(),
+                role: Role::User,
+                content: "hello".to_string(),
+                timestamp: None,
+                seq: 0,
+            }],
+            &[],
+        )
+        .unwrap();
+        let path = file.path().to_path_buf();
+
+        assert!(fs::read_to_string(&path).unwrap().contains("hello"));
+        drop(file);
+        assert!(!path.exists());
     }
 
     #[test]

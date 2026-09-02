@@ -3,9 +3,27 @@ pub(crate) const ROBOTS: &str = "User-agent: *\nDisallow: /\n";
 pub(crate) const SESSION_PAGE_CSS: &str = include_str!("assets/session.css");
 pub(crate) const CHEVRON_SVG: &str = "<svg class=\"chev\" viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\"><path d=\"M6 4l4 4-4 4\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
 
-pub(crate) const TOC_NAV_SCRIPT: &str = r#"<script>
+pub(crate) const SESSION_PAGE_SCRIPT: &str = r#"<script>
 (function(){
   function setup(){
+    var detailsToggle = document.querySelector('.details-toggle');
+    var details = Array.prototype.slice.call(document.querySelectorAll('details'));
+    if(detailsToggle && details.length){
+      detailsToggle.hidden = false;
+      function allOpen(){ return details.every(function(detail){ return detail.open; }); }
+      function syncDetailsToggle(){
+        var expanded = allOpen();
+        detailsToggle.textContent = expanded ? 'Collapse all' : 'Expand all';
+        detailsToggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      }
+      detailsToggle.addEventListener('click', function(){
+        var expanded = !allOpen();
+        details.forEach(function(detail){ detail.open = expanded; });
+        syncDetailsToggle();
+      });
+      details.forEach(function(detail){ detail.addEventListener('toggle', syncDetailsToggle); });
+      syncDetailsToggle();
+    }
     var sections = Array.prototype.slice.call(document.querySelectorAll('.turn.user'));
     var ticks = Array.prototype.slice.call(document.querySelectorAll('.tick'));
     if(!sections.length || !ticks.length) return;

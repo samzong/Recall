@@ -179,6 +179,7 @@ pub(crate) struct App {
     pub(crate) handoff_target_selected: usize,
     pub(crate) share_popup: Option<SharePopup>,
     pub(crate) share_publish_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    pub(crate) local_preview: Option<Result<tempfile::NamedTempFile, String>>,
     pub(crate) exec_on_exit: Option<(ResumeCommand, Option<String>)>,
     pub(crate) viewing_search_query: String,
     pub(crate) viewing_search_input: Option<String>,
@@ -274,6 +275,7 @@ impl App {
             handoff_target_selected: 0,
             share_popup: None,
             share_publish_rx: None,
+            local_preview: None,
             exec_on_exit: None,
             viewing_search_query: String::new(),
             viewing_search_input: None,
@@ -2464,6 +2466,10 @@ impl App {
         self.viewing_children =
             store.child_subagents(&session.source, &session.source_id).unwrap_or_default();
         self.viewing_sanitized_lines = build_viewing_caches(&msgs);
+        self.local_preview = Some(
+            crate::share::create_session_preview(&session, &msgs, &usage_events)
+                .map_err(|error| error.to_string()),
+        );
         self.viewing_messages = msgs;
         self.viewing_session = Some(session);
         self.viewing_selected_msg = 0;
@@ -2585,24 +2591,16 @@ impl App {
     }
 
     fn preview_current_session(&mut self) {
-        let Some(session) = self.viewing_session.clone() else {
-            return;
-        };
-        let messages = self.viewing_messages.clone();
-        let session_id = session.id.clone();
-        let usage_events = crate::db::store::Store::open()
-            .and_then(|store| store.list_usage_events_for_session(&session_id))
-            .unwrap_or_default();
-        match crate::share::open_session_preview(&session, &messages, &usage_events) {
-            Ok(path) => {
-                self.viewing_search_status = None;
-                self.status_message = Some(format!("Opened preview: {}", path.display()));
-            }
-            Err(error) => {
-                self.viewing_search_status = None;
-                self.status_message = Some(format!("Preview failed: {error}"));
-            }
-        }
+        let started = Instant::now();
+        self.viewing_search_status = None;
+        self.status_message = Some(match self.local_preview.as_ref() {
+            Some(Ok(file)) => match crate::share::open_preview_file(file.path()) {
+                Ok(()) => format!("Opened preview in {} ms", started.elapsed().as_millis()),
+                Err(error) => format!("Preview failed: {error}"),
+            },
+            Some(Err(error)) => format!("Preview failed: {error}"),
+            None => "Preview unavailable".to_string(),
+        });
     }
 
     fn share_current_session(&mut self) {
@@ -2832,6 +2830,7 @@ mod tests {
             handoff_target_selected: 0,
             share_popup: None,
             share_publish_rx: None,
+            local_preview: None,
             exec_on_exit: None,
             viewing_search_query: String::new(),
             viewing_search_input: None,
