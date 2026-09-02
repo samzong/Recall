@@ -3,7 +3,7 @@ use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd,
 use crate::types::{Message, Role, Session};
 use crate::utils;
 
-use super::assets::{CHEVRON_SVG, SESSION_PAGE_CSS, TOC_NAV_SCRIPT};
+use super::assets::{CHEVRON_SVG, SESSION_PAGE_CSS, SESSION_PAGE_SCRIPT};
 use super::meta::SessionDisplayMeta;
 
 #[derive(Debug, Clone, Default)]
@@ -25,12 +25,21 @@ pub(crate) fn share_id_for_session(session: &Session) -> String {
     let trimmed = out.trim_matches('-').to_string();
     if trimmed.is_empty() { session.id.clone() } else { trimmed }
 }
+#[cfg(any(test, feature = "bench"))]
 pub(crate) fn render_session_html(
     session: &Session,
     messages: &[Message],
     display_meta: &SessionDisplayMeta,
 ) -> String {
-    render_session_html_with_tldr(session, messages, display_meta, None)
+    render_session_html_inner(session, messages, display_meta, None, true)
+}
+
+pub(crate) fn render_session_preview_html(
+    session: &Session,
+    messages: &[Message],
+    display_meta: &SessionDisplayMeta,
+) -> String {
+    render_session_html_inner(session, messages, display_meta, None, false)
 }
 
 pub(crate) fn render_session_html_with_tldr(
@@ -38,6 +47,16 @@ pub(crate) fn render_session_html_with_tldr(
     messages: &[Message],
     display_meta: &SessionDisplayMeta,
     tldr_markdown: Option<&str>,
+) -> String {
+    render_session_html_inner(session, messages, display_meta, tldr_markdown, true)
+}
+
+fn render_session_html_inner(
+    session: &Session,
+    messages: &[Message],
+    display_meta: &SessionDisplayMeta,
+    tldr_markdown: Option<&str>,
+    load_external_fonts: bool,
 ) -> String {
     let title = session.custom_title.as_deref().unwrap_or(&session.title);
     let display_title = display_title(title);
@@ -48,9 +67,11 @@ pub(crate) fn render_session_html_with_tldr(
     out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
     out.push_str("<meta name=\"robots\" content=\"noindex,nofollow\">");
     out.push_str("<link rel=\"icon\" href=\"data:,\">");
-    out.push_str("<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">");
-    out.push_str("<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>");
-    out.push_str("<link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=JetBrains+Mono:wght@400;500&display=swap\">");
+    if load_external_fonts {
+        out.push_str("<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">");
+        out.push_str("<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>");
+        out.push_str("<link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=JetBrains+Mono:wght@400;500&display=swap\">");
+    }
     out.push_str("<title>");
     out.push_str(&escape_html(&display_title));
     out.push_str("</title><style>");
@@ -66,6 +87,7 @@ pub(crate) fn render_session_html_with_tldr(
     out.push_str(&messages.len().to_string());
     out.push_str(" messages</span>");
     append_header_display_meta(&mut out, display_meta);
+    out.push_str("<button type=\"button\" class=\"details-toggle\" aria-expanded=\"false\" hidden>Expand all</button>");
     out.push_str("</div></div></header>");
     out.push_str("<div class=\"layout\"><div class=\"page\"><article class=\"document\">");
     if let Some(tldr) = tldr_markdown.filter(|tldr| !tldr.trim().is_empty()) {
@@ -90,7 +112,7 @@ pub(crate) fn render_session_html_with_tldr(
     out.push_str("<footer class=\"site-footer\"><div class=\"site-footer-inner\">");
     out.push_str("<span class=\"brand-dot\"></span><span>Published with <b>Recall</b></span>");
     out.push_str("</div></footer>");
-    out.push_str(TOC_NAV_SCRIPT);
+    out.push_str(SESSION_PAGE_SCRIPT);
     out.push_str("</body></html>");
     out
 }
@@ -776,6 +798,15 @@ mod tests {
     }
 
     #[test]
+    fn local_preview_has_no_render_blocking_network_resources() {
+        let html = render_session_preview_html(&session("s1"), &[], &SessionDisplayMeta::default());
+
+        assert!(!html.contains("fonts.googleapis.com"));
+        assert!(!html.contains("fonts.gstatic.com"));
+        assert!(render_html(&session("s1"), &[]).contains("fonts.googleapis.com"));
+    }
+
+    #[test]
     fn html_renderer_places_tldr_before_transcript_and_escapes_it() {
         let html = render_session_html_with_tldr(
             &session("s1"),
@@ -918,27 +949,6 @@ mod tests {
         assert!(html.contains("<a href=\"https://example.com\">good</a>"));
         assert!(!html.contains("<img"));
         assert!(html.contains("alt"));
-    }
-
-    #[test]
-    fn preview_writes_html_file() {
-        let dir =
-            std::env::temp_dir().join(format!("recall-preview-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let session = session("preview-test");
-        let messages = vec![Message {
-            session_id: "local-id".to_string(),
-            role: Role::User,
-            content: "hello".to_string(),
-            timestamp: None,
-            seq: 0,
-        }];
-        let path = dir.join("preview.html");
-        let html = render_html(&session, &messages);
-        std::fs::write(&path, html).unwrap();
-        let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("hello"));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

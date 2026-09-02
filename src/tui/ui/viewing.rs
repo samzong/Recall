@@ -151,6 +151,8 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" export  ", Style::default().fg(THEME.text_muted)),
         Span::styled("s", Style::default().fg(THEME.accent)),
         Span::styled(" share  ", Style::default().fg(THEME.text_muted)),
+        Span::styled("v", Style::default().fg(THEME.accent)),
+        Span::styled(" preview  ", Style::default().fg(THEME.text_muted)),
         Span::styled("h", Style::default().fg(THEME.accent)),
         Span::styled(" handoff  ", Style::default().fg(THEME.text_muted)),
     ];

@@ -122,7 +122,6 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
                 app.fail_usage_refresh("Usage worker unavailable");
             }
         }
-
         app.try_search(&store, &search_worker);
         while let Some(response) = search_worker.try_recv() {
             app.apply_search_response(&store, response);
@@ -130,7 +129,6 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
         while let Some(response) = usage_worker.try_recv() {
             app.apply_usage_response(response);
         }
-
         if app.should_quit {
             break;
         }
@@ -139,7 +137,9 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
     drop(guard);
     terminal.show_cursor()?;
 
-    if let Some((command, cwd)) = app.exec_on_exit.take() {
+    let exec_on_exit = app.exec_on_exit.take();
+    drop(app);
+    if let Some((command, cwd)) = exec_on_exit {
         exec_resume(command, cwd)?;
     }
 
