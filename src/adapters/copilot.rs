@@ -22,7 +22,7 @@ use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 pub(crate) struct CopilotAdapter;
 
-const EVENT_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 2;
 const USAGE_PARSER_VERSION: u32 = 2;
 
 impl SourceAdapter for CopilotAdapter {

@@ -25,7 +25,7 @@ use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 pub(crate) struct CursorAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 2;
-const EVENT_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 struct ComposerMeta {

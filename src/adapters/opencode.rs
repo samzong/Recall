@@ -14,7 +14,7 @@ use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
 pub(crate) const USAGE_PARSER_VERSION: u32 = 1;
-pub(crate) const EVENT_PARSER_VERSION: u32 = 3;
+pub(crate) const EVENT_PARSER_VERSION: u32 = 4;
 pub(crate) const METADATA_PARSER_VERSION: u32 = 1;
 const PARSED_PART_FILTER_SQL: &str = "
     json_valid(m.data)
@@ -360,6 +360,7 @@ fn parse_part_events(
         }
         Some("patch") => {
             let files = patch_files(&part);
+            let attrs_json = Some(patch_attrs_without_files(&part));
             if files.is_empty() {
                 return vec![RawSessionEvent {
                     event_seq,
@@ -373,7 +374,7 @@ fn parse_part_events(
                     summary: None,
                     source_path: None,
                     source_event_id: Some(part_id.to_string()),
-                    attrs_json: Some(part.to_string()),
+                    attrs_json,
                     parser_version: EVENT_PARSER_VERSION,
                 }];
             }
@@ -392,7 +393,7 @@ fn parse_part_events(
                     message_seq: None,
                     source_path: None,
                     source_event_id: Some(part_id.to_string()),
-                    attrs_json: Some(part.to_string()),
+                    attrs_json: attrs_json.clone(),
                     parser_version: EVENT_PARSER_VERSION,
                 })
                 .collect()
@@ -616,6 +617,14 @@ fn patch_files(part: &Value) -> Vec<String> {
         .filter(|file| !file.trim().is_empty())
         .map(|file| file.trim().to_string())
         .collect()
+}
+
+fn patch_attrs_without_files(part: &Value) -> String {
+    let mut attrs = part.clone();
+    if let Some(object) = attrs.as_object_mut() {
+        object.remove("files");
+    }
+    attrs.to_string()
 }
 
 fn display_json_value(value: &Value) -> String {
@@ -1155,6 +1164,11 @@ mod tests {
         assert_eq!(raw[0].events[3].name.as_deref(), Some("patch"));
         assert_eq!(raw[0].events[3].target.as_deref(), Some("README.md"));
         assert_eq!(raw[0].events[3].event_seq, raw[0].events[2].event_seq + 1);
+        assert_eq!(
+            raw[0].events[2].attrs_json.as_deref(),
+            Some(r#"{"hash":"abc","type":"patch"}"#)
+        );
+        assert_eq!(raw[0].events[3].attrs_json, raw[0].events[2].attrs_json);
         drop(conn);
         let _ = std::fs::remove_file(path);
     }
