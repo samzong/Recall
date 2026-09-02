@@ -358,6 +358,7 @@ fn is_cli_source_path(path: Option<&str>) -> bool {
 
 fn merge_scan_results(into: &mut SyncScanResult, extra: SyncScanResult) {
     into.sessions.extend(extra.sessions);
+    into.observations.extend(extra.observations);
     into.stats.skipped_sessions += extra.stats.skipped_sessions;
     into.stats.filtered_sessions += extra.stats.filtered_sessions;
     into.stats.candidates += extra.stats.candidates;

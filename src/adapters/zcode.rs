@@ -46,7 +46,11 @@ impl SourceAdapter for ZcodeAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_zcode_db()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult {
+                sessions: vec![],
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            }));
         };
         Ok(Some(opencode::scan_for_sync_conn_with_options(
             &conn,

@@ -91,7 +91,11 @@ impl SourceAdapter for OpenCodeAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_opencode_db()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult {
+                sessions: vec![],
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            }));
         };
 
         Ok(Some(scan_for_sync_conn(&conn, store, since_ts, self.id(), include_events)?))
@@ -702,7 +706,7 @@ pub(crate) fn scan_for_sync_conn_with_options(
     }
 
     let sessions = scan_session_messages(conn, candidates, include_events, options)?;
-    Ok(SyncScanResult { sessions, stats })
+    Ok(SyncScanResult { sessions, stats, observations: Vec::new() })
 }
 
 #[cfg(test)]

@@ -44,7 +44,11 @@ impl SourceAdapter for MimoCodeAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_mimo_db()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult {
+                sessions: vec![],
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            }));
         };
         let mut result =
             opencode::scan_for_sync_conn(&conn, store, since_ts, "mimo-code", include_events)?;

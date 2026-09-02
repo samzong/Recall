@@ -59,7 +59,11 @@ impl SourceAdapter for AntigravityAdapter {
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(cli_dir) = resolve_antigravity_dir()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult {
+                sessions: vec![],
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            }));
         };
         Ok(Some(scan_for_sync_impl(&cli_dir, store, since_ts)?))
     }

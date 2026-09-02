@@ -84,7 +84,11 @@ impl SourceAdapter for CursorAdapter {
         let mut result = if let Some(conn) = open_global_db()? {
             scan_for_sync_conn(&conn, store, since_ts, include_events, &transcript_paths)?
         } else {
-            SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }
+            SyncScanResult {
+                sessions: vec![],
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            }
         };
         let covered = ids_covered_by_ide(store, &result.sessions);
         let store_result =
@@ -159,7 +163,7 @@ fn scan_for_sync_conn(
         }
     }
 
-    Ok(SyncScanResult { sessions, stats })
+    Ok(SyncScanResult { sessions, stats, observations: Vec::new() })
 }
 
 fn scan_cursor_sessions(
@@ -1101,6 +1105,7 @@ fn ids_covered_by_ide(store: &Store, emitted: &[RawSession]) -> HashSet<String> 
 
 fn merge_scan_results(into: &mut SyncScanResult, extra: SyncScanResult) {
     into.sessions.extend(extra.sessions);
+    into.observations.extend(extra.observations);
     into.stats.skipped_sessions += extra.stats.skipped_sessions;
     into.stats.filtered_sessions += extra.stats.filtered_sessions;
     into.stats.candidates += extra.stats.candidates;

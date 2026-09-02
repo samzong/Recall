@@ -66,7 +66,11 @@ impl SourceAdapter for GrokAdapter {
         force: bool,
     ) -> anyhow::Result<Option<SyncScanOutput>> {
         let Some(sessions_dir) = resolve_grok_sessions_dir()? else {
-            let result = SyncScanResult { sessions: vec![], stats: SyncScanStats::default() };
+            let result = SyncScanResult {
+                sessions: vec![],
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            };
             if store.session_meta_map("grok")?.is_empty() {
                 return Ok(Some(SyncScanOutput { scan: result, reconcile: None }));
             }
@@ -130,7 +134,7 @@ fn scan_for_sync_impl(
                 sessions.push(raw);
             }
         }
-        SyncScanResult { sessions, stats }
+        SyncScanResult { sessions, stats, observations: Vec::new() }
     } else {
         file_scan::run_file_scan_with_options(
             store,

@@ -62,7 +62,11 @@ impl SourceAdapter for DeepSeekHarnessAdapter {
         _include_events: bool,
     ) -> Result<Option<SyncScanResult>> {
         let Some(sessions_dir) = resolve_dsh_sessions_dir()? else {
-            return Ok(Some(SyncScanResult { sessions: Vec::new(), stats: Default::default() }));
+            return Ok(Some(SyncScanResult {
+                sessions: Vec::new(),
+                stats: Default::default(),
+                observations: Vec::new(),
+            }));
         };
 
         Ok(Some(file_scan::run_file_scan_with_options(

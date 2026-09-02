@@ -72,7 +72,11 @@ impl SourceAdapter for CodexAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(codex_dir) = resolve_codex_dir()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult {
+                sessions: vec![],
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            }));
         };
         let result = scan_for_sync_impl(&codex_dir, store, since_ts, include_events)?;
         Ok(Some(result))

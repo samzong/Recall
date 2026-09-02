@@ -229,7 +229,7 @@ fn scan_projects(
         }
     }
 
-    Ok(SyncScanResult { sessions, stats })
+    Ok(SyncScanResult { sessions, stats, observations: Vec::new() })
 }
 
 fn crush_db_path(project_path: &str, data_dir: &str) -> PathBuf {

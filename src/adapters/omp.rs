@@ -70,7 +70,11 @@ impl SourceAdapter for OmpAdapter {
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let session_dirs = resolve_omp_session_dirs()?;
         if session_dirs.is_empty() {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult {
+                sessions: vec![],
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            }));
         }
 
         Ok(Some(scan_for_sync_impl(&session_dirs, store, since_ts, include_events)?))

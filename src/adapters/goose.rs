@@ -243,11 +243,18 @@ fn scan_db(
     } else {
         ReconcilePlan::PartialInventory(inventory_issues)
     };
-    Ok(SyncScanOutput { scan: SyncScanResult { sessions, stats }, reconcile: Some(reconcile) })
+    Ok(SyncScanOutput {
+        scan: SyncScanResult { sessions, stats, observations: Vec::new() },
+        reconcile: Some(reconcile),
+    })
 }
 
 fn unavailable_scan_result(store: Option<&Store>) -> anyhow::Result<SyncScanOutput> {
-    let result = SyncScanResult { sessions: Vec::new(), stats: SyncScanStats::default() };
+    let result = SyncScanResult {
+        sessions: Vec::new(),
+        stats: SyncScanStats::default(),
+        observations: Vec::new(),
+    };
     let has_history = match store {
         Some(store) => !store.session_meta_map(SOURCE)?.is_empty(),
         None => false,
