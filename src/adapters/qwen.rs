@@ -54,7 +54,11 @@ impl SourceAdapter for QwenAdapter {
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(runtime_dir) = resolve_qwen_runtime_dir()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult {
+                sessions: vec![],
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            }));
         };
         Ok(Some(file_scan::run_file_scan_with_options(
             store,

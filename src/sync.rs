@@ -375,13 +375,11 @@ impl SyncJob {
             self.stats.excluded_out += n;
         }
 
-        let Some(scan_result) =
-            self.scan_sessions(adapter, source_id, label, &mut purged_excluded_ids)?
-        else {
+        let Some(scan_result) = self.scan_sessions(adapter, label)? else {
             return Ok(());
         };
         let adapters::SyncScanOutput {
-            scan: adapters::SyncScanResult { sessions: raw_sessions, stats: scan },
+            scan: adapters::SyncScanResult { sessions: raw_sessions, stats: scan, observations },
             reconcile,
         } = scan_result;
 
@@ -390,6 +388,17 @@ impl SyncJob {
         for (done, raw) in raw_sessions.into_iter().enumerate() {
             self.progress.indexing(label, done, found);
             self.process_raw_session(source_id, raw, &mut existing, &mut purged_excluded_ids)?;
+        }
+        self.apply_source_observations(source_id, observations, &mut existing)?;
+        if let Some(matcher) = &self.path_excluder {
+            let n = delete_excluded_sessions_for_source(
+                &self.store,
+                source_id,
+                matcher,
+                &self.options.scope,
+                &mut purged_excluded_ids,
+            )?;
+            self.stats.excluded_out += n;
         }
         self.reconcile_source(source_id, label, reconcile)?;
 
@@ -411,9 +420,7 @@ impl SyncJob {
     fn scan_sessions(
         &mut self,
         adapter: &dyn adapters::SourceAdapter,
-        source_id: &str,
         label: &str,
-        purged_excluded_ids: &mut HashSet<String>,
     ) -> Result<Option<adapters::SyncScanOutput>> {
         if self.options.verbose {
             println!("Scanning {label}...");
@@ -456,6 +463,7 @@ impl SyncJob {
                             parsed,
                             ..Default::default()
                         },
+                        observations: Vec::new(),
                     },
                     reconcile: None,
                 }
@@ -463,20 +471,58 @@ impl SyncJob {
         };
         self.stats.skipped += scan_result.scan.stats.skipped_sessions;
         self.stats.filtered_out += scan_result.scan.stats.filtered_sessions;
-        if let Some(matcher) = &self.path_excluder {
-            let n = delete_excluded_sessions_for_source(
-                &self.store,
-                source_id,
-                matcher,
-                &self.options.scope,
-                purged_excluded_ids,
-            )?;
-            self.stats.excluded_out += n;
-        }
         if self.options.verbose {
             println!("  Found {} sessions", scan_result.scan.sessions.len());
         }
         Ok(Some(scan_result))
+    }
+
+    fn apply_source_observations(
+        &mut self,
+        source_id: &str,
+        observations: Vec<adapters::SourceObservation>,
+        existing: &mut ExistingState,
+    ) -> Result<()> {
+        for observation in observations {
+            let Some(stored) = existing.paths.get_mut(&observation.source_id) else {
+                continue;
+            };
+            let repo_identity = self.repo_cache.resolve(stored.directory.as_deref());
+            if !self.options.scope.matches(SessionScopeFields {
+                directory: stored.directory.as_deref(),
+                repo_remote: stored
+                    .repo_remote
+                    .as_deref()
+                    .or_else(|| repo_identity.as_ref().map(|repo| repo.remote.as_str())),
+                repo_slug: stored
+                    .repo_slug
+                    .as_deref()
+                    .or_else(|| repo_identity.as_ref().map(|repo| repo.slug.as_str())),
+                repo_name: stored
+                    .repo_name
+                    .as_deref()
+                    .or_else(|| repo_identity.as_ref().map(|repo| repo.name.as_str())),
+            }) {
+                continue;
+            }
+            if let Some(source_file_path) = observation.source_file_path.as_deref()
+                && stored.source_file_path.as_deref() != Some(source_file_path)
+            {
+                self.store.update_session_fields(
+                    source_id,
+                    &observation.source_id,
+                    None,
+                    None,
+                    None,
+                    Some(source_file_path),
+                )?;
+                stored.source_file_path = Some(source_file_path.to_string());
+            }
+            if existing.imported_ids.remove(&observation.source_id) {
+                self.store.clear_import_marker(source_id, &observation.source_id)?;
+            }
+        }
+        Ok(())
     }
 
     fn reconcile_source(
@@ -1109,14 +1155,17 @@ fn path_or_ancestor_matches(path: &str, matcher: &globset::GlobSet) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::path::PathBuf;
 
+    use crate::adapters::file_scan::{self, FileScanEntry};
     use crate::adapters::{
         InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
-        SyncScanOutput, SyncScanResult,
+        SourceObservation, SyncScanOutput, SyncScanResult,
     };
     use crate::config::AppConfig;
     use crate::db::{
         schema,
+        search::RepoFilter,
         store::{SessionPath, Store},
     };
     use crate::project_scope::ProjectScope;
@@ -1140,6 +1189,12 @@ mod tests {
     struct ReconcileAdapter {
         plan: ReconcilePlan,
         include_session: bool,
+    }
+
+    struct ObservationAdapter {
+        directory: Option<&'static str>,
+        include_session: bool,
+        failing_path: Option<PathBuf>,
     }
 
     impl SourceAdapter for FailingAdapter {
@@ -1195,8 +1250,76 @@ mod tests {
             _force: bool,
         ) -> anyhow::Result<Option<SyncScanOutput>> {
             Ok(Some(SyncScanOutput {
-                scan: SyncScanResult { sessions: self.scan()?, stats: Default::default() },
+                scan: SyncScanResult {
+                    sessions: self.scan()?,
+                    stats: Default::default(),
+                    observations: Vec::new(),
+                },
                 reconcile: Some(self.plan.clone()),
+            }))
+        }
+
+        fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
+            None
+        }
+    }
+
+    impl SourceAdapter for ObservationAdapter {
+        fn id(&self) -> &str {
+            "test"
+        }
+
+        fn label(&self) -> &str {
+            "Test"
+        }
+
+        fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
+            if self.include_session {
+                return Ok(vec![RawSession::search_only(
+                    "new",
+                    self.directory.map(str::to_string),
+                    1_000,
+                    Some(2_000),
+                    None,
+                    vec![RawMessage {
+                        role: Role::User,
+                        content: "new".to_string(),
+                        timestamp: Some(2_000),
+                    }],
+                )]);
+            }
+            Ok(Vec::new())
+        }
+
+        fn scan_for_sync_output(
+            &self,
+            store: &Store,
+            since_ts: Option<i64>,
+            _include_events: bool,
+            _force: bool,
+        ) -> anyhow::Result<Option<SyncScanOutput>> {
+            if let Some(path) = &self.failing_path {
+                let entry = FileScanEntry {
+                    session_id: "observed".to_string(),
+                    stat_target: path.clone(),
+                    directory: None,
+                };
+                let scan =
+                    file_scan::run_file_scan(store, "test", since_ts, vec![entry], |_, _| {
+                        anyhow::bail!("injected parse failure")
+                    })?;
+                return Ok(Some(SyncScanOutput { scan, reconcile: None }));
+            }
+            Ok(Some(SyncScanOutput {
+                scan: SyncScanResult {
+                    sessions: self.scan()?,
+                    stats: Default::default(),
+                    observations: vec![SourceObservation {
+                        source_id: "observed".to_string(),
+                        source_file_path: Some("/tmp/observed.jsonl".to_string()),
+                    }],
+                },
+                reconcile: None,
             }))
         }
 
@@ -1243,6 +1366,7 @@ mod tests {
             Ok(Some(crate::adapters::SyncScanResult {
                 sessions: self.scan()?,
                 stats: Default::default(),
+                observations: Vec::new(),
             }))
         }
 
@@ -1530,6 +1654,145 @@ mod tests {
         job.run_with(&adapters, None).unwrap();
 
         assert!(job.store.session_meta("test", "stale").unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_file_parse_does_not_apply_source_observation() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ObservationAdapter {
+            directory: None,
+            include_session: false,
+            failing_path: Some(file.path().to_path_buf()),
+        })];
+        let mut job = global_job(&adapters);
+        let mut imported = session("imported", "test", "observed");
+        imported.is_import = true;
+        job.store.insert_session(&imported).unwrap();
+
+        job.run_with(&adapters, None).unwrap();
+
+        let stored = job.store.list_recent_sessions(10).unwrap().pop().unwrap();
+        assert!(stored.is_import);
+        assert!(stored.source_file_path.is_none());
+    }
+
+    #[test]
+    fn successful_skipped_observation_updates_path_and_clears_import_marker() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ObservationAdapter {
+            directory: None,
+            include_session: false,
+            failing_path: None,
+        })];
+        let mut job = global_job(&adapters);
+        let mut imported = session("imported", "test", "observed");
+        imported.is_import = true;
+        job.store.insert_session(&imported).unwrap();
+
+        job.run_with(&adapters, None).unwrap();
+
+        let stored = job.store.list_recent_sessions(10).unwrap().pop().unwrap();
+        assert!(!stored.is_import);
+        assert_eq!(stored.source_file_path.as_deref(), Some("/tmp/observed.jsonl"));
+    }
+
+    #[test]
+    fn scoped_observation_without_directory_uses_stored_session_scope() {
+        let scopes = [
+            ProjectScope::Directory("/repo/root".to_string()),
+            ProjectScope::Repository {
+                filter: RepoFilter::Name("unmatched".to_string()),
+                local_root: Some("/repo/root".to_string()),
+            },
+        ];
+        for scope in scopes {
+            let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ObservationAdapter {
+                directory: None,
+                include_session: false,
+                failing_path: None,
+            })];
+            let (mut job, _) = scoped_job(scope);
+            let mut imported = session("imported", "test", "observed");
+            imported.directory = Some("/repo/root/project".to_string());
+            imported.is_import = true;
+            job.store.insert_session(&imported).unwrap();
+
+            job.run_with(&adapters, None).unwrap();
+
+            let stored = job.store.list_recent_sessions(10).unwrap().pop().unwrap();
+            assert!(!stored.is_import);
+            assert_eq!(stored.source_file_path.as_deref(), Some("/tmp/observed.jsonl"));
+        }
+    }
+
+    #[test]
+    fn skipped_observation_applies_path_exclusion_after_success() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ObservationAdapter {
+            directory: None,
+            include_session: false,
+            failing_path: None,
+        })];
+        let mut config = AppConfig::default();
+        config.excluded_paths = vec!["**/observed.jsonl".to_string()];
+        let mut job = SyncJob::new(
+            SyncRunOptions {
+                force: false,
+                verbose: false,
+                emit: false,
+                usage_only: false,
+                backfill_events: false,
+                sources: None,
+                scope: ProjectScope::Global,
+            },
+            Store::open_in_memory().unwrap(),
+            config,
+            &adapters,
+        )
+        .unwrap();
+        job.store.insert_session(&session("existing", "test", "observed")).unwrap();
+
+        job.run_with(&adapters, None).unwrap();
+
+        assert!(job.store.session_meta("test", "observed").unwrap().is_none());
+    }
+
+    #[test]
+    fn out_of_scope_observation_does_not_update_existing_session() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ObservationAdapter {
+            directory: Some("/elsewhere"),
+            include_session: false,
+            failing_path: None,
+        })];
+        let (mut job, _) = scoped_job(ProjectScope::Directory("/repo/root".to_string()));
+        let mut imported = session("imported", "test", "observed");
+        imported.directory = Some("/elsewhere".to_string());
+        imported.is_import = true;
+        job.store.insert_session(&imported).unwrap();
+
+        job.run_with(&adapters, None).unwrap();
+
+        let stored = job.store.list_recent_sessions(10).unwrap().pop().unwrap();
+        assert!(stored.is_import);
+        assert!(stored.source_file_path.is_none());
+    }
+
+    #[test]
+    fn session_processing_failure_does_not_apply_source_observation() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ObservationAdapter {
+            directory: None,
+            include_session: true,
+            failing_path: None,
+        })];
+        let mut job = global_job(&adapters);
+        let mut imported = session("imported", "test", "observed");
+        imported.is_import = true;
+        job.store.insert_session(&imported).unwrap();
+        job.store.conn.execute("DROP TABLE messages", []).unwrap();
+
+        assert!(job.run_with(&adapters, None).is_err());
+
+        let stored = job.store.list_recent_sessions(10).unwrap().pop().unwrap();
+        assert!(stored.is_import);
+        assert!(stored.source_file_path.is_none());
     }
 
     #[test]

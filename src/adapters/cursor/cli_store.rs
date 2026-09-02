@@ -53,7 +53,11 @@ pub(super) fn scan_for_sync(
     usage_parser_version: u32,
 ) -> anyhow::Result<SyncScanResult> {
     let Some(chats_dir) = resolve_chats_dir()? else {
-        return Ok(SyncScanResult { sessions: vec![], stats: Default::default() });
+        return Ok(SyncScanResult {
+            sessions: vec![],
+            stats: Default::default(),
+            observations: Vec::new(),
+        });
     };
     let entries = collect_store_entries(&chats_dir, covered);
     file_scan::run_file_scan_with_options_and_mtime(

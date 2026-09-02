@@ -183,6 +183,13 @@ pub(crate) struct SyncScanStats {
 pub(crate) struct SyncScanResult {
     pub(crate) sessions: Vec<RawSession>,
     pub(crate) stats: SyncScanStats,
+    pub(crate) observations: Vec<SourceObservation>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SourceObservation {
+    pub(crate) source_id: String,
+    pub(crate) source_file_path: Option<String>,
 }
 
 pub(crate) struct SyncScanOutput {

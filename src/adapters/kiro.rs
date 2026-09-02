@@ -9,8 +9,8 @@ use tracing::{debug, warn};
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-    first_timestamp, last_timestamp,
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SourceObservation, SyncScanResult,
+    SyncScanStats, first_timestamp, last_timestamp,
 };
 use crate::db::store::{SessionPath, Store};
 use crate::types::Role;
@@ -60,12 +60,16 @@ impl SourceAdapter for KiroAdapter {
                 parse_kiro_file_entry,
             )?
         } else {
-            SyncScanResult { sessions: Vec::new(), stats: SyncScanStats::default() }
+            SyncScanResult {
+                sessions: Vec::new(),
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            }
         };
 
         let paths = store.session_paths_for_source("kiro-cli").unwrap_or_default();
         reconcile_file_source_ids(&mut result.sessions, &paths);
-        let mut covered = covered_for_sqlite(&result.sessions, &paths);
+        let mut covered = covered_for_sqlite(&result.sessions, &result.observations, &paths);
         for session in scan_sqlite_sessions() {
             if covered_contains(&covered, &session.source_id) {
                 continue;
@@ -518,8 +522,15 @@ fn reconcile_file_source_ids(sessions: &mut [RawSession], paths: &[SessionPath])
     }
 }
 
-fn covered_for_sqlite(sessions: &[RawSession], paths: &[SessionPath]) -> HashSet<String> {
+fn covered_for_sqlite(
+    sessions: &[RawSession],
+    observations: &[SourceObservation],
+    paths: &[SessionPath],
+) -> HashSet<String> {
     let mut covered = covered_ids(sessions);
+    for observation in observations {
+        insert_id_keys(&mut covered, &observation.source_id);
+    }
     for path in paths {
         if path.source_file_path.is_some() {
             insert_id_keys(&mut covered, &path.source_id);
@@ -870,9 +881,31 @@ mod tests {
         let file = raw("file-1");
         let paths =
             [session_path("file-1", Some("/tmp/file.jsonl")), session_path("sqlite-only", None)];
-        let covered = covered_for_sqlite(&[file], &paths);
+        let covered = covered_for_sqlite(&[file], &[], &paths);
         assert!(covered_contains(&covered, "file-1"));
         assert!(!covered_contains(&covered, "sqlite-only"));
+    }
+
+    #[test]
+    fn observed_file_sessions_are_covered_before_sqlite_overlay() {
+        let result = SyncScanResult {
+            sessions: Vec::new(),
+            stats: SyncScanStats::default(),
+            observations: vec![crate::adapters::SourceObservation {
+                source_id: "file-1".to_string(),
+                source_file_path: Some("/tmp/file.jsonl".to_string()),
+            }],
+        };
+        let paths = [session_path("file-1", None)];
+
+        let covered = covered_for_sqlite(&result.sessions, &result.observations, &paths);
+
+        assert!(
+            result
+                .observations
+                .iter()
+                .all(|observation| covered_contains(&covered, &observation.source_id))
+        );
     }
 
     #[test]

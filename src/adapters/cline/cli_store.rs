@@ -34,7 +34,11 @@ pub(super) fn scan_for_sync(
     covered: &HashSet<String>,
 ) -> anyhow::Result<SyncScanResult> {
     let Some(sessions_dir) = resolve_sessions_dir()? else {
-        return Ok(SyncScanResult { sessions: vec![], stats: Default::default() });
+        return Ok(SyncScanResult {
+            sessions: vec![],
+            stats: Default::default(),
+            observations: Vec::new(),
+        });
     };
     let entries = collect_session_entries(&sessions_dir, covered);
     file_scan::run_file_scan_with_options_and_mtime(

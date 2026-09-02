@@ -42,7 +42,11 @@ impl SourceAdapter for KiloCodeAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_kilo_db()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult {
+                sessions: vec![],
+                stats: SyncScanStats::default(),
+                observations: Vec::new(),
+            }));
         };
         Ok(Some(opencode::scan_for_sync_conn(&conn, store, since_ts, "kilo-code", include_events)?))
     }

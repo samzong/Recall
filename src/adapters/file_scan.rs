@@ -9,7 +9,7 @@ use crate::adapters::sync_state::{
     event_state_is_current_for_mtime, metadata_state_is_current_for_mtime,
     usage_state_is_current_for_mtime,
 };
-use crate::adapters::{RawSession, SyncScanResult, SyncScanStats};
+use crate::adapters::{RawSession, SourceObservation, SyncScanResult, SyncScanStats};
 use crate::db::store::Store;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -178,7 +178,6 @@ where
     S: Fn(&FileScanEntry) -> Option<FileScanSnapshot<T>>,
 {
     let existing = store.session_meta_map(source_id)?;
-    let mut imported = store.imported_source_ids(source_id)?;
     let usage_state = match options.usage_parser_version {
         Some(_) => store.usage_state_meta_map(source_id)?,
         None => Default::default(),
@@ -192,6 +191,7 @@ where
         None => Default::default(),
     };
     let mut sessions = Vec::new();
+    let mut observations = Vec::new();
     let mut stats = SyncScanStats::default();
 
     for entry in entries {
@@ -201,26 +201,15 @@ where
             continue;
         };
         let mtime_ms = snapshot.effective_mtime_ms();
-
-        if existing.contains_key(&entry.session_id) {
-            if let Some(source_file_path) = entry.stat_target.to_str() {
-                store.update_session_fields(
-                    source_id,
-                    &entry.session_id,
-                    None,
-                    None,
-                    None,
-                    Some(source_file_path),
-                )?;
-            }
-            if imported.remove(&entry.session_id) {
-                store.clear_import_marker(source_id, &entry.session_id)?;
-            }
-        }
+        let observation = existing.contains_key(&entry.session_id).then(|| SourceObservation {
+            source_id: entry.session_id.clone(),
+            source_file_path: entry.stat_target.to_str().map(str::to_string),
+        });
 
         if let Some(cutoff) = since_ts
             && mtime_ms < cutoff
         {
+            observations.extend(observation);
             stats.filtered_sessions += 1;
             stats.rejected_before_parse += 1;
             continue;
@@ -244,6 +233,7 @@ where
                 mtime_ms,
             )
         {
+            observations.extend(observation);
             stats.skipped_sessions += 1;
             stats.rejected_before_parse += 1;
             continue;
@@ -256,11 +246,12 @@ where
             continue;
         }
         if let Some(raw) = raw {
+            observations.extend(observation);
             sessions.push(raw);
         }
     }
 
-    Ok(SyncScanResult { sessions, stats })
+    Ok(SyncScanResult { sessions, stats, observations })
 }
 
 pub(crate) fn stat_mtime_ms(path: &Path) -> Option<i64> {
@@ -345,6 +336,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(result.sessions.len(), 0);
+        assert!(result.observations.is_empty());
         assert_eq!(result.stats.skipped_sessions, 0);
         assert_eq!(result.stats.filtered_sessions, 0);
     }
@@ -365,6 +357,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.sessions.len(), 1);
+        assert!(result.observations.is_empty());
         assert_eq!(result.sessions[0].source_id, "sess-new");
         assert_eq!(result.stats.skipped_sessions, 0);
         let _ = fs::remove_file(&path);
@@ -379,6 +372,7 @@ mod tests {
             stat_target: path.clone(),
             directory: None,
         };
+        store.insert_session(&make_session("s1", "sess-changing", Some(0), 1)).unwrap();
 
         let result = run_file_scan_with_options_and_snapshot(
             &store,
@@ -398,6 +392,7 @@ mod tests {
         .unwrap();
 
         assert!(result.sessions.is_empty());
+        assert!(result.observations.is_empty());
         assert_eq!(result.stats.unstable_sessions, 1);
 
         let entry = FileScanEntry {
@@ -420,12 +415,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(retry.sessions.len(), 1);
+        assert_eq!(retry.observations.len(), 1);
         assert_eq!(retry.stats.unstable_sessions, 0);
         let _ = fs::remove_file(&path);
     }
 
     #[test]
-    fn matching_mtime_skips_without_parsing() {
+    fn matching_mtime_skip_returns_observation_without_parsing() {
         let store = setup_store();
         let path = temp_file_with_mtime("skip");
         let mtime_ms = stat_mtime_ms(&path).unwrap();
@@ -444,36 +440,32 @@ mod tests {
 
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
-        let paths = store.session_paths_for_source("test-source").unwrap();
-        let stored = paths.iter().find(|path| path.source_id == "sess-skip").unwrap();
-        assert_eq!(stored.source_file_path.as_deref(), path.to_str());
+        assert_eq!(
+            result.observations,
+            vec![SourceObservation {
+                source_id: "sess-skip".to_string(),
+                source_file_path: path.to_str().map(str::to_string),
+            }]
+        );
         let _ = fs::remove_file(&path);
     }
 
     #[test]
-    fn matching_mtime_skip_still_clears_import_marker() {
+    fn parse_rejection_does_not_return_observation() {
         let store = setup_store();
-        let path = temp_file_with_mtime("import-clear");
-        let mtime_ms = stat_mtime_ms(&path).unwrap();
-        let mut session = make_session("s1", "sess-imported", Some(mtime_ms), 1);
-        session.is_import = true;
-        store.insert_session(&session).unwrap();
-
+        let path = temp_file_with_mtime("parse-rejection");
+        store.insert_session(&make_session("s1", "sess-rejected", Some(0), 1)).unwrap();
         let entry = FileScanEntry {
-            session_id: "sess-imported".to_string(),
+            session_id: "sess-rejected".to_string(),
             stat_target: path.clone(),
             directory: None,
         };
 
-        let result = run_file_scan(&store, "test-source", None, vec![entry], |_, _| {
-            panic!("parse should not be called for skipped entry")
-        })
-        .unwrap();
+        let result =
+            run_file_scan(&store, "test-source", None, vec![entry], |_, _| Ok(None)).unwrap();
 
-        assert_eq!(result.stats.skipped_sessions, 1);
-        let sessions = store.list_recent_sessions(10).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert!(!sessions[0].is_import, "local raw backing must clear the import marker");
+        assert!(result.sessions.is_empty());
+        assert!(result.observations.is_empty());
         let _ = fs::remove_file(&path);
     }
 
@@ -705,9 +697,9 @@ mod tests {
 
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.filtered_sessions, 1);
-        let paths = store.session_paths_for_source("test-source").unwrap();
-        let stored = paths.iter().find(|path| path.source_id == "sess-old").unwrap();
-        assert_eq!(stored.source_file_path.as_deref(), path.to_str());
+        assert_eq!(result.observations.len(), 1);
+        assert_eq!(result.observations[0].source_id, "sess-old");
+        assert_eq!(result.observations[0].source_file_path.as_deref(), path.to_str());
         let _ = fs::remove_file(&path);
     }
 
