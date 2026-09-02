@@ -997,6 +997,31 @@ impl SyncJob {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn persist_raw_session_for_conformance(
+    store: Store,
+    source: &str,
+    raw: adapters::RawSession,
+) -> Result<Store> {
+    let mut job = SyncJob::new(
+        SyncRunOptions {
+            force: false,
+            verbose: false,
+            emit: false,
+            usage_only: false,
+            backfill_events: false,
+            sources: None,
+            scope: ProjectScope::Global,
+        },
+        store,
+        AppConfig::default(),
+        &[],
+    )?;
+    let mut existing = job.load_existing_state(source)?;
+    job.process_raw_session(source, raw, &mut existing, &mut HashSet::new())?;
+    Ok(job.store)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide_existing_session_action(
     usage_only: bool,
