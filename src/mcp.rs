@@ -115,6 +115,7 @@ struct FileHistoryArgs {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 struct SessionHit {
     session_id: String,
+    source_session_id: String,
     source: String,
     project: Option<String>,
     title: String,
@@ -152,6 +153,7 @@ struct EventList {
 struct SessionDetail {
     message: Option<String>,
     session_id: Option<String>,
+    source_session_id: Option<String>,
     source: Option<String>,
     project: Option<String>,
     title: Option<String>,
@@ -159,6 +161,8 @@ struct SessionDetail {
     timestamp: Option<String>,
     message_count: Option<u32>,
     returned_messages: usize,
+    first_message_seq: Option<u32>,
+    last_message_seq: Option<u32>,
     truncated: bool,
     messages: String,
 }
@@ -258,7 +262,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Search past AI coding sessions across Claude Code, Codex, OpenCode, Cursor, and other indexed tools. Use when the user asks whether they have seen an error, made a decision, or solved a similar problem before. Returns session id, source, project, title, matched excerpt, and ISO-8601 timestamp.",
+        description = "Search past AI coding sessions across Claude Code, Codex, OpenCode, Cursor, and other indexed tools. Use when the user asks whether they have seen an error, made a decision, or solved a similar problem before. Returns Recall session_id, source-native source_session_id, source, project, title, matched excerpt, and ISO-8601 timestamp.",
         annotations(
             title = "Search sessions",
             read_only_hint = true,
@@ -274,7 +278,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Load one indexed session by Recall session_id. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 characters. Returns metadata plus messages as plain text in sequence order.",
+        description = "Load one indexed session by Recall session_id. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 characters. Returns metadata, including source-native source_session_id and the first_message_seq and last_message_seq represented by the response, plus messages as plain text in sequence order.",
         annotations(
             title = "Get session",
             read_only_hint = true,
@@ -293,7 +297,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "List the most recently active indexed sessions, newest first. Use to browse what the user has been working on when there is no search query. Each hit has the same shape as search_sessions: session id, source, project, title, excerpt (summary when present), and ISO-8601 timestamp.",
+        description = "List the most recently active indexed sessions, newest first. Use to browse what the user has been working on when there is no search query. Each hit has the same shape as search_sessions: Recall session_id, source-native source_session_id, source, project, title, excerpt (summary when present), and ISO-8601 timestamp.",
         annotations(
             title = "List recent sessions",
             read_only_hint = true,
@@ -559,10 +563,12 @@ fn get_ready(store: &Store, args: &GetSessionArgs) -> std::result::Result<Sessio
     };
     let max_messages = clamp_limit(args.max_messages, GET_MAX_MESSAGES_DEFAULT, u32::MAX);
     let messages = store.get_messages(&session.id).map_err(|error| error.to_string())?;
-    let (text, returned, truncated) = render_messages(&messages, max_messages, args.tail);
+    let (text, returned, truncated, first_message_seq, last_message_seq) =
+        render_messages(&messages, max_messages, args.tail);
     Ok(SessionDetail {
         message: None,
         session_id: Some(session.id.clone()),
+        source_session_id: Some(session.source_id.clone()),
         source: Some(session.source.clone()),
         project: session.directory.clone(),
         title: Some(session_title(&session)),
@@ -570,6 +576,8 @@ fn get_ready(store: &Store, args: &GetSessionArgs) -> std::result::Result<Sessio
         timestamp: Some(iso8601(session.started_at)),
         message_count: Some(session.message_count),
         returned_messages: returned,
+        first_message_seq,
+        last_message_seq,
         truncated,
         messages: text,
     })
@@ -579,6 +587,7 @@ fn empty_detail(message: Option<String>) -> SessionDetail {
     SessionDetail {
         message,
         session_id: None,
+        source_session_id: None,
         source: None,
         project: None,
         title: None,
@@ -586,6 +595,8 @@ fn empty_detail(message: Option<String>) -> SessionDetail {
         timestamp: None,
         message_count: None,
         returned_messages: 0,
+        first_message_seq: None,
+        last_message_seq: None,
         truncated: false,
         messages: String::new(),
     }
@@ -614,6 +625,7 @@ fn store_is_empty(store: &Store) -> bool {
 fn session_hit(session: &Session, excerpt: Option<String>) -> SessionHit {
     SessionHit {
         session_id: session.id.clone(),
+        source_session_id: session.source_id.clone(),
         source: session.source.clone(),
         project: session.directory.clone(),
         title: session_title(session),
@@ -642,7 +654,11 @@ fn clamp_limit(limit: Option<u32>, default: u32, max: u32) -> usize {
     usize::try_from(limit.unwrap_or(default).clamp(1, max)).unwrap_or(max as usize)
 }
 
-fn render_messages(messages: &[Message], max_messages: usize, tail: bool) -> (String, usize, bool) {
+fn render_messages(
+    messages: &[Message],
+    max_messages: usize,
+    tail: bool,
+) -> (String, usize, bool, Option<u32>, Option<u32>) {
     let selected = if tail {
         messages.iter().rev().take(max_messages).collect::<Vec<_>>()
     } else {
@@ -663,13 +679,16 @@ fn render_messages(messages: &[Message], max_messages: usize, tail: bool) -> (St
             break;
         }
         bytes += extra;
-        blocks.push(block);
+        blocks.push((message.seq, block));
     }
     if tail {
         blocks.reverse();
     }
     let returned = blocks.len();
-    (blocks.join("\n\n"), returned, truncated)
+    let first_message_seq = blocks.first().map(|(seq, _)| *seq);
+    let last_message_seq = blocks.last().map(|(seq, _)| *seq);
+    let text = blocks.into_iter().map(|(_, block)| block).collect::<Vec<_>>().join("\n\n");
+    (text, returned, truncated, first_message_seq, last_message_seq)
 }
 
 fn role_label(role: &Role) -> &'static str {
@@ -768,6 +787,15 @@ mod tests {
         IndexState::Ready(store)
     }
 
+    fn without_fields(value: impl Serialize, fields: &[&str]) -> Value {
+        let mut value = to_json(value);
+        let object = value.as_object_mut().unwrap();
+        for field in fields {
+            object.remove(*field);
+        }
+        value
+    }
+
     #[test]
     fn missing_index_is_a_tool_error() {
         let index = IndexState::Unavailable { path: None, message: MISSING_INDEX.to_string() };
@@ -830,12 +858,24 @@ mod tests {
         .unwrap();
         assert_eq!(list.hits.len(), 1);
         assert_eq!(list.hits[0].session_id, "s1");
+        assert_eq!(list.hits[0].source_session_id, "src-s1");
         assert_eq!(list.hits[0].source, "codex");
         assert_eq!(list.hits[0].project.as_deref(), Some("/tmp/demo"));
         assert_eq!(list.hits[0].title, "iterator panic");
         assert!(list.hits[0].excerpt.as_deref().unwrap().contains("iterators"));
         assert_eq!(list.hits[0].timestamp, iso8601(2_000));
         assert!(list.message.is_none());
+        assert_eq!(
+            without_fields(&list.hits[0], &["source_session_id"]),
+            serde_json::json!({
+                "session_id": "s1",
+                "source": "codex",
+                "project": "/tmp/demo",
+                "title": "iterator panic",
+                "excerpt": "how do I use iterators in Rust",
+                "timestamp": iso8601(2_000),
+            })
+        );
     }
 
     #[test]
@@ -852,8 +892,10 @@ mod tests {
         .unwrap();
         assert_eq!(list.hits.len(), 2);
         assert_eq!(list.hits[0].session_id, "new");
+        assert_eq!(list.hits[0].source_session_id, "src-new");
         assert_eq!(list.hits[0].excerpt.as_deref(), Some("newer summary"));
         assert_eq!(list.hits[1].session_id, "old");
+        assert_eq!(list.hits[1].source_session_id, "src-old");
     }
 
     #[test]
@@ -895,7 +937,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(detail.session_id.as_deref(), Some("s1"));
+        assert_eq!(detail.source_session_id.as_deref(), Some("src-s1"));
         assert_eq!(detail.returned_messages, 1);
+        assert_eq!(detail.first_message_seq, Some(0));
+        assert_eq!(detail.last_message_seq, Some(0));
         assert!(detail.truncated);
         assert!(detail.messages.starts_with("[user] "));
         assert!(detail.messages.ends_with('…'));
@@ -903,6 +948,68 @@ mod tests {
         assert!(
             detail.messages.chars().count() <= "[user] ".chars().count() + GET_MESSAGE_CHAR_CAP
         );
+    }
+
+    #[test]
+    fn get_session_adds_provenance_without_changing_legacy_fields() {
+        let store = setup();
+        let mut stored = session("s1", "codex", "ordinary", 1_000);
+        stored.message_count = 2;
+        store.insert_session(&stored).unwrap();
+        store
+            .insert_messages(&[
+                message("s1", Role::User, "question", 4),
+                message("s1", Role::Assistant, "answer", 7),
+            ])
+            .unwrap();
+        let detail = get_session(
+            &ready(store),
+            &GetSessionArgs { session_id: "s1".into(), max_messages: None, tail: false },
+        )
+        .unwrap();
+
+        assert_eq!(detail.source_session_id.as_deref(), Some("src-s1"));
+        assert_eq!(detail.first_message_seq, Some(4));
+        assert_eq!(detail.last_message_seq, Some(7));
+        assert_eq!(
+            without_fields(
+                &detail,
+                &["source_session_id", "first_message_seq", "last_message_seq"]
+            ),
+            serde_json::json!({
+                "message": null,
+                "session_id": "s1",
+                "source": "codex",
+                "project": "/tmp/demo",
+                "title": "ordinary",
+                "summary": "ordinary summary",
+                "timestamp": iso8601(1_000),
+                "message_count": 2,
+                "returned_messages": 2,
+                "truncated": false,
+                "messages": "[user] question\n\n[assistant] answer",
+            })
+        );
+    }
+
+    #[test]
+    fn get_session_empty_messages_have_null_sequence_range() {
+        let store = setup();
+        let mut stored = session("s1", "codex", "empty", 1_000);
+        stored.message_count = 0;
+        store.insert_session(&stored).unwrap();
+        let detail = get_session(
+            &ready(store),
+            &GetSessionArgs { session_id: "s1".into(), max_messages: None, tail: false },
+        )
+        .unwrap();
+
+        assert_eq!(detail.source_session_id.as_deref(), Some("src-s1"));
+        assert_eq!(detail.returned_messages, 0);
+        assert_eq!(detail.first_message_seq, None);
+        assert_eq!(detail.last_message_seq, None);
+        assert!(!detail.truncated);
+        assert!(detail.messages.is_empty());
     }
 
     #[test]
@@ -928,6 +1035,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(detail.returned_messages, 2);
+        assert_eq!(detail.first_message_seq, Some(2));
+        assert_eq!(detail.last_message_seq, Some(3));
         assert!(detail.truncated);
         assert_eq!(detail.messages, "[user] third\n\n[assistant] fourth");
     }
@@ -958,8 +1067,11 @@ mod tests {
         .unwrap();
 
         assert!(detail.truncated);
-        assert!(detail.returned_messages < 20);
-        assert!(!detail.messages.contains("message-00-"));
+        assert_eq!(detail.returned_messages, 15);
+        assert_eq!(detail.first_message_seq, Some(5));
+        assert_eq!(detail.last_message_seq, Some(19));
+        assert!(!detail.messages.contains("message-04-"));
+        assert!(detail.messages.contains("message-05-"));
         assert!(
             detail.messages.rsplit("\n\n").next().unwrap().starts_with("[assistant] message-19-")
         );
@@ -1071,6 +1183,8 @@ mod tests {
         )
         .unwrap();
         assert!(detail.truncated);
+        assert_eq!(detail.first_message_seq, Some(0));
+        assert_eq!(detail.last_message_seq, Some(0));
         assert!(detail.messages.ends_with('…'));
         assert_eq!(
             detail.messages.chars().count(),
@@ -1114,6 +1228,8 @@ mod tests {
             .expect("get_session capability");
 
         assert!(get_session["inputSchema"]["properties"]["tail"].is_object());
+        assert!(get_session["description"].as_str().unwrap().contains("source_session_id"));
+        assert!(get_session["description"].as_str().unwrap().contains("first_message_seq"));
         assert!(report.server.capabilities.tools.is_some());
         let text = render_capabilities(&report);
         assert!(text.contains("get_session"));

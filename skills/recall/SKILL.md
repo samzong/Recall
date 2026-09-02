@@ -22,6 +22,8 @@ If neither MCP nor the installed CLI is available, stop and offer `brew install 
 
 Use MCP `list_recent_sessions` without a query, `search_sessions` with a query, and `get_session` only when transcript evidence is needed.
 
+MCP search and recent hits expose `session_id` as Recall's index identity and `source_session_id` as the source tool's session identity. `get_session` returns both identities plus `first_message_seq` and `last_message_seq` for the messages represented in its text; both sequence fields are null when no messages are returned.
+
 Use the equivalent CLI workflow when needed:
 
 ```bash
