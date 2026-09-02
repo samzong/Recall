@@ -30,8 +30,11 @@ cargo test integration::regression    # regression suite
 cargo test integration::eval_harness  # eval harness
 ```
 
-`make check` must pass before push. CI runs exactly the same command — there is
-no CI-only logic. The gate uses `--workspace` and `--features bench`, so it
+`make check` must pass before push. CI runs exactly the same command. Its only
+extra job, on pushes to `main`, is the release-binary build from
+`build-binaries.yml`: it exists to keep the per-target caches warm, because a
+tag-triggered run can only restore caches saved from `main`. The gate uses
+`--workspace` and `--features bench`, so it
 covers extension crates, `crates/rx`, and the `bench_api` shim that `benches/` compiles
 against. Build a single extension with `cargo build -p recall-<name>`. Build the
 launcher with `cargo build -p rx`.
@@ -42,7 +45,10 @@ the release, not derived from the commit types. A pre-release hook prepends the
 changelog entry for that version with git-cliff, so `CHANGELOG.md` is part of
 the release commit and of the tag it describes, and the GitHub release notes
 are read back out of it. Existing changelog content is never rewritten, so
-hand-written upgrade notes survive. The `v*` tag triggers the binary build.
+hand-written upgrade notes survive. The `v*` tag triggers the Release workflow:
+`make check` on the tag runs in parallel with the four platform builds, and
+publishing requires both to pass and every binary to come from the validated
+commit.
 Extensions release independently: bumping an extension's package version in a
 PR is the release intent — after merge, a workflow creates the
 `recall-<name>-v<version>` tag, builds binaries, and regenerates the catalog.

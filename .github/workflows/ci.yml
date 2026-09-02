@@ -20,9 +20,15 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-audit --locked --version 0.22.2
-      - uses: actions/cache@v5
         with:
-          path: ~/.cache/ort.pyke.io
-          key: ort-${{ hashFiles('Cargo.lock') }}
+          shared-key: check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo install cargo-audit --locked --version 0.22.2
       - run: make check
+
+  release-cache:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      ref: ${{ github.sha }}
+      save-cache: true

@@ -38,15 +38,30 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
         semantic::ensure_background_worker(true)?;
     }
 
+    fn restore_terminal() {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+    }
+
     struct TerminalGuard;
     impl Drop for TerminalGuard {
         fn drop(&mut self) {
-            let _ = disable_raw_mode();
-            let _ =
-                execute!(io::stdout(), crossterm::event::DisableMouseCapture, LeaveAlternateScreen);
+            restore_terminal();
         }
     }
 
+    let previous_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if cfg!(panic = "abort") {
+            restore_terminal();
+        }
+        previous_panic_hook(info);
+    }));
     enable_raw_mode()?;
     let guard = TerminalGuard;
     let mut stdout = io::stdout();
