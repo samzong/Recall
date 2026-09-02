@@ -408,7 +408,8 @@ fn export_jsonl_reads_every_record_from_one_snapshot() {
     )
     .unwrap();
     schema::init(&conn).unwrap();
-    let store = Store { conn };
+    let store =
+        Store { trigram_message_flag: schema::has_trigram_message_flag(&conn).unwrap(), conn };
 
     let mut first = make_session("s1", "codex", "raw1", "version-a");
     first.started_at = 2;

@@ -1,6 +1,6 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -43,8 +43,11 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 10 {
         migrate_v10(conn)?;
     }
-    if version < SCHEMA_VERSION {
+    if version < 11 {
         migrate_v11(conn)?;
+    }
+    if version < SCHEMA_VERSION || fts_needs_trigram_rebuild(conn)? {
+        migrate_v12(conn)?;
     }
     Ok(())
 }
@@ -357,6 +360,164 @@ fn migrate_v11(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn fts_needs_trigram_rebuild(conn: &Connection) -> anyhow::Result<bool> {
+    let has_messages: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_messages == 0 {
+        return Ok(false);
+    }
+    let has_flag = has_trigram_message_flag(conn)?;
+    let trigger_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger'
+           AND name IN ('messages_trigram_ai', 'messages_trigram_ad')
+           AND instr(sql, 'trigram_indexed IS NULL') > 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!has_flag || trigger_count != 2 || !has_trigram_fts(conn)?)
+}
+
+pub(crate) fn has_trigram_message_flag(conn: &Connection) -> anyhow::Result<bool> {
+    let has_flag: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('messages') WHERE name = 'trigram_indexed'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(has_flag != 0)
+}
+
+pub(crate) fn has_trigram_fts(conn: &Connection) -> anyhow::Result<bool> {
+    let fts_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts_trigram'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(fts_sql.is_some_and(|sql| sql.contains("trigram")))
+}
+
+fn migrate_v12(conn: &Connection) -> anyhow::Result<()> {
+    let file_backed = conn.path().is_some_and(|path| !path.is_empty());
+    migrate_v12_with_lock(conn, file_backed, crate::utils::try_acquire_worker_lock)
+}
+
+fn migrate_v12_with_lock<T>(
+    conn: &Connection,
+    file_backed: bool,
+    acquire_lock: impl FnOnce() -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<()> {
+    if !fts_needs_trigram_rebuild(conn)? {
+        if read_schema_version(conn)? < SCHEMA_VERSION {
+            conn.execute_batch("PRAGMA user_version = 12;")?;
+        }
+        return Ok(());
+    }
+
+    let _lock = if file_backed {
+        let Some(lock) = acquire_lock()? else {
+            eprintln!(
+                "Search index upgrade deferred: background indexing is running; will retry on next launch."
+            );
+            return Ok(());
+        };
+        Some(lock)
+    } else {
+        None
+    };
+
+    if !fts_needs_trigram_rebuild(conn)? {
+        if read_schema_version(conn)? < SCHEMA_VERSION {
+            conn.execute_batch("PRAGMA user_version = 12;")?;
+        }
+        return Ok(());
+    }
+
+    eprintln!("Upgrading search index (one-time; may take a minute on large databases)...");
+    let started = std::time::Instant::now();
+    let version = read_schema_version(conn)?;
+    let version_update = if version < SCHEMA_VERSION { "PRAGMA user_version = 12;" } else { "" };
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE messages ADD COLUMN trigram_indexed INTEGER
+         CHECK (trigram_indexed IN (0, 1))",
+    )?;
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(err) = rebuild_trigram_fts(conn, version_update) {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(err);
+    }
+    if file_backed {
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        eprintln!("Search index upgraded in {:.0?}.", started.elapsed());
+    }
+    Ok(())
+}
+
+fn rebuild_trigram_fts(conn: &Connection, version_update: &str) -> anyhow::Result<()> {
+    backfill_trigram_flags(conn)?;
+    conn.execute_batch(&format!(
+        "
+        DROP TRIGGER IF EXISTS messages_trigram_ai;
+        DROP TRIGGER IF EXISTS messages_trigram_ad;
+        DROP TABLE IF EXISTS messages_fts_trigram;
+
+        CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(
+            content,
+            content=messages,
+            content_rowid=id,
+            tokenize='trigram remove_diacritics 1'
+        );
+
+        CREATE TRIGGER messages_trigram_ai AFTER INSERT ON messages
+        WHEN new.trigram_indexed = 1
+          OR new.trigram_indexed IS NULL BEGIN
+            INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, new.content);
+        END;
+
+        CREATE TRIGGER messages_trigram_ad AFTER DELETE ON messages
+        WHEN old.trigram_indexed = 1
+          OR old.trigram_indexed IS NULL BEGIN
+            INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content)
+            VALUES('delete', old.id, old.content);
+        END;
+
+        INSERT INTO messages_fts_trigram(rowid, content)
+        SELECT id, content FROM messages
+        WHERE trigram_indexed = 1;
+
+        {version_update}
+
+        COMMIT;
+        ",
+    ))?;
+    Ok(())
+}
+
+fn backfill_trigram_flags(conn: &Connection) -> anyhow::Result<()> {
+    let flags: Vec<(i64, bool)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, content FROM messages WHERE trigram_indexed IS NULL")?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let needs = crate::utils::text_needs_trigram(row.get_ref(1)?.as_str()?);
+            Ok((id, needs))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut update = conn.prepare("UPDATE messages SET trigram_indexed = ?2 WHERE id = ?1")?;
+    for (id, needs) in flags {
+        update.execute(rusqlite::params![id, needs])?;
+    }
+    Ok(())
+}
+
 fn add_column_if_missing(conn: &Connection, stmt: &str) -> anyhow::Result<()> {
     if let Err(err) = conn.execute(stmt, []) {
         let msg = err.to_string();
@@ -367,9 +528,13 @@ fn add_column_if_missing(conn: &Connection, stmt: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn read_schema_version(conn: &Connection) -> anyhow::Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(Into::into)
+}
+
 #[cfg(test)]
 pub(crate) fn schema_version(conn: &Connection) -> anyhow::Result<i64> {
-    conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(Into::into)
+    read_schema_version(conn)
 }
 
 pub(crate) const fn current_schema_version() -> i64 {
@@ -379,6 +544,8 @@ pub(crate) const fn current_schema_version() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::store::Store;
+    use crate::types::{Message, Role};
 
     #[test]
     fn migrate_v6_adds_metadata_columns_to_existing_v5_db() {
@@ -586,6 +753,191 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM session_parent_links", [], |row| row.get(0))
             .unwrap();
         assert_eq!(links, 0, "parent links cascade when their session is removed");
+    }
+
+    #[test]
+    fn init_adds_trigram_fts_even_when_user_version_is_ahead() {
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        migrate_v10(&conn).unwrap();
+        migrate_v11(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);
+             PRAGMA user_version = 13;",
+        )
+        .unwrap();
+        let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
+        let query = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, seq) VALUES ('s1', 'user', ?1, 0)",
+            [content],
+        )
+        .unwrap();
+
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0, "unicode61 cannot match a mid-clause CJK substring");
+
+        init(&conn).unwrap();
+
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1, "trigram rebuild must re-index existing rows for substring match");
+
+        init(&conn).unwrap();
+        let stable: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stable, 1, "ensure pass must be idempotent on an already-trigram index");
+
+        conn.execute("DELETE FROM sessions WHERE id = 's1'", []).unwrap();
+        let removed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(removed, 0, "trigram index must delete rows with their messages");
+    }
+
+    #[test]
+    fn init_recreates_missing_trigram_fts_and_reindexes_existing_messages() {
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);
+             INSERT INTO messages (session_id, role, content, seq)
+             VALUES ('s1', 'assistant', 'context cache', 1);",
+        )
+        .unwrap();
+        let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
+        let query = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, seq) VALUES ('s1', 'user', ?1, 0)",
+            [content],
+        )
+        .unwrap();
+        let old_write_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_write_hits, 1, "pre-v12 inserts must remain trigram searchable");
+        let old_latin_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH 'context'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_latin_hits, 1, "pre-v12 Latin inserts must remain trigram searchable");
+        conn.execute_batch("DROP TABLE messages_fts_trigram;").unwrap();
+
+        init(&conn).unwrap();
+
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "a missing FTS table must be recreated and reindexed on open");
+        let latin_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH 'context'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(latin_hits, 0, "rebuild must index only CJK legacy rows");
+    }
+
+    #[test]
+    fn migrate_v12_retries_after_worker_lock_deferral() {
+        register_sqlite_vec();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(db.path()).unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        migrate_v10(&conn).unwrap();
+        migrate_v11(&conn).unwrap();
+
+        migrate_v12_with_lock(&conn, true, || Ok::<Option<()>, anyhow::Error>(None)).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 11);
+        assert!(!has_trigram_fts(&conn).unwrap());
+
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);",
+        )
+        .unwrap();
+        let store = Store { trigram_message_flag: has_trigram_message_flag(&conn).unwrap(), conn };
+        let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
+        let query = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
+        store
+            .insert_messages(&[Message {
+                session_id: "s1".to_string(),
+                role: Role::User,
+                content: content.to_string(),
+                timestamp: None,
+                seq: 0,
+            }])
+            .unwrap();
+
+        migrate_v12_with_lock(&store.conn, true, || Ok::<Option<()>, anyhow::Error>(Some(())))
+            .unwrap();
+        assert_eq!(schema_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        assert!(has_trigram_fts(&store.conn).unwrap());
+        let hits: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "messages written during deferral must join the rebuilt index");
     }
 
     #[test]

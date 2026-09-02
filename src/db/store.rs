@@ -31,6 +31,7 @@ pub(crate) fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sess
 
 pub(crate) struct Store {
     pub(crate) conn: Connection,
+    pub(crate) trigram_message_flag: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +121,8 @@ impl Store {
              PRAGMA foreign_keys=ON;",
         )?;
         crate::db::schema::init(&conn)?;
-        Ok(Store { conn })
+        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
+        Ok(Store { conn, trigram_message_flag })
     }
 
     pub(crate) fn open_read_only_at(path: &Path) -> Result<Self> {
@@ -130,7 +132,8 @@ impl Store {
              PRAGMA busy_timeout=5000;
              PRAGMA foreign_keys=ON;",
         )?;
-        Ok(Store { conn })
+        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
+        Ok(Store { conn, trigram_message_flag })
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -138,7 +141,8 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
         crate::db::schema::init(&conn)?;
-        Ok(Store { conn })
+        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
+        Ok(Store { conn, trigram_message_flag })
     }
 
     #[cfg(test)]
@@ -153,7 +157,8 @@ impl Store {
              PRAGMA foreign_keys=ON;",
         )?;
         crate::db::schema::init(&conn)?;
-        Ok(Store { conn })
+        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
+        Ok(Store { conn, trigram_message_flag })
     }
 }
 

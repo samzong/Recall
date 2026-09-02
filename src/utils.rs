@@ -1,5 +1,51 @@
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+
+use fs2::FileExt;
+
+pub(crate) fn text_needs_trigram(text: &str) -> bool {
+    if text.is_ascii() {
+        return false;
+    }
+    text.chars().any(|c| {
+        matches!(
+            c,
+            '\u{3400}'..='\u{9fff}'
+                | '\u{f900}'..='\u{faff}'
+                | '\u{3040}'..='\u{30ff}'
+                | '\u{3100}'..='\u{318f}'
+                | '\u{31a0}'..='\u{31bf}'
+                | '\u{31f0}'..='\u{31ff}'
+                | '\u{a960}'..='\u{a97f}'
+                | '\u{ac00}'..='\u{d7ff}'
+                | '\u{ff66}'..='\u{ff9f}'
+                | '\u{20000}'..='\u{323af}'
+        )
+    })
+}
+
+pub(crate) fn try_acquire_worker_lock() -> anyhow::Result<Option<File>> {
+    let path = worker_lock_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file =
+        OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            file.set_len(0)?;
+            writeln!(file, "{}", std::process::id())?;
+            Ok(Some(file))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn worker_lock_path() -> anyhow::Result<std::path::PathBuf> {
+    let dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
+    Ok(dir.join("recall").join("background-worker.lock"))
+}
 
 pub(crate) fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {

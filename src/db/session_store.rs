@@ -152,21 +152,7 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn insert_messages(&self, messages: &[Message]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO messages (session_id, role, content, timestamp, seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            for msg in messages {
-                stmt.execute(rusqlite::params![
-                    msg.session_id,
-                    msg.role.as_str(),
-                    msg.content,
-                    msg.timestamp,
-                    msg.seq,
-                ])?;
-            }
-        }
+        insert_messages_tx(&tx, messages, self.trigram_message_flag)?;
         tx.commit()?;
         Ok(())
     }
@@ -231,6 +217,7 @@ impl Store {
             session_events,
             event_parser_version,
             topology,
+            self.trigram_message_flag,
         )?;
         tx.commit()?;
         Ok(())
@@ -286,6 +273,7 @@ impl Store {
             session_events,
             event_parser_version,
             topology,
+            self.trigram_message_flag,
         )?;
         tx.commit()?;
         Ok(())
@@ -709,6 +697,7 @@ fn persist_session_with_usage_and_events_tx(
     session_events: &[RawSessionEvent],
     event_parser_version: Option<u32>,
     topology: &SessionTopologyWrite<'_>,
+    trigram_message_flag: bool,
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import, thread_role, metadata_parser_version)
@@ -738,21 +727,7 @@ fn persist_session_with_usage_and_events_tx(
 
     replace_parent_links_tx(tx, &session.id, topology.parents)?;
 
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO messages (session_id, role, content, timestamp, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for msg in messages {
-            stmt.execute(rusqlite::params![
-                msg.session_id,
-                msg.role.as_str(),
-                msg.content,
-                msg.timestamp,
-                msg.seq,
-            ])?;
-        }
-    }
+    insert_messages_tx(tx, messages, trigram_message_flag)?;
 
     {
         tx.execute(
@@ -884,6 +859,45 @@ fn persist_session_with_usage_and_events_tx(
         )?;
     }
 
+    Ok(())
+}
+
+fn insert_messages_tx(
+    tx: &rusqlite::Transaction<'_>,
+    messages: &[Message],
+    trigram_message_flag: bool,
+) -> Result<()> {
+    if trigram_message_flag {
+        let mut stmt = tx.prepare(
+            "INSERT INTO messages (
+                session_id, role, content, timestamp, seq, trigram_indexed
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for msg in messages {
+            stmt.execute(rusqlite::params![
+                msg.session_id,
+                msg.role.as_str(),
+                msg.content,
+                msg.timestamp,
+                msg.seq,
+                crate::utils::text_needs_trigram(&msg.content),
+            ])?;
+        }
+    } else {
+        let mut stmt = tx.prepare(
+            "INSERT INTO messages (session_id, role, content, timestamp, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for msg in messages {
+            stmt.execute(rusqlite::params![
+                msg.session_id,
+                msg.role.as_str(),
+                msg.content,
+                msg.timestamp,
+                msg.seq,
+            ])?;
+        }
+    }
     Ok(())
 }
 
