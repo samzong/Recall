@@ -161,6 +161,22 @@ enum ShareCommands {
         #[arg(long, help = "Local directory used for generated share pages")]
         publish_dir: Option<PathBuf>,
     },
+    #[command(about = "List published share pages")]
+    List {
+        #[arg(long, value_enum, default_value_t = crate::share::ShareFormat::Text)]
+        format: crate::share::ShareFormat,
+    },
+    #[command(about = "Remove a published share page and redeploy", visible_alias = "rm")]
+    Unpublish {
+        #[arg(help = "Share id from `recall share list`, or the published URL")]
+        id: String,
+        #[arg(long, help = "Show the target page without deleting or deploying")]
+        dry_run: bool,
+        #[arg(long, help = "Unpublish without confirmation")]
+        yes: bool,
+        #[arg(long, value_enum, default_value_t = crate::share::ShareFormat::Text)]
+        format: crate::share::ShareFormat,
+    },
 }
 
 #[derive(Subcommand)]
@@ -278,9 +294,15 @@ pub(crate) fn run() -> Result<()> {
             )?
         }
         Some(Commands::Import { file, dry_run }) => crate::import::run_cli(&file, dry_run)?,
-        Some(Commands::Share { command: ShareCommands::Init { project_name, publish_dir } }) => {
-            crate::share_init::run(project_name, publish_dir)?
-        }
+        Some(Commands::Share { command }) => match command {
+            ShareCommands::Init { project_name, publish_dir } => {
+                crate::share_init::run(project_name, publish_dir)?
+            }
+            ShareCommands::List { format } => crate::share::run_list(format)?,
+            ShareCommands::Unpublish { id, dry_run, yes, format } => {
+                crate::share::run_unpublish(&id, dry_run, yes, format)?
+            }
+        },
         Some(Commands::Skill {
             command: SkillCommands::Install { scope, agents, dry_run, yes },
         }) => run_skill_install(scope, agents, dry_run, yes)?,
@@ -529,6 +551,52 @@ mod tests {
                 assert_eq!(publish_dir.unwrap().to_string_lossy(), "/tmp/recall-share");
             }
             _ => panic!("expected share init command"),
+        }
+    }
+
+    #[test]
+    fn share_list_and_unpublish_parse() {
+        let list = Cli::try_parse_from(["recall", "share", "list", "--format", "json"]).unwrap();
+        match list.command {
+            Some(Commands::Share { command: ShareCommands::List { format } }) => {
+                assert_eq!(format, crate::share::ShareFormat::Json);
+            }
+            _ => panic!("expected share list command"),
+        }
+
+        let unpublish = Cli::try_parse_from([
+            "recall",
+            "share",
+            "unpublish",
+            "https://recall-share-test.pages.dev/abc-123",
+            "--dry-run",
+            "--yes",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        match unpublish.command {
+            Some(Commands::Share {
+                command: ShareCommands::Unpublish { id, dry_run, yes, format },
+            }) => {
+                assert_eq!(id, "https://recall-share-test.pages.dev/abc-123");
+                assert!(dry_run);
+                assert!(yes);
+                assert_eq!(format, crate::share::ShareFormat::Json);
+            }
+            _ => panic!("expected share unpublish command"),
+        }
+
+        let alias = Cli::try_parse_from(["recall", "share", "rm", "abc-123"]).unwrap();
+        match alias.command {
+            Some(Commands::Share {
+                command: ShareCommands::Unpublish { id, dry_run, yes, .. },
+            }) => {
+                assert_eq!(id, "abc-123");
+                assert!(!dry_run);
+                assert!(!yes);
+            }
+            _ => panic!("expected share rm alias"),
         }
     }
 

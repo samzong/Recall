@@ -26,6 +26,8 @@ recall export > recall-export.jsonl # 导出全部会话
 recall import recall-export.jsonl --dry-run  # 预览导入
 recall session list  # 为 agent/脚本列出会话
 recall session share --id <session-id> --format json  # 发布选中的一个会话
+recall share list --format json  # 列出已发布的分享地址
+recall share unpublish <share-id> --yes  # 下线一个公开页面
 recall info  # 索引统计与 worker 状态
 ```
 

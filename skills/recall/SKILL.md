@@ -1,6 +1,6 @@
 ---
 name: recall
-description: Use Recall as a project memory layer for local AI coding session history. Trigger when the user mentions recall, wants a live share link (分享会话/分享对话/分享这个对话/给我链接/share session/session link), wants to refresh or update an existing share link (更新分享链接/刷新分享/重新分享/update share link), resume or open a session, search or export sessions, review project history, recover decisions, find failed approaches, or inspect Claude Code/Codex/OpenCode/Cursor/Grok session evidence.
+description: Use Recall as a project memory layer for local AI coding session history. Trigger when the user mentions recall, wants a live share link (分享会话/分享对话/分享这个对话/给我链接/share session/session link), wants to refresh or update an existing share link (更新分享链接/刷新分享/重新分享/update share link), wants to list or unpublish existing share pages (列出分享/有哪些分享/取消分享/unpublish share), resume or open a session, search or export sessions, review project history, recover decisions, find failed approaches, or inspect Claude Code/Codex/OpenCode/Cursor/Grok session evidence.
 ---
 
 # Recall
@@ -23,6 +23,8 @@ Pick the workflow from user intent. Do not run the full project-review scoping f
 | --- | --- | --- |
 | Share a live link | "分享会话", "分享这个对话", "share this session", "给我链接" | Publish Or Refresh Share Link |
 | Refresh an existing link | "用 recall 更新分享链接", "刷新分享", "重新分享", "update the share link" | Publish Or Refresh Share Link |
+| List published shares | "有哪些分享", "列出分享链接", "what is currently shared" | List Published Shares |
+| Unpublish a share | "取消分享", "下线这个分享", "unpublish this share" | Unpublish Share Page |
 | Resume or open | "继续这个会话", "resume this chat" | Session Resume/Open |
 | Find one session | "找上次讨论 migration 的会话", "当前项目最新 grok 会话" | Latest/Find Session Lookup |
 | Review project history | "用 recall 审查这个项目", "历史风险" | Scoping Protocol + Analysis Modes |
@@ -146,6 +148,29 @@ When the user wants to share a session or update an existing share link, execute
 
 Sharing publishes session content to the configured share target. Warn briefly if the session may contain secrets.
 
+## List Published Shares
+
+When the user asks which sessions are currently shared or wants the live URLs, run:
+
+```bash
+recall share list --format json
+```
+
+Read `shares[].url`, `shares[].title`, and `shares[].share_id`. This lists the local publish inventory that the next Pages deploy publishes. If sharing is not initialized, tell the user to run `recall share init`.
+
+Reply with the URLs and titles. Do not dump raw JSON unless debugging.
+
+## Unpublish Share Page
+
+When the user asks to take a share down, do not unpublish until they confirm the exact URL.
+
+1. If they did not give a URL or share id, run `recall share list --format json` and ask which page to remove.
+2. After they confirm, run:
+   ```bash
+   recall share unpublish <share-id-or-url> --yes --format json
+   ```
+   `--yes` is required when stdin is not a terminal. Never unpublish because a share list was requested.
+
 ## Scoping Protocol
 
 When the request is broad, such as "use Recall to review this project", do not jump straight to full export. Ask one concise scoping question that makes Recall's value clear:
@@ -266,6 +291,8 @@ recall session export --id <session-id> --format jsonl
 recall session share --id <session-id> --format json
 recall session share --id <session-id> --tldr-file /tmp/recall-tldr.md --format json
 recall session share --id <session-id> --dry-run --format json  # preview only; never use for share/update requests
+recall share list --format json
+recall share unpublish <share-id-or-url> --yes --format json
 recall session resume --id <session-id> --print-command
 recall import recall-export.jsonl --dry-run
 recall import recall-export.jsonl
@@ -309,6 +336,7 @@ Do not use these as the primary workflow for analysis:
 - `recall usage` without `--json`: launches a dashboard flow.
 - `recall session share --dry-run` when the user asked to share, update, or refresh a link.
 - Returning a URL without running `recall session share` (no `--dry-run`).
+- `recall share unpublish` unless the user asked to take that public page down.
 - Resume or app-launch behavior from the TUI: it opens another interactive session and has side effects.
 - Hidden commands such as `__bench-*` or `__background-worker`: internal or development-only.
 - Raw source transcript paths: use the public export unless the user explicitly asks for source-level forensics.

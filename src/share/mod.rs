@@ -1,8 +1,10 @@
 mod assets;
+mod inventory;
 pub(crate) mod meta;
 mod publish;
 pub(crate) mod render;
 
+pub(crate) use inventory::{ShareFormat, run_list, run_unpublish};
 pub(crate) use publish::{
     default_project_name, default_publish_dir, expand_path, init_cloudflare_pages,
     open_session_preview, preflight_cloudflare_pages, preview_session_with_options,

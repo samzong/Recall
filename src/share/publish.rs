@@ -186,13 +186,8 @@ pub(crate) fn publish_session_with_options(
     deploy_pages(&preview.publish_dir, &preview.project_name)?;
     Ok(preview.url)
 }
-fn build_publish_preview(
-    config: &AppConfig,
-    session: &Session,
-    messages: &[Message],
-    usage_events: &[SessionUsageEventRecord],
-    options: &ShareRenderOptions,
-) -> Result<(SharePreview, String)> {
+
+pub(super) fn require_share_config(config: &AppConfig) -> Result<&ShareConfig> {
     let share = config
         .share
         .as_ref()
@@ -201,6 +196,27 @@ fn build_publish_preview(
         bail!("unsupported share provider '{}'", share.provider);
     }
     validate_project_name(&share.project_name)?;
+    Ok(share)
+}
+
+pub(super) fn share_page_url(project_domain: &str, share_id: &str) -> String {
+    format!("https://{project_domain}/{share_id}")
+}
+
+fn html_is_recall_share_page(html: &str) -> bool {
+    html.starts_with(SHARE_HTML_PREFIX)
+        && SHARE_HTML_SIGNATURES.iter().any(|signature| html.contains(signature))
+        && html.ends_with("</body></html>")
+}
+
+fn build_publish_preview(
+    config: &AppConfig,
+    session: &Session,
+    messages: &[Message],
+    usage_events: &[SessionUsageEventRecord],
+    options: &ShareRenderOptions,
+) -> Result<(SharePreview, String)> {
+    let share = require_share_config(config)?;
     let project_domain = configured_project_domain(share)?;
 
     let publish_dir = expand_path(&share.publish_dir);
@@ -222,14 +238,14 @@ fn build_publish_preview(
             publish_dir,
             file_path,
             share_id: share_id.clone(),
-            url: format!("https://{project_domain}/{share_id}"),
+            url: share_page_url(&project_domain, &share_id),
             html_bytes: html.len(),
         },
         html,
     ))
 }
 
-fn configured_project_domain(share: &ShareConfig) -> Result<String> {
+pub(super) fn configured_project_domain(share: &ShareConfig) -> Result<String> {
     if share.project_domain.is_empty() {
         resolve_pages_project_domain(&share.project_name).with_context(|| {
             format!(
@@ -243,12 +259,26 @@ fn configured_project_domain(share: &ShareConfig) -> Result<String> {
         Ok(share.project_domain.clone())
     }
 }
-fn init_publish_dir(publish_dir: &Path) -> Result<()> {
+
+pub(super) fn ensure_readable_publish_dir(publish_dir: &Path) -> Result<bool> {
+    if !publish_dir.exists() {
+        return Ok(false);
+    }
+    if publish_dir_is_unmanaged(publish_dir, publish_dir_has_marker(publish_dir))? {
+        bail!("publish directory {} is not managed by Recall", publish_dir.display());
+    }
+    Ok(true)
+}
+
+fn publish_dir_has_marker(publish_dir: &Path) -> bool {
+    let marker = publish_dir.join(PUBLISH_DIR_MARKER);
+    fs::read_to_string(&marker).is_ok_and(|contents| contents == PUBLISH_DIR_MARKER_CONTENT)
+}
+
+pub(super) fn init_publish_dir(publish_dir: &Path) -> Result<()> {
     fs::create_dir_all(publish_dir)
         .with_context(|| format!("failed to create {}", publish_dir.display()))?;
-    let marker = publish_dir.join(PUBLISH_DIR_MARKER);
-    let managed =
-        fs::read_to_string(&marker).is_ok_and(|contents| contents == PUBLISH_DIR_MARKER_CONTENT);
+    let managed = publish_dir_has_marker(publish_dir);
     if publish_dir_is_unmanaged(publish_dir, managed)? {
         bail!(
             "publish directory {} is not managed by Recall; choose an empty directory",
@@ -256,7 +286,7 @@ fn init_publish_dir(publish_dir: &Path) -> Result<()> {
         );
     }
     if !managed {
-        fs::write(&marker, PUBLISH_DIR_MARKER_CONTENT)?;
+        fs::write(publish_dir.join(PUBLISH_DIR_MARKER), PUBLISH_DIR_MARKER_CONTENT)?;
     }
     fs::write(publish_dir.join("_headers"), HEADERS)?;
     fs::write(publish_dir.join("robots.txt"), ROBOTS)?;
@@ -290,10 +320,7 @@ fn publish_dir_is_unmanaged(publish_dir: &Path, managed: bool) -> Result<bool> {
             }
             Some(name) if name.ends_with(".html") => {
                 let html = fs::read_to_string(entry.path())?;
-                if !html.starts_with(SHARE_HTML_PREFIX)
-                    || !SHARE_HTML_SIGNATURES.iter().any(|signature| html.contains(signature))
-                    || !html.ends_with("</body></html>")
-                {
+                if !html_is_recall_share_page(&html) {
                     return Ok(true);
                 }
             }
@@ -354,7 +381,7 @@ fn list_pages_projects() -> Result<serde_json::Value> {
         .map_err(|e| anyhow!("failed to parse wrangler project list JSON: {e}"))
 }
 
-fn deploy_pages(publish_dir: &Path, project_name: &str) -> Result<()> {
+pub(super) fn deploy_pages(publish_dir: &Path, project_name: &str) -> Result<()> {
     let output = wrangler_command()?
         .args(["pages", "deploy"])
         .arg(publish_dir)

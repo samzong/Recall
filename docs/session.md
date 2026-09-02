@@ -286,6 +286,99 @@ JSON output:
 }
 ```
 
+### `recall share list`
+
+List pages currently in the configured publish directory, with their public
+URLs. This is the local inventory that the next Cloudflare Pages deploy
+publishes; it is not a live crawl of `pages.dev`.
+
+```bash
+recall share list
+recall share list --format json
+```
+
+Options:
+
+- `--format <text|json>`: default `text`.
+
+Behavior:
+
+- Requires existing `recall share init` configuration.
+- Reads `*.html` files from the managed publish directory.
+- Reconstructs each URL as `https://{project_domain}/{share_id}`.
+- Title and source come from the rendered page when present.
+- A missing publish directory prints an empty list, not an error.
+- Refuses to list a directory that is not managed by Recall.
+
+JSON output:
+
+```json
+{
+  "provider": "cloudflare-pages",
+  "project_name": "recall-share-7f3a2c",
+  "project_domain": "recall-share-7f3a2c.pages.dev",
+  "publish_dir": "/Users/me/Library/Application Support/recall/share-pages",
+  "url_base": "https://recall-share-7f3a2c.pages.dev",
+  "shares": [
+    {
+      "share_id": "019e6d8d-588b-7fd2-a326-c525469ed120",
+      "url": "https://recall-share-7f3a2c.pages.dev/019e6d8d-588b-7fd2-a326-c525469ed120",
+      "title": "Fix bug",
+      "source": "Codex",
+      "file_path": "/Users/me/Library/Application Support/recall/share-pages/019e6d8d-588b-7fd2-a326-c525469ed120.html",
+      "html_bytes": 18432
+    }
+  ]
+}
+```
+
+### `recall share unpublish`
+
+Delete one published page from the local publish directory and redeploy so the
+public URL stops serving it. Alias: `recall share rm`.
+
+```bash
+recall share unpublish <share-id>
+recall share unpublish https://recall-share-7f3a2c.pages.dev/<share-id>
+recall share unpublish <share-id> --dry-run
+recall share unpublish <share-id> --yes --format json
+```
+
+Options:
+
+- `<share-id>`: the id from `recall share list`, or this project's published
+  URL (`https://{project_domain}/{share-id}`). Other origins are rejected.
+- `--dry-run`: resolve the page and print the URL without deleting or deploying.
+- `--yes`: skip the interactive confirmation prompt. Required when stdin is not
+  a terminal.
+- `--format <text|json>`: default `text`.
+
+Behavior:
+
+- Requires existing `recall share init` configuration.
+- Deletes `{share_id}.html` from the managed publish directory, then deploys
+  that directory with Wrangler. Cloudflare Pages deployments are full snapshots,
+  so the public route 404s after a successful deploy.
+- If deploy fails, the local HTML file is restored.
+- Does not delete the Cloudflare Pages project.
+- Prints progress to stderr and the URL to stdout.
+
+JSON output:
+
+```json
+{
+  "share": {
+    "share_id": "019e6d8d-588b-7fd2-a326-c525469ed120",
+    "url": "https://recall-share-7f3a2c.pages.dev/019e6d8d-588b-7fd2-a326-c525469ed120",
+    "title": "Fix bug",
+    "source": "Codex",
+    "file_path": "/Users/me/Library/Application Support/recall/share-pages/019e6d8d-588b-7fd2-a326-c525469ed120.html",
+    "html_bytes": 18432
+  },
+  "dry_run": false
+}
+```
+
 ### `recall session resume`
 
 Resume one selected session in the source CLI when the adapter supports it.
@@ -337,6 +430,14 @@ recall session show --id <chosen-id> --include metadata,messages --format text
 recall session share --id <chosen-id> --format json
 ```
 
+### List Or Take Down Published Shares
+
+```bash
+recall share list --format json
+# User chooses which public URL to remove.
+recall share unpublish <share-id> --yes --format json
+```
+
 ### Export Selected Candidates
 
 ```bash
@@ -377,6 +478,8 @@ Example JSON error:
   Cloudflare-backed design.
 - `session share` must not add automatic confirmation prompts; coding agents
   should ask the user before invoking it.
+- `share unpublish` prompts on a TTY and requires `--yes` when stdin is not a
+  terminal; coding agents should ask the user before passing `--yes`.
 - `session show` should preserve Recall's existing sanitization behavior for
   displayed tool lines where applicable, but JSON output should clearly document
   whether content is sanitized or raw.
@@ -465,6 +568,10 @@ match `excluded_paths` still runs, restricted to the current scope.
   `session export --format jsonl` reuses the existing JSONL export path.
 - Reuse `SearchEngine::hybrid_search` for `session list --query`.
 - Reuse `share::publish_session` for `session share`.
+- Inventory published pages from the managed publish directory; do not add a
+  separate share registry or crawl `pages.dev`.
+- Reuse the same Wrangler deploy path for `share unpublish` after deleting the
+  local HTML file.
 - Reuse `resume_command_for` and `app_command_for` for `session resume` and
   `session open`.
 - Keep stdout clean for data output; send sync/share/deploy progress to stderr.
@@ -474,6 +581,7 @@ match `excluded_paths` still runs, restricted to the current scope.
 - A coding agent can list candidate sessions with one JSON command.
 - A coding agent can retrieve a full session transcript without opening the TUI.
 - A coding agent can share a chosen session and receive the final URL as JSON.
+- A coding agent can list currently published share URLs and unpublish one.
 - A coding agent can export selected sessions without relying on search filters
   alone.
 - A coding agent can resume or open supported sessions by id.
