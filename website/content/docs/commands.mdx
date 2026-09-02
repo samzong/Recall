@@ -47,3 +47,17 @@ recall export --jsonl --source codex --project /path/to/repo --limit 20
 ```bash
 recall info
 ```
+
+## Share
+
+```bash
+recall share init
+recall session share --id <session-id> --format json
+recall share list --format json
+recall share unpublish <share-id> --yes
+```
+
+`recall share init` configures the Cloudflare Pages target once. Publish a
+session with `recall session share`. `recall share list` shows the pages in the
+local publish directory and their public URLs. `recall share unpublish` deletes
+one page and redeploys so the live URL stops serving it.

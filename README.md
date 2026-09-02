@@ -31,6 +31,8 @@ recall export --project all > recall-export.jsonl # export all sessions
 recall import recall-export.jsonl --dry-run  # preview an import
 recall session list  # list sessions for agents/scripts
 recall session share --id <session-id> --format json  # publish one selected session
+recall share list --format json  # list published share URLs
+recall share unpublish <share-id> --yes  # take down one public page
 recall info  # index stats and worker status
 ```
 
