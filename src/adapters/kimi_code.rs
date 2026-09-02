@@ -64,13 +64,13 @@ impl SourceAdapter for KimiCodeAdapter {
         let Some(sessions_dir) = resolve_kimi_dir()? else {
             return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
         };
-        let result = file_scan::run_file_scan_with_options_and_mtime(
+        let result = file_scan::run_file_scan_with_options_and_snapshot(
             store,
             "kimi-code",
             since_ts,
             kimi_scan_options(),
             collect_session_entries(&sessions_dir),
-            kimi_session_mtime_ms,
+            kimi_session_snapshot,
             parse_kimi_session_file,
         )?;
         Ok(Some(result))
@@ -82,12 +82,31 @@ fn resolve_kimi_dir() -> anyhow::Result<Option<PathBuf>> {
 }
 
 fn scan_kimi_sessions(sessions_dir: &Path) -> anyhow::Result<Vec<RawSession>> {
+    scan_kimi_sessions_with_parser(sessions_dir, parse_kimi_session_file)
+}
+
+fn scan_kimi_sessions_with_parser<F>(
+    sessions_dir: &Path,
+    parse_fn: F,
+) -> anyhow::Result<Vec<RawSession>>
+where
+    F: Fn(FileScanEntry, i64) -> anyhow::Result<Option<RawSession>>,
+{
     let mut sessions = Vec::new();
     for entry in collect_session_entries(sessions_dir) {
-        let Some(mtime_ms) = kimi_session_mtime_ms(&entry) else {
+        let Some(snapshot) = kimi_session_snapshot(&entry) else {
             continue;
         };
-        if let Some(raw) = parse_kimi_session_file(entry, mtime_ms)? {
+        let raw = parse_fn(entry.clone(), snapshot.effective_mtime_ms())?;
+        if kimi_session_snapshot(&entry).as_ref() != Some(&snapshot) {
+            warn!(
+                "skipping unstable Kimi Code session {}: source files changed while parsing ({})",
+                entry.session_id,
+                entry.stat_target.display()
+            );
+            continue;
+        }
+        if let Some(raw) = raw {
             sessions.push(raw);
         }
     }
@@ -184,30 +203,32 @@ fn parse_kimi_session_file_impl(
         return Ok(None);
     };
     let meta = read_state_json(&session_dir.join("state.json"))?;
+    let session_id = meta.id.clone().unwrap_or_else(|| entry.session_id.clone());
 
     let file = fs::File::open(wire_path)?;
     let reader = BufReader::new(file);
     let source_path = wire_path.to_str().map(str::to_string);
-    parse_kimi_wire(
-        meta,
-        entry.session_id.clone(),
-        reader.lines(),
-        mtime_ms,
-        entry.directory.clone(),
-        source_path,
-    )
+    parse_kimi_wire(meta, session_id, reader.lines(), mtime_ms, None, source_path)
 }
 
 fn session_dir_for_wire(wire_path: &Path) -> Option<&Path> {
     wire_path.parent().and_then(Path::parent).and_then(Path::parent)
 }
 
-fn kimi_session_mtime_ms(entry: &FileScanEntry) -> Option<i64> {
-    let wire_mtime = file_scan::stat_mtime_ms(&entry.stat_target)?;
-    let state_mtime = session_dir_for_wire(&entry.stat_target)
-        .and_then(|dir| file_scan::stat_mtime_ms(&dir.join("state.json")))
-        .unwrap_or(wire_mtime);
-    Some(wire_mtime.max(state_mtime))
+#[derive(Debug, PartialEq, Eq)]
+struct KimiSessionSnapshot {
+    state: file_scan::FileMetadataSnapshot,
+    wire: file_scan::FileMetadataSnapshot,
+}
+
+fn kimi_session_snapshot(
+    entry: &FileScanEntry,
+) -> Option<file_scan::FileScanSnapshot<KimiSessionSnapshot>> {
+    let session_dir = session_dir_for_wire(&entry.stat_target)?;
+    let state = file_scan::file_metadata_snapshot(&session_dir.join("state.json"))?;
+    let wire = file_scan::file_metadata_snapshot(&entry.stat_target)?;
+    let effective_mtime_ms = state.mtime_ms()?.max(wire.mtime_ms()?);
+    Some(file_scan::FileScanSnapshot::new(effective_mtime_ms, KimiSessionSnapshot { state, wire }))
 }
 
 fn parse_kimi_wire(
@@ -378,6 +399,7 @@ pub(crate) fn parse_kimi_session(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
@@ -406,6 +428,76 @@ mod tests {
             "\n",
             r#"{"type":"usage.record","time":1700000006000,"model":"kimi-k3","usageScope":"turn","usage":{"inputOther":1200,"output":80,"inputCacheRead":300,"inputCacheCreation":40}}"#,
         )
+    }
+
+    fn write_kimi_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let session_dir = root.join("wd_repo").join("session_abc");
+        let wire_dir = session_dir.join("agents").join("main");
+        fs::create_dir_all(&wire_dir).unwrap();
+        let state_path = session_dir.join("state.json");
+        let wire_path = wire_dir.join("wire.jsonl");
+        fs::write(&state_path, fixture_state()).unwrap();
+        fs::write(&wire_path, fixture_wire()).unwrap();
+        (state_path, wire_path)
+    }
+
+    fn append_wire_change(path: &Path) -> std::io::Result<()> {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)?
+            .write_all(b"\n{\"type\":\"metadata\",\"changed\":true}\n")
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SnapshotMutation {
+        State,
+        AppendWire,
+        ReplaceState,
+    }
+
+    fn run_kimi_snapshot_scan(
+        store: &Store,
+        root: &Path,
+        mutation: Option<SnapshotMutation>,
+    ) -> SyncScanResult {
+        file_scan::run_file_scan_with_options_and_snapshot(
+            store,
+            "kimi-code",
+            None,
+            kimi_scan_options(),
+            collect_session_entries(root),
+            kimi_session_snapshot,
+            |entry, mtime_ms| {
+                let state_path = session_dir_for_wire(&entry.stat_target).unwrap().join("state.json");
+                match mutation {
+                    Some(SnapshotMutation::State) => {
+                        fs::write(
+                            &state_path,
+                            r#"{"id":"session_abc","cwd":"/repo","createdAt":1700000000000,"title":"changed while parsing","isCustomTitle":true}"#,
+                        )?;
+                        parse_kimi_session_file(entry, mtime_ms)
+                    }
+                    Some(SnapshotMutation::AppendWire) => {
+                        let raw = parse_kimi_session_file(entry.clone(), mtime_ms)?;
+                        append_wire_change(&entry.stat_target)?;
+                        Ok(raw)
+                    }
+                    Some(SnapshotMutation::ReplaceState) => {
+                        let raw = parse_kimi_session_file(entry, mtime_ms)?;
+                        let replacement = state_path.with_extension("replacement");
+                        fs::write(
+                            &replacement,
+                            r#"{"id":"session_abc","cwd":"/repo","createdAt":1700000000000,"title":"replacement state with a different length","isCustomTitle":false}"#,
+                        )?;
+                        fs::remove_file(&state_path)?;
+                        fs::rename(replacement, state_path)?;
+                        Ok(raw)
+                    }
+                    None => parse_kimi_session_file(entry, mtime_ms),
+                }
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -467,6 +559,132 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_changes_withhold_incremental_candidate_until_stable_retry() {
+        for mutation in
+            [SnapshotMutation::State, SnapshotMutation::AppendWire, SnapshotMutation::ReplaceState]
+        {
+            let root = tempfile::tempdir().unwrap();
+            write_kimi_fixture(root.path());
+            crate::db::schema::register_sqlite_vec();
+            let store = Store::open_in_memory().unwrap();
+            let entry = collect_session_entries(root.path()).pop().unwrap();
+            let initial_mtime = kimi_session_snapshot(&entry).unwrap().effective_mtime_ms();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sessions (id, source, source_id, title, started_at, updated_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        "stored-id",
+                        "kimi-code",
+                        "session_abc",
+                        "prior indexed title",
+                        1_700_000_000_000_i64,
+                        initial_mtime - 1,
+                        1,
+                    ],
+                )
+                .unwrap();
+
+            let result = run_kimi_snapshot_scan(&store, root.path(), Some(mutation));
+            assert!(result.sessions.is_empty(), "{mutation:?}");
+            assert_eq!(result.stats.unstable_sessions, 1, "{mutation:?}");
+            let indexed = store.list_recent_sessions(10).unwrap();
+            assert_eq!(indexed.len(), 1, "{mutation:?}");
+            assert_eq!(indexed[0].title, "prior indexed title", "{mutation:?}");
+            assert_eq!(indexed[0].updated_at, Some(initial_mtime - 1), "{mutation:?}");
+
+            let retry = run_kimi_snapshot_scan(&store, root.path(), None);
+            assert_eq!(retry.sessions.len(), 1, "{mutation:?}");
+            assert_eq!(retry.stats.unstable_sessions, 0, "{mutation:?}");
+        }
+    }
+
+    #[test]
+    fn incremental_snapshot_preserves_usage_backfill_and_stable_skip() {
+        let root = tempfile::tempdir().unwrap();
+        write_kimi_fixture(root.path());
+        let entry = collect_session_entries(root.path()).pop().unwrap();
+        let mtime_ms = kimi_session_snapshot(&entry).unwrap().effective_mtime_ms();
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (id, source, source_id, title, started_at, updated_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "stored-id",
+                    "kimi-code",
+                    "session_abc",
+                    "existing",
+                    1_700_000_000_000_i64,
+                    mtime_ms,
+                    1,
+                ],
+            )
+            .unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "kimi-code",
+                "session_abc",
+                &[],
+                USAGE_PARSER_VERSION - 1,
+                Some(mtime_ms),
+            )
+            .unwrap();
+
+        let backfill = file_scan::run_file_scan_with_options_and_snapshot(
+            &store,
+            "kimi-code",
+            None,
+            kimi_scan_options(),
+            collect_session_entries(root.path()),
+            kimi_session_snapshot,
+            parse_kimi_session_file,
+        )
+        .unwrap();
+        assert_eq!(backfill.sessions.len(), 1);
+        assert_eq!(backfill.stats.skipped_sessions, 0);
+
+        store
+            .persist_usage_events_for_existing_session(
+                "kimi-code",
+                "session_abc",
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime_ms),
+            )
+            .unwrap();
+        let skipped = file_scan::run_file_scan_with_options_and_snapshot(
+            &store,
+            "kimi-code",
+            None,
+            kimi_scan_options(),
+            collect_session_entries(root.path()),
+            kimi_session_snapshot,
+            |_, _| panic!("stable current session must skip parsing"),
+        )
+        .unwrap();
+        assert!(skipped.sessions.is_empty());
+        assert_eq!(skipped.stats.skipped_sessions, 1);
+    }
+
+    #[test]
+    fn full_scan_withholds_candidate_changed_during_parse() {
+        let root = tempfile::tempdir().unwrap();
+        write_kimi_fixture(root.path());
+
+        let sessions = scan_kimi_sessions_with_parser(root.path(), |entry, mtime_ms| {
+            let raw = parse_kimi_session_file(entry.clone(), mtime_ms)?;
+            append_wire_change(&entry.stat_target)?;
+            Ok(raw)
+        })
+        .unwrap();
+
+        assert!(sessions.is_empty());
+        assert_eq!(scan_kimi_sessions(root.path()).unwrap().len(), 1);
+    }
+
+    #[test]
     fn incremental_scan_reparses_when_only_state_changes() {
         let root = tempfile::tempdir().unwrap();
         let session_dir = root.path().join("wd_repo").join("session_rename");
@@ -523,13 +741,13 @@ mod tests {
             )
             .unwrap();
 
-        let result = file_scan::run_file_scan_with_options_and_mtime(
+        let result = file_scan::run_file_scan_with_options_and_snapshot(
             &store,
             "kimi-code",
             None,
             kimi_scan_options(),
             collect_session_entries(root.path()),
-            kimi_session_mtime_ms,
+            kimi_session_snapshot,
             parse_kimi_session_file,
         )
         .unwrap();
