@@ -8,8 +8,11 @@ apply when working here.
 
 - The `SourceAdapter` trait in `mod.rs` is the authoritative contract, not the
   DEVELOPMENT.md example. `id()`, `label()`, `scan()`, and `resume_command()`
-  are required; `scan_for_sync()`, `prune()`, `app_command()`, and
-  `usage_parser_version()` are optional overrides.
+  are required; `scan_for_sync()`, `scan_for_sync_output()`, `app_command()`,
+  and `usage_parser_version()` are optional overrides.
+- Adapters never delete from `Store`. An adapter with a complete source
+  inventory may return a bounded `ReconcilePlan`; sync owns applying it after
+  the source run succeeds and only in global scope.
 - Register new adapters in `all_adapters()` in `mod.rs`. Registration alone
   wires the adapter into sync, search, the TUI source filter, and the CLI
   `--source` flag. No schema change is needed — `sessions.source` is a value,

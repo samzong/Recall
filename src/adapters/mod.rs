@@ -27,6 +27,10 @@ pub(crate) mod sync_state;
 pub(crate) mod usage;
 pub(crate) mod zcode;
 
+use std::collections::HashSet;
+use std::io;
+use std::path::PathBuf;
+
 use crate::db::store::Store;
 use crate::types::{ParentLink, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
@@ -45,8 +49,19 @@ pub(crate) trait SourceAdapter {
     ) -> anyhow::Result<Option<SyncScanResult>> {
         Ok(None)
     }
-    fn prune(&self, _store: &Store) -> anyhow::Result<()> {
-        Ok(())
+    fn scan_for_sync_output(
+        &self,
+        store: &Store,
+        since_ts: Option<i64>,
+        include_events: bool,
+        force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
+        if force {
+            return Ok(None);
+        }
+        Ok(self
+            .scan_for_sync(store, since_ts, include_events)?
+            .map(|scan| SyncScanOutput { scan, reconcile: None }))
     }
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand>;
     fn app_command(&self, _source_id: &str) -> Option<ResumeCommand> {
@@ -167,6 +182,25 @@ pub(crate) struct SyncScanStats {
 pub(crate) struct SyncScanResult {
     pub(crate) sessions: Vec<RawSession>,
     pub(crate) stats: SyncScanStats,
+}
+
+pub(crate) struct SyncScanOutput {
+    pub(crate) scan: SyncScanResult,
+    pub(crate) reconcile: Option<ReconcilePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InventoryIssue {
+    pub(crate) path: PathBuf,
+    pub(crate) category: io::ErrorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReconcilePlan {
+    CompleteLiveSet(HashSet<String>),
+    ExactTombstones(HashSet<String>),
+    PartialInventory(Vec<InventoryIssue>),
+    UnavailableInventory(Vec<InventoryIssue>),
 }
 
 #[derive(Debug, Clone)]

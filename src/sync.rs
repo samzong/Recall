@@ -368,11 +368,15 @@ impl SyncJob {
             self.stats.excluded_out += n;
         }
 
-        let Some((raw_sessions, scan)) =
+        let Some(scan_result) =
             self.scan_sessions(adapter, source_id, label, &mut purged_excluded_ids)?
         else {
             return Ok(());
         };
+        let adapters::SyncScanOutput {
+            scan: adapters::SyncScanResult { sessions: raw_sessions, stats: scan },
+            reconcile,
+        } = scan_result;
 
         let mut existing = self.load_existing_state(source_id)?;
         let found = raw_sessions.len();
@@ -380,6 +384,7 @@ impl SyncJob {
             self.progress.indexing(label, done, found);
             self.process_raw_session(source_id, raw, &mut existing, &mut purged_excluded_ids)?;
         }
+        self.reconcile_source(source_id, label, reconcile)?;
 
         let touched = self.stats.touched() - touched_before;
         let elapsed_ms = started.elapsed().as_millis();
@@ -402,35 +407,27 @@ impl SyncJob {
         source_id: &str,
         label: &str,
         purged_excluded_ids: &mut HashSet<String>,
-    ) -> Result<Option<(Vec<adapters::RawSession>, adapters::SyncScanStats)>> {
+    ) -> Result<Option<adapters::SyncScanOutput>> {
         if self.options.verbose {
             println!("Scanning {label}...");
         }
-        // Prune deletes every row whose source file disappeared, which a
-        // scoped run must not do outside its scope. Adapters cannot prune by
-        // scope, so a scoped sync leaves it to global runs.
-        if matches!(self.options.scope, ProjectScope::Global)
-            && let Err(e) = adapter.prune(&self.store)
-            && self.options.emit
-        {
-            eprintln!("Error pruning {label}: {e}");
-        }
         let include_events = !self.options.usage_only || self.options.backfill_events;
-        let optimized = if self.options.force {
-            None
-        } else {
-            match adapter.scan_for_sync(&self.store, self.since_ts, include_events) {
-                Ok(scan) => scan,
-                Err(e) => {
-                    if self.options.emit {
-                        eprintln!("Error scanning {label}: {e}");
-                    }
-                    return Ok(None);
+        let optimized = match adapter.scan_for_sync_output(
+            &self.store,
+            self.since_ts,
+            include_events,
+            self.options.force,
+        ) {
+            Ok(scan) => scan,
+            Err(e) => {
+                if self.options.emit {
+                    eprintln!("Error scanning {label}: {e}");
                 }
+                return Ok(None);
             }
         };
-        let (raw_sessions, scan_stats) = match optimized {
-            Some(scan) => (scan.sessions, scan.stats),
+        let scan_result = match optimized {
+            Some(scan) => scan,
             None => {
                 let raw_sessions = match adapter.scan() {
                     Ok(s) => s,
@@ -444,14 +441,21 @@ impl SyncJob {
                 // A full scan parses everything it finds; there is no
                 // candidate stage to account for separately.
                 let parsed = raw_sessions.len() as u32;
-                (
-                    raw_sessions,
-                    adapters::SyncScanStats { candidates: parsed, parsed, ..Default::default() },
-                )
+                adapters::SyncScanOutput {
+                    scan: adapters::SyncScanResult {
+                        sessions: raw_sessions,
+                        stats: adapters::SyncScanStats {
+                            candidates: parsed,
+                            parsed,
+                            ..Default::default()
+                        },
+                    },
+                    reconcile: None,
+                }
             }
         };
-        self.stats.skipped += scan_stats.skipped_sessions;
-        self.stats.filtered_out += scan_stats.filtered_sessions;
+        self.stats.skipped += scan_result.scan.stats.skipped_sessions;
+        self.stats.filtered_out += scan_result.scan.stats.filtered_sessions;
         if let Some(matcher) = &self.path_excluder {
             let n = delete_excluded_sessions_for_source(
                 &self.store,
@@ -463,9 +467,67 @@ impl SyncJob {
             self.stats.excluded_out += n;
         }
         if self.options.verbose {
-            println!("  Found {} sessions", raw_sessions.len());
+            println!("  Found {} sessions", scan_result.scan.sessions.len());
         }
-        Ok(Some((raw_sessions, scan_stats)))
+        Ok(Some(scan_result))
+    }
+
+    fn reconcile_source(
+        &self,
+        source_id: &str,
+        label: &str,
+        reconcile: Option<adapters::ReconcilePlan>,
+    ) -> Result<()> {
+        if !matches!(self.options.scope, ProjectScope::Global) {
+            return Ok(());
+        }
+        let Some(reconcile) = reconcile else {
+            return Ok(());
+        };
+        match reconcile {
+            adapters::ReconcilePlan::PartialInventory(issues) => {
+                self.report_incomplete_inventory(label, "partial", &issues);
+            }
+            adapters::ReconcilePlan::UnavailableInventory(issues) => {
+                self.report_incomplete_inventory(label, "unavailable", &issues);
+            }
+            adapters::ReconcilePlan::CompleteLiveSet(live) => {
+                let existing = self.store.session_meta_map(source_id)?;
+                for source_id_to_delete in existing.keys().filter(|id| !live.contains(*id)) {
+                    self.store.delete_session_data(source_id, source_id_to_delete)?;
+                }
+            }
+            adapters::ReconcilePlan::ExactTombstones(source_ids) => {
+                let existing = self.store.session_meta_map(source_id)?;
+                for source_id_to_delete in
+                    source_ids.into_iter().filter(|id| existing.contains_key(id))
+                {
+                    self.store.delete_session_data(source_id, &source_id_to_delete)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn report_incomplete_inventory(
+        &self,
+        label: &str,
+        state: &str,
+        issues: &[adapters::InventoryIssue],
+    ) {
+        if !self.options.emit {
+            return;
+        }
+        if let Some(issue) = issues.first() {
+            eprintln!(
+                "Reconciliation skipped for {label}: inventory {state} at {} ({:?}; {} issue(s)).",
+                issue.path.display(),
+                issue.category,
+                issues.len()
+            );
+        } else {
+            eprintln!("Reconciliation skipped for {label}: inventory {state}.");
+        }
     }
 
     fn load_existing_state(&mut self, source_id: &str) -> Result<ExistingState> {
@@ -1040,7 +1102,10 @@ fn path_or_ancestor_matches(path: &str, matcher: &globset::GlobSet) -> bool {
 mod tests {
     use std::collections::HashSet;
 
-    use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter};
+    use crate::adapters::{
+        InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
+        SyncScanOutput, SyncScanResult,
+    };
     use crate::config::AppConfig;
     use crate::db::{
         schema,
@@ -1060,6 +1125,76 @@ mod tests {
         messages: &'static [&'static str],
         source_file_path: Option<&'static str>,
         optimized: bool,
+    }
+
+    struct FailingAdapter;
+
+    struct ReconcileAdapter {
+        plan: ReconcilePlan,
+        include_session: bool,
+    }
+
+    impl SourceAdapter for FailingAdapter {
+        fn id(&self) -> &str {
+            "test"
+        }
+
+        fn label(&self) -> &str {
+            "Test"
+        }
+
+        fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
+            anyhow::bail!("injected scan failure")
+        }
+
+        fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
+            None
+        }
+    }
+
+    impl SourceAdapter for ReconcileAdapter {
+        fn id(&self) -> &str {
+            "test"
+        }
+
+        fn label(&self) -> &str {
+            "Test"
+        }
+
+        fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
+            if self.include_session {
+                return Ok(vec![RawSession::search_only(
+                    "new",
+                    None,
+                    1_000,
+                    Some(2_000),
+                    None,
+                    vec![RawMessage {
+                        role: Role::User,
+                        content: "new".to_string(),
+                        timestamp: Some(2_000),
+                    }],
+                )]);
+            }
+            Ok(Vec::new())
+        }
+
+        fn scan_for_sync_output(
+            &self,
+            _store: &Store,
+            _since_ts: Option<i64>,
+            _include_events: bool,
+            _force: bool,
+        ) -> anyhow::Result<Option<SyncScanOutput>> {
+            Ok(Some(SyncScanOutput {
+                scan: SyncScanResult { sessions: self.scan()?, stats: Default::default() },
+                reconcile: Some(self.plan.clone()),
+            }))
+        }
+
+        fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
+            None
+        }
     }
 
     impl SourceAdapter for StaticAdapter {
@@ -1342,6 +1477,112 @@ mod tests {
         job.run_with(&adapters, None).unwrap();
 
         assert_eq!(job.store.session_meta("test", "outside").unwrap(), Some((Some(1), 7)));
+    }
+
+    #[test]
+    fn failed_scan_preserves_existing_sessions() {
+        schema::register_sqlite_vec();
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(FailingAdapter)];
+        let mut job = SyncJob::new(
+            SyncRunOptions {
+                force: false,
+                verbose: false,
+                emit: false,
+                usage_only: false,
+                backfill_events: false,
+                sources: None,
+                scope: ProjectScope::Global,
+            },
+            Store::open_in_memory().unwrap(),
+            AppConfig::default(),
+            &adapters,
+        )
+        .unwrap();
+        job.store.insert_session(&session("stale", "test", "stale")).unwrap();
+
+        job.run_with(&adapters, None).unwrap();
+
+        assert!(job.store.session_meta("test", "stale").unwrap().is_some());
+    }
+
+    #[test]
+    fn complete_live_set_deletes_only_stale_sessions() {
+        for force in [false, true] {
+            let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ReconcileAdapter {
+                plan: ReconcilePlan::CompleteLiveSet(HashSet::from(["keep".to_string()])),
+                include_session: false,
+            })];
+            let (mut job, _) = scoped_job(ProjectScope::Global);
+            job.options.force = force;
+            job.store.insert_session(&session("keep", "test", "keep")).unwrap();
+            job.store.insert_session(&session("stale", "test", "stale")).unwrap();
+
+            job.run_with(&adapters, None).unwrap();
+
+            assert!(job.store.session_meta("test", "keep").unwrap().is_some());
+            assert!(job.store.session_meta("test", "stale").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn complete_exact_tombstone_deletes_owned_session() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ReconcileAdapter {
+            plan: ReconcilePlan::ExactTombstones(HashSet::from(["subagent".to_string()])),
+            include_session: false,
+        })];
+        let (mut job, _) = scoped_job(ProjectScope::Global);
+        job.store.insert_session(&session("subagent", "test", "subagent")).unwrap();
+
+        job.run_with(&adapters, None).unwrap();
+
+        assert!(job.store.session_meta("test", "subagent").unwrap().is_none());
+    }
+
+    #[test]
+    fn partial_inventory_preserves_existing_sessions() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ReconcileAdapter {
+            plan: ReconcilePlan::PartialInventory(vec![InventoryIssue {
+                path: "/unreadable".into(),
+                category: std::io::ErrorKind::PermissionDenied,
+            }]),
+            include_session: false,
+        })];
+        let (mut job, _) = scoped_job(ProjectScope::Global);
+        job.store.insert_session(&session("stale", "test", "stale")).unwrap();
+
+        job.run_with(&adapters, None).unwrap();
+
+        assert!(job.store.session_meta("test", "stale").unwrap().is_some());
+    }
+
+    #[test]
+    fn scoped_sync_cannot_apply_complete_reconcile_plan() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ReconcileAdapter {
+            plan: ReconcilePlan::CompleteLiveSet(HashSet::new()),
+            include_session: false,
+        })];
+        let (mut job, _) = scoped_job(ProjectScope::Directory("/repo/root".to_string()));
+        let mut existing = session("stale", "test", "stale");
+        existing.directory = Some("/repo/root".to_string());
+        job.store.insert_session(&existing).unwrap();
+
+        job.run_with(&adapters, None).unwrap();
+
+        assert!(job.store.session_meta("test", "stale").unwrap().is_some());
+    }
+
+    #[test]
+    fn session_processing_failure_does_not_apply_reconcile_plan() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ReconcileAdapter {
+            plan: ReconcilePlan::CompleteLiveSet(HashSet::new()),
+            include_session: true,
+        })];
+        let (mut job, _) = scoped_job(ProjectScope::Global);
+        job.store.insert_session(&session("stale", "test", "stale")).unwrap();
+        job.store.conn.execute("DROP TABLE messages", []).unwrap();
+
+        assert!(job.run_with(&adapters, None).is_err());
+        assert!(job.store.session_meta("test", "stale").unwrap().is_some());
     }
 
     #[test]
