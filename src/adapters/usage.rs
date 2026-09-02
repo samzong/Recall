@@ -52,3 +52,21 @@ impl RawUsageEvent {
 pub(crate) fn usage_count(usage: &Value, keys: &[&str]) -> i64 {
     keys.iter().find_map(|key| json_i64(usage.get(*key))).unwrap_or(0).max(0)
 }
+
+pub(crate) fn disjoint_output_and_reasoning(
+    usage: &Value,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    other_tokens: i64,
+) -> (i64, i64) {
+    let reported_total = ["totalTokens", "total_tokens"]
+        .iter()
+        .find_map(|key| json_i64(usage.get(*key)))
+        .filter(|total| *total >= 0);
+    if reasoning_tokens > 0 && reported_total == Some(other_tokens.saturating_add(output_tokens)) {
+        let disjoint_reasoning = reasoning_tokens.min(output_tokens);
+        (output_tokens - disjoint_reasoning, disjoint_reasoning)
+    } else {
+        (output_tokens, reasoning_tokens)
+    }
+}

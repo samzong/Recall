@@ -16,7 +16,7 @@ use crate::adapters::{
 use crate::db::store::Store;
 use crate::types::{RawUsageEvent, Role};
 
-const USAGE_PARSER_VERSION: u32 = 1;
+const USAGE_PARSER_VERSION: u32 = 2;
 
 pub(crate) struct QwenAdapter;
 
@@ -305,10 +305,11 @@ fn extract_usage_event(
     source_path: Option<&str>,
 ) -> Option<RawUsageEvent> {
     let usage = record.get("usageMetadata").or_else(|| record.get("tokens"))?;
-    let input_tokens = usage_count(usage, &["promptTokenCount", "input"]);
     let output_tokens = usage_count(usage, &["candidatesTokenCount", "output"]);
     let cache_read_tokens = usage_count(usage, &["cachedContentTokenCount", "cached"]);
     let reasoning_tokens = usage_count(usage, &["thoughtsTokenCount", "thoughts"]);
+    let input_tokens =
+        usage_count(usage, &["promptTokenCount", "input"]).saturating_sub(cache_read_tokens);
     if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 && reasoning_tokens == 0 {
         return None;
     }
@@ -381,7 +382,7 @@ mod tests {
         let event = &session.usage_events[0];
         assert_eq!(event.model, "qwen3-coder-plus");
         assert_eq!(event.provider, "qwen");
-        assert_eq!(event.input_tokens, 100);
+        assert_eq!(event.input_tokens, 70);
         assert_eq!(event.output_tokens, 20);
         assert_eq!(event.cache_read_tokens, 30);
         assert_eq!(event.reasoning_tokens, 5);

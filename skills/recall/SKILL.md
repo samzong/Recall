@@ -1,371 +1,143 @@
 ---
 name: recall
-description: Use Recall as a project memory layer for local AI coding session history. Trigger when the user asks to share, refresh, list, or unpublish session pages; resume or open a session; search or export sessions; review project history; recover decisions or failed approaches; inspect evidence from supported coding agents; or continue a numbered unfinished-session candidate previously offered by Recall.
+description: Use Recall to search, inspect, continue, export, resume, or share indexed AI coding sessions. Trigger for project-history lookup, recent work from other agents, file history, unfinished-session continuation, and published session-page management.
 ---
 
 # Recall
 
-## Overview
+Recall is a local-first index of AI coding sessions. Use past sessions as evidence, then verify current code, commands, paths, and invariants before acting.
 
-Recall is a local-first CLI that indexes AI coding sessions from multiple tools. Treat it as a project memory layer: use it to recover history, reduce repeated mistakes, and turn prior sessions into current review evidence.
+Prefer active Recall MCP tools for read-only lookup. Use the installed `recall` CLI when no equivalent MCP tool exists or MCP is unavailable. File-event history is MCP-only. When developing Recall itself, do not use the project build as a substitute for the user's installed history index.
 
-Prefer active Recall MCP tools for read-only session lookup. Fall back to the installed `recall` command when Recall MCP is unavailable or the requested workflow is CLI-only. If you are developing Recall itself, use the project build only for testing Recall behavior, not as a substitute for the user's installed history index.
+If neither MCP nor the installed CLI is available, stop and offer `brew install samzong/tap/recall`. Never claim to have inspected unavailable history. Return only the session content needed for the task because history may contain private code, credentials, prompts, and user intent.
 
-If neither active Recall MCP tools nor the `recall` command are available, stop the Recall workflow, tell the user Recall is unavailable, and offer `brew install samzong/tap/recall` instead of pretending history was inspected.
+## Scope
 
-Recall history is evidence, not truth. Verify technical claims, code behavior, commands, paths, and invariants against the current repository before acting.
+- An exact path covers that directory and its children.
+- `owner/repo` or a remote URL covers all worktrees of that repository.
+- `all` covers every indexed project.
+- The CLI derives an omitted `--project` from its working directory. Recall MCP treats an omitted `project` as global, so pass the current project unless the user explicitly requests all projects.
 
-## Intent Routing
+## Find Sessions
 
-Pick the workflow from user intent. Do not run the full project-review scoping flow for one-shot session actions.
+Use MCP `list_recent_sessions` without a query, `search_sessions` with a query, and `get_session` only when transcript evidence is needed.
 
-| Intent | Example prompts | Workflow |
-| --- | --- | --- |
-| Share a live link | "share this session", "give me a session link" | Publish Or Refresh Share Link |
-| Refresh an existing link | "refresh the share link", "share it again" | Publish Or Refresh Share Link |
-| List published shares | "list shared sessions", "what is currently shared" | List Published Shares |
-| Unpublish a share | "unpublish this share", "take this share down" | Unpublish Share Page |
-| Resume or open | "continue this session", "resume this chat" | Session Resume/Open |
-| Find one session | "find the last session about migration", "latest Grok session for this project" | Latest/Find Session Lookup |
-| Review project history | "review this project with Recall", "historical risks" | Scoping Protocol + Analysis Modes |
-| Reflect on AI coding workflow | "reflect on this project", "review my AI coding workflow", "timeline reflection", "workflow friction", "calibration discussion" | Route to the `reflect` skill |
-| No clear Recall task | Recall is invoked without a requested operation or analysis goal | Recent Continuation Check |
+Use the equivalent CLI workflow when needed:
 
-Treat "share" and "update/refresh share link" as the same action: sync the latest transcript, publish to Pages, return the live URL.
+```bash
+recall session list --project /absolute/project/path --source <source> --limit 20 --sort updated --format json
+recall session list --project owner/repo --query "<keywords>" --time 7d --limit 20 --sort updated --format json
+recall session show --id <session-id> --format json --include metadata,messages
+```
 
-## Recent Continuation Check
+Add `--sync` only when current data matters and index mutation is permitted. Check the selected session's project before using it. Discover current sources and protocol details with `recall info --format json` or `recall mcp capabilities --format json` instead of maintaining a catalog in this skill.
 
-Use this fallback only after Intent Routing determines that Recall was invoked without a clear operation or analysis goal. Decide from the meaning of the request, never by matching an invocation token or fixed phrase. If the user states an intent, follow that intent and do not run this fallback.
+Search results are relevance-ranked and bounded. In a queried CLI listing, `--sort updated` does not change that ranking. Select the newest timestamp only within the returned candidates, and do not claim an exact latest match.
 
-1. Resolve the current project with Project Scope Defaults. Do not broaden to all projects when the current project cannot be resolved.
-2. Prefer active Recall MCP tools:
-   - Call `list_recent_sessions` for the current project with no source filter and a limit of 5.
-   - Call `get_session` for each candidate with `max_messages` set to 12 and `tail` set to `true`.
-3. If Recall MCP tools are unavailable, use the CLI:
-   ```bash
-   recall session list --project /absolute/project/path --limit 5 --sort updated --format json
-   recall session show --id <session-id> --format json --include metadata,messages --from-seq <max(message_count-12,0)>
-   ```
-   Use the indexed session record. If the index is missing or empty, report that and offer `recall sync`; do not inspect raw source transcript files.
-4. Judge unfinished work from the meaning of the session ending, never from tool status, event status, or the final message role alone. Strong evidence includes an unanswered user request, explicitly remaining work or blockers, and interrupted execution. Exclude sessions whose ending reports completion. Exclude the current conversation when identifiable, including a candidate whose tail contains the current fallback request. Omit ambiguous candidates.
-5. Show at most 3 candidates with short reasons and stable numbering:
-   ```text
-   1. [source] title — why it appears unfinished
-   2. [source] title — why it appears unfinished
-   ```
-   Tell the user they can reply with a number to continue. If none qualify, state that no clearly unfinished recent session was found.
-6. A numeric reply selects that candidate. Load the relevant history with Recall MCP or CLI and continue the work in the current agent. Do not launch native resume behavior unless the user explicitly asks for it.
+## Find Recent Work
 
-## Project Scope Defaults
+When the user asks what other agents recently did, call `list_recent_sessions` for the current project with no source filter and a limit of 10. Exclude the current conversation when identifiable and call `get_session` only for relevant candidates.
 
-`--project` is the single scope selector and Recall resolves repo identity
-itself, so no manual repo-identity reconstruction is needed.
+If MCP is unavailable, use:
 
-- A path scopes to that directory and its children only. Use it for "just this
-  worktree" or a subdirectory of a monorepo.
-- `owner/repo` or a remote URL scopes to the repository identity, spanning every
-  worktree of that repo.
-- `all` scopes to every project.
-- Without `--project`, Recall derives the scope from the current directory: a
-  checkout with a resolvable `origin` means that repository, a checkout without
-  one means its top-level directory, anything else means every project.
+```bash
+recall session list --project /absolute/project/path --limit 10 --sort updated --format json
+```
 
-Default scoping rules:
+The result proves only that sessions were recently indexed. Do not describe them as live peers or attribute them to another agent without supporting metadata. The listing may fold spawned subagents beneath a visible parent, so it is not an exhaustive peer inventory. Report when the bounded result cannot isolate relevant work.
 
-- If the user explicitly says global, all projects, or no project filter, pass
-  `--project all` rather than omitting the flag.
-- If the user gives an exact path, pass that path.
-- If the request is about the current checkout only, pass
-  `git rev-parse --show-toplevel`.
-- If the request is about the current project and may include other worktrees,
-  omit `--project` when the command runs inside that checkout, or pass the
-  `owner/repo` slug explicitly.
-- Every structured response carries `filters.effective_scope`; report which
-  scope was used so path/worktree ambiguity stays visible.
+## Find File History
 
-## Latest/Find Session Lookup
+Use MCP `file_history` for requests about sessions that touched a path. Pass `path` and the current `project`; add `source` only when requested. Omit `kind` to include the default `file_write` and `file_read` events, and default `limit` to 20.
 
-Use this workflow for one-shot requests such as "latest Grok session for this project" or "find the last session about X". Do not run the broad project-review scoping flow.
+Run `recall sync --project <same-scope>` first only when recent writes may be absent and index mutation is permitted. If MCP is unavailable, explain that file history requires MCP and offer `recall mcp install`. Transcript search and raw transcript inspection are not substitutes for file-event targets.
 
-1. Determine source, recency, and project scope from the user wording.
-2. If a single exact directory scope is intended, use:
-   ```bash
-   recall session list --project /absolute/project/path --source <source> --limit 20 --sort updated --sync --format json
-   ```
-3. If repo identity scope is intended, especially in gmc or alternate worktrees, pass the identity directly:
-   ```bash
-   recall session list --project owner/repo --source <source> --limit 20 --sort updated --sync --format json
-   ```
-   Running inside the checkout without `--project` resolves to the same scope. Check the selected session's `project` before acting on it.
-4. For a named or older session, add `--query "<keywords>"` and/or `--time 7d`, but keep the same project-scope rules.
-5. Show the selected session with:
-   ```bash
-   recall session show --id <recall-session-id> --format json --include metadata,messages,usage,events
-   ```
+Return the matching event rows with session, source, title, kind, target, and time. The limit applies to recent events, not distinct sessions, so do not claim exhaustive session coverage. Load transcript evidence only when needed.
 
-## Publish Or Refresh Share Link
+## Continue Work
 
-When the user wants to share a session or update an existing share link, execute immediately. Do not ask scoping questions. Do not use `--dry-run` unless they explicitly ask to preview or validate only.
+When Recall is invoked without a clear task, list the five most recent sessions in the current project and inspect their latest 12 messages. Do not broaden to all projects.
 
-### What the user expects
+With MCP, call `list_recent_sessions`, then `get_session` with `max_messages: 12` and `tail: true`. Without MCP, use:
 
-- "share this session" -> a **live, openable URL** for the current conversation.
-- "refresh the Recall share link" -> **re-publish** the current conversation so the page reflects the latest messages. The URL usually stays the same; the deployed HTML changes.
+```bash
+recall session list --project /absolute/project/path --limit 5 --sort updated --format json
+recall session show --id <session-id> --format json --include metadata,messages --from-seq <calculated-sequence>
+```
 
-### Steps
+Set `<calculated-sequence>` to `max(message_count - 12, 0)` from the list result. Offer at most three numbered candidates. Include only sessions whose ending contains an unanswered request, explicit remaining work, a blocker, or interrupted execution. Exclude completed and ambiguous sessions. Exclude the current session when identifiable; otherwise state that self-exclusion could not be verified. Treat the bounded list as candidates, not a complete inventory of unfinished work. A numeric reply selects the same candidate and continues it in the current agent.
 
-1. Infer the active source from the runtime when possible:
-   - Grok -> `grok`
-   - Cursor -> `cursor`
-   - Codex -> `codex`
-   - Claude Code -> `claude-code`
-   - OpenCode -> `opencode`
-   - Kimi Code -> `kimi-code`
-   - Qwen Code -> `qwen-code`
-   - Kilo Code -> `kilo-code`
-   - Crush -> `crush`
-   - MiMo Code -> `mimo-code`
-   - ZCode -> `zcode`
-   - Goose -> `goose`
-   - OMP -> `omp`
-   If the source is unclear, omit `--source` and rely on project + recency.
+Do not launch native resume or app-open behavior unless the user explicitly requests it.
 
-2. Sync and resolve the session id. Always include `--sync` so share/update uses the latest messages.
-   - Current conversation (default):
-     ```bash
-     recall session list --project /absolute/project/path --source <source> --limit 1 --sort updated --sync --format json
-     ```
-   - Named or older session: add `--query "<keywords>"` and/or `--time 7d`, still prefer `--sort updated`.
-   - Explicit id from the user: skip list and use that id directly.
+## Resume Or Open
 
-3. Publish for real. This is mandatory for share/update requests:
-   ```bash
-   recall session share --id <recall-session-id> --format json
-   ```
-   Never stop at `--dry-run` for these requests. Dry-run only computes a future URL locally and leaves the live page at 404 or stale.
-   Progress text goes to stderr; read the URL from stdout JSON at `share.url`.
-   Add `--copy-url` when they ask to copy it; add `--open` when they ask to open it.
+"Continue here" loads history into the current agent. Native resume and app-open start another process, so run them only when explicitly requested. Resolve the exact session first; add `--print-command` for read-only inspection.
 
-   Before publishing, write a short TL;DR markdown file from the current agent
-   context and pass it with `--tldr-file`. Weight the user's request highest,
-   weight the final outcome next, and use trace/process details only as
-   low-weight context:
-   ```bash
-   # Agent writes /tmp/recall-tldr.md from the current conversation context.
-   recall session share --id <recall-session-id> --tldr-file /tmp/recall-tldr.md --format json
-   ```
-   If the TL;DR file is missing, unreadable, or blank, Recall skips the TL;DR
-   block and still publishes the session.
+```bash
+recall session resume --id <session-id> --print-command
+recall session open --id <session-id> --print-command
+```
 
-4. Reply in this shape:
-   ```text
-   <url>
+## Share Sessions
 
-   <one-line context: title, source, and whether this was a fresh share or refreshed publish>
-   ```
-   Do not dump raw JSON unless debugging.
+An explicit share or refresh request authorizes a real deployment. Use `--dry-run` only for an explicit preview. Before publishing, stop if the selected session contains concrete credentials or private material the user did not authorize sharing.
 
-### Failure handling
+Use an explicit session id when provided. Otherwise sync and list recent sessions for the active project, filtering by source only when known. Select the current conversation only when its identity is unambiguous; inspect the smallest necessary tail or ask the user if several candidates remain.
 
-- If sharing fails because Pages is not configured, tell the user to run `recall share init` once, then retry publish.
-- If publish succeeds but the URL still 404s, rerun step 3 without `--dry-run` and report that redeploy finished.
+```bash
+recall session list --project /absolute/project/path --source <source> --limit 5 --sort updated --sync --format json
+```
 
-Sharing publishes session content to the configured share target. Warn briefly if the session may contain secrets.
+Create a unique temporary file with `mktemp /tmp/recall-tldr.XXXXXX`, write a short Markdown TL;DR from the current conversation context, and do not reload the transcript just to summarize it. Then publish with that path:
 
-## List Published Shares
+```bash
+recall session share --id <session-id> --tldr-file <temporary-tldr-path> --format json
+```
 
-When the user asks which sessions are currently shared or wants the live URLs, run:
+Remove the temporary file after publishing. Missing, unreadable, or blank TL;DR input does not block publishing. Read `share.url` from the JSON and verify it with `curl -I -L`. If the first check returns 404, publish once more and recheck, then stop. If sharing is not configured, tell the user to run `recall share init`. Return the live URL rather than raw JSON.
+
+List and unpublish shared pages with:
 
 ```bash
 recall share list --format json
+recall share unpublish <share-id-or-url> --yes --format json
 ```
 
-Read `shares[].url`, `shares[].title`, and `shares[].share_id`. This lists the local publish inventory that the next Pages deploy publishes. If sharing is not initialized, tell the user to run `recall share init`.
+The list is the local publish inventory, not a live crawl. Unpublish only an exact target selected by the user; list first and ask when no target was supplied.
 
-Reply with the URLs and titles. Do not dump raw JSON unless debugging.
+## Review Project History
 
-## Unpublish Share Page
+If a broad review lacks a topic or depth, ask one scoping question. Otherwise search before exporting, start with recent history, and expand only when the request or evidence requires it:
 
-When the user asks to take a share down, do not unpublish until they confirm the exact URL.
-
-1. If they did not give a URL or share id, run `recall share list --format json` and ask which page to remove.
-2. After they confirm, run:
-   ```bash
-   recall share unpublish <share-id-or-url> --yes --format json
-   ```
-   `--yes` is required when stdin is not a terminal. Never unpublish because a share list was requested.
-
-## Scoping Protocol
-
-When the request is broad, such as "use Recall to review this project", do not jump straight to full export. Ask one concise scoping question that makes Recall's value clear:
-
-```text
-Default Recall review: historical risk audit, decision archaeology, failed approaches, unfinished work, and current-code assumptions to verify. Should I start with that quick scan, go deep across all project history, or focus on a topic like architecture, tests, performance, a feature, or PR readiness?
+```bash
+recall info --format json
+recall search "<query>" --project /absolute/project/path --format json
+recall export --project /absolute/project/path --limit 0
 ```
 
-Do not ask when the user already provides enough scope. Proceed directly when the request includes the project path plus a clear topic, time range, or depth.
+Treat search snippets as leads. Parse exports as JSONL instead of text, and verify historical conclusions against current code. Token usage is not monetary cost without an explicit price source.
 
-Prefer these defaults for broad reviews:
-
-- Analysis mode: historical risk audit + decision archaeology + failed approaches.
-- Time range: recent history first, then all history when the user asks for deep analysis or the quick scan finds dense evidence.
-- Source scope: all sources unless the user names a source.
-- Output: concise findings with historical evidence and current verification steps.
-
-## Analysis Modes
-
-Choose one or more modes based on the user's request:
-
-- Historical risk audit: find repeated problems, long-lived bugs, regressions, unresolved risks, and repeated rework.
-- Decision archaeology: recover why designs changed, what trade-offs were made, and which alternatives were rejected.
-- Failed approaches: identify attempted fixes or designs that failed, were reverted, or were rejected by the user.
-- Current task context: search around a specific feature, file, bug, PR, module, command, or product area before changing code.
-- User preference extraction: capture repeated user constraints, style preferences, review standards, forbidden abstractions, and acceptance criteria.
-- PR/readiness scan: check whether a proposed change conflicts with historical constraints or known failure modes.
-- Project timeline: summarize how the project evolved across sessions.
-- Usage/cost analysis: use only when the user explicitly asks about tokens, model usage, or cost patterns.
-
-## Depth Levels
-
-Use a depth that matches the request and data size:
-
-- Quick scan: `recall info`, optional `recall sync`, then targeted `recall search` queries. Use this to find leads quickly.
-- Standard review: run several targeted searches, then export a bounded sample such as `--limit 100` or `--limit 300`.
-- Deep review: export all matching project sessions with `--limit 0`, parse JSONL structurally, and synthesize themes across sessions.
-
-If the user asks for "deep", "full", "comprehensive", or "analyze history", use deep review unless the export is impractically large. If the export is large, start with a bounded export and report the next deepening step.
-
-## Workflow
-
-1. Identify the project scope and analysis mode.
-   - Apply Project Scope Defaults before choosing `--project`.
-   - A path matches that directory and child paths only; an `owner/repo` identity spans every worktree.
-   - Ask at most one scoping question for broad requests.
-   - State the default analysis mode when proceeding without a question.
-
-2. Refresh or inspect the index.
-   - Run `recall info` to inspect indexed sources and status.
-   - Run `recall sync` before relying on recent history, unless the user requested read-only inspection.
-   - Use `recall sync --source <source>` only when a single source is relevant.
-   - Do not run `recall sync --force` unless the user asks to rebuild or there is evidence the index is stale in a way incremental sync cannot fix.
-
-3. Search before exporting when the question has a target.
-   - Use `recall search "<query>" --project /absolute/project/path`.
-   - Add `--source <source>` or `--time <range>` to narrow noisy results.
-   - Treat search snippets as leads, not complete evidence.
-   - Search for both the user's topic and generic project-memory signals such as "failed", "reverted", "decision", "root cause", "regression", "do not", "not again", "unfinished", and "follow-up".
-
-4. Export for deep analysis.
-   - Use `recall export --project /absolute/project/path --limit 0` for full project history.
-   - Use `recall session export --id <session-id> --format jsonl` for selected sessions.
-   - Use `recall session show --id <session-id> --format json --include metadata,messages,usage,events` when one session needs structured inspection.
-   - Start with a smaller `--limit` when exploring very large histories.
-   - Write temporary analysis artifacts outside the repo unless the user asked for a tracked artifact.
-   - Parse JSONL with structured JSON tooling, line by line. Do not parse JSON with grep or ad hoc string splitting.
-
-5. Cross-check conclusions.
-   - Use Recall to find prior decisions, failed attempts, constraints, and user preferences.
-   - Verify any code behavior, path, command, or invariant against the current repository before changing files.
-
-## Output Protocol
-
-Do not merely report that Recall found sessions. Convert history into useful project memory:
-
-- Historical facts: what prior sessions actually show.
-- Evidence: cite source, title or session id, and approximate time when available.
-- Repeated patterns: problems or requests that recur across sessions.
-- Failed or rejected paths: approaches the agent should not repeat without new evidence.
-- Current verification list: assumptions from history that must be checked against current code.
-- Actionable next steps: the smallest current-code checks or changes suggested by the history.
-
-For broad project reviews, prefer this shape:
+Return project memory, not a list of matching sessions. Cite source, title or session id, and approximate time for each fact. Summarize transcripts and quote only short excerpts that serve as evidence. For a broad review, use this shape:
 
 ```text
 Recall review of <project>:
 
 1. Historical facts that matter now
 2. Repeated risks or unresolved problems
-3. Failed/rejected approaches to avoid
-4. User/project preferences extracted from history
+3. Failed or rejected approaches to avoid
+4. User or project constraints extracted from history
 5. Current code assumptions to verify
-6. Recommended next verification steps
+6. Recommended next checks
 ```
 
-Keep transcript content summarized. Quote only short excerpts when they are necessary evidence.
+Route requests about workflow friction, handoffs, repeated corrections, or calibration to the installed `reflect` skill.
 
-## Reflect Routing
+## Avoid In Tool Calls
 
-When the user wants project-level reflection on their AI coding process, workflow friction, handoffs, repeated corrections, or possible future calibration, route to the installed `reflect` skill. Keep this `recall` skill focused on project memory lookup, sharing, export, and review workflows.
-
-## Commands For Tool Calls
-
-Use these Recall commands in agent tool calls:
-
-```bash
-recall info
-recall mcp capabilities --format json
-recall sync
-recall sync --source codex
-recall search "migration bug" --project /absolute/project/path
-recall search "migration bug" --project /absolute/project/path --source codex --time 30d
-recall export --project /absolute/project/path --limit 0
-recall export --project /absolute/project/path --source codex --time 30d --limit 100
-recall session list --project /absolute/project/path --limit 20 --format json
-recall session show --id <session-id> --format json --include metadata,messages,usage,events
-recall session export --id <session-id> --format jsonl
-recall session share --id <session-id> --format json
-recall session share --id <session-id> --tldr-file /tmp/recall-tldr.md --format json
-recall session share --id <session-id> --dry-run --format json  # preview only; never use for share/update requests
-recall share list --format json
-recall share unpublish <share-id-or-url> --yes --format json
-recall session resume --id <session-id> --print-command
-recall import recall-export.jsonl --dry-run
-recall import recall-export.jsonl
-recall usage --json
-```
-
-Supported time filters are `today`, `7d` or `week`, and `30d` or `month`. Unknown time values fall back to all history.
-
-Supported source ids include `claude-code`, `opencode`, `codex`, `pi`, `omp`, `antigravity-cli`, `gemini-cli`, `grok`, `kiro-cli`, `copilot-cli`, `copilot-chat`, `cursor`, `cline`, `roo`, `kimi-code`, `deepseek-harness`, `qwen-code`, `kilo-code`, `crush`, `mimo-code`, `zcode`, and `goose`. Source labels such as `CC`, `OC`, `CDX`, and `CUR` are also accepted by the CLI, but source ids are clearer in scripts.
-
-## Export Schema
-
-`recall export` and `recall session export --format jsonl` emit one JSON object per indexed session. `recall session show --format json` uses the same top-level record schema for one selected session. Each record includes:
-
-- `schema_version`
-- `record_type`
-- `session`
-- `messages`
-- `usage_events`
-- `events`
-
-Since schema_version 3 the export is lossless against the Recall index: it also carries `session.source_file_path`, usage-event `parser_version` / `source_path` / `raw_usage_json`, and event `attrs_json` / `parser_version`. Expect optional fields to be `null`. `recall import` accepts schema_version 2 and 3 files and skips sessions that already exist locally by `(source, source_id)`.
-
-Important fields:
-
-- `session.source`: the adapter id, such as `codex` or `claude-code`.
-- `session.source_id`: the original tool's session id.
-- `session.title`: the indexed session title.
-- `session.directory`: the project directory captured for the session.
-- `session.started_at` and `session.updated_at`: millisecond timestamps.
-- `messages[].role`: `user` or `assistant`.
-- `messages[].content`: the indexed message text.
-- `usage_events[]`: token usage when available.
-- `events[]`: tool/session events when available, including `attrs_json` raw attributes.
-
-## Avoid In Agent Tool Calls
-
-Do not use these as the primary workflow for analysis:
-
-- `recall` with no subcommand: launches the TUI.
-- `recall usage` without `--json`: launches a dashboard flow.
-- `recall session share --dry-run` when the user asked to share, update, or refresh a link.
-- Returning a URL without running `recall session share` (no `--dry-run`).
-- `recall share unpublish` unless the user asked to take that public page down.
-- Resume or app-launch behavior from the TUI: it opens another interactive session and has side effects.
-- Hidden commands such as `__bench-*` or `__background-worker`: internal or development-only.
-- Raw source transcript paths: use the public export unless the user explicitly asks for source-level forensics.
-
-## Privacy And Output
-
-Session history can contain private code, prompts, credentials, and user intent. Summarize only what is needed for the task. Do not paste full transcripts unless the user explicitly asks for them.
+- `recall` with no subcommand launches the TUI.
+- `recall usage` without `--json` launches an interactive dashboard.
+- `recall session share --dry-run` when the user asked to share or refresh a link, and returning a URL without a real publish.
+- `recall share unpublish` without an exact target selected by the user.
+- `recall sync --force` unless the user asks for a rebuild or incremental sync provably cannot repair the index.
+- Hidden `__bench-*` and `__background-worker` commands.
+- Raw source transcript paths unless the user explicitly asks for source-level forensics.

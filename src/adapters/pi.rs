@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
-use crate::adapters::usage::usage_count;
+use crate::adapters::usage::{disjoint_output_and_reasoning, usage_count};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp,
@@ -21,7 +21,7 @@ pub(crate) struct PiAdapter;
 
 const METADATA_PARSER_VERSION: u32 = 1;
 
-const USAGE_PARSER_VERSION: u32 = 1;
+const USAGE_PARSER_VERSION: u32 = 2;
 
 impl SourceAdapter for PiAdapter {
     fn id(&self) -> &str {
@@ -529,37 +529,47 @@ fn extract_pi_usage_event(
         .map(|id| format!("message:{id}"))
         .unwrap_or_else(|| format!("line:{event_seq}"));
 
+    let input_tokens = usage_count(usage, &["input", "inputTokens", "input_tokens"]);
+    let raw_output_tokens = usage_count(usage, &["output", "outputTokens", "output_tokens"]);
+    let cache_read_tokens = usage_count(
+        usage,
+        &[
+            "cacheRead",
+            "cache_read",
+            "cacheReadTokens",
+            "cache_read_tokens",
+            "cachedInputTokens",
+            "cached_input_tokens",
+        ],
+    );
+    let cache_write_tokens = usage_count(
+        usage,
+        &["cacheWrite", "cache_write", "cacheWriteTokens", "cache_write_tokens"],
+    );
+    let raw_reasoning_tokens = usage_count(
+        usage,
+        &[
+            "reasoning",
+            "reasoningTokens",
+            "reasoning_tokens",
+            "reasoningOutputTokens",
+            "reasoning_output_tokens",
+        ],
+    );
+    let other_tokens =
+        input_tokens.saturating_add(cache_read_tokens).saturating_add(cache_write_tokens);
+    let (output_tokens, reasoning_tokens) =
+        disjoint_output_and_reasoning(usage, raw_output_tokens, raw_reasoning_tokens, other_tokens);
+
     Some(RawUsageEvent {
         message_seq,
         model,
         provider,
-        input_tokens: usage_count(usage, &["input", "inputTokens", "input_tokens"]),
-        output_tokens: usage_count(usage, &["output", "outputTokens", "output_tokens"]),
-        cache_read_tokens: usage_count(
-            usage,
-            &[
-                "cacheRead",
-                "cache_read",
-                "cacheReadTokens",
-                "cache_read_tokens",
-                "cachedInputTokens",
-                "cached_input_tokens",
-            ],
-        ),
-        cache_write_tokens: usage_count(
-            usage,
-            &["cacheWrite", "cache_write", "cacheWriteTokens", "cache_write_tokens"],
-        ),
-        reasoning_tokens: usage_count(
-            usage,
-            &[
-                "reasoning",
-                "reasoningTokens",
-                "reasoning_tokens",
-                "reasoningOutputTokens",
-                "reasoning_output_tokens",
-            ],
-        ),
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
         source_path: Some(source_path.to_string()),
         raw_usage_json: Some(usage.to_string()),
         ..RawUsageEvent::observed(event_key, event_seq, timestamp, USAGE_PARSER_VERSION)
@@ -864,6 +874,67 @@ mod tests {
         assert_eq!(event.source_path.as_deref(), Some(path.to_string_lossy().as_ref()));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn usage_normalizes_reasoning_included_in_output() {
+        let entry = serde_json::json!({"id": "assistant1"});
+        let message = serde_json::json!({
+            "provider": "openrouter",
+            "model": "deepseek",
+            "usage": {
+                "input": 10,
+                "output": 7,
+                "cacheRead": 2,
+                "cacheWrite": 1,
+                "reasoningTokens": 4,
+                "totalTokens": 20
+            }
+        });
+
+        let event = extract_pi_usage_event(
+            &entry,
+            &message,
+            1,
+            3_000,
+            Some(1),
+            (None, None),
+            "/tmp/session.jsonl",
+        )
+        .unwrap();
+
+        assert_eq!(event.output_tokens, 3);
+        assert_eq!(event.reasoning_tokens, 4);
+    }
+
+    #[test]
+    fn usage_caps_reasoning_that_exceeds_inclusive_output() {
+        let entry = serde_json::json!({"id": "assistant1"});
+        let message = serde_json::json!({
+            "provider": "xai",
+            "model": "grok",
+            "usage": {
+                "input": 10,
+                "output": 3,
+                "cacheRead": 2,
+                "reasoningTokens": 4,
+                "totalTokens": 15
+            }
+        });
+
+        let event = extract_pi_usage_event(
+            &entry,
+            &message,
+            1,
+            3_000,
+            Some(1),
+            (None, None),
+            "/tmp/session.jsonl",
+        )
+        .unwrap();
+
+        assert_eq!(event.output_tokens, 0);
+        assert_eq!(event.reasoning_tokens, 3);
     }
 
     #[test]
