@@ -341,6 +341,18 @@ fn parse_claude_session_file(
     }))
 }
 
+#[cfg(test)]
+pub(crate) fn parse_conformance_fixture(claude_dir: &Path) -> anyhow::Result<Option<RawSession>> {
+    let mut indexes = load_session_indexes(claude_dir);
+    let Some(entry) = collect_project_entries(claude_dir, &mut indexes).into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+        return Ok(None);
+    };
+    parse_claude_session_file(entry, mtime_ms, &indexes, true)
+}
+
 pub(crate) struct ParsedConversation {
     pub(crate) messages: Vec<RawMessage>,
     pub(crate) usage_events: Vec<RawUsageEvent>,

@@ -211,6 +211,17 @@ fn parse_kimi_session_file_impl(
     parse_kimi_wire(meta, session_id, reader.lines(), mtime_ms, None, source_path)
 }
 
+#[cfg(test)]
+pub(crate) fn parse_conformance_fixture(sessions_dir: &Path) -> anyhow::Result<Option<RawSession>> {
+    let Some(entry) = collect_session_entries(sessions_dir).into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(snapshot) = kimi_session_snapshot(&entry) else {
+        return Ok(None);
+    };
+    parse_kimi_session_file_impl(&entry, snapshot.effective_mtime_ms())
+}
+
 fn session_dir_for_wire(wire_path: &Path) -> Option<&Path> {
     wire_path.parent().and_then(Path::parent).and_then(Path::parent)
 }
