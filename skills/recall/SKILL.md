@@ -1,6 +1,6 @@
 ---
 name: recall
-description: Use Recall as a project memory layer for local AI coding session history. Trigger when the user mentions recall, wants a live share link (分享会话/分享对话/分享这个对话/给我链接/share session/session link), wants to refresh or update an existing share link (更新分享链接/刷新分享/重新分享/update share link), wants to list or unpublish existing share pages (列出分享/有哪些分享/取消分享/unpublish share), resume or open a session, search or export sessions, review project history, recover decisions, find failed approaches, or inspect Claude Code/Codex/OpenCode/Cursor/Grok session evidence.
+description: Use Recall as a project memory layer for local AI coding session history. Trigger when the user asks to share, refresh, list, or unpublish session pages; resume or open a session; search or export sessions; review project history; recover decisions or failed approaches; inspect evidence from supported coding agents; or continue a numbered unfinished-session candidate previously offered by Recall.
 ---
 
 # Recall
@@ -9,9 +9,9 @@ description: Use Recall as a project memory layer for local AI coding session hi
 
 Recall is a local-first CLI that indexes AI coding sessions from multiple tools. Treat it as a project memory layer: use it to recover history, reduce repeated mistakes, and turn prior sessions into current review evidence.
 
-Use the installed `recall` command when inspecting the user's session history. If you are developing Recall itself, use the project build only for testing Recall behavior, not as a substitute for the user's installed history index.
+Prefer active Recall MCP tools for read-only session lookup. Fall back to the installed `recall` command when Recall MCP is unavailable or the requested workflow is CLI-only. If you are developing Recall itself, use the project build only for testing Recall behavior, not as a substitute for the user's installed history index.
 
-If `recall` is unavailable, stop the Recall workflow, tell the user it is not installed, and offer `brew install samzong/tap/recall` instead of pretending history was inspected.
+If neither active Recall MCP tools nor the `recall` command are available, stop the Recall workflow, tell the user Recall is unavailable, and offer `brew install samzong/tap/recall` instead of pretending history was inspected.
 
 Recall history is evidence, not truth. Verify technical claims, code behavior, commands, paths, and invariants against the current repository before acting.
 
@@ -21,16 +21,40 @@ Pick the workflow from user intent. Do not run the full project-review scoping f
 
 | Intent | Example prompts | Workflow |
 | --- | --- | --- |
-| Share a live link | "分享会话", "分享这个对话", "share this session", "给我链接" | Publish Or Refresh Share Link |
-| Refresh an existing link | "用 recall 更新分享链接", "刷新分享", "重新分享", "update the share link" | Publish Or Refresh Share Link |
-| List published shares | "有哪些分享", "列出分享链接", "what is currently shared" | List Published Shares |
-| Unpublish a share | "取消分享", "下线这个分享", "unpublish this share" | Unpublish Share Page |
-| Resume or open | "继续这个会话", "resume this chat" | Session Resume/Open |
-| Find one session | "找上次讨论 migration 的会话", "当前项目最新 grok 会话" | Latest/Find Session Lookup |
-| Review project history | "用 recall 审查这个项目", "历史风险" | Scoping Protocol + Analysis Modes |
+| Share a live link | "share this session", "give me a session link" | Publish Or Refresh Share Link |
+| Refresh an existing link | "refresh the share link", "share it again" | Publish Or Refresh Share Link |
+| List published shares | "list shared sessions", "what is currently shared" | List Published Shares |
+| Unpublish a share | "unpublish this share", "take this share down" | Unpublish Share Page |
+| Resume or open | "continue this session", "resume this chat" | Session Resume/Open |
+| Find one session | "find the last session about migration", "latest Grok session for this project" | Latest/Find Session Lookup |
+| Review project history | "review this project with Recall", "historical risks" | Scoping Protocol + Analysis Modes |
 | Reflect on AI coding workflow | "reflect on this project", "review my AI coding workflow", "timeline reflection", "workflow friction", "calibration discussion" | Route to the `reflect` skill |
+| No clear Recall task | Recall is invoked without a requested operation or analysis goal | Recent Continuation Check |
 
 Treat "share" and "update/refresh share link" as the same action: sync the latest transcript, publish to Pages, return the live URL.
+
+## Recent Continuation Check
+
+Use this fallback only after Intent Routing determines that Recall was invoked without a clear operation or analysis goal. Decide from the meaning of the request, never by matching an invocation token or fixed phrase. If the user states an intent, follow that intent and do not run this fallback.
+
+1. Resolve the current project with Project Scope Defaults. Do not broaden to all projects when the current project cannot be resolved.
+2. Prefer active Recall MCP tools:
+   - Call `list_recent_sessions` for the current project with no source filter and a limit of 5.
+   - Call `get_session` for each candidate with `max_messages` set to 12 and `tail` set to `true`.
+3. If Recall MCP tools are unavailable, use the CLI:
+   ```bash
+   recall session list --project /absolute/project/path --limit 5 --sort updated --format json
+   recall session show --id <session-id> --format json --include metadata,messages --from-seq <max(message_count-12,0)>
+   ```
+   Use the indexed session record. If the index is missing or empty, report that and offer `recall sync`; do not inspect raw source transcript files.
+4. Judge unfinished work from the meaning of the session ending, never from tool status, event status, or the final message role alone. Strong evidence includes an unanswered user request, explicitly remaining work or blockers, and interrupted execution. Exclude sessions whose ending reports completion. Exclude the current conversation when identifiable, including a candidate whose tail contains the current fallback request. Omit ambiguous candidates.
+5. Show at most 3 candidates with short reasons and stable numbering:
+   ```text
+   1. [source] title — why it appears unfinished
+   2. [source] title — why it appears unfinished
+   ```
+   Tell the user they can reply with a number to continue. If none qualify, state that no clearly unfinished recent session was found.
+6. A numeric reply selects that candidate. Load the relevant history with Recall MCP or CLI and continue the work in the current agent. Do not launch native resume behavior unless the user explicitly asks for it.
 
 ## Project Scope Defaults
 
@@ -85,8 +109,8 @@ When the user wants to share a session or update an existing share link, execute
 
 ### What the user expects
 
-- "分享会话" -> a **live, openable URL** for the current conversation.
-- "用 recall 更新分享链接" -> **re-publish** the current conversation so the page reflects the latest messages. The URL usually stays the same; the deployed HTML changes.
+- "share this session" -> a **live, openable URL** for the current conversation.
+- "refresh the Recall share link" -> **re-publish** the current conversation so the page reflects the latest messages. The URL usually stays the same; the deployed HTML changes.
 
 ### Steps
 
@@ -279,6 +303,7 @@ Use these Recall commands in agent tool calls:
 
 ```bash
 recall info
+recall mcp capabilities --format json
 recall sync
 recall sync --source codex
 recall search "migration bug" --project /absolute/project/path

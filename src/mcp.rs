@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::SecondsFormat;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo, Tool};
 use rmcp::{
     ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router, transport::stdio,
 };
@@ -61,9 +61,16 @@ struct SearchSessionsArgs {
 struct GetSessionArgs {
     /// Recall session id from search_sessions or list_recent_sessions.
     session_id: String,
-    /// Maximum messages to return from the start of the session. Defaults to 50.
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
+    #[schemars(
+        description = "Maximum messages to return. Defaults to 50. Reads from the start unless tail is true."
+    )]
     max_messages: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Return the newest messages instead of the oldest, preserving sequence order."
+    )]
+    tail: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -156,6 +163,18 @@ struct SessionDetail {
     messages: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum McpCapabilitiesFormat {
+    Text,
+    Json,
+}
+
+#[derive(Serialize)]
+struct McpCapabilities {
+    server: ServerInfo,
+    tools: Vec<Tool>,
+}
+
 enum IndexState {
     Ready(Store),
     Unavailable { path: Option<PathBuf>, message: String },
@@ -213,6 +232,17 @@ pub(crate) fn run(db: Option<PathBuf>) -> Result<()> {
     let runtime =
         tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build()?;
     runtime.block_on(serve(db))
+}
+
+pub(crate) fn run_capabilities(format: McpCapabilitiesFormat) -> Result<()> {
+    let report = mcp_capabilities();
+    match format {
+        McpCapabilitiesFormat::Text => print!("{}", render_capabilities(&report)),
+        McpCapabilitiesFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+    }
+    Ok(())
 }
 
 async fn serve(db: Option<PathBuf>) -> Result<()> {
@@ -298,12 +328,59 @@ impl RecallMcp {
 #[tool_handler]
 impl ServerHandler for RecallMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("recall", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Read-only memory over the local Recall session index. Search or list past coding sessions, look up which sessions touched a file, then fetch a session when you need the transcript. This server never writes, syncs, or mutates the index.",
-            )
+        mcp_server_info()
     }
+}
+
+fn mcp_server_info() -> ServerInfo {
+    ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        .with_server_info(Implementation::new("recall", env!("CARGO_PKG_VERSION")))
+        .with_instructions(
+            "Read-only memory over the local Recall session index. Search or list past coding sessions, look up which sessions touched a file, then fetch a session when you need the transcript. This server never writes, syncs, or mutates the index.",
+        )
+}
+
+fn mcp_capabilities() -> McpCapabilities {
+    McpCapabilities { server: mcp_server_info(), tools: RecallMcp::tool_router().list_all() }
+}
+
+fn render_capabilities(report: &McpCapabilities) -> String {
+    let mut output = format!("Recall MCP {}\n", env!("CARGO_PKG_VERSION"));
+    if let Some(instructions) = report.server.instructions.as_deref() {
+        output.push_str(instructions);
+        output.push('\n');
+    }
+    let capabilities = serde_json::to_value(&report.server.capabilities)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .map(|values| values.into_iter().map(|(key, _)| key).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    if !capabilities.is_empty() {
+        output.push_str("Capabilities: ");
+        output.push_str(&capabilities);
+        output.push('\n');
+    }
+    for tool in &report.tools {
+        output.push('\n');
+        output.push_str(tool.name.as_ref());
+        output.push('\n');
+        if let Some(description) = tool.description.as_deref() {
+            output.push_str(description);
+            output.push('\n');
+        }
+        let inputs = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .map(|values| values.keys().cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        if !inputs.is_empty() {
+            output.push_str("Inputs: ");
+            output.push_str(&inputs);
+            output.push('\n');
+        }
+    }
+    output
 }
 
 fn lock_index(index: &Mutex<IndexState>) -> std::sync::MutexGuard<'_, IndexState> {
@@ -482,7 +559,7 @@ fn get_ready(store: &Store, args: &GetSessionArgs) -> std::result::Result<Sessio
     };
     let max_messages = clamp_limit(args.max_messages, GET_MAX_MESSAGES_DEFAULT, u32::MAX);
     let messages = store.get_messages(&session.id).map_err(|error| error.to_string())?;
-    let (text, returned, truncated) = render_messages(&messages, max_messages);
+    let (text, returned, truncated) = render_messages(&messages, max_messages, args.tail);
     Ok(SessionDetail {
         message: None,
         session_id: Some(session.id.clone()),
@@ -565,35 +642,34 @@ fn clamp_limit(limit: Option<u32>, default: u32, max: u32) -> usize {
     usize::try_from(limit.unwrap_or(default).clamp(1, max)).unwrap_or(max as usize)
 }
 
-fn render_messages(messages: &[Message], max_messages: usize) -> (String, usize, bool) {
-    let mut text = String::new();
-    let mut returned = 0;
-    let mut truncated = messages.len() > max_messages;
-    for message in messages.iter().take(max_messages) {
+fn render_messages(messages: &[Message], max_messages: usize, tail: bool) -> (String, usize, bool) {
+    let selected = if tail {
+        messages.iter().rev().take(max_messages).collect::<Vec<_>>()
+    } else {
+        messages.iter().take(max_messages).collect::<Vec<_>>()
+    };
+    let mut blocks = Vec::new();
+    let mut bytes = 0;
+    let mut truncated = messages.len() > selected.len();
+    for message in selected {
         let (body, cut) = truncate_chars(&message.content, GET_MESSAGE_CHAR_CAP);
         if cut {
             truncated = true;
         }
         let block = format!("[{}] {body}", role_label(&message.role));
-        let extra = if text.is_empty() { block.len() } else { block.len() + 2 };
-        if !text.is_empty() && text.len() + extra > GET_RESPONSE_CHAR_CAP {
+        let extra = if blocks.is_empty() { block.len() } else { block.len() + 2 };
+        if bytes + extra > GET_RESPONSE_CHAR_CAP {
             truncated = true;
             break;
         }
-        if !text.is_empty() {
-            text.push_str("\n\n");
-        }
-        if text.len() + block.len() > GET_RESPONSE_CHAR_CAP {
-            let remaining = GET_RESPONSE_CHAR_CAP.saturating_sub(text.len());
-            text.push_str(&truncate_chars(&block, remaining).0);
-            truncated = true;
-            returned += 1;
-            break;
-        }
-        text.push_str(&block);
-        returned += 1;
+        bytes += extra;
+        blocks.push(block);
     }
-    (text, returned, truncated)
+    if tail {
+        blocks.reverse();
+    }
+    let returned = blocks.len();
+    (blocks.join("\n\n"), returned, truncated)
 }
 
 fn role_label(role: &Role) -> &'static str {
@@ -813,9 +889,11 @@ mod tests {
             .unwrap();
         let index = ready(store);
 
-        let detail =
-            get_session(&index, &GetSessionArgs { session_id: "s1".into(), max_messages: Some(1) })
-                .unwrap();
+        let detail = get_session(
+            &index,
+            &GetSessionArgs { session_id: "s1".into(), max_messages: Some(1), tail: false },
+        )
+        .unwrap();
         assert_eq!(detail.session_id.as_deref(), Some("s1"));
         assert_eq!(detail.returned_messages, 1);
         assert!(detail.truncated);
@@ -828,11 +906,71 @@ mod tests {
     }
 
     #[test]
+    fn get_session_tail_returns_latest_messages_in_sequence_order() {
+        let store = setup();
+        let mut stored = session("s1", "codex", "unfinished", 1_000);
+        stored.message_count = 4;
+        store.insert_session(&stored).unwrap();
+        store
+            .insert_messages(&[
+                message("s1", Role::User, "first", 0),
+                message("s1", Role::Assistant, "second", 1),
+                message("s1", Role::User, "third", 2),
+                message("s1", Role::Assistant, "fourth", 3),
+            ])
+            .unwrap();
+        let index = ready(store);
+
+        let detail = get_session(
+            &index,
+            &GetSessionArgs { session_id: "s1".into(), max_messages: Some(2), tail: true },
+        )
+        .unwrap();
+
+        assert_eq!(detail.returned_messages, 2);
+        assert!(detail.truncated);
+        assert_eq!(detail.messages, "[user] third\n\n[assistant] fourth");
+    }
+
+    #[test]
+    fn get_session_tail_keeps_newest_messages_under_response_cap() {
+        let store = setup();
+        let mut stored = session("s1", "codex", "long tail", 1_000);
+        stored.message_count = 20;
+        store.insert_session(&stored).unwrap();
+        let messages = (0..20)
+            .map(|seq| {
+                message(
+                    "s1",
+                    Role::Assistant,
+                    &format!("message-{seq:02}-{}", "x".repeat(1_990)),
+                    seq,
+                )
+            })
+            .collect::<Vec<_>>();
+        store.insert_messages(&messages).unwrap();
+        let index = ready(store);
+
+        let detail = get_session(
+            &index,
+            &GetSessionArgs { session_id: "s1".into(), max_messages: Some(20), tail: true },
+        )
+        .unwrap();
+
+        assert!(detail.truncated);
+        assert!(detail.returned_messages < 20);
+        assert!(!detail.messages.contains("message-00-"));
+        assert!(
+            detail.messages.rsplit("\n\n").next().unwrap().starts_with("[assistant] message-19-")
+        );
+    }
+
+    #[test]
     fn get_session_missing_id_is_a_tool_error() {
         let store = setup();
         store.insert_session(&session("s1", "codex", "title", 1_000)).unwrap();
         let index = ready(store);
-        let args = GetSessionArgs { session_id: "missing".into(), max_messages: None };
+        let args = GetSessionArgs { session_id: "missing".into(), max_messages: None, tail: false };
         let error = get_session(&index, &args).expect_err("missing session");
         assert!(error.contains(SESSION_NOT_FOUND));
         assert_eq!(
@@ -927,9 +1065,11 @@ mod tests {
         let content = "x".repeat(GET_MESSAGE_CHAR_CAP + 1);
         store.insert_messages(&[message("s1", Role::User, &content, 0)]).unwrap();
         let index = ready(store);
-        let detail =
-            get_session(&index, &GetSessionArgs { session_id: "s1".into(), max_messages: None })
-                .unwrap();
+        let detail = get_session(
+            &index,
+            &GetSessionArgs { session_id: "s1".into(), max_messages: None, tail: false },
+        )
+        .unwrap();
         assert!(detail.truncated);
         assert!(detail.messages.ends_with('…'));
         assert_eq!(
@@ -961,6 +1101,24 @@ mod tests {
             assert_eq!(notes.idempotent_hint, Some(true));
             assert_eq!(notes.open_world_hint, Some(false));
         }
+    }
+
+    #[test]
+    fn capabilities_report_uses_registered_tool_schemas() {
+        let report = mcp_capabilities();
+        let value = serde_json::to_value(&report).unwrap();
+        let tools = value["tools"].as_array().unwrap();
+        let get_session = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_session")
+            .expect("get_session capability");
+
+        assert!(get_session["inputSchema"]["properties"]["tail"].is_object());
+        assert!(report.server.capabilities.tools.is_some());
+        let text = render_capabilities(&report);
+        assert!(text.contains("get_session"));
+        assert!(text.contains("Inputs: "));
+        assert!(text.contains("tail"));
     }
 
     fn event(

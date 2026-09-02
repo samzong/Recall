@@ -123,7 +123,7 @@ enum Commands {
         #[arg(help = "Target shell")]
         shell: Shell,
     },
-    #[command(about = "Serve a read-only MCP server over stdio")]
+    #[command(about = "Serve and inspect the read-only MCP server")]
     Mcp {
         #[arg(long, help = "Read this Recall database instead of the default index")]
         db: Option<PathBuf>,
@@ -181,6 +181,11 @@ enum ShareCommands {
 
 #[derive(Subcommand)]
 enum McpCommands {
+    #[command(about = "Print the Recall MCP server capabilities and tools")]
+    Capabilities {
+        #[arg(long, value_enum, default_value_t = crate::mcp::McpCapabilitiesFormat::Text)]
+        format: crate::mcp::McpCapabilitiesFormat,
+    },
     #[command(about = "Register the Recall MCP server with local agent hosts")]
     Install {
         #[arg(
@@ -326,6 +331,9 @@ pub(crate) fn run() -> Result<()> {
             anyhow::bail!("--db is only valid when serving (`recall mcp`)");
         }
         Some(Commands::Mcp { db, command: None }) => crate::mcp::run(db)?,
+        Some(Commands::Mcp { command: Some(McpCommands::Capabilities { format }), .. }) => {
+            crate::mcp::run_capabilities(format)?
+        }
         Some(Commands::Mcp {
             command: Some(McpCommands::Install { agents, dry_run, bin }),
             ..
@@ -641,7 +649,7 @@ mod tests {
         assert!(compact_help.contains("extension Manage Recall extensions"));
         assert!(compact_help.contains("session Operate on indexed sessions"));
         assert!(compact_help.contains("completions Generate shell completion script"));
-        assert!(compact_help.contains("mcp Serve a read-only MCP server over stdio"));
+        assert!(compact_help.contains("mcp Serve and inspect the read-only MCP server"));
     }
 
     #[test]
@@ -728,9 +736,30 @@ mod tests {
     }
 
     #[test]
-    fn mcp_help_lists_install_and_uninstall() {
+    fn mcp_capabilities_parses_formats() {
+        let cli = Cli::try_parse_from(["recall", "mcp", "capabilities"]).unwrap();
+        match cli.command {
+            Some(Commands::Mcp { command: Some(McpCommands::Capabilities { format }), .. }) => {
+                assert_eq!(format, crate::mcp::McpCapabilitiesFormat::Text)
+            }
+            _ => panic!("expected mcp capabilities command"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["recall", "mcp", "capabilities", "--format", "json"]).unwrap();
+        match cli.command {
+            Some(Commands::Mcp { command: Some(McpCommands::Capabilities { format }), .. }) => {
+                assert_eq!(format, crate::mcp::McpCapabilitiesFormat::Json)
+            }
+            _ => panic!("expected mcp capabilities command"),
+        }
+    }
+
+    #[test]
+    fn mcp_help_lists_subcommands() {
         let mut command = Cli::command();
         let help = command.find_subcommand_mut("mcp").unwrap().render_long_help().to_string();
+        assert!(help.contains("capabilities"));
         assert!(help.contains("install"));
         assert!(help.contains("uninstall"));
         assert!(help.contains("--db"));
