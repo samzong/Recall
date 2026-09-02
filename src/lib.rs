@@ -23,6 +23,7 @@ pub(crate) mod share;
 pub(crate) mod share_init;
 pub(crate) mod skill_audit;
 pub(crate) mod sync;
+pub(crate) mod sync_progress;
 pub(crate) mod transcript;
 pub(crate) mod tui;
 pub(crate) mod types;

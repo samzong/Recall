@@ -101,7 +101,34 @@ pub(crate) struct SkillAuditEventRow {
     pub(crate) attrs_json: Option<String>,
 }
 
+const COMPACT_MIN_FREE_BYTES: u64 = 1 << 30;
+
+pub(crate) struct CompactionPlan {
+    pub(crate) reclaimable_bytes: u64,
+    pub(crate) required_disk_bytes: u64,
+}
+
 impl Store {
+    fn pragma_u64(&self, name: &str) -> Result<u64> {
+        Ok(self.conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, i64>(0))? as u64)
+    }
+
+    pub(crate) fn compaction_plan(&self) -> Result<Option<CompactionPlan>> {
+        let page_size = self.pragma_u64("page_size")?;
+        let page_count = self.pragma_u64("page_count")?;
+        let freelist = self.pragma_u64("freelist_count")?;
+        let reclaimable_bytes = freelist * page_size;
+        if reclaimable_bytes < COMPACT_MIN_FREE_BYTES || freelist * 2 < page_count {
+            return Ok(None);
+        }
+        Ok(Some(CompactionPlan { reclaimable_bytes, required_disk_bytes: page_count * page_size }))
+    }
+
+    pub(crate) fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM;")?;
+        Ok(())
+    }
+
     pub(crate) fn default_db_path() -> Result<PathBuf> {
         let data_dir = dirs::data_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?

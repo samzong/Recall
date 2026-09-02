@@ -13,6 +13,7 @@ use crate::project_scope::{ProjectScope, SessionScopeFields};
 use crate::query::resolve_source_filter;
 use crate::repo_identity::{RepoIdentity, RepoIdentityCache};
 use crate::semantic;
+use crate::sync_progress::{SyncProgress, format_bytes, format_elapsed};
 use crate::types::{Message, Role, Session};
 use crate::utils;
 
@@ -48,7 +49,38 @@ pub(crate) fn run_cli(
         sources,
         scope,
     })?;
+    compact_database_if_bloated()?;
     semantic::ensure_background_worker(false)?;
+    Ok(())
+}
+
+fn compact_database_if_bloated() -> Result<()> {
+    let store = Store::open()?;
+    let Some(plan) = store.compaction_plan()? else {
+        return Ok(());
+    };
+    let db_path = Store::default_db_path()?;
+    let available = fs2::available_space(db_path.parent().unwrap_or(&db_path))?;
+    if available < plan.required_disk_bytes {
+        eprintln!(
+            "Compaction skipped: reclaiming {} needs {} of free disk, {} available.",
+            format_bytes(plan.reclaimable_bytes),
+            format_bytes(plan.required_disk_bytes),
+            format_bytes(available)
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "Compacting database to reclaim {} (one-time)...",
+        format_bytes(plan.reclaimable_bytes)
+    );
+    let started = std::time::Instant::now();
+    match store.vacuum() {
+        Ok(()) => {
+            eprintln!("Database compacted in {}.", format_elapsed(started.elapsed().as_millis()))
+        }
+        Err(err) => eprintln!("Compaction skipped ({err}); it will be retried on the next sync."),
+    }
     Ok(())
 }
 
@@ -227,6 +259,8 @@ struct SyncJob {
     repo_cache: RepoIdentityCache,
     stats: SyncStats,
     adapter_runs: Vec<AdapterRun>,
+    progress: SyncProgress,
+    started: std::time::Instant,
 }
 
 impl SyncJob {
@@ -243,7 +277,7 @@ impl SyncJob {
         config.normalize_sources(&labels);
         let since_ts = if options.usage_only { None } else { config.sync_window.to_since_cutoff() };
         let path_excluder = config.build_path_excluder()?;
-        Ok(Self {
+        let mut job = Self {
             store,
             options,
             config,
@@ -253,7 +287,33 @@ impl SyncJob {
             repo_cache: RepoIdentityCache::default(),
             stats: SyncStats::default(),
             adapter_runs: Vec::new(),
-        })
+            progress: SyncProgress::disabled(),
+            started: std::time::Instant::now(),
+        };
+        if job.options.emit && !job.options.verbose {
+            let selected = available_adapters
+                .iter()
+                .filter(|adapter| job.is_selected(adapter.as_ref()))
+                .count();
+            job.progress = SyncProgress::for_terminal(selected);
+        }
+        Ok(job)
+    }
+
+    fn passes_filters(&self, adapter: &dyn adapters::SourceAdapter) -> bool {
+        if self.options.usage_only
+            && !adapters::adapter_supports_usage_dashboard(adapter, self.options.backfill_events)
+        {
+            return false;
+        }
+        self.options
+            .sources
+            .as_ref()
+            .is_none_or(|sources| sources.iter().any(|id| id == adapter.id()))
+    }
+
+    fn is_selected(&self, adapter: &dyn adapters::SourceAdapter) -> bool {
+        self.passes_filters(adapter) && self.config.is_source_enabled(adapter.id())
     }
 
     fn run_with(
@@ -264,6 +324,7 @@ impl SyncJob {
         for adapter in available_adapters {
             self.sync_adapter(adapter.as_ref(), &mut on_source)?;
         }
+        self.progress.finish();
         self.report_progress()
     }
 
@@ -275,15 +336,7 @@ impl SyncJob {
         let source_id = adapter.id();
         let label = adapter.label();
 
-        if self.options.usage_only
-            && !adapters::adapter_supports_usage_dashboard(adapter, self.options.backfill_events)
-        {
-            return Ok(());
-        }
-
-        if let Some(sources) = &self.options.sources
-            && !sources.iter().any(|id| id == source_id)
-        {
+        if !self.passes_filters(adapter) {
             return Ok(());
         }
 
@@ -298,6 +351,7 @@ impl SyncJob {
             on_source(source_id);
         }
 
+        self.progress.begin_source(label);
         let started = std::time::Instant::now();
         let touched_before = self.stats.touched();
         let out_of_scope_before = self.stats.out_of_scope;
@@ -321,16 +375,21 @@ impl SyncJob {
         };
 
         let mut existing = self.load_existing_state(source_id)?;
-        for raw in raw_sessions {
+        let found = raw_sessions.len();
+        for (done, raw) in raw_sessions.into_iter().enumerate() {
+            self.progress.indexing(label, done, found);
             self.process_raw_session(source_id, raw, &mut existing, &mut purged_excluded_ids)?;
         }
 
+        let touched = self.stats.touched() - touched_before;
+        let elapsed_ms = started.elapsed().as_millis();
+        self.progress.end_source(label, found, touched, elapsed_ms);
         self.adapter_runs.push(AdapterRun {
             label: label.to_string(),
             scan,
             out_of_scope: self.stats.out_of_scope - out_of_scope_before,
-            touched: self.stats.touched() - touched_before,
-            elapsed_ms: started.elapsed().as_millis(),
+            touched,
+            elapsed_ms,
         });
 
         info!("{label} done");
@@ -848,13 +907,18 @@ impl SyncJob {
                 );
             }
         } else if self.options.emit {
+            let elapsed = format_elapsed(self.started.elapsed().as_millis());
             if self.options.force {
-                println!("Reprocessed {touched} sessions, {total_messages} messages");
+                println!("Reprocessed {touched} sessions, {total_messages} messages in {elapsed}");
             } else if touched == 0 {
-                println!("Up to date.");
+                println!("Up to date ({elapsed}).");
+            } else if reprocessed_sessions > 0 {
+                println!(
+                    "{new_sessions} new, {updated_sessions} updated, {reprocessed_sessions} backfilled, {total_messages} messages in {elapsed}"
+                );
             } else {
                 println!(
-                    "{new_sessions} new, {updated_sessions} updated, {total_messages} messages"
+                    "{new_sessions} new, {updated_sessions} updated, {total_messages} messages in {elapsed}"
                 );
             }
         }

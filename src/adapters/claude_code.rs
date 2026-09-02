@@ -21,7 +21,7 @@ use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, R
 pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 5;
-const EVENT_PARSER_VERSION: u32 = 2;
+const EVENT_PARSER_VERSION: u32 = 3;
 const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for ClaudeCodeAdapter {

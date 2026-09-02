@@ -2,6 +2,8 @@ use serde_json::Value;
 
 use crate::types::RawSessionEvent;
 
+const TOOL_RESULT_SUMMARY_MAX_BYTES: usize = 4096;
+
 pub(crate) struct EventContext {
     pub(crate) event_seq: u32,
     pub(crate) timestamp: Option<i64>,
@@ -83,7 +85,7 @@ pub(crate) fn tool_result_event(
         status: None,
         target: None,
         message_seq: context.message_seq,
-        summary,
+        summary: summary.map(cap_tool_result_summary),
         source_path: context.source_path,
         source_event_id: context.source_event_id,
         attrs_json: None,
@@ -216,4 +218,47 @@ fn infer_tool_kind(name: &str, target: Option<&str>) -> &'static str {
 fn non_empty(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+fn cap_tool_result_summary(summary: String) -> String {
+    if summary.len() <= TOOL_RESULT_SUMMARY_MAX_BYTES {
+        return summary;
+    }
+    let mut end = TOOL_RESULT_SUMMARY_MAX_BYTES;
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut capped = summary[..end].to_string();
+    capped.push('…');
+    capped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventContext, TOOL_RESULT_SUMMARY_MAX_BYTES, tool_result_event};
+
+    fn context() -> EventContext {
+        EventContext {
+            event_seq: 0,
+            timestamp: None,
+            source_path: None,
+            source_event_id: None,
+            message_seq: None,
+            parser_version: 1,
+        }
+    }
+
+    #[test]
+    fn tool_result_summary_is_capped_on_a_char_boundary() {
+        let long = "汉".repeat(TOOL_RESULT_SUMMARY_MAX_BYTES);
+        let event = tool_result_event(context(), None, Some(long));
+        let summary = event.summary.unwrap();
+        assert!(summary.ends_with('…'));
+        assert!(summary.len() <= TOOL_RESULT_SUMMARY_MAX_BYTES + '…'.len_utf8());
+        assert!(summary.trim_end_matches('…').chars().all(|c| c == '汉'));
+
+        let short = "ok".to_string();
+        let event = tool_result_event(context(), None, Some(short.clone()));
+        assert_eq!(event.summary, Some(short));
+    }
 }
