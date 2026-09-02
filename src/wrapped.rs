@@ -2,17 +2,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Write};
 
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
+use chrono::{
+    DateTime, Datelike, Days, Local, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Timelike,
+};
 use serde::Serialize;
 use unicode_width::UnicodeWidthStr;
 
-use crate::db::search::TimeRange;
 use crate::db::store::Store;
 use crate::types::UsageEventRecord;
 use crate::usage::{TokenTotals, UsageDedup};
 
 const INNER: usize = 52;
-const YEAR_MS: i64 = 365 * 24 * 3600 * 1000;
 const WEEKDAYS: [&str; 7] =
     ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 
@@ -42,13 +42,32 @@ impl WrappedPeriod {
     }
 
     fn after_millis_at(self, now: DateTime<Local>) -> Option<i64> {
-        match self {
-            Self::Week => TimeRange::Week.cutoff_millis_at(now),
-            Self::Month => TimeRange::Month.cutoff_millis_at(now),
-            Self::Year => Some(now.timestamp_millis() - YEAR_MS),
-            Self::All => None,
-        }
+        let lookback_days = match self {
+            Self::Week => 6,
+            Self::Month => 29,
+            Self::Year => 364,
+            Self::All => return None,
+        };
+        let start = now
+            .date_naive()
+            .checked_sub_days(Days::new(lookback_days))?
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid wall-clock value");
+        Some(first_valid_local_millis(start, |candidate| {
+            Local.from_local_datetime(&candidate).earliest().map(|value| value.timestamp_millis())
+        }))
     }
+}
+
+fn first_valid_local_millis(
+    start: NaiveDateTime,
+    mut resolve: impl FnMut(NaiveDateTime) -> Option<i64>,
+) -> i64 {
+    (0_i64..=48 * 60)
+        .find_map(|minutes| {
+            start.checked_add_signed(TimeDelta::minutes(minutes)).and_then(&mut resolve)
+        })
+        .expect("local period boundary resolves within 48 hours")
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -134,7 +153,8 @@ impl WrappedAcc {
     }
 
     fn finish(self, period: WrappedPeriod) -> WrappedReport {
-        let empty = self.days.is_empty();
+        let has_usage = !self.days.is_empty();
+        let empty = !has_usage && self.sessions.is_empty();
         let mut by_source = self
             .by_source
             .into_iter()
@@ -174,8 +194,8 @@ impl WrappedAcc {
             sessions: self.sessions.len(),
             active_days: self.days.len(),
             longest_streak: longest_streak(&self.days),
-            top_model: if empty { None } else { top_model },
-            top_source: if empty { None } else { top_source },
+            top_model: if has_usage { top_model } else { None },
+            top_source: if has_usage { top_source } else { None },
             busiest_weekday,
             busiest_hour,
             by_source,
@@ -209,9 +229,14 @@ fn build_wrapped_report_at(
     now: DateTime<Local>,
 ) -> Result<WrappedReport> {
     let after = period.after_millis_at(now);
-    let acc = store.fold_usage_events_after(None, after, WrappedAcc::default(), |acc, event| {
-        acc.add(&event);
-    })?;
+    let mut acc =
+        store.fold_usage_events_after(None, after, WrappedAcc::default(), |acc, event| {
+            acc.add(&event);
+        })?;
+    for (source, session_id) in store.indexed_active_sessions_after(after)? {
+        acc.sessions.insert(session_id.clone());
+        acc.by_source.entry(source).or_default().sessions.insert(session_id);
+    }
     Ok(acc.finish(period))
 }
 
@@ -879,19 +904,33 @@ mod tests {
     }
 
     #[test]
-    fn period_cutoff_matches_usage_windows() {
+    fn period_cutoff_uses_local_calendar_days() {
         let now = fixture_now();
         let events = vec![
+            event("codex", "before-week", "w0", local_ts(2026, 8, 19, 13), "gpt-5.5", 10, 1),
             event("codex", "s1", "k1", local_ts(2026, 8, 24, 12), "gpt-5.5", 10, 1),
+            event("codex", "before-month", "m0", local_ts(2026, 7, 27, 13), "gpt-5.5", 10, 1),
             event("codex", "s2", "k2", local_ts(2026, 8, 10, 12), "gpt-5.5", 10, 1),
             event("codex", "s3", "k3", local_ts(2026, 4, 1, 12), "gpt-5.5", 10, 1),
+            event("codex", "before-year", "y0", local_ts(2025, 8, 26, 13), "gpt-5.5", 10, 1),
             event("codex", "s4", "k4", local_ts(2025, 6, 1, 12), "gpt-5.5", 10, 1),
         ];
 
         assert_eq!(aggregate_wrapped_events(&events, WrappedPeriod::Week, now).sessions, 1);
-        assert_eq!(aggregate_wrapped_events(&events, WrappedPeriod::Month, now).sessions, 2);
-        assert_eq!(aggregate_wrapped_events(&events, WrappedPeriod::Year, now).sessions, 3);
-        assert_eq!(aggregate_wrapped_events(&events, WrappedPeriod::All, now).sessions, 4);
+        assert_eq!(aggregate_wrapped_events(&events, WrappedPeriod::Month, now).sessions, 3);
+        assert_eq!(aggregate_wrapped_events(&events, WrappedPeriod::Year, now).sessions, 5);
+        assert_eq!(aggregate_wrapped_events(&events, WrappedPeriod::All, now).sessions, 7);
+    }
+
+    #[test]
+    fn local_day_start_advances_through_timezone_gap() {
+        let start = NaiveDate::from_ymd_opt(2026, 9, 6).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        let expected = start.checked_add_signed(TimeDelta::minutes(45)).unwrap();
+        let resolved = first_valid_local_millis(start, |candidate| {
+            (candidate >= expected).then(|| candidate.and_utc().timestamp_millis())
+        });
+
+        assert_eq!(resolved, expected.and_utc().timestamp_millis());
     }
 
     #[test]
@@ -995,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn period_card_labels_describe_rolling_windows() {
+    fn period_card_labels_describe_calendar_windows() {
         assert_eq!(WrappedPeriod::Week.card_label(), "last 7 days");
         assert_eq!(WrappedPeriod::Month.card_label(), "last 30 days");
         assert_eq!(WrappedPeriod::Year.card_label(), "last 365 days");
@@ -1053,10 +1092,26 @@ mod tests {
     }
 
     #[test]
-    fn store_backed_report_reads_existing_usage_events() {
+    fn store_backed_reports_use_indexed_session_counts() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let session = make_session("s1", "claude-code");
+        store.insert_session(&make_session("s2", "claude-code")).unwrap();
+        let mut old_session = make_session("s3", "codex");
+        old_session.started_at = local_ts(2026, 8, 19, 13);
+        old_session.updated_at = Some(local_ts(2026, 8, 25, 13));
+        store.insert_session(&old_session).unwrap();
+        let mut usage_only_session = make_session("s4", "codex");
+        usage_only_session.started_at = local_ts(2026, 8, 1, 13);
+        usage_only_session.updated_at = Some(local_ts(2026, 8, 1, 13));
+        store
+            .persist_session_with_usage(
+                &usage_only_session,
+                &[],
+                &[make_usage("evt-2", local_ts(2026, 8, 25, 14), "gpt-5.5", 10, 1)],
+                Some(4),
+            )
+            .unwrap();
         let messages = vec![Message {
             session_id: "s1".to_string(),
             role: Role::User,
@@ -1075,14 +1130,105 @@ mod tests {
 
         let report = build_wrapped_report_at(&store, WrappedPeriod::All, fixture_now()).unwrap();
         assert!(!report.empty);
-        assert_eq!(report.sessions, 1);
-        assert_eq!(report.tokens.total_tokens, 120);
+        assert_eq!(report.sessions, 4);
+        assert_eq!(report.by_source[0].sessions, 2);
+        assert_eq!(report.tokens.total_tokens, 131);
         assert_eq!(report.top_source.unwrap().source, "claude-code");
+
+        let week = build_wrapped_report_at(&store, WrappedPeriod::Week, fixture_now()).unwrap();
+        assert_eq!(week.sessions, 4);
+        assert_eq!(week.by_source.iter().map(|row| row.sessions).sum::<usize>(), 4);
+        let codex = week.by_source.iter().find(|row| row.source == "codex").unwrap();
+        assert_eq!(codex.sessions, 2);
+        assert_eq!(codex.tokens.total_tokens, 11);
 
         let week_cutoff_now =
             Local.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).single().expect("valid local time");
         let empty = build_wrapped_report_at(&store, WrappedPeriod::Week, week_cutoff_now).unwrap();
         assert!(empty.empty);
+    }
+
+    #[test]
+    fn store_backed_report_keeps_indexed_sessions_without_usage() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        store.insert_session(&make_session("s1", "cursor")).unwrap();
+
+        let report = build_wrapped_report_at(&store, WrappedPeriod::Week, fixture_now()).unwrap();
+        assert!(!report.empty);
+        assert_eq!(report.sessions, 1);
+        assert_eq!(report.tokens.total_tokens, 0);
+        assert_eq!(report.by_source.len(), 1);
+        assert_eq!(report.by_source[0].source, "cursor");
+        assert_eq!(report.by_source[0].sessions, 1);
+    }
+
+    #[test]
+    fn store_backed_report_normalizes_legacy_usage_rows() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+
+        let mut codex = make_usage("codex", local_ts(2026, 8, 20, 14), "gpt-5.5", 0, 10);
+        codex.reasoning_tokens = 4;
+        codex.parser_version = 4;
+        store
+            .persist_session_with_usage(&make_session("codex", "codex"), &[], &[codex], Some(4))
+            .unwrap();
+
+        let mut gemini = make_usage("gemini", local_ts(2026, 8, 20, 14), "gemini-2.5-pro", 100, 20);
+        gemini.cache_read_tokens = 30;
+        gemini.reasoning_tokens = 5;
+        store
+            .persist_session_with_usage(
+                &make_session("gemini", "gemini-cli"),
+                &[],
+                &[gemini],
+                Some(1),
+            )
+            .unwrap();
+
+        let mut qwen = make_usage("qwen", local_ts(2026, 8, 20, 14), "qwen3", 100, 20);
+        qwen.cache_read_tokens = 30;
+        qwen.reasoning_tokens = 5;
+        store
+            .persist_session_with_usage(&make_session("qwen", "qwen-code"), &[], &[qwen], Some(1))
+            .unwrap();
+
+        let mut pi = make_usage("pi", local_ts(2026, 8, 20, 14), "deepseek", 10, 7);
+        pi.cache_read_tokens = 2;
+        pi.cache_write_tokens = 1;
+        pi.reasoning_tokens = 4;
+        pi.parser_version = 1;
+        pi.raw_usage_json = Some(r#"{"totalTokens":20}"#.to_string());
+        store.persist_session_with_usage(&make_session("pi", "pi"), &[], &[pi], Some(1)).unwrap();
+
+        let report = build_wrapped_report_at(&store, WrappedPeriod::All, fixture_now()).unwrap();
+        assert_eq!(report.tokens.input_tokens, 150);
+        assert_eq!(report.tokens.output_tokens, 49);
+        assert_eq!(report.tokens.cache_read_tokens, 62);
+        assert_eq!(report.tokens.cache_write_tokens, 1);
+        assert_eq!(report.tokens.reasoning_tokens, 18);
+        assert_eq!(report.tokens.total_tokens, 280);
+
+        let codex = store.list_usage_events_for_session("codex").unwrap();
+        assert_eq!(codex[0].output_tokens, 6);
+        assert_eq!(codex[0].reasoning_tokens, 4);
+        assert_eq!(codex[0].parser_version, 5);
+
+        let gemini = store.list_usage_events_for_session("gemini").unwrap();
+        assert_eq!(gemini[0].input_tokens, 70);
+        assert_eq!(gemini[0].cache_read_tokens, 30);
+        assert_eq!(gemini[0].parser_version, 2);
+
+        let qwen = store.list_usage_events_for_session("qwen").unwrap();
+        assert_eq!(qwen[0].input_tokens, 70);
+        assert_eq!(qwen[0].cache_read_tokens, 30);
+        assert_eq!(qwen[0].parser_version, 2);
+
+        let pi = store.list_usage_events_for_session("pi").unwrap();
+        assert_eq!(pi[0].output_tokens, 3);
+        assert_eq!(pi[0].reasoning_tokens, 4);
+        assert_eq!(pi[0].parser_version, 2);
     }
 
     #[test]

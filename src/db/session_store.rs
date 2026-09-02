@@ -73,6 +73,21 @@ impl Store {
         rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
 
+    pub(crate) fn indexed_active_sessions_after(
+        &self,
+        after_millis: Option<i64>,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source, id
+             FROM sessions
+             WHERE (?1 IS NULL OR COALESCE(updated_at, started_at) >= ?1)",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![after_millis], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub(crate) fn imported_source_ids(&self, source: &str) -> Result<HashSet<String>> {
         let mut stmt = self
             .conn

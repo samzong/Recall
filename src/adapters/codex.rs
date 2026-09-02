@@ -19,7 +19,7 @@ use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, R
 
 pub(crate) struct CodexAdapter;
 
-const USAGE_PARSER_VERSION: u32 = 4;
+const USAGE_PARSER_VERSION: u32 = 5;
 const EVENT_PARSER_VERSION: u32 = 3;
 const METADATA_PARSER_VERSION: u32 = 1;
 
@@ -863,8 +863,8 @@ fn extract_codex_usage_event(
 
     let cache_read_tokens = tokens.cached.min(tokens.input).max(0);
     let input_tokens = tokens.input.saturating_sub(cache_read_tokens).max(0);
-    let output_tokens = tokens.output.max(0);
     let reasoning_tokens = tokens.reasoning.max(0);
+    let output_tokens = tokens.output.saturating_sub(reasoning_tokens).max(0);
     if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 && reasoning_tokens == 0 {
         return None;
     }
@@ -1500,7 +1500,7 @@ mod tests {
         assert_eq!(raw.usage_events[0].provider, "openai");
         assert_eq!(raw.usage_events[0].input_tokens, 8);
         assert_eq!(raw.usage_events[0].cache_read_tokens, 2);
-        assert_eq!(raw.usage_events[0].output_tokens, 3);
+        assert_eq!(raw.usage_events[0].output_tokens, 2);
         assert_eq!(raw.usage_events[0].reasoning_tokens, 1);
         assert_eq!(raw.usage_events[0].token_source, crate::types::TokenSource::Derived);
 
@@ -1556,7 +1556,7 @@ mod tests {
         assert_eq!(raw.usage_events[0].provider, "openai");
         assert_eq!(raw.usage_events[0].input_tokens, 500);
         assert_eq!(raw.usage_events[0].cache_read_tokens, 1000);
-        assert_eq!(raw.usage_events[0].output_tokens, 200);
+        assert_eq!(raw.usage_events[0].output_tokens, 150);
         assert_eq!(raw.usage_events[0].reasoning_tokens, 50);
 
         assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));

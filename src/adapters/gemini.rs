@@ -12,7 +12,7 @@ use crate::types::{RawUsageEvent, Role};
 
 pub(crate) struct GeminiAdapter;
 
-const USAGE_PARSER_VERSION: u32 = 1;
+const USAGE_PARSER_VERSION: u32 = 2;
 
 impl SourceAdapter for GeminiAdapter {
     fn id(&self) -> &str {
@@ -181,10 +181,10 @@ fn extract_gemini_usage_event(
     source_path: Option<&str>,
 ) -> Option<RawUsageEvent> {
     let tokens = msg.get("tokens")?;
-    let input_tokens = usage_count(tokens, &["input"]);
     let output_tokens = usage_count(tokens, &["output"]);
     let cache_read_tokens = usage_count(tokens, &["cached"]);
     let reasoning_tokens = usage_count(tokens, &["thoughts"]);
+    let input_tokens = usage_count(tokens, &["input"]).saturating_sub(cache_read_tokens);
     if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 && reasoning_tokens == 0 {
         return None;
     }
@@ -279,7 +279,7 @@ mod tests {
         let event = &session.usage_events[0];
         assert_eq!(event.model, "gemini-2.5-pro");
         assert_eq!(event.provider, "google");
-        assert_eq!(event.input_tokens, 100);
+        assert_eq!(event.input_tokens, 70);
         assert_eq!(event.output_tokens, 20);
         assert_eq!(event.cache_read_tokens, 30);
         assert_eq!(event.reasoning_tokens, 5);
