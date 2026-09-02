@@ -1,0 +1,79 @@
+name: Build binaries
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or tag ref to build
+        required: true
+        type: string
+      save-cache:
+        description: Save the per-target rust-cache after building
+        required: false
+        default: false
+        type: boolean
+      upload:
+        description: Package and upload release artifacts
+        required: false
+        default: false
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: recall-linux-x86_64
+          - target: x86_64-apple-darwin
+            os: macos-15
+            artifact: recall-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: recall-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: recall-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+          save-if: ${{ inputs.save-cache }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p recall -p rx
+
+      - name: Record built commit
+        if: inputs.upload
+        shell: bash
+        run: git rev-parse HEAD > ${{ matrix.artifact }}.sha
+
+      - name: Package (unix)
+        if: inputs.upload && runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.artifact }}.tar.gz recall rx
+          cd ../../..
+
+      - name: Package (windows)
+        if: inputs.upload && runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/recall.exe,target/${{ matrix.target }}/release/rx.exe -DestinationPath ${{ matrix.artifact }}.zip
+
+      - uses: actions/upload-artifact@v5
+        if: inputs.upload
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.*

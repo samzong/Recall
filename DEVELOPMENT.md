@@ -169,7 +169,7 @@ make run                    # TUI filter should include MT
 
 ## CI
 
-CI runs `make check` — the same single command you run locally. There is no separate CI-only logic.
+CI runs `make check` — the same single command you run locally. The only CI-only job is the release-binary build on pushes to `main` (`build-binaries.yml`), which keeps the per-target release caches warm; tag-triggered release runs can only restore caches saved from `main`.
 
 ```
 make check = cargo audit → cargo fmt --check → cargo clippy --workspace --all-targets --features bench -- -D warnings → cargo test --workspace
