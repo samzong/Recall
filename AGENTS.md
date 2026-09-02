@@ -30,10 +30,10 @@ cargo test integration::regression    # regression suite
 cargo test integration::eval_harness  # eval harness
 ```
 
-`make check` must pass before push. CI runs exactly the same command. Its only
-extra job, on pushes to `main`, is the release-binary build from
-`build-binaries.yml`: it exists to keep the per-target caches warm, because a
-tag-triggered run can only restore caches saved from `main`. The gate uses
+`make check` must pass before push. CI runs exactly the same command.
+`release-cache.yml` warms the per-target release caches on a periodic schedule
+or by manual dispatch. Exact cache hits skip rebuilding the binaries.
+Tag-triggered runs restore caches saved from `main`. The gate uses
 `--workspace` and `--features bench`, so it
 covers extension crates, `crates/rx`, and the `bench_api` shim that `benches/` compiles
 against. Build a single extension with `cargo build -p recall-<name>`. Build the
@@ -53,9 +53,9 @@ Extensions release independently: bumping an extension's package version in a
 PR is the release intent — after merge, a workflow creates the
 `recall-<name>-v<version>` tag, builds binaries, and regenerates the catalog.
 
-One-time setup: `git config core.hooksPath .githooks` enables the DCO signoff
-hook. Install `cargo-audit 0.22.2` for `make check`; `brew install git-cliff`
-is also required to cut a release.
+One-time setup: `git config core.hooksPath .githooks` enables DCO signoff and
+rejects malformed core release commit subjects. Install `cargo-audit 0.22.2`
+for `make check`; `brew install git-cliff` is also required to cut a release.
 
 ## Architecture
 
