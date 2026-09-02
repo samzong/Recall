@@ -226,8 +226,8 @@ where
             continue;
         }
 
-        if let Some((old_updated_at, _)) = existing.get(&entry.session_id)
-            && *old_updated_at == Some(mtime_ms)
+        if let Some(old) = existing.get(&entry.session_id)
+            && old.updated_at == Some(mtime_ms)
             && usage_state_is_current_for_mtime(
                 options.usage_parser_version,
                 usage_state.get(&entry.session_id).copied(),

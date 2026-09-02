@@ -188,8 +188,8 @@ fn scan_projects(
                 continue;
             }
             if store.is_some()
-                && existing.get(&row.id).is_some_and(|&(old_updated_at, _)| {
-                    old_updated_at == Some(updated_at)
+                && existing.get(&row.id).is_some_and(|old| {
+                    old.updated_at == Some(updated_at)
                         && crate::adapters::sync_state::session_state_is_current(
                             USAGE_PARSER_VERSION,
                             EVENT_PARSER_VERSION,

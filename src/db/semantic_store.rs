@@ -125,7 +125,7 @@ impl Store {
             "UPDATE session_embedding_state
              SET status = 'processing',
                  units_done = ?2
-             WHERE session_id = ?1",
+             WHERE session_id = ?1 AND status = 'processing'",
             rusqlite::params![session_id, units_done as i64],
         )?;
         Ok(())
@@ -139,7 +139,7 @@ impl Store {
                  units_done = units_total,
                  finished_at = ?2,
                  last_error = NULL
-             WHERE session_id = ?1",
+             WHERE session_id = ?1 AND status = 'processing'",
             rusqlite::params![session_id, now],
         )?;
         Ok(())
@@ -152,7 +152,7 @@ impl Store {
              SET status = 'failed',
                  finished_at = ?2,
                  last_error = ?3
-             WHERE session_id = ?1",
+             WHERE session_id = ?1 AND status = 'processing'",
             rusqlite::params![session_id, now, error],
         )?;
         Ok(())

@@ -51,6 +51,13 @@ pub(crate) struct SessionPath {
     pub(crate) repo_name: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct IndexedSessionMeta {
+    pub(crate) id: String,
+    pub(crate) updated_at: Option<i64>,
+    pub(crate) message_count: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionListSort {
     Newest,

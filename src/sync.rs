@@ -6,8 +6,8 @@ use tracing::info;
 use crate::adapters;
 use crate::config::AppConfig;
 use crate::db::store::{
-    EventSessionStateMeta, MetadataSessionStateMeta, SessionPath, SessionTopologyWrite, Store,
-    UsageSessionStateMeta,
+    EventSessionStateMeta, IndexedSessionMeta, MetadataSessionStateMeta, SessionPath,
+    SessionTopologyWrite, Store, UsageSessionStateMeta,
 };
 use crate::project_scope::{ProjectScope, SessionScopeFields};
 use crate::query::resolve_source_filter;
@@ -174,7 +174,7 @@ impl SyncStats {
 }
 
 struct ExistingState {
-    meta: HashMap<String, (Option<i64>, u32)>,
+    meta: HashMap<String, IndexedSessionMeta>,
     paths: HashMap<String, SessionPath>,
     imported_ids: HashSet<String>,
     usage_meta: HashMap<String, UsageSessionStateMeta>,
@@ -202,7 +202,14 @@ impl ExistingState {
         event_parser_version: Option<u32>,
         metadata_parser_version: Option<u32>,
     ) {
-        self.meta.insert(session.source_id.clone(), (session.updated_at, session.message_count));
+        self.meta.insert(
+            session.source_id.clone(),
+            IndexedSessionMeta {
+                id: session.id.clone(),
+                updated_at: session.updated_at,
+                message_count: session.message_count,
+            },
+        );
         self.paths.insert(
             session.source_id.clone(),
             SessionPath {
@@ -668,15 +675,15 @@ impl SyncJob {
                 )
             });
 
-        match existing.meta.get(&raw_source_id).copied() {
-            Some((old_updated_at, old_msg_count)) => {
+        let session_uuid = match existing.meta.get(&raw_source_id).cloned() {
+            Some(old) => {
                 let was_imported = existing.imported_ids.remove(&raw_source_id);
                 let metadata_changed = existing.paths.get(&raw_source_id).is_some_and(|old| {
                     raw_session_metadata_changed(&raw, repo_identity.as_ref(), old)
                 });
-                let content_changed = old_msg_count != msg_count
+                let content_changed = old.message_count != msg_count
                     || metadata_changed
-                    || (raw.updated_at.is_some() && raw.updated_at != old_updated_at);
+                    || (raw.updated_at.is_some() && raw.updated_at != old.updated_at);
                 match decide_existing_session_action(
                     self.options.usage_only,
                     self.options.backfill_events,
@@ -714,13 +721,14 @@ impl SyncJob {
                 } else {
                     self.stats.reprocessed_sessions += 1;
                 }
+                old.id
             }
             None => {
                 self.stats.new_sessions += 1;
+                uuid::Uuid::new_v4().to_string()
             }
-        }
+        };
 
-        let session_uuid = uuid::Uuid::new_v4().to_string();
         let title = raw
             .custom_title
             .clone()
@@ -1112,7 +1120,7 @@ mod tests {
         store::{SessionPath, Store},
     };
     use crate::project_scope::ProjectScope;
-    use crate::types::{Role, Session};
+    use crate::types::{Message, Role, Session};
 
     use super::{
         BackfillPlan, ExistingSessionAction, SyncJob, SyncRunOptions,
@@ -1269,6 +1277,25 @@ mod tests {
             source_file_path: None,
             is_import: false,
         }
+    }
+
+    fn global_job(adapters: &[Box<dyn SourceAdapter>]) -> SyncJob {
+        schema::register_sqlite_vec();
+        SyncJob::new(
+            SyncRunOptions {
+                force: false,
+                verbose: false,
+                emit: false,
+                usage_only: false,
+                backfill_events: false,
+                sources: None,
+                scope: ProjectScope::Global,
+            },
+            Store::open_in_memory().unwrap(),
+            AppConfig::default(),
+            adapters,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1598,48 +1625,61 @@ mod tests {
     }
 
     #[test]
-    fn sync_job_refreshes_changed_session_through_adapter_seam() {
-        schema::register_sqlite_vec();
+    fn sync_job_refresh_preserves_session_id_and_replaces_indexed_content() {
         let initial: Vec<Box<dyn SourceAdapter>> = vec![Box::new(StaticAdapter {
             updated_at: 2_000,
-            messages: &["first"],
+            messages: &["old content"],
             source_file_path: None,
             optimized: false,
         })];
-        let mut job = SyncJob::new(
-            SyncRunOptions {
-                force: false,
-                verbose: false,
-                emit: false,
-                usage_only: false,
-                backfill_events: false,
-                sources: None,
-                scope: ProjectScope::Global,
-            },
-            Store::open_in_memory().unwrap(),
-            AppConfig::default(),
-            &initial,
-        )
-        .unwrap();
+        let mut job = global_job(&initial);
 
         job.run_with(&initial, None).unwrap();
-        assert_eq!(job.store.session_meta("test", "raw1").unwrap(), Some((Some(2_000), 1)));
+        let original = job.store.list_recent_sessions(1).unwrap().pop().unwrap();
 
         let updated: Vec<Box<dyn SourceAdapter>> = vec![Box::new(StaticAdapter {
             updated_at: 3_000,
-            messages: &["first", "second"],
+            messages: &["new content"],
             source_file_path: None,
             optimized: false,
         })];
         job.run_with(&updated, None).unwrap();
 
-        assert_eq!(job.store.session_meta("test", "raw1").unwrap(), Some((Some(3_000), 2)));
-        let session = job.store.list_recent_sessions(1).unwrap().pop().unwrap();
-        let messages = job.store.get_messages(&session.id).unwrap();
-        assert_eq!(
-            messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
-            ["first", "second"]
-        );
+        let refreshed = job.store.list_recent_sessions(1).unwrap().pop().unwrap();
+        assert_eq!(refreshed.id, original.id);
+        assert_eq!(job.store.get_messages(&refreshed.id).unwrap()[0].content, "new content");
+    }
+
+    #[test]
+    fn imported_session_takeover_preserves_session_id_and_replaces_content() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(StaticAdapter {
+            updated_at: 3_000,
+            messages: &["sourceownedtoken"],
+            source_file_path: None,
+            optimized: false,
+        })];
+        let mut job = global_job(&adapters);
+        let mut imported = session("imported-id", "test", "raw1");
+        imported.updated_at = Some(2_000);
+        imported.message_count = 1;
+        imported.is_import = true;
+        job.store.insert_session(&imported).unwrap();
+        job.store
+            .insert_messages(&[Message {
+                session_id: imported.id.clone(),
+                role: Role::User,
+                content: "importeduniquetoken".to_string(),
+                timestamp: Some(2_000),
+                seq: 0,
+            }])
+            .unwrap();
+
+        job.run_with(&adapters, None).unwrap();
+
+        let refreshed = job.store.list_recent_sessions(1).unwrap().pop().unwrap();
+        assert_eq!(refreshed.id, "imported-id");
+        assert!(!refreshed.is_import);
+        assert_eq!(job.store.get_messages(&refreshed.id).unwrap()[0].content, "sourceownedtoken");
     }
 
     #[test]

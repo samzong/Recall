@@ -7,8 +7,8 @@ use rusqlite::OptionalExtension;
 use super::event_store::replace_session_events;
 use super::project_store::apply_scope_filters;
 use super::store::{
-    MetadataSessionStateMeta, SESSION_COLUMNS, SessionListSort, SessionTopologyWrite, Store,
-    session_from_row,
+    IndexedSessionMeta, MetadataSessionStateMeta, SESSION_COLUMNS, SessionListSort,
+    SessionTopologyWrite, Store, session_from_row,
 };
 use crate::db::search::{ThreadRoleFilter, TimeRange};
 use crate::project_scope::ProjectScope;
@@ -42,12 +42,19 @@ impl Store {
     pub(crate) fn session_meta_map(
         &self,
         source: &str,
-    ) -> Result<HashMap<String, (Option<i64>, u32)>> {
+    ) -> Result<HashMap<String, IndexedSessionMeta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT source_id, updated_at, message_count FROM sessions WHERE source = ?1",
+            "SELECT source_id, id, updated_at, message_count FROM sessions WHERE source = ?1",
         )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| {
-            Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?)))
+            Ok((
+                row.get::<_, String>(0)?,
+                IndexedSessionMeta {
+                    id: row.get(1)?,
+                    updated_at: row.get(2)?,
+                    message_count: row.get(3)?,
+                },
+            ))
         })?;
         rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
