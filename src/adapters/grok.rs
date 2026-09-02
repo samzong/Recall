@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,8 @@ use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
+    InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
+    SyncScanOutput, SyncScanResult, SyncScanStats,
 };
 use crate::db::store::Store;
 use crate::types::{RawUsageEvent, Role};
@@ -57,23 +58,24 @@ impl SourceAdapter for GrokAdapter {
         Ok(sessions)
     }
 
-    fn scan_for_sync(
+    fn scan_for_sync_output(
         &self,
         store: &Store,
         since_ts: Option<i64>,
         _include_events: bool,
-    ) -> anyhow::Result<Option<SyncScanResult>> {
+        force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
         let Some(sessions_dir) = resolve_grok_sessions_dir()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            let result = SyncScanResult { sessions: vec![], stats: SyncScanStats::default() };
+            if store.session_meta_map("grok")?.is_empty() {
+                return Ok(Some(SyncScanOutput { scan: result, reconcile: None }));
+            }
+            return Ok(Some(SyncScanOutput {
+                scan: result,
+                reconcile: Some(ReconcilePlan::UnavailableInventory(Vec::new())),
+            }));
         };
-        Ok(Some(scan_for_sync_impl(&sessions_dir, store, since_ts)?))
-    }
-
-    fn prune(&self, store: &Store) -> anyhow::Result<()> {
-        let Some(sessions_dir) = resolve_grok_sessions_dir()? else {
-            return Ok(());
-        };
-        prune_impl(&sessions_dir, store)
+        Ok(Some(scan_for_sync_impl(&sessions_dir, store, since_ts, force)?))
     }
 }
 
@@ -111,51 +113,80 @@ fn scan_for_sync_impl(
     sessions_dir: &Path,
     store: &Store,
     since_ts: Option<i64>,
-) -> anyhow::Result<SyncScanResult> {
-    let (entries, _) = collect_grok_entries(sessions_dir);
-    file_scan::run_file_scan_with_options(
-        store,
-        "grok",
-        since_ts,
-        FileScanOptions {
-            usage_parser_version: Some(USAGE_PARSER_VERSION),
-            event_parser_version: None,
-            metadata_parser_version: None,
-        },
-        entries,
-        |entry, mtime_ms| parse_grok_session_for_entry(&entry, mtime_ms),
-    )
-}
-
-fn prune_impl(sessions_dir: &Path, store: &Store) -> anyhow::Result<()> {
-    let (_, subagent_ids) = collect_grok_entries(sessions_dir);
-    if subagent_ids.is_empty() {
-        return Ok(());
-    }
-    let existing = store.session_meta_map("grok")?;
-    for source_id in &subagent_ids {
-        if existing.contains_key(source_id) {
-            store.delete_session_data("grok", source_id)?;
+    force: bool,
+) -> anyhow::Result<SyncScanOutput> {
+    let (entries, reconcile) = collect_grok_entries(sessions_dir);
+    let result = if force {
+        let mut sessions = Vec::new();
+        let mut stats = SyncScanStats::default();
+        for entry in entries {
+            stats.candidates += 1;
+            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+                stats.rejected_before_parse += 1;
+                continue;
+            };
+            stats.parsed += 1;
+            if let Some(raw) = parse_grok_session_for_entry(&entry, mtime_ms)? {
+                sessions.push(raw);
+            }
         }
-    }
-    Ok(())
+        SyncScanResult { sessions, stats }
+    } else {
+        file_scan::run_file_scan_with_options(
+            store,
+            "grok",
+            since_ts,
+            FileScanOptions {
+                usage_parser_version: Some(USAGE_PARSER_VERSION),
+                event_parser_version: None,
+                metadata_parser_version: None,
+            },
+            entries,
+            |entry, mtime_ms| parse_grok_session_for_entry(&entry, mtime_ms),
+        )?
+    };
+    Ok(SyncScanOutput { scan: result, reconcile: Some(reconcile) })
 }
 
-fn collect_grok_entries(sessions_dir: &Path) -> (Vec<FileScanEntry>, Vec<String>) {
+fn collect_grok_entries(sessions_dir: &Path) -> (Vec<FileScanEntry>, ReconcilePlan) {
     let mut entries = Vec::new();
     let mut subagent_ids = Vec::new();
+    let mut issues = Vec::new();
 
     let workspace_dirs = match fs::read_dir(sessions_dir) {
         Ok(dirs) => dirs,
         Err(err) => {
             debug!("cannot read Grok sessions dir: {err}");
-            return (entries, subagent_ids);
+            return (
+                entries,
+                ReconcilePlan::UnavailableInventory(vec![InventoryIssue {
+                    path: sessions_dir.to_path_buf(),
+                    category: err.kind(),
+                }]),
+            );
         }
     };
 
-    for workspace_entry in workspace_dirs.flatten() {
+    for workspace_entry in workspace_dirs {
+        let workspace_entry = match workspace_entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                issues.push(InventoryIssue {
+                    path: sessions_dir.to_path_buf(),
+                    category: err.kind(),
+                });
+                continue;
+            }
+        };
         let workspace_path = workspace_entry.path();
-        if !workspace_path.is_dir() {
+        let workspace_metadata = match fs::metadata(&workspace_path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                issues.push(InventoryIssue { path: workspace_path, category: err.kind() });
+                continue;
+            }
+        };
+        if !workspace_metadata.is_dir() {
             continue;
         }
         let workspace_name =
@@ -165,40 +196,86 @@ fn collect_grok_entries(sessions_dir: &Path) -> (Vec<FileScanEntry>, Vec<String>
         }
 
         let fallback_directory = decode_grok_workspace_dir(workspace_name);
-
-        let session_dirs = match fs::read_dir(&workspace_path) {
-            Ok(dirs) => dirs,
-            Err(_) => continue,
-        };
-
-        for session_entry in session_dirs.flatten() {
-            let session_path = session_entry.path();
-            if !session_path.is_dir() {
-                continue;
-            }
-            let session_id = match session_path.file_name().and_then(|name| name.to_str()) {
-                Some(id) if is_grok_session_id(id) => id.to_string(),
-                _ => continue,
-            };
-
-            let updates_path = session_path.join("updates.jsonl");
-            if !updates_path.is_file() {
-                continue;
-            }
-
-            let (summary_directory, session_kind) = load_summary_probe(&session_path);
-            if matches!(session_kind.as_deref(), Some("subagent" | "subagent_resume")) {
-                subagent_ids.push(session_id);
-                continue;
-            }
-
-            let directory = summary_directory.or(fallback_directory.clone());
-
-            entries.push(FileScanEntry { session_id, stat_target: updates_path, directory });
-        }
+        collect_grok_workspace(
+            &workspace_path,
+            fallback_directory,
+            &mut entries,
+            &mut subagent_ids,
+            &mut issues,
+        );
     }
 
-    (entries, subagent_ids)
+    let reconcile = if issues.is_empty() {
+        ReconcilePlan::ExactTombstones(subagent_ids.into_iter().collect::<HashSet<_>>())
+    } else {
+        ReconcilePlan::PartialInventory(issues)
+    };
+    (entries, reconcile)
+}
+
+fn collect_grok_workspace(
+    workspace_path: &Path,
+    fallback_directory: Option<String>,
+    entries: &mut Vec<FileScanEntry>,
+    subagent_ids: &mut Vec<String>,
+    issues: &mut Vec<InventoryIssue>,
+) {
+    let session_dirs = match fs::read_dir(workspace_path) {
+        Ok(dirs) => dirs,
+        Err(err) => {
+            issues
+                .push(InventoryIssue { path: workspace_path.to_path_buf(), category: err.kind() });
+            return;
+        }
+    };
+
+    for session_entry in session_dirs {
+        let session_entry = match session_entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                issues.push(InventoryIssue {
+                    path: workspace_path.to_path_buf(),
+                    category: err.kind(),
+                });
+                continue;
+            }
+        };
+        let session_path = session_entry.path();
+        let session_metadata = match fs::metadata(&session_path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                issues.push(InventoryIssue { path: session_path, category: err.kind() });
+                continue;
+            }
+        };
+        if !session_metadata.is_dir() {
+            continue;
+        }
+        let session_id = match session_path.file_name().and_then(|name| name.to_str()) {
+            Some(id) if is_grok_session_id(id) => id.to_string(),
+            _ => continue,
+        };
+
+        let updates_path = session_path.join("updates.jsonl");
+        match fs::metadata(&updates_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                issues.push(InventoryIssue { path: updates_path, category: err.kind() });
+                continue;
+            }
+        }
+
+        let (summary_directory, session_kind) = load_summary_probe(&session_path);
+        if matches!(session_kind.as_deref(), Some("subagent" | "subagent_resume")) {
+            subagent_ids.push(session_id);
+            continue;
+        }
+
+        let directory = summary_directory.or(fallback_directory.clone());
+        entries.push(FileScanEntry { session_id, stat_target: updates_path, directory });
+    }
 }
 
 fn load_summary_probe(session_dir: &Path) -> (Option<String>, Option<String>) {
@@ -747,11 +824,14 @@ mod tests {
             r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hey"}}}}"#,
         );
 
-        let (entries, subagent_ids) = collect_grok_entries(&root);
+        let (entries, reconcile) = collect_grok_entries(&root);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id, session_id);
         assert_eq!(entries[0].directory.as_deref(), Some("/tmp/from-summary"));
-        assert!(subagent_ids.is_empty());
+        assert!(matches!(
+            reconcile,
+            ReconcilePlan::ExactTombstones(ids) if ids.is_empty()
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -784,17 +864,73 @@ mod tests {
             r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"229e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"machinery"}}}}"#,
         );
 
-        let (entries, mut subagent_ids) = collect_grok_entries(&root);
+        let (entries, reconcile) = collect_grok_entries(&root);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id, normal_id);
-        subagent_ids.sort();
-        assert_eq!(subagent_ids, vec![subagent_id.to_string(), resume_id.to_string()]);
+        assert!(matches!(
+            reconcile,
+            ReconcilePlan::ExactTombstones(ids)
+                if ids == HashSet::from([subagent_id.to_string(), resume_id.to_string()])
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn prune_deletes_existing_subagent_session() {
+    fn unreadable_root_is_unavailable_without_reconcile_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let not_directory = root.path().join("sessions");
+        fs::write(&not_directory, "not a directory").unwrap();
+        let store = setup_store();
+
+        let result = scan_for_sync_impl(&not_directory, &store, None, false).unwrap();
+
+        assert!(matches!(result.reconcile, Some(ReconcilePlan::UnavailableInventory(_))));
+    }
+
+    #[test]
+    fn unreadable_nested_directory_is_partial_without_reconcile_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let not_directory = root.path().join("workspace");
+        fs::write(&not_directory, "not a directory").unwrap();
+        let mut entries = Vec::new();
+        let mut subagent_ids = Vec::new();
+        let mut issues = Vec::new();
+
+        collect_grok_workspace(&not_directory, None, &mut entries, &mut subagent_ids, &mut issues);
+
+        assert!(entries.is_empty());
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn parse_failure_preserves_existing_session() {
+        let root = temp_grok_root("parse-failure");
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            session_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z"}"#,
+            "not json",
+        );
+        let store = setup_store();
+        store.insert_session(&make_existing_session(session_id, 1, 1)).unwrap();
+
+        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+
+        assert!(result.scan.sessions.is_empty());
+        assert!(store.session_meta("grok", session_id).unwrap().is_some());
+        assert!(matches!(
+            result.reconcile,
+            Some(ReconcilePlan::ExactTombstones(ids)) if ids.is_empty()
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn complete_scan_returns_exact_subagent_tombstone() {
         let root = temp_grok_root("subagent-delete");
         let normal_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
         let subagent_id = "119e9003-1ed9-70e3-803b-1e7f96a072eb";
@@ -815,12 +951,15 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(subagent_id, 1, 1)).unwrap();
 
-        prune_impl(&root, &store).unwrap();
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
 
-        assert!(!store.session_meta_map("grok").unwrap().contains_key(subagent_id));
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, normal_id);
+        assert!(store.session_meta_map("grok").unwrap().contains_key(subagent_id));
+        assert_eq!(result.scan.sessions.len(), 1);
+        assert_eq!(result.scan.sessions[0].source_id, normal_id);
+        assert!(matches!(
+            result.reconcile,
+            Some(ReconcilePlan::ExactTombstones(ids)) if ids == HashSet::from([subagent_id.to_string()])
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -840,8 +979,12 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(session_id, mtime, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
-        assert_eq!(result.sessions.len(), 1, "missing usage state must trigger a backfill parse");
+        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        assert_eq!(
+            result.scan.sessions.len(),
+            1,
+            "missing usage state must trigger a backfill parse"
+        );
 
         store
             .persist_usage_events_for_existing_session(
@@ -853,9 +996,16 @@ mod tests {
             )
             .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
-        assert_eq!(result.sessions.len(), 0);
-        assert_eq!(result.stats.skipped_sessions, 1);
+        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        assert_eq!(result.scan.sessions.len(), 0);
+        assert_eq!(result.scan.stats.skipped_sessions, 1);
+
+        let forced = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        assert_eq!(forced.scan.sessions.len(), 1);
+        assert!(matches!(
+            forced.reconcile,
+            Some(ReconcilePlan::ExactTombstones(ids)) if ids.is_empty()
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }

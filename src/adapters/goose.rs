@@ -9,8 +9,8 @@ use tracing::{debug, warn};
 use crate::adapters::events;
 use crate::adapters::opencode;
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-    first_timestamp, last_timestamp,
+    InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
+    SyncScanOutput, SyncScanResult, SyncScanStats, first_timestamp, last_timestamp,
 };
 use crate::db::store::Store;
 use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
@@ -91,32 +91,17 @@ impl SourceAdapter for GooseAdapter {
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        Ok(scan_db(open_goose_db()?, None, None, true)?.sessions)
+        Ok(scan_db(open_goose_db()?, None, None, true, false)?.scan.sessions)
     }
 
-    fn scan_for_sync(
+    fn scan_for_sync_output(
         &self,
         store: &Store,
         since_ts: Option<i64>,
         include_events: bool,
-    ) -> anyhow::Result<Option<SyncScanResult>> {
-        Ok(Some(scan_db(open_goose_db()?, Some(store), since_ts, include_events)?))
-    }
-
-    fn prune(&self, store: &Store) -> anyhow::Result<()> {
-        let Some((conn, _)) = open_goose_db()? else {
-            return Ok(());
-        };
-        if !has_table(&conn, "sessions") {
-            return Ok(());
-        }
-        let live = load_all_session_ids(&conn)?;
-        for source_id in store.session_meta_map(SOURCE)?.keys() {
-            if !live.contains(source_id) {
-                store.delete_session_data(SOURCE, source_id)?;
-            }
-        }
-        Ok(())
+        force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
+        Ok(Some(scan_db(open_goose_db()?, Some(store), since_ts, include_events, force)?))
     }
 }
 
@@ -175,33 +160,38 @@ fn scan_db(
     store: Option<&Store>,
     since_ts: Option<i64>,
     include_events: bool,
-) -> anyhow::Result<SyncScanResult> {
+    force: bool,
+) -> anyhow::Result<SyncScanOutput> {
     let Some((conn, db_path)) = opened else {
-        return Ok(SyncScanResult { sessions: Vec::new(), stats: SyncScanStats::default() });
+        return unavailable_scan_result(store);
     };
-    if !has_table(&conn, "sessions") || !has_table(&conn, "messages") {
+    let snapshot = conn.unchecked_transaction()?;
+    if !has_table(&snapshot, "sessions") || !has_table(&snapshot, "messages") {
         debug!("Goose sessions.db missing required tables, skipping");
-        return Ok(SyncScanResult { sessions: Vec::new(), stats: SyncScanStats::default() });
+        return unavailable_scan_result(store);
     }
 
-    let existing = match store {
+    let incremental_store = if force { None } else { store };
+    let since_ts = if force { None } else { since_ts };
+    let existing = match incremental_store {
         Some(store) => store.session_meta_map(SOURCE)?,
         None => HashMap::new(),
     };
-    let usage_state = match store {
+    let usage_state = match incremental_store {
         Some(store) => store.usage_state_meta_map(SOURCE)?,
         None => HashMap::new(),
     };
-    let event_state = match store {
+    let event_state = match incremental_store {
         Some(store) if include_events => store.event_state_meta_map(SOURCE)?,
         _ => HashMap::new(),
     };
-    let metadata_state = match store {
+    let metadata_state = match incremental_store {
         Some(store) => store.metadata_state_meta_map(SOURCE)?,
         None => HashMap::new(),
     };
 
-    let rows = load_session_rows(&conn)?;
+    let (live, inventory_issues) = load_all_session_ids(&snapshot, &db_path)?;
+    let rows = load_session_rows(&snapshot)?;
     let mut sessions = Vec::new();
     let mut stats = SyncScanStats::default();
 
@@ -216,7 +206,7 @@ fn scan_db(
             stats.filtered_sessions += 1;
             continue;
         }
-        if store.is_some()
+        if incremental_store.is_some()
             && existing.get(&row.id).is_some_and(|&(old_updated_at, _)| {
                 old_updated_at == freshness
                     && crate::adapters::sync_state::session_state_is_current(
@@ -237,7 +227,7 @@ fn scan_db(
             stats.skipped_sessions += 1;
             continue;
         }
-        match scan_session(&conn, &row, &db_path, include_events) {
+        match scan_session(&snapshot, &row, &db_path, include_events) {
             Ok(Some(raw)) => {
                 stats.parsed += 1;
                 sessions.push(raw);
@@ -247,7 +237,28 @@ fn scan_db(
         }
     }
 
-    Ok(SyncScanResult { sessions, stats })
+    snapshot.commit()?;
+    let reconcile = if inventory_issues.is_empty() {
+        ReconcilePlan::CompleteLiveSet(live)
+    } else {
+        ReconcilePlan::PartialInventory(inventory_issues)
+    };
+    Ok(SyncScanOutput { scan: SyncScanResult { sessions, stats }, reconcile: Some(reconcile) })
+}
+
+fn unavailable_scan_result(store: Option<&Store>) -> anyhow::Result<SyncScanOutput> {
+    let result = SyncScanResult { sessions: Vec::new(), stats: SyncScanStats::default() };
+    let has_history = match store {
+        Some(store) => !store.session_meta_map(SOURCE)?.is_empty(),
+        None => false,
+    };
+    if has_history {
+        return Ok(SyncScanOutput {
+            scan: result,
+            reconcile: Some(ReconcilePlan::UnavailableInventory(Vec::new())),
+        });
+    }
+    Ok(SyncScanOutput { scan: result, reconcile: None })
 }
 
 fn include_session_type(session_type: &str) -> bool {
@@ -291,19 +302,26 @@ fn load_session_rows(conn: &Connection) -> anyhow::Result<Vec<SessionRow>> {
     Ok(sessions)
 }
 
-fn load_all_session_ids(conn: &Connection) -> anyhow::Result<HashSet<String>> {
+fn load_all_session_ids(
+    conn: &Connection,
+    db_path: &Path,
+) -> anyhow::Result<(HashSet<String>, Vec<InventoryIssue>)> {
     let mut stmt = conn.prepare("SELECT id FROM sessions")?;
     let rows = stmt.query_map([], |row| row.get(0))?;
     let mut ids = HashSet::new();
+    let mut issues = Vec::new();
     for row in rows {
         match row {
             Ok(id) => {
                 ids.insert(id);
             }
-            Err(err) => warn!("skipping malformed Goose session id: {err}"),
+            Err(_) => issues.push(InventoryIssue {
+                path: db_path.to_path_buf(),
+                category: std::io::ErrorKind::InvalidData,
+            }),
         }
     }
-    Ok(ids)
+    Ok((ids, issues))
 }
 
 fn scan_session(
@@ -917,8 +935,8 @@ mod tests {
         assert!(
             resolve_db_path_from(None, None, Some(PathBuf::from("/no/such/home")), None).is_none()
         );
-        let result = scan_db(None, None, None, true).unwrap();
-        assert!(result.sessions.is_empty());
+        let result = scan_db(None, None, None, true, false).unwrap();
+        assert!(result.scan.sessions.is_empty());
     }
 
     #[test]
@@ -973,9 +991,9 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, None, None, true).unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        let raw = &result.sessions[0];
+        let result = scan_db(opened, None, None, true, false).unwrap();
+        assert_eq!(result.scan.sessions.len(), 1);
+        let raw = &result.scan.sessions[0];
         assert_eq!(raw.source_id, "20250310_2");
         assert_eq!(raw.directory.as_deref(), Some("/repo"));
         assert_eq!(raw.custom_title.as_deref(), Some("seed title"));
@@ -1022,7 +1040,7 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let raw = &scan_db(opened, None, None, false).unwrap().sessions[0];
+        let raw = &scan_db(opened, None, None, false, false).unwrap().scan.sessions[0];
         assert_eq!(raw.started_at, 1_741_615_822_000);
         assert_eq!(raw.updated_at, Some(1_741_615_823_000));
         assert_eq!(raw.messages[0].timestamp, Some(1_741_615_822_000));
@@ -1048,10 +1066,10 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, None, None, false).unwrap();
-        assert_eq!(result.stats.rejected_before_parse, 3);
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, "u1");
+        let result = scan_db(opened, None, None, false, false).unwrap();
+        assert_eq!(result.scan.stats.rejected_before_parse, 3);
+        assert_eq!(result.scan.sessions.len(), 1);
+        assert_eq!(result.scan.sessions[0].source_id, "u1");
     }
 
     #[test]
@@ -1073,7 +1091,7 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let raw = &scan_db(opened, None, None, false).unwrap().sessions[0];
+        let raw = &scan_db(opened, None, None, false, false).unwrap().scan.sessions[0];
         assert_eq!(raw.custom_title, None);
         assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));
         assert_eq!(raw.parent_links[0].source, SOURCE);
@@ -1110,7 +1128,7 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let raw = &scan_db(opened, None, None, true).unwrap().sessions[0];
+        let raw = &scan_db(opened, None, None, true, false).unwrap().scan.sessions[0];
         assert!(raw.usage_events.is_empty());
         assert_eq!(raw.messages[0].content, "hi");
     }
@@ -1157,9 +1175,17 @@ mod tests {
             .unwrap();
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, Some(&store), None, true).unwrap();
-        assert_eq!(result.stats.skipped_sessions, 1);
-        assert!(result.sessions.is_empty());
+        let result = scan_db(opened, Some(&store), None, true, false).unwrap();
+        assert_eq!(result.scan.stats.skipped_sessions, 1);
+        assert!(result.scan.sessions.is_empty());
+
+        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
+        let forced = scan_db(opened, Some(&store), None, true, true).unwrap();
+        assert_eq!(forced.scan.sessions.len(), 1);
+        assert!(matches!(
+            forced.reconcile,
+            Some(ReconcilePlan::CompleteLiveSet(ids)) if ids == HashSet::from(["s1".to_string()])
+        ));
     }
 
     #[test]
@@ -1205,11 +1231,11 @@ mod tests {
             .unwrap();
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, Some(&store), None, true).unwrap();
-        assert_eq!(result.stats.skipped_sessions, 0);
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].updated_at, Some(400_000));
-        assert_eq!(result.sessions[0].messages.len(), 2);
+        let result = scan_db(opened, Some(&store), None, true, false).unwrap();
+        assert_eq!(result.scan.stats.skipped_sessions, 0);
+        assert_eq!(result.scan.sessions.len(), 1);
+        assert_eq!(result.scan.sessions[0].updated_at, Some(400_000));
+        assert_eq!(result.scan.sessions[0].messages.len(), 2);
     }
 
     #[test]
@@ -1222,10 +1248,10 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, None, Some(300_000), false).unwrap();
-        assert_eq!(result.stats.filtered_sessions, 0);
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].updated_at, Some(400_000));
+        let result = scan_db(opened, None, Some(300_000), false, false).unwrap();
+        assert_eq!(result.scan.stats.filtered_sessions, 0);
+        assert_eq!(result.scan.sessions.len(), 1);
+        assert_eq!(result.scan.sessions[0].updated_at, Some(400_000));
     }
 
     #[test]
@@ -1248,7 +1274,7 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let raw = &scan_db(opened, None, None, true).unwrap().sessions[0];
+        let raw = &scan_db(opened, None, None, true, false).unwrap().scan.sessions[0];
         assert!(raw.messages.is_empty());
         assert_eq!(raw.events.len(), 1);
         assert_eq!(raw.started_at, 400_000);
@@ -1256,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_deletes_sessions_missing_from_goose() {
+    fn complete_scan_returns_live_set_without_mutating_store() {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("sessions.db");
         let conn = setup_goose_db(&db_path);
@@ -1267,16 +1293,72 @@ mod tests {
         store.insert_session(&make_session("keep", Some(200_000), 1)).unwrap();
         store.insert_session(&make_session("gone", Some(200_000), 1)).unwrap();
 
-        let opened = opencode::open_readonly(&db_path).unwrap().unwrap();
-        let live = load_all_session_ids(&opened).unwrap();
-        for source_id in store.session_meta_map(SOURCE).unwrap().keys() {
-            if !live.contains(source_id) {
-                store.delete_session_data(SOURCE, source_id).unwrap();
-            }
-        }
+        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
+        let result = scan_db(opened, Some(&store), None, true, false).unwrap();
         let remaining = store.session_meta_map(SOURCE).unwrap();
         assert!(remaining.contains_key("keep"));
-        assert!(!remaining.contains_key("gone"));
+        assert!(remaining.contains_key("gone"));
+        assert!(matches!(
+            result.reconcile,
+            Some(ReconcilePlan::CompleteLiveSet(ids)) if ids == HashSet::from(["keep".to_string()])
+        ));
+    }
+
+    #[test]
+    fn external_database_query_failure_preserves_existing_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("sessions.db");
+        let conn = setup_goose_db(&db_path);
+        conn.execute(
+            "ALTER TABLE sessions RENAME COLUMN working_dir TO unexpected_working_dir",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = setup_store();
+        store.insert_session(&make_session("existing", Some(200_000), 1)).unwrap();
+        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
+
+        assert!(scan_db(opened, Some(&store), None, true, false).is_err());
+        assert!(store.session_meta(SOURCE, "existing").unwrap().is_some());
+    }
+
+    #[test]
+    fn malformed_live_id_marks_inventory_partial_and_keeps_valid_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("sessions.db");
+        let conn = setup_goose_db(&db_path);
+        insert_session(&conn, &SessionSpec { id: "keep", ..SessionSpec::default() });
+        insert_message(&conn, "keep", "user", r#"[{"type":"text","text":"hello"}]"#, 100, None);
+        conn.execute(
+            "INSERT INTO sessions (id, working_dir) VALUES (?1, '/broken')",
+            rusqlite::params![vec![0xff_u8]],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = setup_store();
+        store.insert_session(&make_session("keep", Some(200_000), 1)).unwrap();
+        store.insert_session(&make_session("stale", Some(200_000), 1)).unwrap();
+        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
+
+        let result = scan_db(opened, Some(&store), None, true, false).unwrap();
+
+        assert!(matches!(result.reconcile, Some(ReconcilePlan::PartialInventory(_))));
+        assert!(result.scan.sessions.iter().any(|session| session.source_id == "keep"));
+        assert!(store.session_meta(SOURCE, "stale").unwrap().is_some());
+    }
+
+    #[test]
+    fn missing_database_with_history_is_unavailable() {
+        let store = setup_store();
+        store.insert_session(&make_session("existing", Some(200_000), 1)).unwrap();
+
+        let result = scan_db(None, Some(&store), None, true, false).unwrap();
+
+        assert!(matches!(result.reconcile, Some(ReconcilePlan::UnavailableInventory(_))));
+        assert!(store.session_meta(SOURCE, "existing").unwrap().is_some());
     }
 
     #[test]
