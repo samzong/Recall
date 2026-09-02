@@ -676,10 +676,10 @@ pub(crate) fn scan_for_sync_conn_with_options(
     let mut candidates = Vec::new();
 
     for session in sessions {
-        if let Some(&(old_updated_at, old_message_count)) = existing.get(&session.id) {
+        if let Some(old) = existing.get(&session.id) {
             let current_message_count = current_counts.get(&session.id).copied().unwrap_or(0);
-            if session.time_updated == old_updated_at
-                && current_message_count == old_message_count
+            if session.time_updated == old.updated_at
+                && current_message_count == old.message_count
                 && crate::adapters::sync_state::session_state_is_current(
                     USAGE_PARSER_VERSION,
                     EVENT_PARSER_VERSION,

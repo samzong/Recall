@@ -1522,6 +1522,58 @@ fn replace_session_clears_import_marker_on_success() {
 }
 
 #[test]
+fn stale_embedding_job_cannot_update_replacement_state() {
+    let store = setup();
+    let mut original = make_session("stable-id", "test", "raw-1", "Original");
+    original.updated_at = Some(2_000);
+    store
+        .persist_session_with_usage_and_events(
+            &original,
+            &[make_message("stable-id", Role::User, "old content", 0)],
+            &[],
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+    let job = store.claim_next_session_embedding_job().unwrap().unwrap();
+    let status = || {
+        store
+            .conn
+            .query_row(
+                "SELECT status FROM session_embedding_state WHERE session_id = 'stable-id'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(status(), "processing");
+
+    let mut replacement = make_session("stable-id", "test", "raw-1", "Replacement");
+    replacement.updated_at = Some(3_000);
+    store
+        .replace_session_with_usage_and_events(
+            "test",
+            "raw-1",
+            &replacement,
+            &[make_message("stable-id", Role::User, "new content", 0)],
+            &[],
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+    assert_eq!(status(), "pending");
+
+    store.update_session_embedding_progress(&job.session_id, 1).unwrap();
+    assert_eq!(status(), "pending");
+    store.complete_session_embedding(&job.session_id).unwrap();
+    assert_eq!(status(), "pending");
+    store.fail_session_embedding(&job.session_id, "stale").unwrap();
+    assert_eq!(status(), "pending");
+}
+
+#[test]
 fn gemini_parser_plain_conversation() {
     let json = r#"{
         "sessionId": "abc-123",

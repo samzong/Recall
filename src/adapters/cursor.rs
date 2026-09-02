@@ -136,8 +136,8 @@ fn scan_for_sync_conn(
         }
 
         let source_updated_at = updated_at.or(global_mtime);
-        if let Some((old_updated_at, _)) = existing.get(&composer_id)
-            && *old_updated_at == source_updated_at
+        if let Some(old) = existing.get(&composer_id)
+            && old.updated_at == source_updated_at
             && crate::adapters::sync_state::session_state_is_current(
                 USAGE_PARSER_VERSION,
                 EVENT_PARSER_VERSION,
