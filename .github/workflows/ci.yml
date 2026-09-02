@@ -25,10 +25,3 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo install cargo-audit --locked --version 0.22.2
       - run: make check
-
-  release-cache:
-    if: github.event_name == 'push'
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      ref: ${{ github.sha }}
-      save-cache: true

@@ -1,0 +1,20 @@
+name: Release cache
+
+on:
+  schedule:
+    - cron: "37 6 1,7,13,19,25,31 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cache
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      ref: ${{ github.sha }}
+      save-cache: true

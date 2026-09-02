@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       save-cache:
-        description: Save the per-target rust-cache after building
+        description: Warm and save the per-target rust-cache
         required: false
         default: false
         type: boolean
@@ -48,11 +48,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           shared-key: release-${{ matrix.target }}
           save-if: ${{ inputs.save-cache }}
 
       - name: Build
+        if: ${{ inputs.upload || !inputs.save-cache || steps.rust-cache.outputs.cache-hit != 'true' }}
         run: cargo build --release --target ${{ matrix.target }} -p recall -p rx
 
       - name: Record built commit

@@ -45,6 +45,14 @@ jobs:
             echo "::error::checked out commit does not match release tag $RELEASE_TAG"
             exit 1
           fi
+          if git cat-file -e HEAD:.githooks/commit-msg 2>/dev/null; then
+            subject="$(git log -1 --format=%s)"
+            expected_subject="chore(release): bump to v$version"
+            if [ "$subject" != "$expected_subject" ]; then
+              echo "::error::release commit subject '$subject' does not match '$expected_subject'"
+              exit 1
+            fi
+          fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable

@@ -1,0 +1,28 @@
+#!/bin/sh
+
+workspace_version() {
+    awk '
+        /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+        /^\[/ { in_workspace_package = 0 }
+        in_workspace_package && $1 == "version" {
+            gsub(/"/, "", $3)
+            print $3
+            exit
+        }
+    '
+}
+
+head_version=$(git show HEAD:Cargo.toml 2>/dev/null | workspace_version)
+index_version=$(git show :Cargo.toml 2>/dev/null | workspace_version)
+
+if [ -z "$head_version" ] || [ -z "$index_version" ] || [ "$head_version" = "$index_version" ]; then
+    exit 0
+fi
+
+subject=$(sed -n '1p' "$1")
+expected="chore(release): bump to v$index_version"
+
+if [ "$subject" != "$expected" ]; then
+    printf "Release version bump requires commit subject: %s\n" "$expected" >&2
+    exit 1
+fi
