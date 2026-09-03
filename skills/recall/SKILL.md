@@ -24,6 +24,8 @@ Use MCP `list_recent_sessions` without a query, `search_sessions` with a query, 
 
 MCP search and recent hits expose `session_id` as Recall's index identity and `source_session_id` as the source tool's session identity. `get_session` returns both identities plus `first_message_seq` and `last_message_seq` for the messages represented in its text; both sequence fields are null when no messages are returned.
 
+Set `include_events: true` on `get_session` only when tool relationships, file operations, meta records, or other structured evidence is needed. The opt-in payload returns at most 50 events anchored to the returned message range plus unanchored events. Each event string field is capped at 200 characters and all event string fields at 10,000 characters total; check `returned_events` and `events_truncated` before treating it as complete. Events expose only sequence, timestamp, kind, actor, name, status, target, message anchor, source event ID, tool call ID, meta, visibility, and short summary fields. They never include raw arguments, raw results, source paths, or parser internals.
+
 For every MCP discovery call, generate a fresh high-entropy `invocation_nonce` literal and never reuse it. Recall prefers a verified host session ID and otherwise looks for that exact nonce in Codex or Claude Code discovery tool input. Treat `current_session.resolution: resolved` as proof that the named session was excluded before ranking and limit. When it is `unknown`, results are unchanged: do not guess the current session from time, project, recency, tool name, or result order.
 
 Use the equivalent CLI workflow when needed:
