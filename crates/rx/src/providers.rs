@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
 };
 
-use crate::args::{ModelsCommand, ProvidersCommand};
+use crate::args::ProvidersCommand;
 use crate::catalog;
 use crate::config::{AuthMode, Paths};
 use crate::launch::{self, EnvLookup};
@@ -300,7 +300,13 @@ pub(crate) fn run(command: ProvidersCommand, paths: &Paths, env: &EnvLookup) -> 
         ProvidersCommand::Login { provider } => login(paths, env, provider.as_deref()),
         ProvidersCommand::Logout { provider } => logout(paths, env, provider.as_deref()),
         ProvidersCommand::Use { provider } => use_provider(paths, env, provider.as_deref()),
-        ProvidersCommand::Models(command) => models(command, paths, env),
+        ProvidersCommand::ModelsHelp => {
+            print!("{}", models_help());
+            Ok(())
+        }
+        ProvidersCommand::ModelsUpdate { provider } => {
+            update_models(paths, env, provider.as_deref())
+        }
     }
 }
 
@@ -322,16 +328,6 @@ pub(crate) fn models_help() -> &'static str {
         "Usage:\n",
         "  rx providers models update [provider]\n\n",
     )
-}
-
-fn models(command: ModelsCommand, paths: &Paths, env: &EnvLookup) -> Result<()> {
-    match command {
-        ModelsCommand::Help => {
-            print!("{}", models_help());
-            Ok(())
-        }
-        ModelsCommand::Update { provider } => update_models(paths, env, provider.as_deref()),
-    }
 }
 
 fn update_models(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Result<()> {

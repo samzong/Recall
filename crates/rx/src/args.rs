@@ -55,13 +55,8 @@ pub(crate) enum ProvidersCommand {
     Login { provider: Option<String> },
     Logout { provider: Option<String> },
     Use { provider: Option<String> },
-    Models(ModelsCommand),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ModelsCommand {
-    Help,
-    Update { provider: Option<String> },
+    ModelsHelp,
+    ModelsUpdate { provider: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,7 +192,7 @@ fn parse_providers(args: &[OsString]) -> Result<ProvidersCommand> {
         None if args.is_empty() => Ok(ProvidersCommand::Help),
         Some("-h" | "--help" | "help") if args.len() <= 1 => Ok(ProvidersCommand::Help),
         Some("list") if args.len() == 1 => Ok(ProvidersCommand::List),
-        Some("models") => Ok(ProvidersCommand::Models(parse_models(&args[1..])?)),
+        Some("models") => parse_models(&args[1..]),
         Some(command @ ("login" | "logout" | "use")) => {
             let provider = parse_provider_argument(command, &args[1..])?;
             Ok(match command {
@@ -220,11 +215,11 @@ fn parse_providers(args: &[OsString]) -> Result<ProvidersCommand> {
     }
 }
 
-fn parse_models(args: &[OsString]) -> Result<ModelsCommand> {
+fn parse_models(args: &[OsString]) -> Result<ProvidersCommand> {
     match args.first().and_then(|arg| arg.to_str()) {
-        None if args.is_empty() => Ok(ModelsCommand::Help),
-        Some("-h" | "--help" | "help") if args.len() <= 1 => Ok(ModelsCommand::Help),
-        Some("update") => Ok(ModelsCommand::Update {
+        None if args.is_empty() => Ok(ProvidersCommand::ModelsHelp),
+        Some("-h" | "--help" | "help") if args.len() <= 1 => Ok(ProvidersCommand::ModelsHelp),
+        Some("update") => Ok(ProvidersCommand::ModelsUpdate {
             provider: parse_provider_argument("models update", &args[1..])?,
         }),
         Some(command) => {

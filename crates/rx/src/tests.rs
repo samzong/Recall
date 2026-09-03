@@ -8,8 +8,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use crate::args::{
-    Command, CompletionShell, CompletionsCommand, Harness, LaunchRequest, ModelsCommand,
-    ProviderIdFilter, ProvidersCommand, UpdateCommand, parse, rewrite_argv0,
+    Command, CompletionShell, CompletionsCommand, Harness, LaunchRequest, ProviderIdFilter,
+    ProvidersCommand, UpdateCommand, parse, rewrite_argv0,
 };
 use crate::config::{self, Paths};
 use crate::launch::{self, EnvLookup};
@@ -548,17 +548,17 @@ fn providers_commands_parse() {
     );
     assert_eq!(
         parse_line(&["rx", "providers", "models"]),
-        Command::Providers(ProvidersCommand::Models(ModelsCommand::Help))
+        Command::Providers(ProvidersCommand::ModelsHelp)
     );
     assert_eq!(
         parse_line(&["rx", "providers", "models", "update"]),
-        Command::Providers(ProvidersCommand::Models(ModelsCommand::Update { provider: None }))
+        Command::Providers(ProvidersCommand::ModelsUpdate { provider: None })
     );
     assert_eq!(
         parse_line(&["rx", "providers", "models", "update", "openrouter"]),
-        Command::Providers(ProvidersCommand::Models(ModelsCommand::Update {
+        Command::Providers(ProvidersCommand::ModelsUpdate {
             provider: Some("openrouter".to_string()),
-        }))
+        })
     );
 }
 
@@ -942,7 +942,7 @@ fn use_none_skips_implicit_openrouter() {
 fn models_update_rejects_none_provider() {
     let (_dir, paths) = temp_paths();
     let error = crate::providers::run(
-        ProvidersCommand::Models(ModelsCommand::Update { provider: Some("none".to_string()) }),
+        ProvidersCommand::ModelsUpdate { provider: Some("none".to_string()) },
         &paths,
         &EnvLookup::isolated(HashMap::new()),
     )
@@ -2030,7 +2030,7 @@ fn providers_models_update_command_fetches_configured_provider() {
     fs::write(&paths.config, format!("[provider.lab]\nbase_url = \"{base_url}\"\n")).unwrap();
     config::login(&paths, "lab", "sk-test".to_string()).unwrap();
     crate::providers::run(
-        ProvidersCommand::Models(ModelsCommand::Update { provider: Some("lab".to_string()) }),
+        ProvidersCommand::ModelsUpdate { provider: Some("lab".to_string()) },
         &paths,
         &EnvLookup::isolated(HashMap::new()),
     )
