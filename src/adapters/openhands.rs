@@ -179,7 +179,7 @@ fn parse_sdk_layout(
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let base = read_json(&dir.join("base_state.json")).unwrap_or(Value::Null);
-    let directory = json_path(&base, &["workspace", "cwd", "working_directory"]);
+    let directory = json_string(&base, &["workspace", "cwd", "working_directory"]);
     let title = json_string(&base, &["title", "name"]);
     let mut messages = Vec::new();
     let mut events = Vec::new();
@@ -208,7 +208,8 @@ fn parse_sdk_layout(
                 events.push(events::tool_result_event(
                     event_context(&value, timestamp, events.len() as u32, &path),
                     json_string(&value, &["tool_name", "name"]),
-                    observation_summary(&value),
+                    extract_text(value.get("content"))
+                        .or_else(|| extract_text(value.pointer("/observation/content"))),
                 ));
             }
             _ => {}
@@ -253,7 +254,7 @@ fn parse_docs_layout(
         first_timestamp(event_timestamp(&value), &messages, &[], &[]).unwrap_or(mtime_ms);
     let mut raw = RawSession::search_only(
         id,
-        json_path(&value, &["workspace", "cwd", "working_directory"]),
+        json_string(&value, &["workspace", "cwd", "working_directory"]),
         started_at,
         Some(mtime_ms),
         None,
@@ -398,11 +399,6 @@ fn action_event(
     Some(events::tool_call_event(event_context(value, timestamp, event_seq, path), name, args))
 }
 
-fn observation_summary(value: &Value) -> Option<String> {
-    extract_text(value.get("content"))
-        .or_else(|| extract_text(value.pointer("/observation/content")))
-}
-
 fn event_context(
     value: &Value,
     timestamp: Option<i64>,
@@ -425,10 +421,6 @@ fn json_string(value: &Value, keys: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-}
-
-fn json_path(value: &Value, keys: &[&str]) -> Option<String> {
-    json_string(value, keys)
 }
 
 fn read_json(path: &Path) -> Option<Value> {
