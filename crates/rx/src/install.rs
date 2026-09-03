@@ -146,7 +146,7 @@ fn executable_extensions() -> Option<OsString> {
     None
 }
 
-pub(crate) fn extra_bin_dirs() -> Vec<PathBuf> {
+fn extra_bin_dirs() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };

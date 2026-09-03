@@ -48,7 +48,7 @@ fn has_version_suffix(url: &str) -> bool {
     })
 }
 
-pub(crate) fn fetch_get(url: &str, headers: &[(&str, String)]) -> Result<String> {
+fn fetch_get(url: &str, headers: &[(&str, String)]) -> Result<String> {
     let (status, body) = fetch(url, headers)?;
     if !(200..300).contains(&status) {
         bail!("HTTP {status}: {}", truncate(&body, 300));
@@ -121,7 +121,13 @@ pub(crate) fn load_opencode_models(
     allow_fetch: bool,
 ) -> Result<BTreeMap<String, Value>> {
     ensure(paths, provider_id, base_url, key, allow_fetch)?;
-    read_json_object(artifact_path(paths, provider_id, "opencode.json"))
+    let path = artifact_path(paths, provider_id, "opencode.json");
+    if !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let body =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 pub(crate) fn load_pi_models(
@@ -132,7 +138,13 @@ pub(crate) fn load_pi_models(
     allow_fetch: bool,
 ) -> Result<Vec<Value>> {
     ensure(paths, provider_id, base_url, key, allow_fetch)?;
-    read_json_array(artifact_path(paths, provider_id, "pi.json"))
+    let path = artifact_path(paths, provider_id, "pi.json");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let body =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 pub(crate) fn load_listed_models(
@@ -284,7 +296,8 @@ fn has_stale_catalog(paths: &Paths, provider_id: &str, endpoint: &str) -> bool {
 }
 
 fn complete_cache_meta(paths: &Paths, provider_id: &str, endpoint: &str) -> Option<CacheMeta> {
-    let meta = read_meta(paths, provider_id)?;
+    let body = fs::read_to_string(artifact_path(paths, provider_id, "meta.json")).ok()?;
+    let meta: CacheMeta = serde_json::from_str(&body).ok()?;
     if meta.endpoint != endpoint || meta.format != CATALOG_FORMAT {
         return None;
     }
@@ -292,11 +305,6 @@ fn complete_cache_meta(paths: &Paths, provider_id: &str, endpoint: &str) -> Opti
         .into_iter()
         .all(|suffix| artifact_path(paths, provider_id, suffix).is_file())
         .then_some(meta)
-}
-
-fn read_meta(paths: &Paths, provider_id: &str) -> Option<CacheMeta> {
-    let body = fs::read_to_string(artifact_path(paths, provider_id, "meta.json")).ok()?;
-    serde_json::from_str(&body).ok()
 }
 
 fn catalog_has_models(path: &Path) -> bool {
@@ -307,24 +315,6 @@ fn catalog_has_models(path: &Path) -> bool {
         return false;
     };
     value.get("models").and_then(Value::as_array).is_some_and(|models| !models.is_empty())
-}
-
-fn read_json_object(path: PathBuf) -> Result<BTreeMap<String, Value>> {
-    if !path.is_file() {
-        return Ok(BTreeMap::new());
-    }
-    let body =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))
-}
-
-fn read_json_array(path: PathBuf) -> Result<Vec<Value>> {
-    if !path.is_file() {
-        return Ok(Vec::new());
-    }
-    let body =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn catalogs_dir(paths: &Paths) -> PathBuf {

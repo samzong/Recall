@@ -132,24 +132,20 @@ pub(crate) fn seed_from_openai_body(
     if let Ok(models) = parse_user_catalog(body)
         && !models.is_empty()
     {
-        let models = apply_fallback_context(provider_id, models);
+        let fallback_context = catalog::fallback_context(provider_id);
+        let models = models
+            .into_iter()
+            .map(|model| UserModel {
+                context_length: Some(model.context_length.unwrap_or(fallback_context)),
+                ..model
+            })
+            .collect::<Vec<_>>();
         let seed = with_provider(provider_id, build_seed(&models));
         if !seed.additional_model_options.is_empty() {
             return seed;
         }
     }
     seed_from_listed(provider_id, fallback)
-}
-
-fn apply_fallback_context(provider_id: &str, models: Vec<UserModel>) -> Vec<UserModel> {
-    let fallback = catalog::fallback_context(provider_id);
-    models
-        .into_iter()
-        .map(|model| UserModel {
-            context_length: Some(model.context_length.unwrap_or(fallback)),
-            ..model
-        })
-        .collect()
 }
 
 fn with_provider(provider_id: &str, mut caches: SeedCaches) -> SeedCaches {
@@ -173,12 +169,12 @@ fn from_listed_models(provider_id: &str, models: &[ListedModel]) -> Vec<UserMode
         .collect()
 }
 
-pub(crate) fn parse_user_catalog(body: &str) -> Result<Vec<UserModel>> {
+fn parse_user_catalog(body: &str) -> Result<Vec<UserModel>> {
     let value: Value = serde_json::from_str(body).context("catalog response is not JSON")?;
     parse_user_catalog_value(&value)
 }
 
-pub(crate) fn parse_user_catalog_value(value: &Value) -> Result<Vec<UserModel>> {
+fn parse_user_catalog_value(value: &Value) -> Result<Vec<UserModel>> {
     let Some(data) = value.get("data").and_then(Value::as_array) else {
         bail!("catalog JSON has no data array");
     };
