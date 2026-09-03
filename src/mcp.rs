@@ -55,6 +55,11 @@ struct SearchSessionsArgs {
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(range(min = 1, max = 50))]
     limit: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional unique literal copied into this tool call so Recall can verify and exclude the invoking session when no host identity is available. It never affects relevance."
+    )]
+    invocation_nonce: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -87,6 +92,11 @@ struct ListRecentSessionsArgs {
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(range(min = 1, max = 50))]
     limit: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional unique literal copied into this tool call so Recall can verify and exclude the invoking session when no host identity is available."
+    )]
+    invocation_nonce: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -189,15 +199,12 @@ impl CurrentSessionContext {
         codex_thread: Option<&str>,
         codex_session: Option<&str>,
     ) -> Self {
-        if let Some(source_session_id) = verified_session_id(claude_session) {
-            return Self {
-                host_identity: Some(SourceSessionIdentity {
-                    source: "claude-code".to_string(),
-                    source_session_id: source_session_id.to_string(),
-                }),
-            };
-        }
-        let host_identity =
+        let claude_identity =
+            verified_session_id(claude_session).map(|source_session_id| SourceSessionIdentity {
+                source: "claude-code".to_string(),
+                source_session_id: source_session_id.to_string(),
+            });
+        let codex_identity =
             match (verified_session_id(codex_thread), verified_session_id(codex_session)) {
                 (Some(thread), Some(session)) if thread == session => Some(SourceSessionIdentity {
                     source: "codex".to_string(),
@@ -205,15 +212,47 @@ impl CurrentSessionContext {
                 }),
                 _ => None,
             };
+        let host_identity = match (claude_identity, codex_identity) {
+            (Some(identity), None) | (None, Some(identity)) => Some(identity),
+            _ => None,
+        };
         Self { host_identity }
     }
 
-    fn resolve(&self, store: &Store) -> CurrentSession {
-        let Some(identity) = self.host_identity.as_ref() else {
+    fn resolve(&self, store: &Store, invocation_nonce: Option<&str>) -> CurrentSession {
+        self.resolve_with_probe(
+            store,
+            invocation_nonce,
+            adapters::invocation_probe::probe_invocation_nonce,
+        )
+    }
+
+    fn resolve_with_probe<F>(
+        &self,
+        store: &Store,
+        invocation_nonce: Option<&str>,
+        probe: F,
+    ) -> CurrentSession
+    where
+        F: FnOnce(&str) -> adapters::invocation_probe::InvocationProbeResult,
+    {
+        if let Some(identity) = self.host_identity.as_ref()
+            && let Ok(Some(session)) =
+                store.get_session_by_source_id(&identity.source, &identity.source_session_id)
+        {
+            return CurrentSession::resolved(&session);
+        }
+        let Some(invocation_nonce) = invocation_nonce.filter(|value| !value.trim().is_empty())
+        else {
             return CurrentSession::unknown();
         };
+        let result = probe(invocation_nonce);
+        if !result.complete || result.candidates.len() != 1 {
+            return CurrentSession::unknown();
+        }
+        let candidate = &result.candidates[0];
         store
-            .get_session_by_source_id(&identity.source, &identity.source_session_id)
+            .get_session_by_source_id(&candidate.source, &candidate.source_id)
             .ok()
             .flatten()
             .as_ref()
@@ -364,7 +403,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Search past AI coding sessions across Claude Code, Codex, OpenCode, Cursor, and other indexed tools. Use when the user asks whether they have seen an error, made a decision, or solved a similar problem before. Returns Recall session_id, source-native source_session_id, source, project, title, matched excerpt, and ISO-8601 timestamp.",
+        description = "Search past AI coding sessions across Claude Code, Codex, OpenCode, Cursor, and other indexed tools. Use when the user asks whether they have seen an error, made a decision, or solved a similar problem before. Pass a fresh invocation_nonce when the host does not expose a session ID. current_session.resolution is resolved only after exact Store verification; only then is that session excluded before ranking and limit. Unknown leaves results unchanged. Returns Recall session_id, source-native source_session_id, source, project, title, matched excerpt, and ISO-8601 timestamp.",
         annotations(
             title = "Search sessions",
             read_only_hint = true,
@@ -403,7 +442,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "List the most recently active indexed sessions, newest first. Use to browse what the user has been working on when there is no search query. Each hit has the same shape as search_sessions: Recall session_id, source-native source_session_id, source, project, title, excerpt (summary when present), and ISO-8601 timestamp.",
+        description = "List the most recently active indexed sessions, newest first. Use to browse what the user has been working on when there is no search query. Pass a fresh invocation_nonce when the host does not expose a session ID. current_session.resolution is resolved only after exact Store verification; only then is that session excluded before ordering and limit. Unknown leaves results unchanged. Each hit has the same shape as search_sessions: Recall session_id, source-native source_session_id, source, project, title, excerpt (summary when present), and ISO-8601 timestamp.",
         annotations(
             title = "List recent sessions",
             read_only_hint = true,
@@ -484,7 +523,7 @@ fn mcp_server_info() -> ServerInfo {
     ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
         .with_server_info(Implementation::new("recall", env!("CARGO_PKG_VERSION")))
         .with_instructions(
-            "Read-only memory over the local Recall session index. Search or list past coding sessions, look up which sessions touched a file, then fetch a session when you need the transcript. This server never writes, syncs, or mutates the index.",
+            "Read-only memory over the local Recall session index. Search or list past coding sessions, look up which sessions touched a file, then fetch a session when you need the transcript. Discovery tools report whether the current session was resolved and excluded; pass a fresh invocation_nonce when the host provides no session identity. Unknown resolution never guesses or changes results. This server never writes, syncs, waits for transcripts, or mutates the index.",
         )
 }
 
@@ -568,7 +607,7 @@ fn empty_events(message: impl Into<String>) -> EventList {
 fn search_sessions(
     index: &IndexState,
     args: &SearchSessionsArgs,
-) -> std::result::Result<HitList, HitList> {
+) -> std::result::Result<HitList, Box<HitList>> {
     search_sessions_with_context(index, args, &CurrentSessionContext::default())
 }
 
@@ -576,13 +615,13 @@ fn search_sessions_with_context(
     index: &IndexState,
     args: &SearchSessionsArgs,
     context: &CurrentSessionContext,
-) -> std::result::Result<HitList, HitList> {
+) -> std::result::Result<HitList, Box<HitList>> {
     match index {
-        IndexState::Unavailable { message, .. } => Err(empty_hits(message.clone())),
+        IndexState::Unavailable { message, .. } => Err(Box::new(empty_hits(message.clone()))),
         IndexState::Ready(store) => {
-            let current_session = context.resolve(store);
+            let current_session = context.resolve(store, args.invocation_nonce.as_deref());
             search_ready(store, args, &current_session)
-                .map_err(|message| empty_hits_with_current(message, current_session))
+                .map_err(|message| Box::new(empty_hits_with_current(message, current_session)))
         }
     }
 }
@@ -630,7 +669,7 @@ fn search_ready(
 fn list_recent_sessions(
     index: &IndexState,
     args: &ListRecentSessionsArgs,
-) -> std::result::Result<HitList, HitList> {
+) -> std::result::Result<HitList, Box<HitList>> {
     list_recent_sessions_with_context(index, args, &CurrentSessionContext::default())
 }
 
@@ -638,13 +677,13 @@ fn list_recent_sessions_with_context(
     index: &IndexState,
     args: &ListRecentSessionsArgs,
     context: &CurrentSessionContext,
-) -> std::result::Result<HitList, HitList> {
+) -> std::result::Result<HitList, Box<HitList>> {
     match index {
-        IndexState::Unavailable { message, .. } => Err(empty_hits(message.clone())),
+        IndexState::Unavailable { message, .. } => Err(Box::new(empty_hits(message.clone()))),
         IndexState::Ready(store) => {
-            let current_session = context.resolve(store);
+            let current_session = context.resolve(store, args.invocation_nonce.as_deref());
             list_ready(store, args, &current_session)
-                .map_err(|message| empty_hits_with_current(message, current_session))
+                .map_err(|message| Box::new(empty_hits_with_current(message, current_session)))
         }
     }
 }
@@ -1001,6 +1040,24 @@ mod tests {
         }
     }
 
+    fn probe_result(
+        candidates: &[(&str, &str)],
+        complete: bool,
+    ) -> adapters::invocation_probe::InvocationProbeResult {
+        adapters::invocation_probe::InvocationProbeResult {
+            candidates: candidates
+                .iter()
+                .map(|(source, source_id)| adapters::invocation_probe::InvocationProbeCandidate {
+                    source: (*source).to_string(),
+                    source_id: (*source_id).to_string(),
+                })
+                .collect(),
+            files_read: candidates.len(),
+            bytes_read: candidates.len() * 100,
+            complete,
+        }
+    }
+
     fn without_fields(value: impl Serialize, fields: &[&str]) -> Value {
         let mut value = to_json(value);
         let object = value.as_object_mut().unwrap();
@@ -1013,8 +1070,13 @@ mod tests {
     #[test]
     fn missing_index_is_a_tool_error() {
         let index = IndexState::Unavailable { path: None, message: MISSING_INDEX.to_string() };
-        let args =
-            SearchSessionsArgs { query: "error".into(), project: None, source: None, limit: None };
+        let args = SearchSessionsArgs {
+            query: "error".into(),
+            project: None,
+            source: None,
+            limit: None,
+            invocation_nonce: None,
+        };
         let list = search_sessions(&index, &args).expect_err("missing index");
         assert!(list.hits.is_empty());
         assert_eq!(list.message.as_deref(), Some(MISSING_INDEX));
@@ -1030,13 +1092,19 @@ mod tests {
             project: None,
             source: None,
             limit: None,
+            invocation_nonce: None,
         };
         let search = search_sessions(&index, &search_args).unwrap();
         assert!(search.hits.is_empty());
         assert_eq!(search.message.as_deref(), Some(EMPTY_INDEX));
         assert_eq!(json_result(search_sessions(&index, &search_args)).is_error, Some(false));
 
-        let list_args = ListRecentSessionsArgs { project: None, source: None, limit: None };
+        let list_args = ListRecentSessionsArgs {
+            project: None,
+            source: None,
+            limit: None,
+            invocation_nonce: None,
+        };
         let listed = list_recent_sessions(&index, &list_args).unwrap();
         assert!(listed.hits.is_empty());
         assert_eq!(listed.message.as_deref(), Some(EMPTY_INDEX));
@@ -1067,6 +1135,7 @@ mod tests {
                 project: None,
                 source: None,
                 limit: Some(80),
+                invocation_nonce: None,
             },
         )
         .unwrap();
@@ -1101,7 +1170,12 @@ mod tests {
 
         let list = list_recent_sessions(
             &index,
-            &ListRecentSessionsArgs { project: None, source: None, limit: Some(10) },
+            &ListRecentSessionsArgs {
+                project: None,
+                source: None,
+                limit: Some(10),
+                invocation_nonce: None,
+            },
         )
         .unwrap();
         assert_eq!(list.hits.len(), 2);
@@ -1140,14 +1214,18 @@ mod tests {
                 .is_none()
         );
         let claude_id = "604c4e71-f49c-4cc0-9388-88905fe65473";
-        let claude =
-            CurrentSessionContext::from_values(Some(claude_id), Some(codex_id), Some(codex_id));
+        let claude = CurrentSessionContext::from_values(Some(claude_id), None, None);
         assert_eq!(
             claude.host_identity,
             Some(SourceSessionIdentity {
                 source: "claude-code".to_string(),
                 source_session_id: claude_id.to_string(),
             })
+        );
+        assert!(
+            CurrentSessionContext::from_values(Some(claude_id), Some(codex_id), Some(codex_id))
+                .host_identity
+                .is_none()
         );
     }
 
@@ -1175,6 +1253,7 @@ mod tests {
                 project: None,
                 source: None,
                 limit: Some(1),
+                invocation_nonce: None,
             },
             &current_context,
         )
@@ -1191,6 +1270,7 @@ mod tests {
                 project: None,
                 source: None,
                 limit: Some(50),
+                invocation_nonce: None,
             },
             &current_context,
         )
@@ -1200,7 +1280,12 @@ mod tests {
 
         let recent = list_recent_sessions_with_context(
             &index,
-            &ListRecentSessionsArgs { project: None, source: None, limit: Some(1) },
+            &ListRecentSessionsArgs {
+                project: None,
+                source: None,
+                limit: Some(1),
+                invocation_nonce: None,
+            },
             &current_context,
         )
         .unwrap();
@@ -1210,7 +1295,12 @@ mod tests {
 
         let recent_fifty = list_recent_sessions_with_context(
             &index,
-            &ListRecentSessionsArgs { project: None, source: None, limit: Some(50) },
+            &ListRecentSessionsArgs {
+                project: None,
+                source: None,
+                limit: Some(50),
+                invocation_nonce: None,
+            },
             &current_context,
         )
         .unwrap();
@@ -1239,6 +1329,7 @@ mod tests {
                     project: None,
                     source: None,
                     limit: Some(1),
+                    invocation_nonce: None,
                 },
                 &current_context,
             )
@@ -1264,6 +1355,7 @@ mod tests {
                 project: Some("/tmp/other".into()),
                 source: Some("claude-code".into()),
                 limit: Some(1),
+                invocation_nonce: None,
             },
             &context("codex", "src-current"),
         )
@@ -1299,6 +1391,55 @@ mod tests {
     }
 
     #[test]
+    fn invocation_nonce_resolves_only_one_complete_indexed_candidate() {
+        let store = setup();
+        let mut current = session("current", "codex", "current", 10_000);
+        current.source_id = "nonce-source".to_string();
+        store.insert_session(&current).unwrap();
+        let context = CurrentSessionContext::default();
+
+        let resolved = context.resolve_with_probe(&store, Some("nonce"), |_| {
+            probe_result(&[("codex", "nonce-source")], true)
+        });
+        assert_eq!(resolved.resolution, CurrentSessionResolution::Resolved);
+        assert_eq!(resolved.session_id.as_deref(), Some("current"));
+
+        for result in [
+            probe_result(&[], true),
+            probe_result(&[("codex", "nonce-source"), ("claude-code", "other")], true),
+            probe_result(&[("codex", "nonce-source")], false),
+            probe_result(&[("codex", "unindexed")], true),
+            probe_result(&[("claude-code", "nonce-source")], true),
+        ] {
+            assert_eq!(
+                context.resolve_with_probe(&store, Some("nonce"), |_| result),
+                CurrentSession::unknown()
+            );
+        }
+        assert_eq!(
+            context.resolve_with_probe(&store, Some(" "), |_| {
+                panic!("blank nonce must not probe")
+            }),
+            CurrentSession::unknown()
+        );
+    }
+
+    #[test]
+    fn resolved_host_identity_skips_invocation_probe() {
+        let store = setup();
+        let mut current = session("current", "codex", "current", 10_000);
+        current.source_id = "host-source".to_string();
+        store.insert_session(&current).unwrap();
+
+        let resolved =
+            context("codex", "host-source").resolve_with_probe(&store, Some("nonce"), |_| {
+                panic!("resolved host identity must skip probing")
+            });
+        assert_eq!(resolved.resolution, CurrentSessionResolution::Resolved);
+        assert_eq!(resolved.session_id.as_deref(), Some("current"));
+    }
+
+    #[test]
     fn unknown_source_is_empty_not_a_crash() {
         let store = setup();
         store.insert_session(&session("s1", "codex", "title", 1_000)).unwrap();
@@ -1309,6 +1450,7 @@ mod tests {
             project: None,
             source: Some("not-a-source".into()),
             limit: None,
+            invocation_nonce: None,
         };
         let list = search_sessions(&index, &args).expect_err("unknown source");
         assert!(list.hits.is_empty());
@@ -1543,7 +1685,12 @@ mod tests {
         index.ensure_open();
         let listed = list_recent_sessions(
             &index,
-            &ListRecentSessionsArgs { project: None, source: None, limit: None },
+            &ListRecentSessionsArgs {
+                project: None,
+                source: None,
+                limit: None,
+                invocation_nonce: None,
+            },
         )
         .unwrap();
         assert_eq!(listed.hits.len(), 1);
@@ -1560,7 +1707,12 @@ mod tests {
         let index = ready(store);
         let list = list_recent_sessions(
             &index,
-            &ListRecentSessionsArgs { project: None, source: None, limit: None },
+            &ListRecentSessionsArgs {
+                project: None,
+                source: None,
+                limit: None,
+                invocation_nonce: None,
+            },
         )
         .unwrap();
         let excerpt = list.hits[0].excerpt.as_deref().unwrap();
@@ -1597,6 +1749,7 @@ mod tests {
         let args: SearchSessionsArgs =
             serde_json::from_value(serde_json::json!({"query": "q", "limit": "12"})).unwrap();
         assert_eq!(args.limit, Some(12));
+        assert!(args.invocation_nonce.is_none());
         assert_eq!(clamp_limit(Some(80), 10, 50), 50);
         assert_eq!(clamp_limit(None, 10, 50), 10);
         assert_eq!(clamp_limit(Some(80), EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX), 50);
@@ -1626,8 +1779,18 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "get_session")
             .expect("get_session capability");
+        let search_sessions = tools
+            .iter()
+            .find(|tool| tool["name"] == "search_sessions")
+            .expect("search_sessions capability");
+        let list_recent_sessions = tools
+            .iter()
+            .find(|tool| tool["name"] == "list_recent_sessions")
+            .expect("list_recent_sessions capability");
 
         assert!(get_session["inputSchema"]["properties"]["tail"].is_object());
+        assert!(search_sessions["inputSchema"]["properties"]["invocation_nonce"].is_object());
+        assert!(list_recent_sessions["inputSchema"]["properties"]["invocation_nonce"].is_object());
         assert!(get_session["description"].as_str().unwrap().contains("source_session_id"));
         assert!(get_session["description"].as_str().unwrap().contains("first_message_seq"));
         assert!(report.server.capabilities.tools.is_some());
@@ -1635,6 +1798,8 @@ mod tests {
         assert!(text.contains("get_session"));
         assert!(text.contains("Inputs: "));
         assert!(text.contains("tail"));
+        assert!(text.contains("invocation_nonce"));
+        assert!(text.contains("current_session.resolution"));
     }
 
     fn event(

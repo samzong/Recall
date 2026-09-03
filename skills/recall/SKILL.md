@@ -24,6 +24,8 @@ Use MCP `list_recent_sessions` without a query, `search_sessions` with a query, 
 
 MCP search and recent hits expose `session_id` as Recall's index identity and `source_session_id` as the source tool's session identity. `get_session` returns both identities plus `first_message_seq` and `last_message_seq` for the messages represented in its text; both sequence fields are null when no messages are returned.
 
+For every MCP discovery call, generate a fresh high-entropy `invocation_nonce` literal and never reuse it. Recall prefers a verified host session ID and otherwise looks for that exact nonce in Codex or Claude Code discovery tool input. Treat `current_session.resolution: resolved` as proof that the named session was excluded before ranking and limit. When it is `unknown`, results are unchanged: do not guess the current session from time, project, recency, tool name, or result order.
+
 Use the equivalent CLI workflow when needed:
 
 ```bash
@@ -38,7 +40,7 @@ Search results are relevance-ranked and bounded. In a queried CLI listing, `--so
 
 ## Find Recent Work
 
-When the user asks what other agents recently did, call `list_recent_sessions` for the current project with no source filter and a limit of 10. Exclude the current conversation when identifiable and call `get_session` only for relevant candidates.
+When the user asks what other agents recently did, call `list_recent_sessions` for the current project with no source filter, a fresh `invocation_nonce`, and a limit of 10. Call `get_session` only for relevant candidates. If `current_session.resolution` is `unknown`, state that self-exclusion could not be verified.
 
 If MCP is unavailable, use:
 
@@ -60,14 +62,14 @@ Return the matching event rows with session, source, title, kind, target, and ti
 
 When Recall is invoked without a clear task, list the five most recent sessions in the current project and inspect their latest 12 messages. Do not broaden to all projects.
 
-With MCP, call `list_recent_sessions`, then `get_session` with `max_messages: 12` and `tail: true`. Without MCP, use:
+With MCP, call `list_recent_sessions` with a fresh `invocation_nonce`, then `get_session` with `max_messages: 12` and `tail: true`. Without MCP, use:
 
 ```bash
 recall session list --project /absolute/project/path --limit 5 --sort updated --format json
 recall session show --id <session-id> --format json --include metadata,messages --from-seq <calculated-sequence>
 ```
 
-Set `<calculated-sequence>` to `max(message_count - 12, 0)` from the list result. Offer at most three numbered candidates. Include only sessions whose ending contains an unanswered request, explicit remaining work, a blocker, or interrupted execution. Exclude completed and ambiguous sessions. Exclude the current session when identifiable; otherwise state that self-exclusion could not be verified. Treat the bounded list as candidates, not a complete inventory of unfinished work. A numeric reply selects the same candidate and continues it in the current agent.
+Set `<calculated-sequence>` to `max(message_count - 12, 0)` from the list result. Offer at most three numbered candidates. Include only sessions whose ending contains an unanswered request, explicit remaining work, a blocker, or interrupted execution. Exclude completed and ambiguous sessions. Trust self-exclusion only when `current_session.resolution` is `resolved`; otherwise state that it could not be verified. Treat the bounded list as candidates, not a complete inventory of unfinished work. A numeric reply selects the same candidate and continues it in the current agent.
 
 Do not launch native resume or app-open behavior unless the user explicitly requests it.
 
