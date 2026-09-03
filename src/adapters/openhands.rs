@@ -1,12 +1,18 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
+use chrono::TimeZone;
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
-use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
+use crate::adapters::file_scan::{
+    self, FileMetadataSnapshot, FileScanEntry, FileScanOptions, FileScanSnapshot,
+};
 use crate::adapters::json_util::{json_i64, rfc3339_ms};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
@@ -16,6 +22,19 @@ use crate::types::{RawSessionEvent, Role};
 
 const SOURCE: &str = "openhands";
 const EVENT_PARSER_VERSION: u32 = 1;
+
+#[derive(Deserialize)]
+struct EventIndexEntry {
+    id: String,
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    kind: String,
+    #[serde(default, rename = "type")]
+    type_name: String,
+    #[serde(default)]
+    event_type: String,
+}
 
 pub(crate) struct OpenHandsAdapter;
 
@@ -52,7 +71,7 @@ impl SourceAdapter for OpenHandsAdapter {
                 observations: Vec::new(),
             }));
         };
-        Ok(Some(file_scan::run_file_scan_with_options(
+        Ok(Some(file_scan::run_file_scan_with_options_and_snapshot(
             context,
             since_ts,
             FileScanOptions {
@@ -61,6 +80,7 @@ impl SourceAdapter for OpenHandsAdapter {
                 metadata_parser_version: None,
             },
             collect_conversation_entries(&Some(root)),
+            conversation_snapshot,
             |entry, mtime_ms| parse_conversation_entry(entry, Some(mtime_ms), include_events),
         )?))
     }
@@ -104,7 +124,7 @@ fn conversations_dir_from(
 fn scan_conversations(root: Option<PathBuf>) -> anyhow::Result<Vec<RawSession>> {
     let mut sessions = Vec::new();
     for entry in collect_conversation_entries(&root) {
-        let mtime_ms = file_scan::stat_mtime_ms(&entry.stat_target);
+        let mtime_ms = conversation_snapshot(&entry).map(|snapshot| snapshot.effective_mtime_ms());
         if let Some(raw) = parse_conversation_entry(entry, mtime_ms, true)? {
             sessions.push(raw);
         }
@@ -145,6 +165,25 @@ fn collect_conversation_entries(root: &Option<PathBuf>) -> Vec<FileScanEntry> {
         entries.push(FileScanEntry { session_id: source_id, stat_target, directory: None });
     }
     entries
+}
+
+fn conversation_snapshot(
+    entry: &FileScanEntry,
+) -> Option<FileScanSnapshot<(FileMetadataSnapshot, Option<FileMetadataSnapshot>)>> {
+    let primary = file_scan::file_metadata_snapshot(&entry.stat_target)?;
+    let base = if entry.stat_target.is_dir() {
+        entry
+            .stat_target
+            .parent()
+            .and_then(|dir| file_scan::file_metadata_snapshot(&dir.join("base_state.json")))
+    } else {
+        None
+    };
+    let mut effective_mtime_ms = primary.mtime_ms()?;
+    if let Some(base_mtime_ms) = base.as_ref().and_then(FileMetadataSnapshot::mtime_ms) {
+        effective_mtime_ms = effective_mtime_ms.max(base_mtime_ms);
+    }
+    Some(FileScanSnapshot::new(effective_mtime_ms, (primary, base)))
 }
 
 fn parse_conversation_entry(
@@ -193,10 +232,14 @@ fn parse_sdk_layout(
     let title = json_string(&base, &["title", "name"]);
     let mut messages = Vec::new();
     let mut events = Vec::new();
-    for path in list_event_files(events_dir) {
-        let value = match read_json(&path) {
-            Some(value) => value,
-            None => continue,
+    let stored_events = list_event_files(events_dir)
+        .into_iter()
+        .filter_map(|path| read_event_index(&path).map(|event| (path, event)))
+        .collect::<Vec<_>>();
+    for index in active_event_indices(&base, &stored_events)? {
+        let path = &stored_events[index].0;
+        let Some(value) = read_json(path) else {
+            continue;
         };
         let kind = event_kind(&value);
         let timestamp = event_timestamp(&value);
@@ -210,13 +253,13 @@ fn parse_sdk_layout(
                 }
             }
             "ActionEvent" if include_events => {
-                if let Some(event) = action_event(&value, timestamp, events.len() as u32, &path) {
+                if let Some(event) = action_event(&value, timestamp, events.len() as u32, path) {
                     events.push(event);
                 }
             }
             "ObservationEvent" if include_events => {
                 events.push(events::tool_result_event(
-                    event_context(&value, timestamp, events.len() as u32, &path),
+                    event_context(&value, timestamp, events.len() as u32, path),
                     json_string(&value, &["tool_name", "name"]),
                     extract_text(value.get("content"))
                         .or_else(|| extract_text(value.pointer("/observation/content"))),
@@ -314,6 +357,65 @@ fn list_event_files(events_dir: &Path) -> Vec<PathBuf> {
     files.into_iter().map(|(_, _, path)| path).collect()
 }
 
+fn active_event_indices(
+    base: &Value,
+    events: &[(PathBuf, EventIndexEntry)],
+) -> anyhow::Result<Vec<usize>> {
+    let mut by_id = HashMap::new();
+    for (index, (_, event)) in events.iter().enumerate() {
+        let id = event.id.trim().to_string();
+        if by_id.insert(id.clone(), index).is_some() {
+            return Err(anyhow::anyhow!("OpenHands event id {id} is duplicated"));
+        }
+    }
+    let leaf = if let Some(leaf) = json_string(base, &["leaf_event_id"]) {
+        Some(leaf)
+    } else if base.get("head_is_empty").and_then(Value::as_bool) == Some(true) {
+        None
+    } else {
+        events
+            .iter()
+            .rev()
+            .find(|(_, event)| {
+                !matches!(
+                    indexed_event_kind(event),
+                    "ConversationStateUpdateEvent" | "ConversationErrorEvent"
+                )
+            })
+            .map(|(_, event)| event.id.trim().to_string())
+    };
+    let Some(mut current) = leaf else {
+        return Ok(Vec::new());
+    };
+    let mut indices = Vec::new();
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current.clone()) {
+            return Err(anyhow::anyhow!("cycle in OpenHands event tree at {current}"));
+        }
+        let index = *by_id.get(&current).ok_or_else(|| {
+            anyhow::anyhow!("OpenHands event tree references missing id {current}")
+        })?;
+        indices.push(index);
+        current = match events[index].1.parent_id.as_deref().map(str::trim) {
+            Some("__root__") => break,
+            Some(parent) => parent.to_string(),
+            None if index == 0 => break,
+            None => events[index - 1].1.id.trim().to_string(),
+        };
+    }
+    indices.reverse();
+    Ok(indices)
+}
+
+fn indexed_event_kind(event: &EventIndexEntry) -> &str {
+    [&event.kind, &event.type_name, &event.event_type]
+        .into_iter()
+        .find(|kind| !kind.is_empty())
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
 fn event_ordinal(name: &str) -> Option<u64> {
     let stem = name.strip_suffix(".json")?;
     let rest = stem.strip_prefix("event-").or_else(|| stem.strip_prefix("event_"))?;
@@ -334,15 +436,20 @@ fn event_timestamp(value: &Value) -> Option<i64> {
 }
 
 fn timestamp_field(value: Option<&Value>) -> Option<i64> {
-    json_i64(value).or_else(|| rfc3339_ms(value)).or_else(|| naive_iso8601_utc_ms(value))
+    json_i64(value)
+        .or_else(|| rfc3339_ms(value))
+        .or_else(|| naive_iso8601_ms(value, &chrono::Local))
 }
 
-fn naive_iso8601_utc_ms(value: Option<&Value>) -> Option<i64> {
+fn naive_iso8601_ms<Tz: TimeZone>(value: Option<&Value>, timezone: &Tz) -> Option<i64> {
     let text = value?.as_str()?.trim();
     const FMTS: &[&str] = &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f"];
     for fmt in FMTS {
         if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(text, fmt) {
-            return Some(naive.and_utc().timestamp_millis());
+            return timezone
+                .from_local_datetime(&naive)
+                .earliest()
+                .map(|timestamp| timestamp.timestamp_millis());
         }
     }
     None
@@ -465,6 +572,20 @@ fn read_json(path: &Path) -> Option<Value> {
         Ok(value) => Some(value),
         Err(err) => {
             warn!("failed to parse OpenHands JSON {}: {err}", path.display());
+            None
+        }
+    }
+}
+
+fn read_event_index(path: &Path) -> Option<EventIndexEntry> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return None,
+    };
+    match serde_json::from_reader(BufReader::new(file)) {
+        Ok(event) => Some(event),
+        Err(err) => {
+            warn!("failed to index OpenHands JSON {}: {err}", path.display());
             None
         }
     }
@@ -601,10 +722,11 @@ mod tests {
     }
 
     #[test]
-    fn naive_iso8601_timestamp_is_treated_as_utc() {
+    fn naive_iso8601_timestamp_uses_source_local_timezone() {
         let naive = serde_json::json!({ "timestamp": "2026-01-01T00:00:01" });
         let zulu = serde_json::json!({ "timestamp": "2026-01-01T00:00:01Z" });
-        assert_eq!(event_timestamp(&naive), Some(1_767_225_601_000));
+        let eastern = chrono::FixedOffset::west_opt(5 * 60 * 60).unwrap();
+        assert_eq!(naive_iso8601_ms(naive.get("timestamp"), &eastern), Some(1_767_243_601_000));
         assert_eq!(event_timestamp(&zulu), Some(1_767_225_601_000));
     }
 
@@ -633,6 +755,100 @@ mod tests {
         assert_eq!(session.events[0].name.as_deref(), Some("terminal"));
         assert_eq!(session.events[0].kind, "tool_call");
         assert_eq!(session.events[1].kind, "tool_result");
+    }
+
+    #[test]
+    fn sdk_layout_reads_only_the_active_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let conversation = root.path().join("branching");
+        let events = conversation.join("events");
+        fs::create_dir_all(&events).unwrap();
+        fs::write(
+            conversation.join("base_state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "leaf_event_id": "active"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for (ordinal, value) in [
+            serde_json::json!({
+                "kind": "MessageEvent",
+                "id": "root",
+                "parent_id": null,
+                "source": "user",
+                "llm_message": { "content": "root message" }
+            }),
+            serde_json::json!({
+                "kind": "MessageEvent",
+                "id": "abandoned",
+                "parent_id": "root",
+                "source": "agent",
+                "llm_message": { "content": "abandoned branch" }
+            }),
+            serde_json::json!({
+                "kind": "MessageEvent",
+                "id": "active",
+                "parent_id": "root",
+                "source": "agent",
+                "llm_message": { "content": "active branch" }
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fs::write(
+                events.join(format!("event-{ordinal:05}-{ordinal}.json")),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+        }
+        let session =
+            parse_conversation_dir(&conversation, "branching", Some(1), false).unwrap().unwrap();
+        let messages =
+            session.messages.into_iter().map(|message| message.content).collect::<Vec<_>>();
+        assert_eq!(messages, vec!["root message", "active branch"]);
+    }
+
+    #[test]
+    fn sdk_layout_respects_an_empty_head() {
+        let root = tempfile::tempdir().unwrap();
+        let conversation = root.path().join("empty-head");
+        copy_tree(&fixtures_dir().join("sdk-layout"), &conversation);
+        fs::write(
+            conversation.join("base_state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "leaf_event_id": null,
+                "head_is_empty": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            parse_conversation_dir(&conversation, "empty-head", Some(1), true).unwrap().is_none()
+        );
+    }
+
+    #[test]
+    fn sdk_snapshot_tracks_base_state_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let conversation = root.path().join("sdk-conv-1");
+        copy_tree(&fixtures_dir().join("sdk-layout"), &conversation);
+        let entry = collect_conversation_entries(&Some(root.path().to_path_buf())).pop().unwrap();
+        let before = conversation_snapshot(&entry).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(
+            conversation.join("base_state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "leaf_event_id": "msg-user-1",
+                "head_is_empty": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let after = conversation_snapshot(&entry).unwrap();
+        assert_ne!(before, after);
+        assert!(after.effective_mtime_ms() > before.effective_mtime_ms());
     }
 
     #[test]

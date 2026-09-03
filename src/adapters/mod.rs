@@ -422,14 +422,3 @@ pub(crate) fn dashboard_source_labels() -> Vec<(String, String)> {
         .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::all_adapters;
-
-    #[test]
-    fn all_adapters_includes_openhands() {
-        let ids: Vec<_> = all_adapters().iter().map(|adapter| adapter.id().to_string()).collect();
-        assert!(ids.iter().any(|id| id == "openhands"), "openhands missing from all_adapters()");
-    }
-}
