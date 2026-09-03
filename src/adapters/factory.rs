@@ -120,36 +120,13 @@ fn parse_session_entry(
     mtime_ms: i64,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    match parse_session_file(&entry.stat_target, &entry.session_id, mtime_ms, include_events) {
+    match parse_factory_jsonl(&entry.stat_target, &entry.session_id, mtime_ms, include_events) {
         Ok(raw) => Ok(raw),
         Err(err) => {
             warn!("failed to parse Factory session {}: {err}", entry.stat_target.display());
             Ok(None)
         }
     }
-}
-
-fn parse_session_file(
-    path: &Path,
-    fallback_id: &str,
-    mtime_ms: i64,
-    include_events: bool,
-) -> anyhow::Result<Option<RawSession>> {
-    let file = fs::File::open(path)?;
-    let settings = read_settings(&settings_path(path));
-    parse_factory_jsonl(
-        BufReader::new(file).lines(),
-        fallback_id,
-        mtime_ms,
-        path.to_str().map(str::to_string),
-        settings.as_ref(),
-        include_events,
-    )
-}
-
-fn settings_path(jsonl: &Path) -> PathBuf {
-    let stem = jsonl.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
-    jsonl.with_file_name(format!("{stem}.settings.json"))
 }
 
 fn read_settings(path: &Path) -> Option<Value> {
@@ -164,20 +141,22 @@ fn read_settings(path: &Path) -> Option<Value> {
 }
 
 fn parse_factory_jsonl(
-    lines: impl Iterator<Item = std::io::Result<String>>,
+    path: &Path,
     fallback_id: &str,
     mtime_ms: i64,
-    source_path: Option<String>,
-    settings: Option<&Value>,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
+    let file = fs::File::open(path)?;
+    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+    let settings = read_settings(&path.with_file_name(format!("{stem}.settings.json")));
+    let source_path = path.to_str().map(str::to_string);
     let mut messages = Vec::new();
     let mut events = Vec::new();
     let mut source_id = fallback_id.to_string();
     let mut directory = None;
     let mut custom_title = None;
 
-    for item in jsonl_indexed(lines) {
+    for item in jsonl_indexed(BufReader::new(file).lines()) {
         let (_index, record) = item?;
         take_meta(&record, &mut source_id, &mut directory, &mut custom_title);
         let kind = record_kind(&record);
@@ -220,10 +199,11 @@ fn parse_factory_jsonl(
     }
 
     if custom_title.is_none() {
-        custom_title = settings.and_then(|value| json_opt(value, &["title"]));
+        custom_title = settings.as_ref().and_then(|value| json_opt(value, &["title"]));
     }
 
     let usage_events = settings
+        .as_ref()
         .map(|value| session_usage(value, &source_id, mtime_ms, source_path.as_deref()))
         .unwrap_or_default();
     if messages.is_empty() && usage_events.is_empty() && events.is_empty() {
