@@ -7,6 +7,7 @@ pub(crate) mod copilot_chat;
 pub(crate) mod crush;
 pub(crate) mod cursor;
 pub(crate) mod deepseek_harness;
+pub(crate) mod droid;
 pub(crate) mod events;
 pub(crate) mod file_scan;
 pub(crate) mod gemini;
@@ -369,6 +370,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(mimo_code::MimoCodeAdapter),
         Box::new(zcode::ZcodeAdapter),
         Box::new(goose::GooseAdapter),
+        Box::new(droid::DroidAdapter),
     ]
 }
 
