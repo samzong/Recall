@@ -1,3 +1,4 @@
+pub(crate) mod amp;
 pub(crate) mod antigravity;
 pub(crate) mod claude_code;
 pub(crate) mod cline;
@@ -371,6 +372,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(zcode::ZcodeAdapter),
         Box::new(goose::GooseAdapter),
         Box::new(droid::DroidAdapter),
+        Box::new(amp::AmpAdapter),
     ]
 }
 
@@ -418,4 +420,15 @@ pub(crate) fn dashboard_source_labels() -> Vec<(String, String)> {
         .filter(|adapter| adapter_supports_usage_dashboard(adapter.as_ref(), true))
         .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_adapters;
+
+    #[test]
+    fn all_adapters_includes_amp() {
+        let ids: Vec<_> = all_adapters().iter().map(|adapter| adapter.id().to_string()).collect();
+        assert!(ids.iter().any(|id| id == "amp"), "amp missing from all_adapters()");
+    }
 }

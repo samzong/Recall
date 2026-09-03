@@ -27,7 +27,7 @@ pub(crate) fn vscode_extension_task_dirs(extension_id: &str) -> Vec<PathBuf> {
     vscode_extension_task_dirs_from(dirs::config_dir(), extension_id)
 }
 
-pub(crate) fn vscode_extension_task_dirs_from(
+pub(crate) fn vscode_extension_storage_dirs_from(
     config_dir: Option<PathBuf>,
     extension_id: &str,
 ) -> Vec<PathBuf> {
@@ -36,14 +36,18 @@ pub(crate) fn vscode_extension_task_dirs_from(
     };
     VSCODE_HOSTS
         .iter()
-        .map(|host| {
-            config_dir
-                .join(host)
-                .join("User")
-                .join("globalStorage")
-                .join(extension_id)
-                .join("tasks")
-        })
+        .map(|host| config_dir.join(host).join("User").join("globalStorage").join(extension_id))
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+pub(crate) fn vscode_extension_task_dirs_from(
+    config_dir: Option<PathBuf>,
+    extension_id: &str,
+) -> Vec<PathBuf> {
+    vscode_extension_storage_dirs_from(config_dir, extension_id)
+        .into_iter()
+        .map(|dir| dir.join("tasks"))
         .filter(|path| path.is_dir())
         .collect()
 }
@@ -120,5 +124,23 @@ mod tests {
             "saoudrizwan.claude-dev",
         );
         assert_eq!(dirs, vec![oss]);
+    }
+
+    #[test]
+    fn storage_dirs_include_cursor_and_skip_missing_hosts() {
+        let root = tempfile::tempdir().unwrap();
+        let cursor =
+            root.path().join("Cursor").join("User").join("globalStorage").join("sourcegraph.amp");
+        let code =
+            root.path().join("Code").join("User").join("globalStorage").join("sourcegraph.amp");
+        fs::create_dir_all(&cursor).unwrap();
+        fs::create_dir_all(&code).unwrap();
+        fs::create_dir_all(
+            root.path().join("VSCodium").join("User").join("globalStorage").join("other"),
+        )
+        .unwrap();
+        let dirs =
+            vscode_extension_storage_dirs_from(Some(root.path().to_path_buf()), "sourcegraph.amp");
+        assert_eq!(dirs, vec![code, cursor]);
     }
 }
