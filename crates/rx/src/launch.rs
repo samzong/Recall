@@ -510,8 +510,6 @@ fn inject(
             })
         }
         Harness::OpenCode => {
-            let provider_id =
-                if provider.setup == Setup::Generated { provider_id } else { provider.id.as_str() };
             let mut env_set = vec![(provider.env.clone(), key.to_string())];
             env_set.push((
                 "OPENCODE_CONFIG_CONTENT".to_string(),
@@ -544,8 +542,6 @@ fn inject(
             })
         }
         Harness::Pi => {
-            let provider_id =
-                if provider.setup == Setup::Generated { provider_id } else { provider.id.as_str() };
             crate::pi::prepare(provider_id, provider, base_url, key, paths, env)?;
             Ok(LaunchPlan {
                 program: PathBuf::from("pi"),
