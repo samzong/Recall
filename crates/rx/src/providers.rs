@@ -360,9 +360,13 @@ fn update_models(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Res
                 bail!("no API key for provider '{id}'; run: rx providers login {id}")
             }
         };
-        let count =
-            catalog::update_models(paths, &target.provider_id, &target.base_url, &target.key)?;
-        println!("{}: {count} models", target.provider_id);
+        let count = catalog::update_models(
+            paths,
+            &target.provider.id,
+            &target.provider.endpoint,
+            &target.key,
+        )?;
+        println!("{}: {count} models", target.provider.id);
     }
     Ok(())
 }

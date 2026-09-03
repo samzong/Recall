@@ -211,14 +211,7 @@ fn target(profile: &GatewayProfile, key: String) -> ProviderTarget {
         default_model: None,
         claude_default_model: None,
     };
-    ProviderTarget {
-        provider_id: profile.provider_id.clone(),
-        base_url: profile.endpoint.clone(),
-        claude_url: crate::provider::claude_base(&provider),
-        provider,
-        key,
-        model: None,
-    }
+    ProviderTarget { provider, key, model: None }
 }
 
 fn validate_route_args(harness: Harness, passthrough: &[OsString]) -> Result<()> {

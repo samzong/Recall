@@ -53,10 +53,7 @@ pub(crate) struct LaunchPlan {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderTarget {
-    pub provider_id: String,
     pub provider: Provider,
-    pub base_url: String,
-    pub claude_url: String,
     pub key: String,
     pub model: Option<String>,
 }
@@ -102,14 +99,7 @@ pub(crate) fn configured_provider(
     let auth = entry.map(|entry| entry.auth).unwrap_or(AuthMode::ApiKey);
     let key = resolve_key(&provider, auth, paths, env)?;
     let model = entry.and_then(|entry| entry.model.clone());
-    Ok(ProviderResolution::Target(Box::new(ProviderTarget {
-        provider_id,
-        base_url: provider.endpoint.clone(),
-        claude_url: crate::provider::claude_base(&provider),
-        provider,
-        key,
-        model,
-    })))
+    Ok(ProviderResolution::Target(Box::new(ProviderTarget { provider, key, model })))
 }
 
 pub(crate) fn plan(request: &LaunchRequest, paths: &Paths, env: &EnvLookup) -> Result<LaunchPlan> {
@@ -140,6 +130,8 @@ pub(crate) fn plan_target(
     env: &EnvLookup,
     target: &ProviderTarget,
 ) -> Result<LaunchPlan> {
+    let provider_id = target.provider.id.as_str();
+    let base_url = target.provider.endpoint.as_str();
     let model = target.model.as_deref().or(match request.harness {
         Harness::Claude => target.provider.claude_default_model,
         Harness::Codex => target.provider.default_model,
@@ -147,27 +139,22 @@ pub(crate) fn plan_target(
     });
     if matches!(request.harness, Harness::Claude) {
         let seed = if env.is_real() {
-            claude_catalog::try_seed_user_catalog(
-                paths,
-                &target.provider_id,
-                &target.base_url,
-                &target.key,
-                env,
-            )
+            claude_catalog::try_seed_user_catalog(paths, provider_id, base_url, &target.key, env)
         } else {
             SeedOutcome::Fallback
         };
         if target.provider.setup == Setup::OpenRouter {
-            let mut plan =
-                inject_claude_openrouter(request, &target.claude_url, &target.key, model, seed);
+            let claude_url = crate::provider::claude_base(&target.provider);
+            let mut plan = inject_claude_openrouter(request, &claude_url, &target.key, model, seed);
             apply_yolo(request, &mut plan, env);
             return Ok(plan);
         }
         if seed == SeedOutcome::Seeded {
+            let claude_url = crate::provider::claude_base(&target.provider);
             let mut plan = inject_claude_generated_seeded(
                 request,
                 &target.provider.env,
-                &target.claude_url,
+                &claude_url,
                 &target.key,
                 model,
             );
@@ -476,15 +463,15 @@ fn inject(
     target: &ProviderTarget,
     model: Option<&str>,
 ) -> Result<LaunchPlan> {
-    let provider_id = target.provider_id.as_str();
     let provider = &target.provider;
-    let base_url = target.base_url.as_str();
+    let provider_id = provider.id.as_str();
+    let base_url = provider.endpoint.as_str();
     let key = target.key.as_str();
     match request.harness {
         Harness::Claude => Ok(LaunchPlan {
             program: PathBuf::from("claude"),
             args: request.passthrough.clone(),
-            env_set: claude_env(&provider.env, &target.claude_url, key, model),
+            env_set: claude_env(&provider.env, &crate::provider::claude_base(provider), key, model),
             stderr_note: None,
         }),
         Harness::Codex => {
