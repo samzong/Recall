@@ -127,6 +127,103 @@ struct SessionHit {
 struct HitList {
     message: Option<String>,
     hits: Vec<SessionHit>,
+    current_session: CurrentSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CurrentSessionResolution {
+    Resolved,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+struct CurrentSession {
+    resolution: CurrentSessionResolution,
+    session_id: Option<String>,
+    source: Option<String>,
+    source_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceSessionIdentity {
+    source: String,
+    source_session_id: String,
+}
+
+#[derive(Clone, Default)]
+struct CurrentSessionContext {
+    host_identity: Option<SourceSessionIdentity>,
+}
+
+impl CurrentSession {
+    fn unknown() -> Self {
+        Self {
+            resolution: CurrentSessionResolution::Unknown,
+            session_id: None,
+            source: None,
+            source_session_id: None,
+        }
+    }
+
+    fn resolved(session: &Session) -> Self {
+        Self {
+            resolution: CurrentSessionResolution::Resolved,
+            session_id: Some(session.id.clone()),
+            source: Some(session.source.clone()),
+            source_session_id: Some(session.source_id.clone()),
+        }
+    }
+}
+
+impl CurrentSessionContext {
+    fn from_env() -> Self {
+        let claude = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+        let codex_thread = std::env::var("CODEX_THREAD_ID").ok();
+        let codex_session = std::env::var("CODEX_SESSION_ID").ok();
+        Self::from_values(claude.as_deref(), codex_thread.as_deref(), codex_session.as_deref())
+    }
+
+    fn from_values(
+        claude_session: Option<&str>,
+        codex_thread: Option<&str>,
+        codex_session: Option<&str>,
+    ) -> Self {
+        if let Some(source_session_id) = verified_session_id(claude_session) {
+            return Self {
+                host_identity: Some(SourceSessionIdentity {
+                    source: "claude-code".to_string(),
+                    source_session_id: source_session_id.to_string(),
+                }),
+            };
+        }
+        let host_identity =
+            match (verified_session_id(codex_thread), verified_session_id(codex_session)) {
+                (Some(thread), Some(session)) if thread == session => Some(SourceSessionIdentity {
+                    source: "codex".to_string(),
+                    source_session_id: thread.to_string(),
+                }),
+                _ => None,
+            };
+        Self { host_identity }
+    }
+
+    fn resolve(&self, store: &Store) -> CurrentSession {
+        let Some(identity) = self.host_identity.as_ref() else {
+            return CurrentSession::unknown();
+        };
+        store
+            .get_session_by_source_id(&identity.source, &identity.source_session_id)
+            .ok()
+            .flatten()
+            .as_ref()
+            .map(CurrentSession::resolved)
+            .unwrap_or_else(CurrentSession::unknown)
+    }
+}
+
+fn verified_session_id(value: Option<&str>) -> Option<&str> {
+    opt_trimmed(value).filter(|value| uuid::Uuid::try_parse(value).is_ok())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -187,6 +284,7 @@ enum IndexState {
 #[derive(Clone)]
 struct RecallMcp {
     index: Arc<Mutex<IndexState>>,
+    current_session: CurrentSessionContext,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -258,7 +356,11 @@ async fn serve(db: Option<PathBuf>) -> Result<()> {
 #[tool_router]
 impl RecallMcp {
     fn new(db: Option<&Path>) -> Self {
-        Self { index: Arc::new(Mutex::new(IndexState::open(db))), tool_router: Self::tool_router() }
+        Self {
+            index: Arc::new(Mutex::new(IndexState::open(db))),
+            current_session: CurrentSessionContext::from_env(),
+            tool_router: Self::tool_router(),
+        }
     }
 
     #[tool(
@@ -274,7 +376,11 @@ impl RecallMcp {
         &self,
         Parameters(args): Parameters<SearchSessionsArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        Ok(json_result(search_sessions(&lock_index(&self.index), &args)))
+        Ok(json_result(search_sessions_with_context(
+            &lock_index(&self.index),
+            &args,
+            &self.current_session,
+        )))
     }
 
     #[tool(
@@ -309,7 +415,11 @@ impl RecallMcp {
         &self,
         Parameters(args): Parameters<ListRecentSessionsArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        Ok(json_result(list_recent_sessions(&lock_index(&self.index), &args)))
+        Ok(json_result(list_recent_sessions_with_context(
+            &lock_index(&self.index),
+            &args,
+            &self.current_session,
+        )))
     }
 
     #[tool(
@@ -342,6 +452,7 @@ impl GetSessionBenchmark {
         Self {
             server: RecallMcp {
                 index: Arc::new(Mutex::new(IndexState::Ready(store))),
+                current_session: CurrentSessionContext::default(),
                 tool_router: RecallMcp::tool_router(),
             },
             max_messages,
@@ -438,40 +549,76 @@ fn to_json(value: impl Serialize) -> Value {
 }
 
 fn empty_hits(message: impl Into<String>) -> HitList {
-    HitList { message: Some(message.into()), hits: Vec::new() }
+    HitList {
+        message: Some(message.into()),
+        hits: Vec::new(),
+        current_session: CurrentSession::unknown(),
+    }
+}
+
+fn empty_hits_with_current(message: impl Into<String>, current_session: CurrentSession) -> HitList {
+    HitList { message: Some(message.into()), hits: Vec::new(), current_session }
 }
 
 fn empty_events(message: impl Into<String>) -> EventList {
     EventList { message: Some(message.into()), events: Vec::new() }
 }
 
+#[cfg(test)]
 fn search_sessions(
     index: &IndexState,
     args: &SearchSessionsArgs,
 ) -> std::result::Result<HitList, HitList> {
+    search_sessions_with_context(index, args, &CurrentSessionContext::default())
+}
+
+fn search_sessions_with_context(
+    index: &IndexState,
+    args: &SearchSessionsArgs,
+    context: &CurrentSessionContext,
+) -> std::result::Result<HitList, HitList> {
     match index {
         IndexState::Unavailable { message, .. } => Err(empty_hits(message.clone())),
-        IndexState::Ready(store) => search_ready(store, args).map_err(empty_hits),
+        IndexState::Ready(store) => {
+            let current_session = context.resolve(store);
+            search_ready(store, args, &current_session)
+                .map_err(|message| empty_hits_with_current(message, current_session))
+        }
     }
 }
 
-fn search_ready(store: &Store, args: &SearchSessionsArgs) -> std::result::Result<HitList, String> {
+fn search_ready(
+    store: &Store,
+    args: &SearchSessionsArgs,
+    current_session: &CurrentSession,
+) -> std::result::Result<HitList, String> {
     let (scope, sources) = resolve_filters(store, args.project.as_deref(), args.source.as_deref())?;
     let limit = clamp_limit(args.limit, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX);
     let embedding = query_embedding(store, &args.query, |message| {
         tracing::info!("{message}");
     })
     .map_err(|error| error.to_string())?;
-    let filters = SearchFilters { sources, time_range: TimeRange::All, scope, thread_role: None };
+    let filters = SearchFilters {
+        sources,
+        time_range: TimeRange::All,
+        scope,
+        thread_role: None,
+        excluded_session_id: current_session.session_id.clone(),
+    };
     let results = SearchEngine::new(&store.conn)
         .hybrid_search(&args.query, embedding.as_deref(), &filters, limit, 3)
         .map_err(|error| error.to_string())?;
     if results.is_empty() {
         let message = if store_is_empty(store) { EMPTY_INDEX } else { SEARCH_EMPTY };
-        return Ok(HitList { message: Some(message.to_string()), hits: Vec::new() });
+        return Ok(HitList {
+            message: Some(message.to_string()),
+            hits: Vec::new(),
+            current_session: current_session.clone(),
+        });
     }
     Ok(HitList {
         message: None,
+        current_session: current_session.clone(),
         hits: results
             .into_iter()
             .map(|result| session_hit(&result.session, result.snippet))
@@ -479,31 +626,56 @@ fn search_ready(store: &Store, args: &SearchSessionsArgs) -> std::result::Result
     })
 }
 
+#[cfg(test)]
 fn list_recent_sessions(
     index: &IndexState,
     args: &ListRecentSessionsArgs,
 ) -> std::result::Result<HitList, HitList> {
+    list_recent_sessions_with_context(index, args, &CurrentSessionContext::default())
+}
+
+fn list_recent_sessions_with_context(
+    index: &IndexState,
+    args: &ListRecentSessionsArgs,
+    context: &CurrentSessionContext,
+) -> std::result::Result<HitList, HitList> {
     match index {
         IndexState::Unavailable { message, .. } => Err(empty_hits(message.clone())),
-        IndexState::Ready(store) => list_ready(store, args).map_err(empty_hits),
+        IndexState::Ready(store) => {
+            let current_session = context.resolve(store);
+            list_ready(store, args, &current_session)
+                .map_err(|message| empty_hits_with_current(message, current_session))
+        }
     }
 }
 
 fn list_ready(
     store: &Store,
     args: &ListRecentSessionsArgs,
+    current_session: &CurrentSession,
 ) -> std::result::Result<HitList, String> {
     let (scope, sources) = resolve_filters(store, args.project.as_deref(), args.source.as_deref())?;
     let limit = clamp_limit(args.limit, LIST_LIMIT_DEFAULT, LIST_LIMIT_MAX);
     let sessions = store
-        .list_recent_sessions_for_search_scope(sources.as_deref(), TimeRange::All, &scope, limit)
+        .list_recent_sessions_for_search_scope(
+            sources.as_deref(),
+            TimeRange::All,
+            &scope,
+            current_session.session_id.as_deref(),
+            limit,
+        )
         .map_err(|error| error.to_string())?;
     if sessions.is_empty() {
         let message = if store_is_empty(store) { EMPTY_INDEX } else { SEARCH_EMPTY };
-        return Ok(HitList { message: Some(message.to_string()), hits: Vec::new() });
+        return Ok(HitList {
+            message: Some(message.to_string()),
+            hits: Vec::new(),
+            current_session: current_session.clone(),
+        });
     }
     Ok(HitList {
         message: None,
+        current_session: current_session.clone(),
         hits: sessions
             .into_iter()
             .map(|session| {
@@ -820,6 +992,15 @@ mod tests {
         IndexState::Ready(store)
     }
 
+    fn context(source: &str, source_session_id: &str) -> CurrentSessionContext {
+        CurrentSessionContext {
+            host_identity: Some(SourceSessionIdentity {
+                source: source.to_string(),
+                source_session_id: source_session_id.to_string(),
+            }),
+        }
+    }
+
     fn without_fields(value: impl Serialize, fields: &[&str]) -> Value {
         let mut value = to_json(value);
         let object = value.as_object_mut().unwrap();
@@ -929,6 +1110,192 @@ mod tests {
         assert_eq!(list.hits[0].excerpt.as_deref(), Some("newer summary"));
         assert_eq!(list.hits[1].session_id, "old");
         assert_eq!(list.hits[1].source_session_id, "src-old");
+    }
+
+    #[test]
+    fn host_identity_requires_verified_source_native_values() {
+        let codex_id = "019c9c4f-a462-7cc1-99a5-4ab521648c91";
+        let codex = CurrentSessionContext::from_values(None, Some(codex_id), Some(codex_id));
+        assert_eq!(
+            codex.host_identity,
+            Some(SourceSessionIdentity {
+                source: "codex".to_string(),
+                source_session_id: codex_id.to_string(),
+            })
+        );
+        assert!(
+            CurrentSessionContext::from_values(None, Some("thread"), Some("session"))
+                .host_identity
+                .is_none()
+        );
+        assert!(
+            CurrentSessionContext::from_values(None, Some(codex_id), None).host_identity.is_none()
+        );
+        assert!(
+            CurrentSessionContext::from_values(None, Some(" "), Some(" ")).host_identity.is_none()
+        );
+        assert!(
+            CurrentSessionContext::from_values(None, Some("same"), Some("same"))
+                .host_identity
+                .is_none()
+        );
+        let claude_id = "604c4e71-f49c-4cc0-9388-88905fe65473";
+        let claude =
+            CurrentSessionContext::from_values(Some(claude_id), Some(codex_id), Some(codex_id));
+        assert_eq!(
+            claude.host_identity,
+            Some(SourceSessionIdentity {
+                source: "claude-code".to_string(),
+                source_session_id: claude_id.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolved_current_session_is_excluded_before_search_and_recent_limits() {
+        let store = setup();
+        let mut current = session("000-current", "codex", "current", 100_000);
+        current.message_count = 1;
+        store.insert_session(&current).unwrap();
+        store.insert_messages(&[message("000-current", Role::User, "identityneedle", 0)]).unwrap();
+        for index in 0..50 {
+            let id = format!("history-{index:02}");
+            let mut stored = session(&id, "codex", "history", 50_000 - index);
+            stored.message_count = 1;
+            store.insert_session(&stored).unwrap();
+            store.insert_messages(&[message(&id, Role::User, "identityneedle", 0)]).unwrap();
+        }
+        let index = ready(store);
+        let current_context = context("codex", "src-000-current");
+
+        let first = search_sessions_with_context(
+            &index,
+            &SearchSessionsArgs {
+                query: "identityneedle".into(),
+                project: None,
+                source: None,
+                limit: Some(1),
+            },
+            &current_context,
+        )
+        .unwrap();
+        assert_eq!(first.hits.len(), 1);
+        assert_ne!(first.hits[0].session_id, "000-current");
+        assert_eq!(first.current_session.resolution, CurrentSessionResolution::Resolved);
+        assert_eq!(first.current_session.session_id.as_deref(), Some("000-current"));
+
+        let fifty = search_sessions_with_context(
+            &index,
+            &SearchSessionsArgs {
+                query: "identityneedle".into(),
+                project: None,
+                source: None,
+                limit: Some(50),
+            },
+            &current_context,
+        )
+        .unwrap();
+        assert_eq!(fifty.hits.len(), 50);
+        assert!(fifty.hits.iter().all(|hit| hit.session_id != "000-current"));
+
+        let recent = list_recent_sessions_with_context(
+            &index,
+            &ListRecentSessionsArgs { project: None, source: None, limit: Some(1) },
+            &current_context,
+        )
+        .unwrap();
+        assert_eq!(recent.hits.len(), 1);
+        assert_ne!(recent.hits[0].session_id, "000-current");
+        assert_eq!(recent.current_session.resolution, CurrentSessionResolution::Resolved);
+
+        let recent_fifty = list_recent_sessions_with_context(
+            &index,
+            &ListRecentSessionsArgs { project: None, source: None, limit: Some(50) },
+            &current_context,
+        )
+        .unwrap();
+        assert_eq!(recent_fifty.hits.len(), 50);
+        assert!(recent_fifty.hits.iter().all(|hit| hit.session_id != "000-current"));
+    }
+
+    #[test]
+    fn unresolved_or_mismatched_host_identity_keeps_discovery_complete() {
+        let store = setup();
+        let mut stored = session("current", "claude-code", "current", 10_000);
+        stored.source_id = "shared-source-id".to_string();
+        store.insert_session(&stored).unwrap();
+        store.insert_messages(&[message("current", Role::User, "mismatchneedle", 0)]).unwrap();
+        let index = ready(store);
+
+        for current_context in [
+            context("codex", "shared-source-id"),
+            context("codex", "not-indexed"),
+            CurrentSessionContext::from_values(None, Some("a"), Some("b")),
+        ] {
+            let result = search_sessions_with_context(
+                &index,
+                &SearchSessionsArgs {
+                    query: "mismatchneedle".into(),
+                    project: None,
+                    source: None,
+                    limit: Some(1),
+                },
+                &current_context,
+            )
+            .unwrap();
+            assert_eq!(result.current_session, CurrentSession::unknown());
+            assert_eq!(result.hits[0].session_id, "current");
+        }
+    }
+
+    #[test]
+    fn discovery_scope_does_not_change_exact_current_session_resolution() {
+        let store = setup();
+        let current = session("current", "codex", "current", 10_000);
+        store.insert_session(&current).unwrap();
+        let mut other = session("other", "claude-code", "other", 9_000);
+        other.directory = Some("/tmp/other".to_string());
+        store.insert_session(&other).unwrap();
+        store.insert_messages(&[message("other", Role::User, "scopeneedle", 0)]).unwrap();
+        let result = search_sessions_with_context(
+            &ready(store),
+            &SearchSessionsArgs {
+                query: "scopeneedle".into(),
+                project: Some("/tmp/other".into()),
+                source: Some("claude-code".into()),
+                limit: Some(1),
+            },
+            &context("codex", "src-current"),
+        )
+        .unwrap();
+        assert_eq!(result.current_session.resolution, CurrentSessionResolution::Resolved);
+        assert_eq!(result.hits[0].session_id, "other");
+    }
+
+    #[test]
+    fn exact_reads_remain_complete_for_the_resolved_current_session() {
+        let store = setup();
+        let mut current = session("current", "codex", "current", 10_000);
+        current.message_count = 1;
+        store.insert_session(&current).unwrap();
+        store.insert_messages(&[message("current", Role::User, "exact transcript", 0)]).unwrap();
+        persist_events(
+            &store,
+            "codex",
+            "current",
+            &[event(0, "file_write", Some("src/current.rs"), Some(10_000), None, None)],
+        );
+        let index = ready(store);
+
+        let detail = get_session(
+            &index,
+            &GetSessionArgs { session_id: "current".into(), max_messages: None, tail: false },
+        )
+        .unwrap();
+        assert_eq!(detail.messages, "[user] exact transcript");
+        let history = file_history(&index, &file_history_args("src/current.rs")).unwrap();
+        assert_eq!(history.events.len(), 1);
+        assert_eq!(history.events[0].session_id, "current");
     }
 
     #[test]

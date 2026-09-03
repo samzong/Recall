@@ -120,6 +120,7 @@ fn no_filters() -> SearchFilters {
         time_range: TimeRange::All,
         scope: ProjectScope::Global,
         thread_role: None,
+        excluded_session_id: None,
     }
 }
 
@@ -876,6 +877,27 @@ fn semantic_adjacent_pages_follow_one_global_order() {
 }
 
 #[test]
+fn semantic_search_excludes_a_session_before_vector_and_hybrid_limits() {
+    let store = setup();
+    let embedding = seed_semantic_page_fixture(&store);
+    let engine = SearchEngine::new(&store.conn);
+
+    let mut vector_filters = no_filters();
+    vector_filters.excluded_session_id = Some("semantic-vec-fill".to_string());
+    let vector =
+        engine.hybrid_search("lexically-absent", Some(&embedding), &vector_filters, 1, 3).unwrap();
+    assert_eq!(vector.len(), 1);
+    assert_eq!(vector[0].session.id, "semantic-fts-04");
+
+    let mut hybrid_filters = no_filters();
+    hybrid_filters.excluded_session_id = Some("semantic-fts-04".to_string());
+    let hybrid =
+        engine.hybrid_search("semanticstable", Some(&embedding), &hybrid_filters, 2, 3).unwrap();
+    assert_eq!(hybrid.len(), 2);
+    assert!(hybrid.iter().all(|result| result.session.id != "semantic-fts-04"));
+}
+
+#[test]
 fn semantic_query_all_returns_complete_fts_set() {
     let store = setup();
     seed_semantic_boundary_sessions(&store, 10_001);
@@ -939,6 +961,7 @@ fn search_with_source_filter() {
         time_range: TimeRange::All,
         scope: ProjectScope::Global,
         thread_role: None,
+        excluded_session_id: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
     assert_eq!(results.len(), 1);
@@ -1006,6 +1029,7 @@ fn search_with_directory_filter_respects_project_boundary() {
         time_range: TimeRange::All,
         scope: ProjectScope::Directory("/tmp/project".to_string()),
         thread_role: None,
+        excluded_session_id: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
     let mut ids: Vec<String> = results.into_iter().map(|result| result.session.id).collect();
@@ -1030,6 +1054,7 @@ fn recent_sessions_with_directory_filter_respects_project_boundary() {
             None,
             TimeRange::All,
             &ProjectScope::Directory("/tmp/project".to_string()),
+            None,
             10,
         )
         .unwrap();
@@ -1071,6 +1096,7 @@ fn search_with_repo_filter_matches_sibling_worktrees() {
             local_root: None,
         },
         thread_role: None,
+        excluded_session_id: None,
     };
     let results = engine.hybrid_search("parser", None, &filters, 10, 3).unwrap();
     let mut ids: Vec<String> = results.into_iter().map(|result| result.session.id).collect();
@@ -1166,7 +1192,7 @@ fn repository_scope_reaches_local_checkout_without_repo_identity() {
         local_root: Some("/repo/root".to_string()),
     };
     let mut ids = store
-        .list_recent_sessions_for_search_scope(None, TimeRange::All, &scope, 10)
+        .list_recent_sessions_for_search_scope(None, TimeRange::All, &scope, None, 10)
         .unwrap()
         .into_iter()
         .map(|session| session.source_id)
@@ -1236,7 +1262,7 @@ fn scope_predicate_matches_sql_and_rust_paths() {
 
     for scope in scopes {
         let mut sql_ids = store
-            .list_recent_sessions_for_search_scope(None, TimeRange::All, &scope, 100)
+            .list_recent_sessions_for_search_scope(None, TimeRange::All, &scope, None, 100)
             .unwrap()
             .into_iter()
             .map(|session| session.source_id)
@@ -2082,6 +2108,7 @@ fn hybrid_search_filters_by_thread_role_in_sql() {
         time_range: TimeRange::All,
         scope: ProjectScope::Global,
         thread_role,
+        excluded_session_id: None,
     };
     let source_ids = |results: Vec<crate::types::SearchResult>| {
         let mut ids = results.into_iter().map(|r| r.session.source_id).collect::<Vec<_>>();

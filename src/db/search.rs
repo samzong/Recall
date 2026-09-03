@@ -21,6 +21,7 @@ pub(crate) struct SearchFilters {
     pub(crate) time_range: TimeRange,
     pub(crate) scope: ProjectScope,
     pub(crate) thread_role: Option<ThreadRoleFilter>,
+    pub(crate) excluded_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +173,7 @@ impl<'a> SearchEngine<'a> {
             time_range: TimeRange::All,
             scope: query.scope.clone(),
             thread_role: None,
+            excluded_session_id: None,
         };
         apply_filters(&mut sql, &mut params, &mut param_idx, &filters);
 
@@ -327,7 +329,19 @@ impl<'a> SearchEngine<'a> {
         requested_k: usize,
     ) -> anyhow::Result<Vec<Hit>> {
         let blob = f32_slice_to_bytes(embedding);
-        let fetch_k = requested_k.clamp(1, SQLITE_VEC_MAX_K) as i64;
+        let excluded_vectors = match filters.excluded_session_id.as_deref() {
+            Some(session_id) => self.conn.query_row(
+                "SELECT COUNT(*)
+                 FROM message_vec mv
+                 JOIN messages m ON m.id = mv.message_id
+                 WHERE m.session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get::<_, usize>(0),
+            )?,
+            None => 0,
+        };
+        let fetch_k =
+            requested_k.saturating_add(excluded_vectors).clamp(1, SQLITE_VEC_MAX_K) as i64;
 
         let mut sql = String::from(
             "SELECT m.session_id, MIN(mv.distance) AS best_distance
@@ -432,6 +446,11 @@ fn apply_filters(
     apply_project_scope(sql, params, param_idx, &filters.scope);
     if let Some(thread_role) = filters.thread_role {
         sql.push_str(thread_role.sql_predicate());
+    }
+    if let Some(excluded_session_id) = filters.excluded_session_id.as_deref() {
+        sql.push_str(&format!(" AND s.id != ?{}", *param_idx));
+        params.push(Box::new(excluded_session_id.to_string()));
+        *param_idx += 1;
     }
 }
 
@@ -594,6 +613,7 @@ mod tests {
             time_range: TimeRange::All,
             scope: ProjectScope::Global,
             thread_role: None,
+            excluded_session_id: None,
         };
         let engine = SearchEngine::new(&store.conn);
 

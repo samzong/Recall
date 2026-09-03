@@ -668,6 +668,7 @@ impl SearchIndex {
             time_range: TimeRange::All,
             scope: ProjectScope::Global,
             thread_role: None,
+            excluded_session_id: None,
         }
     }
 
