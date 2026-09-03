@@ -282,7 +282,7 @@ fn parse_sdk_layout(
         None,
         messages,
     );
-    raw.source_file_path = dir.to_str().map(str::to_string);
+    raw.source_file_path = events_dir.to_str().map(str::to_string);
     raw.custom_title = title;
     if include_events {
         raw = raw.with_events(events, EVENT_PARSER_VERSION);
@@ -745,6 +745,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(session.source_id, "sdk-conv-1");
+        assert_eq!(
+            session.source_file_path.as_deref(),
+            fixtures_dir().join("sdk-layout/events").to_str()
+        );
         assert_eq!(session.directory.as_deref(), Some("/tmp/oh-sdk"));
         assert_eq!(session.started_at, 1_767_225_601_000);
         assert_eq!(session.custom_title.as_deref(), Some("SDK conversation"));
