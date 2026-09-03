@@ -205,7 +205,7 @@ fn parse_thread_value(value: &Value, path: &Path) -> Option<RawSession> {
     }
     let created = json_i64(doc.get("created")).or_else(|| rfc3339_ms(doc.get("created")));
     let started_at = first_timestamp(created, &messages, &[], &[]).unwrap_or(0);
-    let updated_at = last_timestamp(created, &messages, &[], &[]);
+    let updated_at = last_timestamp(None, &messages, &[], &[]);
     let mut session = RawSession::search_only(
         source_id,
         env_cwd(doc.get("env")).or_else(|| env_cwd(value.get("env"))),
@@ -369,6 +369,7 @@ mod tests {
         assert_eq!(session.custom_title.as_deref(), Some("Amp thread title"));
         assert_eq!(session.directory.as_deref(), Some("/tmp/amp-project"));
         assert_eq!(session.started_at, 1_700_000_000_000);
+        assert_eq!(session.updated_at, Some(1_700_000_002_000));
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].role, Role::User);
         assert_eq!(session.messages[0].content, "hello from amp");
