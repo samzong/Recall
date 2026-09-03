@@ -36,13 +36,7 @@ impl SourceAdapter for OpenHandsAdapter {
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        let mut sessions = Vec::new();
-        for entry in collect_conversation_entries(&conversations_dir()) {
-            if let Some(raw) = parse_conversation_entry(entry, 0, true)? {
-                sessions.push(raw);
-            }
-        }
-        Ok(sessions)
+        scan_conversations(conversations_dir())
     }
 
     fn scan_for_sync(
@@ -67,39 +61,55 @@ impl SourceAdapter for OpenHandsAdapter {
                 metadata_parser_version: None,
             },
             collect_conversation_entries(&Some(root)),
-            |entry, mtime_ms| parse_conversation_entry(entry, mtime_ms, include_events),
+            |entry, mtime_ms| parse_conversation_entry(entry, Some(mtime_ms), include_events),
         )?))
     }
 }
 
 fn conversations_dir() -> Option<PathBuf> {
     conversations_dir_from(
+        std::env::var("OPENHANDS_CONVERSATIONS_DIR").ok(),
+        std::env::var("OPENHANDS_PERSISTENCE_DIR").ok(),
         std::env::var("OH_PERSISTENCE_DIR").ok(),
         std::env::var("FILE_STORE_PATH").ok(),
         dirs::home_dir(),
     )
 }
 
+fn nonempty_path(value: Option<String>) -> Option<PathBuf> {
+    value.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
 fn conversations_dir_from(
-    oh_persistence_dir: Option<String>,
-    file_store_path: Option<String>,
+    conversations: Option<String>,
+    persistence: Option<String>,
+    oh_persistence: Option<String>,
+    file_store: Option<String>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    let persistence = oh_persistence_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            file_store_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
+    if let Some(dir) = nonempty_path(conversations).filter(|dir| dir.is_dir()) {
+        return Some(dir);
+    }
+    [persistence, oh_persistence, file_store]
+        .into_iter()
+        .find_map(|root| {
+            nonempty_path(root).map(|path| path.join("conversations")).filter(|dir| dir.is_dir())
         })
-        .or_else(|| home.map(|home| home.join(".openhands")))?;
-    let dir = persistence.join("conversations");
-    dir.is_dir().then_some(dir)
+        .or_else(|| {
+            home.map(|home| home.join(".openhands").join("conversations"))
+                .filter(|path| path.is_dir())
+        })
+}
+
+fn scan_conversations(root: Option<PathBuf>) -> anyhow::Result<Vec<RawSession>> {
+    let mut sessions = Vec::new();
+    for entry in collect_conversation_entries(&root) {
+        let mtime_ms = file_scan::stat_mtime_ms(&entry.stat_target);
+        if let Some(raw) = parse_conversation_entry(entry, mtime_ms, true)? {
+            sessions.push(raw);
+        }
+    }
+    Ok(sessions)
 }
 
 fn collect_conversation_entries(root: &Option<PathBuf>) -> Vec<FileScanEntry> {
@@ -139,7 +149,7 @@ fn collect_conversation_entries(root: &Option<PathBuf>) -> Vec<FileScanEntry> {
 
 fn parse_conversation_entry(
     entry: FileScanEntry,
-    mtime_ms: i64,
+    mtime_ms: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let Some(dir) = entry.stat_target.parent().map(Path::to_path_buf) else {
@@ -157,7 +167,7 @@ fn parse_conversation_entry(
 fn parse_conversation_dir(
     dir: &Path,
     source_id: &str,
-    mtime_ms: i64,
+    mtime_ms: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let events_dir = dir.join("events");
@@ -175,7 +185,7 @@ fn parse_sdk_layout(
     dir: &Path,
     events_dir: &Path,
     source_id: &str,
-    mtime_ms: i64,
+    mtime_ms: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let base = read_json(&dir.join("base_state.json")).unwrap_or(Value::Null);
@@ -218,9 +228,9 @@ fn parse_sdk_layout(
     if messages.is_empty() && events.is_empty() {
         return Ok(None);
     }
-    let started_at =
-        first_timestamp(event_timestamp(&base), &messages, &[], &events).unwrap_or(mtime_ms);
-    let updated_at = last_timestamp(Some(mtime_ms), &messages, &[], &events).or(Some(mtime_ms));
+    let started_at = first_timestamp(event_timestamp(&base), &messages, &[], &events)
+        .unwrap_or(mtime_ms.unwrap_or(0));
+    let updated_at = last_timestamp(mtime_ms, &messages, &[], &events).or(mtime_ms);
     let mut raw = RawSession::search_only(
         source_id.to_string(),
         directory,
@@ -240,7 +250,7 @@ fn parse_sdk_layout(
 fn parse_docs_layout(
     path: &Path,
     source_id: &str,
-    mtime_ms: i64,
+    mtime_ms: Option<i64>,
 ) -> anyhow::Result<Option<RawSession>> {
     let Some(value) = read_json(path) else {
         return Ok(None);
@@ -251,13 +261,13 @@ fn parse_docs_layout(
     if messages.is_empty() {
         return Ok(None);
     }
-    let started_at =
-        first_timestamp(event_timestamp(&value), &messages, &[], &[]).unwrap_or(mtime_ms);
+    let started_at = first_timestamp(event_timestamp(&value), &messages, &[], &[])
+        .unwrap_or(mtime_ms.unwrap_or(0));
     let mut raw = RawSession::search_only(
         id,
         workspace_dir(&value),
         started_at,
-        Some(mtime_ms),
+        last_timestamp(mtime_ms, &messages, &[], &[]).or(mtime_ms),
         None,
         messages,
     );
@@ -493,10 +503,68 @@ mod tests {
     #[test]
     fn default_root_is_home_openhands_conversations() {
         let home = tempfile::tempdir().unwrap();
-        assert!(conversations_dir_from(None, None, Some(home.path().to_path_buf())).is_none());
+        assert!(
+            conversations_dir_from(None, None, None, None, Some(home.path().to_path_buf()))
+                .is_none()
+        );
         fs::create_dir_all(home.path().join(".openhands/conversations")).unwrap();
-        let resolved = conversations_dir_from(None, None, Some(home.path().to_path_buf())).unwrap();
+        let resolved =
+            conversations_dir_from(None, None, None, None, Some(home.path().to_path_buf()))
+                .unwrap();
         assert_eq!(resolved, home.path().join(".openhands/conversations"));
+    }
+
+    #[test]
+    fn openhands_conversations_dir_wins() {
+        let root = tempfile::tempdir().unwrap();
+        let conversations = root.path().join("cli-conversations");
+        fs::create_dir_all(&conversations).unwrap();
+        fs::create_dir_all(root.path().join("persist/conversations")).unwrap();
+        fs::create_dir_all(root.path().join("oh/conversations")).unwrap();
+        fs::create_dir_all(root.path().join("legacy/conversations")).unwrap();
+        fs::create_dir_all(root.path().join("home/.openhands/conversations")).unwrap();
+        let resolved = conversations_dir_from(
+            Some(conversations.to_string_lossy().into_owned()),
+            Some(root.path().join("persist").to_string_lossy().into_owned()),
+            Some(root.path().join("oh").to_string_lossy().into_owned()),
+            Some(root.path().join("legacy").to_string_lossy().into_owned()),
+            Some(root.path().join("home")),
+        )
+        .unwrap();
+        assert_eq!(resolved, conversations);
+    }
+
+    #[test]
+    fn file_store_path_without_conversations_does_not_veto_home() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join(".openhands/conversations")).unwrap();
+        let unrelated = root.path().join("unrelated-store");
+        fs::create_dir_all(&unrelated).unwrap();
+        let resolved = conversations_dir_from(
+            None,
+            None,
+            None,
+            Some(unrelated.to_string_lossy().into_owned()),
+            Some(home.clone()),
+        )
+        .unwrap();
+        assert_eq!(resolved, home.join(".openhands/conversations"));
+    }
+
+    #[test]
+    fn missing_persistence_candidates_are_empty() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            conversations_dir_from(
+                Some(root.path().join("missing-conversations").to_string_lossy().into_owned()),
+                Some(root.path().join("missing-persist").to_string_lossy().into_owned()),
+                Some(root.path().join("missing-oh").to_string_lossy().into_owned()),
+                Some(root.path().join("missing-store").to_string_lossy().into_owned()),
+                Some(root.path().to_path_buf()),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -506,6 +574,8 @@ mod tests {
         fs::create_dir_all(persistence.join("conversations")).unwrap();
         fs::create_dir_all(root.path().join("legacy/conversations")).unwrap();
         let resolved = conversations_dir_from(
+            None,
+            None,
             Some(persistence.to_string_lossy().into_owned()),
             Some(root.path().join("legacy").to_string_lossy().into_owned()),
             Some(PathBuf::from("/unused")),
@@ -520,6 +590,8 @@ mod tests {
         let legacy = root.path().join("legacy");
         fs::create_dir_all(legacy.join("conversations")).unwrap();
         let resolved = conversations_dir_from(
+            None,
+            None,
             None,
             Some(legacy.to_string_lossy().into_owned()),
             Some(PathBuf::from("/unused")),
@@ -547,7 +619,7 @@ mod tests {
             "lex order would invert 100000 vs 99999"
         );
         let session =
-            parse_conversation_dir(&fixtures_dir().join("sdk-layout"), "sdk-conv-1", 1, true)
+            parse_conversation_dir(&fixtures_dir().join("sdk-layout"), "sdk-conv-1", Some(1), true)
                 .unwrap()
                 .unwrap();
         assert_eq!(session.source_id, "sdk-conv-1");
@@ -565,10 +637,14 @@ mod tests {
 
     #[test]
     fn docs_layout_conversation_json_is_used_only_without_events() {
-        let session =
-            parse_conversation_dir(&fixtures_dir().join("docs-layout"), "abc123def456", 9, false)
-                .unwrap()
-                .unwrap();
+        let session = parse_conversation_dir(
+            &fixtures_dir().join("docs-layout"),
+            "abc123def456",
+            Some(9),
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(session.source_id, "abc123def456");
         assert_eq!(session.directory.as_deref(), Some("/tmp/oh-docs"));
         assert_eq!(session.messages[0].content, "Fix the login bug in auth.py");
@@ -586,9 +662,18 @@ mod tests {
             conv.join("conversation.json"),
         )
         .unwrap();
-        let session = parse_conversation_dir(&conv, "mixed", 1, true).unwrap().unwrap();
+        let session = parse_conversation_dir(&conv, "mixed", Some(1), true).unwrap().unwrap();
         assert_eq!(session.messages[0].content, "first user turn");
         assert_ne!(session.messages[0].content, "Fix the login bug in auth.py");
+    }
+
+    #[test]
+    fn scan_uses_stat_target_mtime() {
+        let sessions = scan_conversations(Some(fixtures_dir())).unwrap();
+        let sdk =
+            sessions.iter().find(|session| session.source_id == "sdk-layout").expect("sdk-layout");
+        assert_ne!(sdk.updated_at, Some(0));
+        assert!(sdk.updated_at.unwrap_or(0) > 0);
     }
 
     #[test]
