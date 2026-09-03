@@ -329,6 +329,39 @@ impl RecallMcp {
     }
 }
 
+#[cfg(feature = "bench")]
+pub(crate) struct GetSessionBenchmark {
+    server: RecallMcp,
+    max_messages: u32,
+    tail: bool,
+}
+
+#[cfg(feature = "bench")]
+impl GetSessionBenchmark {
+    pub(crate) fn new(store: Store, max_messages: u32, tail: bool) -> Self {
+        Self {
+            server: RecallMcp {
+                index: Arc::new(Mutex::new(IndexState::Ready(store))),
+                tool_router: RecallMcp::tool_router(),
+            },
+            max_messages,
+            tail,
+        }
+    }
+
+    pub(crate) fn run(&self) -> Vec<u8> {
+        let result = self
+            .server
+            .get_session(Parameters(GetSessionArgs {
+                session_id: "claude-code:session-0".to_string(),
+                max_messages: Some(self.max_messages),
+                tail: self.tail,
+            }))
+            .expect("benchmark get_session");
+        serde_json::to_vec(&result).expect("serialize benchmark get_session")
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for RecallMcp {
     fn get_info(&self) -> ServerInfo {

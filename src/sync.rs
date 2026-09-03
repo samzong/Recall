@@ -1067,7 +1067,7 @@ impl SyncJob {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bench"))]
 pub(crate) fn persist_raw_session_for_conformance(
     store: Store,
     source: &str,

@@ -15,21 +15,32 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use tempfile::TempDir;
 
-use crate::adapters::{claude_code, codex};
+use crate::adapters::events::{EventContext, file_write_event};
+use crate::adapters::{RawMessage, RawSession, claude_code, codex};
 use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::{SessionTopologyWrite, Store};
 use crate::export::{ExportIncludes, ExportOptions};
 use crate::project_scope::ProjectScope;
 use crate::share::meta::SessionDisplayMeta;
 use crate::share::render;
-use crate::types::{Message, Role, Session, UsageEventRecord};
-use crate::{db, export, repo_identity, semantic, transcript, usage};
+use crate::types::{
+    Message, RawSessionEvent, RawUsageEvent, Role, Session, ThreadRole, UsageEventRecord,
+};
+use crate::{db, export, mcp, repo_identity, semantic, sync, transcript, usage};
 
 /// Width of the `message_vec` virtual table.
 pub const EMBEDDING_DIM: usize = 384;
 
 /// Deterministic timestamp base (2025-01-01T00:00:00Z) so fixtures never drift.
 const BASE_TIMESTAMP_MS: i64 = 1_735_689_600_000;
+
+const SYNC_SOURCE: &str = "claude-code";
+const SYNC_MESSAGES: usize = 64;
+const SYNC_USAGE_EVENTS: usize = 16;
+const SYNC_SESSION_EVENTS: usize = 16;
+const SYNC_USAGE_PARSER_VERSION: u32 = 7;
+const SYNC_EVENT_PARSER_VERSION: u32 = 5;
+const SYNC_METADATA_PARSER_VERSION: u32 = 3;
 
 const MODELS: &[&str] = &["claude-sonnet-4-5", "claude-opus-4-1", "gpt-5-codex", "gemini-2.5-pro"];
 const TOOLS: &[&str] = &["Read", "Edit", "Bash", "Grep", "WebFetch"];
@@ -444,6 +455,115 @@ impl BenchStore {
     }
 }
 
+fn sync_messages(session: &Session, revision: u32) -> Vec<Message> {
+    let mut messages = synthetic_messages(session, SYNC_MESSAGES);
+    messages[0].content = format!("syncrevision{revision} {}", messages[0].content);
+    messages
+}
+
+fn sync_usage_events() -> Vec<RawUsageEvent> {
+    (0..SYNC_USAGE_EVENTS)
+        .map(|index| RawUsageEvent {
+            message_seq: Some((index * 4) as u32),
+            model: "claude-sonnet-4-5".to_string(),
+            provider: "anthropic".to_string(),
+            input_tokens: 1_000 + index as i64,
+            output_tokens: 400 + index as i64,
+            cache_read_tokens: 20_000 + index as i64,
+            cache_write_tokens: 2_000 + index as i64,
+            reasoning_tokens: 100 + index as i64,
+            source_path: Some("/fixtures/bench-sync-session.jsonl".to_string()),
+            ..RawUsageEvent::observed(
+                format!("usage-{index}"),
+                index as u32,
+                BASE_TIMESTAMP_MS + index as i64 * 45_000,
+                SYNC_USAGE_PARSER_VERSION,
+            )
+        })
+        .collect()
+}
+
+fn sync_session_events() -> Vec<RawSessionEvent> {
+    (0..SYNC_SESSION_EVENTS)
+        .map(|index| {
+            file_write_event(
+                EventContext {
+                    event_seq: index as u32,
+                    timestamp: Some(BASE_TIMESTAMP_MS + index as i64 * 45_000),
+                    source_path: Some("/fixtures/bench-sync-session.jsonl".to_string()),
+                    source_event_id: Some(format!("event-{index}")),
+                    message_seq: Some((index * 4 + 1) as u32),
+                    parser_version: SYNC_EVENT_PARSER_VERSION,
+                },
+                "Edit".to_string(),
+                format!("src/fixture-{}.rs", index % 4),
+            )
+        })
+        .collect()
+}
+
+fn sync_raw_session(revision: u32) -> RawSession {
+    let mut session = synthetic_session(0, SYNC_MESSAGES);
+    session.directory = None;
+    session.custom_title = Some(session.title.clone());
+    let messages = sync_messages(&session, revision)
+        .into_iter()
+        .map(|message| RawMessage {
+            role: message.role,
+            content: message.content,
+            timestamp: message.timestamp,
+        })
+        .collect();
+    let mut raw = RawSession::search_only(
+        session.source_id,
+        session.directory,
+        session.started_at,
+        session.updated_at.map(|value| value + i64::from(revision) * 60_000),
+        session.entrypoint,
+        messages,
+    )
+    .with_usage(sync_usage_events(), SYNC_USAGE_PARSER_VERSION)
+    .with_events(sync_session_events(), SYNC_EVENT_PARSER_VERSION);
+    raw.source_file_path = session.source_file_path;
+    raw.custom_title = session.custom_title;
+    raw.summary = session.summary;
+    raw.duration_minutes = session.duration_minutes;
+    raw.thread_role = Some(ThreadRole::Primary);
+    raw.metadata_parser_version = Some(SYNC_METADATA_PARSER_VERSION);
+    raw
+}
+
+fn populated_sync_store() -> Store {
+    sync::persist_raw_session_for_conformance(
+        BenchStore::empty().store,
+        SYNC_SOURCE,
+        sync_raw_session(0),
+    )
+    .expect("persist sync fixture")
+}
+
+pub struct SyncWorkload {
+    store: Store,
+    raw: RawSession,
+}
+
+impl SyncWorkload {
+    pub fn incremental_sync_unchanged() -> Self {
+        Self { store: populated_sync_store(), raw: sync_raw_session(0) }
+    }
+
+    pub fn refresh_existing_session() -> Self {
+        Self { store: populated_sync_store(), raw: sync_raw_session(1) }
+    }
+
+    pub fn run(self) -> BenchStore {
+        BenchStore {
+            store: sync::persist_raw_session_for_conformance(self.store, SYNC_SOURCE, self.raw)
+                .expect("process benchmark sync session"),
+        }
+    }
+}
+
 /// Sessions and messages waiting to be written to the index, the write half of
 /// `recall sync` (session upsert, message insert, FTS5 index maintenance).
 pub struct IndexWorkload {
@@ -481,6 +601,38 @@ impl IndexWorkload {
             written += messages.len();
         }
         written
+    }
+}
+
+pub struct McpGetSessionWorkload {
+    benchmark: mcp::GetSessionBenchmark,
+}
+
+impl McpGetSessionWorkload {
+    fn build(messages: usize, max_messages: u32, tail: bool) -> Self {
+        let target = BenchStore::empty();
+        IndexWorkload::generate(1, messages).persist(&target);
+        Self { benchmark: mcp::GetSessionBenchmark::new(target.store, max_messages, tail) }
+    }
+
+    pub fn short_full_8() -> Self {
+        Self::build(8, 8, false)
+    }
+
+    pub fn medium_full_32() -> Self {
+        Self::build(32, 32, false)
+    }
+
+    pub fn long_head_response_cap_256() -> Self {
+        Self::build(256, 256, false)
+    }
+
+    pub fn long_tail_response_cap_256() -> Self {
+        Self::build(256, 256, true)
+    }
+
+    pub fn run(&self) -> Vec<u8> {
+        self.benchmark.run()
     }
 }
 
@@ -631,4 +783,112 @@ pub fn build_embedding_text(title: &str, content: &str) -> String {
 /// Git remote normalization, called once per session directory during sync.
 pub fn normalize_remote_url(url: &str) -> Option<String> {
     repo_identity::normalize_remote_url(url).map(|identity| identity.slug)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record_counts(store: &Store) -> [i64; 4] {
+        let count = |table: &str| {
+            store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .expect("count fixture records")
+        };
+        [count("sessions"), count("messages"), count("usage_events"), count("session_events")]
+    }
+
+    fn detail(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .expect("parse benchmark response")
+            .get("structuredContent")
+            .cloned()
+            .expect("structured benchmark response")
+    }
+
+    #[test]
+    fn sync_hot_path_fixtures_keep_record_counts_stable() {
+        let expected =
+            [1, SYNC_MESSAGES as i64, SYNC_USAGE_EVENTS as i64, SYNC_SESSION_EVENTS as i64];
+
+        let unchanged = SyncWorkload::incremental_sync_unchanged();
+        assert_eq!(record_counts(&unchanged.store), expected);
+        let unchanged = unchanged.run();
+        assert_eq!(record_counts(&unchanged.store), expected);
+
+        let refresh = SyncWorkload::refresh_existing_session();
+        assert_eq!(record_counts(&refresh.store), expected);
+        let refresh = refresh.run();
+        assert_eq!(record_counts(&refresh.store), expected);
+        let refreshed_messages: i64 = refresh
+            .store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE content LIKE 'syncrevision1 %'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count refreshed messages");
+        assert_eq!(refreshed_messages, 1);
+        let refreshed_fts: i64 = refresh
+            .store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'syncrevision1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count refreshed FTS messages");
+        let stale_fts: i64 = refresh
+            .store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'syncrevision0'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count stale FTS messages");
+        assert_eq!(refreshed_fts, 1);
+        assert_eq!(stale_fts, 0);
+    }
+
+    #[test]
+    fn mcp_get_session_fixtures_keep_serialized_sizes_stable() {
+        let cases: [fn() -> McpGetSessionWorkload; 4] = [
+            McpGetSessionWorkload::short_full_8,
+            McpGetSessionWorkload::medium_full_32,
+            McpGetSessionWorkload::long_head_response_cap_256,
+            McpGetSessionWorkload::long_tail_response_cap_256,
+        ];
+        for build in cases {
+            let first = build().run();
+            let second = build().run();
+            assert_eq!(first, second);
+        }
+    }
+
+    #[test]
+    fn mcp_get_session_cases_cover_full_head_cap_and_tail_cap() {
+        for (build, messages) in [
+            (McpGetSessionWorkload::short_full_8 as fn() -> McpGetSessionWorkload, 8_u64),
+            (McpGetSessionWorkload::medium_full_32, 32_u64),
+        ] {
+            let detail = detail(&build().run());
+            assert_eq!(detail["returned_messages"].as_u64(), Some(messages));
+            assert_eq!(detail["first_message_seq"].as_u64(), Some(0));
+            assert_eq!(detail["last_message_seq"].as_u64(), Some(messages - 1));
+            assert_eq!(detail["truncated"].as_bool(), Some(false));
+        }
+
+        let head = detail(&McpGetSessionWorkload::long_head_response_cap_256().run());
+        assert_eq!(head["first_message_seq"].as_u64(), Some(0));
+        assert!(head["last_message_seq"].as_u64().is_some_and(|seq| seq < 255));
+        assert_eq!(head["truncated"].as_bool(), Some(true));
+
+        let tail = detail(&McpGetSessionWorkload::long_tail_response_cap_256().run());
+        assert!(tail["first_message_seq"].as_u64().is_some_and(|seq| seq > 0));
+        assert_eq!(tail["last_message_seq"].as_u64(), Some(255));
+        assert_eq!(tail["truncated"].as_bool(), Some(true));
+    }
 }
