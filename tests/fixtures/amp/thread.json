@@ -4,9 +4,12 @@
   "created": 1700000000000,
   "title": "Amp thread title",
   "env": {
-    "trees": [
-      { "cwd": "/tmp/amp-project" }
-    ]
+    "initial": {
+      "workingDirectory": "file:///tmp/amp-project",
+      "trees": [
+        { "uri": "file:///tmp/amp-project" }
+      ]
+    }
   },
   "messages": [
     {

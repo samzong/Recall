@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::json_util::{json_i64, rfc3339_ms};
-use crate::adapters::paths::vscode_extension_storage_dirs_from;
+use crate::adapters::paths::{file_uri_to_path, vscode_extension_storage_dirs_from};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
@@ -278,7 +278,9 @@ fn block_text(block: &Value) -> Option<&str> {
 
 fn env_cwd(env: Option<&Value>) -> Option<String> {
     let env = env?;
-    if let Some(cwd) = string_path(env.get("cwd")) {
+    if let Some(cwd) =
+        string_path(env.get("cwd")).or_else(|| file_uri_value_to_path(env.get("workingDirectory")))
+    {
         return Some(cwd);
     }
     if let Some(cwd) = env_cwd(env.get("initial")) {
@@ -286,11 +288,17 @@ fn env_cwd(env: Option<&Value>) -> Option<String> {
     }
     let trees = env.get("trees").and_then(Value::as_array)?;
     for tree in trees {
-        if let Some(cwd) = string_path(tree.get("cwd")) {
+        if let Some(cwd) =
+            string_path(tree.get("cwd")).or_else(|| file_uri_value_to_path(tree.get("uri")))
+        {
             return Some(cwd);
         }
     }
     None
+}
+
+fn file_uri_value_to_path(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).and_then(file_uri_to_path)
 }
 
 fn string_path(value: Option<&Value>) -> Option<String> {
@@ -384,6 +392,16 @@ mod tests {
         assert_eq!(session.source_id, "T-0199cccc-dddd-7eee-8fff-000011112222");
         assert_eq!(session.messages[0].content, "wrapped user");
         assert_eq!(session.messages[1].content, "wrapped assistant");
+    }
+
+    #[test]
+    fn env_cwd_falls_back_to_current_amp_tree_uri() {
+        let env = serde_json::json!({
+            "initial": {
+                "trees": [{"uri": "file:///tmp/amp%20project"}]
+            }
+        });
+        assert_eq!(env_cwd(Some(&env)).as_deref(), Some("/tmp/amp project"));
     }
 
     #[test]
