@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 
 use crate::args;
 use crate::catalog;
+use crate::catalog::openai_base;
 use crate::config::Paths;
-use crate::launch::{EnvLookup, openai_base};
+use crate::launch::EnvLookup;
 use crate::opencode;
 use crate::provider::{Provider, Setup};
 

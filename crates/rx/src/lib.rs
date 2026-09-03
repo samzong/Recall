@@ -20,7 +20,7 @@ use std::ffi::OsString;
 use anyhow::Result;
 
 use args::{Command, LaunchRequest, argv0_harness, parse, rewrite_argv0};
-pub use config::Paths;
+use config::Paths;
 use launch::{EnvLookup, plan};
 
 pub(crate) const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -29,7 +29,7 @@ pub fn run(raw_args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<()
     run_with(raw_args.into_iter().map(Into::into).collect(), &Paths::user()?, &EnvLookup::real())
 }
 
-pub fn run_with(raw_args: Vec<OsString>, paths: &Paths, env: &EnvLookup) -> Result<()> {
+fn run_with(raw_args: Vec<OsString>, paths: &Paths, env: &EnvLookup) -> Result<()> {
     let command = if raw_args.first().and_then(|argv0| argv0_harness(argv0)).is_some() {
         parse(&rewrite_argv0(raw_args.clone()))?
     } else {
@@ -83,7 +83,7 @@ fn launch_request(
     launch::exec(&plan)
 }
 
-pub fn help_text() -> &'static str {
+fn help_text() -> &'static str {
     "\
 rx — launch agent harnesses through a configured AI provider
 

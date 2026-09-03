@@ -6,15 +6,13 @@ use std::process::{Command, Stdio};
 use anyhow::{Result, bail};
 
 use crate::args::{self, Harness, LaunchRequest};
-use crate::catalog;
+use crate::catalog::{self, anthropic_base, openai_base};
 use crate::claude_catalog::{self, SeedOutcome};
 use crate::config::{AuthMode, Paths};
 use crate::provider::{Provider, Setup};
 
-pub(crate) use crate::catalog::{anthropic_base, openai_base};
-
 #[derive(Debug, Clone, Default)]
-pub struct EnvLookup {
+pub(crate) struct EnvLookup {
     overrides: HashMap<String, String>,
     real: bool,
 }
@@ -46,11 +44,11 @@ impl EnvLookup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaunchPlan {
-    pub program: PathBuf,
-    pub args: Vec<OsString>,
-    pub env_set: Vec<(String, String)>,
-    pub stderr_note: Option<String>,
+pub(crate) struct LaunchPlan {
+    pub(crate) program: PathBuf,
+    pub(crate) args: Vec<OsString>,
+    pub(crate) env_set: Vec<(String, String)>,
+    pub(crate) stderr_note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +153,7 @@ pub(crate) fn plan_target(
                 &target.base_url,
                 &target.key,
                 env,
-            )?
+            )
         } else {
             SeedOutcome::Fallback
         };
@@ -165,7 +163,7 @@ pub(crate) fn plan_target(
             apply_yolo(request, &mut plan, env);
             return Ok(plan);
         }
-        if matches!(seed, SeedOutcome::Seeded { .. }) {
+        if seed == SeedOutcome::Seeded {
             let mut plan = inject_claude_generated_seeded(
                 request,
                 &target.provider.env,
@@ -318,35 +316,14 @@ fn resolve_key(
     }
 }
 
-fn inject_claude_openrouter(
+pub(crate) fn inject_claude_openrouter(
     request: &LaunchRequest,
     base_url: &str,
     key: &str,
     model: Option<&str>,
     seed: SeedOutcome,
 ) -> LaunchPlan {
-    inject_claude_openrouter_impl(request, base_url, key, model, seed)
-}
-
-#[cfg(test)]
-pub(crate) fn inject_claude_openrouter_for_test(
-    request: &LaunchRequest,
-    base_url: &str,
-    key: &str,
-    model: Option<&str>,
-    seed: SeedOutcome,
-) -> LaunchPlan {
-    inject_claude_openrouter_impl(request, base_url, key, model, seed)
-}
-
-fn inject_claude_openrouter_impl(
-    request: &LaunchRequest,
-    base_url: &str,
-    key: &str,
-    model: Option<&str>,
-    seed: SeedOutcome,
-) -> LaunchPlan {
-    let seeded = matches!(seed, SeedOutcome::Seeded { .. });
+    let seeded = seed == SeedOutcome::Seeded;
     let mut args = request.passthrough.clone();
     if seeded && !claude_catalog::user_passes_settings(&request.passthrough) {
         args.insert(
@@ -364,7 +341,7 @@ fn inject_claude_openrouter_impl(
             "[rx] provider catalog seed failed; falling back to provider model discovery"
                 .to_string(),
         ),
-        SeedOutcome::Seeded { .. } => None,
+        SeedOutcome::Seeded => None,
     };
     LaunchPlan {
         program: PathBuf::from("claude"),
@@ -423,7 +400,7 @@ fn claude_openrouter_env(
     env_set
 }
 
-fn inject_claude_generated_seeded(
+pub(crate) fn inject_claude_generated_seeded(
     request: &LaunchRequest,
     env_key: &str,
     base_url: &str,
@@ -444,17 +421,6 @@ fn inject_claude_generated_seeded(
         env_set: claude_generated_seeded_env(env_key, base_url, key, model),
         stderr_note: None,
     }
-}
-
-#[cfg(test)]
-pub(crate) fn inject_claude_generated_seeded_for_test(
-    request: &LaunchRequest,
-    env_key: &str,
-    base_url: &str,
-    key: &str,
-    model: Option<&str>,
-) -> LaunchPlan {
-    inject_claude_generated_seeded(request, env_key, base_url, key, model)
 }
 
 fn claude_generated_seeded_env(

@@ -302,13 +302,13 @@ fn ensure_self_update_allowed(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn self_update_blocker(path: &Path) -> Option<&'static str> {
+pub(crate) fn self_update_blocker(path: &Path) -> Option<&'static str> {
     homebrew_update_hint(path).or_else(|| {
         fs::canonicalize(path).ok().and_then(|resolved| homebrew_update_hint(&resolved))
     })
 }
 
-fn homebrew_launch_update_notice(path: &Path, latest: &str) -> Option<String> {
+pub(crate) fn homebrew_launch_update_notice(path: &Path, latest: &str) -> Option<String> {
     self_update_blocker(path)
         .map(|_| format!("rx {latest} is available — run `brew upgrade recall`"))
 }
@@ -325,16 +325,6 @@ fn homebrew_update_hint(path: &Path) -> Option<&'static str> {
         .windows(2)
         .any(|pair| pair[0] == OsStr::new("Cellar") && pair[1] == OsStr::new("recall"))
         .then_some(HOMEBREW_UPDATE_HINT)
-}
-
-#[cfg(test)]
-pub(crate) fn self_update_blocker_for_test(path: &Path) -> Option<&'static str> {
-    self_update_blocker(path)
-}
-
-#[cfg(test)]
-pub(crate) fn homebrew_launch_update_notice_for_test(path: &Path, latest: &str) -> Option<String> {
-    homebrew_launch_update_notice(path, latest)
 }
 
 fn http_get(url: &str, headers: &[(&str, &str)]) -> Result<String> {

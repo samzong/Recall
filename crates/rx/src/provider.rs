@@ -220,7 +220,6 @@ fn from_snapshot(provider: SnapshotProvider) -> Provider {
         "openrouter" => {
             (Setup::OpenRouter, Some("~openai/gpt-latest"), Some("~anthropic/claude-sonnet-latest"))
         }
-        "tokener" => (Setup::Generated, None, None),
         _ => (Setup::Generated, None, None),
     };
     Provider {

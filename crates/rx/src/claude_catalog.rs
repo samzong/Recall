@@ -95,7 +95,7 @@ pub(crate) struct SeedCaches {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SeedOutcome {
-    Seeded { model_count: usize },
+    Seeded,
     Fallback,
 }
 
@@ -105,17 +105,17 @@ pub(crate) fn try_seed_user_catalog(
     base_url: &str,
     api_key: &str,
     env: &EnvLookup,
-) -> Result<SeedOutcome> {
+) -> SeedOutcome {
     let caches = match catalog::load_claude_seed(paths, provider_id, base_url, api_key) {
         Ok(Some(caches)) if !caches.additional_model_options.is_empty() => caches,
-        _ => return Ok(SeedOutcome::Fallback),
+        _ => return SeedOutcome::Fallback,
     };
     let config_path = claude_config_path(env);
     match write_seed(&config_path, &caches) {
-        Ok(()) => Ok(SeedOutcome::Seeded { model_count: caches.additional_model_options.len() }),
+        Ok(()) => SeedOutcome::Seeded,
         Err(error) => {
             eprintln!("[rx] catalog seed skipped: {error:#}");
-            Ok(SeedOutcome::Fallback)
+            SeedOutcome::Fallback
         }
     }
 }
@@ -323,11 +323,15 @@ fn claude_config_path(env: &EnvLookup) -> PathBuf {
     }
 }
 
-fn write_seed(path: &Path, caches: &SeedCaches) -> Result<()> {
+pub(crate) fn write_seed(path: &Path, caches: &SeedCaches) -> Result<()> {
     write_seed_with_hook(path, caches, |_| {})
 }
 
-fn write_seed_with_hook<F>(path: &Path, caches: &SeedCaches, mut after_read: F) -> Result<()>
+pub(crate) fn write_seed_with_hook<F>(
+    path: &Path,
+    caches: &SeedCaches,
+    mut after_read: F,
+) -> Result<()>
 where
     F: FnMut(usize),
 {
@@ -356,23 +360,6 @@ where
         }
     }
     bail!("{} changed repeatedly while seeding catalog", path.display())
-}
-
-#[cfg(test)]
-pub(crate) fn write_seed_for_test(path: &Path, caches: &SeedCaches) -> Result<()> {
-    write_seed(path, caches)
-}
-
-#[cfg(test)]
-pub(crate) fn write_seed_with_hook_for_test<F>(
-    path: &Path,
-    caches: &SeedCaches,
-    after_read: F,
-) -> Result<()>
-where
-    F: FnMut(usize),
-{
-    write_seed_with_hook(path, caches, after_read)
 }
 
 fn read_config_document(path: &Path) -> Result<(Value, Option<Vec<u8>>)> {
