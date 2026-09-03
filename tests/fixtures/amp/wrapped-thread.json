@@ -1,0 +1,19 @@
+{
+  "thread": {
+    "id": "T-0199cccc-dddd-7eee-8fff-000011112222",
+    "created": 1700000100000,
+    "title": "Wrapped thread",
+    "messages": [
+      {
+        "role": "user",
+        "content": "wrapped user",
+        "created": 1700000101000
+      },
+      {
+        "role": "assistant",
+        "content": "wrapped assistant",
+        "created": 1700000102000
+      }
+    ]
+  }
+}
