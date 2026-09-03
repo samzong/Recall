@@ -1,10 +1,17 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
-use crate::types::{Message, Role, Session};
+use crate::types::{EvidenceVisibility, Message, Role, Session, SessionEventRecord};
 use crate::utils;
 
 use super::assets::{CHEVRON_SVG, SESSION_PAGE_CSS, SESSION_PAGE_SCRIPT};
 use super::meta::SessionDisplayMeta;
+
+const STRUCTURED_EVENT_LIMIT: usize = 256;
+const STRUCTURED_FIELD_CHAR_LIMIT: usize = 240;
+const STRUCTURED_SUMMARY_CHAR_LIMIT: usize = 240;
+const STRUCTURED_TEXT_CHAR_LIMIT: usize = 32_000;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ShareRenderOptions {
@@ -29,38 +36,42 @@ pub(crate) fn share_id_for_session(session: &Session) -> String {
 pub(crate) fn render_session_html(
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     display_meta: &SessionDisplayMeta,
 ) -> String {
-    render_session_html_inner(session, messages, display_meta, None, true)
+    render_session_html_inner(session, messages, events, display_meta, None, true)
 }
 
 pub(crate) fn render_session_preview_html(
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     display_meta: &SessionDisplayMeta,
 ) -> String {
-    render_session_html_inner(session, messages, display_meta, None, false)
+    render_session_html_inner(session, messages, events, display_meta, None, false)
 }
 
 pub(crate) fn render_session_html_with_tldr(
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     display_meta: &SessionDisplayMeta,
     tldr_markdown: Option<&str>,
 ) -> String {
-    render_session_html_inner(session, messages, display_meta, tldr_markdown, true)
+    render_session_html_inner(session, messages, events, display_meta, tldr_markdown, true)
 }
 
 fn render_session_html_inner(
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     display_meta: &SessionDisplayMeta,
     tldr_markdown: Option<&str>,
     load_external_fonts: bool,
 ) -> String {
     let title = session.custom_title.as_deref().unwrap_or(&session.title);
     let display_title = display_title(title);
-    let blocks = prepare_render_blocks(messages);
+    let blocks = prepare_render_blocks(messages, events, session.source == "claude-code");
     let user_toc = collect_user_toc(&blocks);
     let mut out = String::new();
     out.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
@@ -119,7 +130,7 @@ fn render_session_html_inner(
 fn render_tldr_html(out: &mut String, markdown: &str) {
     out.push_str("<section class=\"tldr\" aria-labelledby=\"tldr-title\">");
     out.push_str("<h2 id=\"tldr-title\" class=\"tldr-title\">TL;DR</h2>");
-    render_content(out, markdown);
+    render_content(out, markdown, false);
     out.push_str("</section>");
 }
 
@@ -129,13 +140,45 @@ enum RenderBlock {
 }
 
 enum AssistantSegment {
-    Text(String),
-    Tools(Vec<String>),
+    Text { content: String, suppress_legacy_logs: bool },
+    LegacyTools(Vec<String>),
+    StructuredTools { executions: Vec<StructuredToolExecution>, truncated: bool },
 }
 
-fn prepare_render_blocks(messages: &[Message]) -> Vec<RenderBlock> {
+struct StructuredToolTimeline {
+    by_message: BTreeMap<u32, Vec<StructuredToolExecution>>,
+    covered_messages: HashSet<u32>,
+    result_anchors: HashSet<u32>,
+    truncated_at: Option<u32>,
+}
+
+struct StructuredToolExecution {
+    paired: bool,
+    events: Vec<PublicToolEvent>,
+}
+
+struct PublicToolEvent {
+    event_seq: u32,
+    message_seq: u32,
+    kind: String,
+    name: Option<String>,
+    status: Option<String>,
+    target: Option<String>,
+    summary: Option<String>,
+    tool_call_id: Option<String>,
+}
+
+fn prepare_render_blocks(
+    messages: &[Message],
+    events: &[SessionEventRecord],
+    legacy_user_tool_results: bool,
+) -> Vec<RenderBlock> {
     let mut blocks = Vec::new();
     let mut pending_tools = Vec::new();
+    let mut structured_coverage_active = false;
+    let mut structured_result_active = false;
+    let mut suppressed_tool_pending = false;
+    let mut structured = prepare_structured_tool_timeline(messages, events);
 
     let attach_tools = |blocks: &mut Vec<RenderBlock>, pending: &mut Vec<String>| {
         if pending.is_empty() {
@@ -143,51 +186,276 @@ fn prepare_render_blocks(messages: &[Message]) -> Vec<RenderBlock> {
         }
         let tools = std::mem::take(pending);
         if let Some(RenderBlock::Assistant(segments)) = blocks.last_mut() {
-            segments.push(AssistantSegment::Tools(tools));
+            segments.push(AssistantSegment::LegacyTools(tools));
         } else {
-            blocks.push(RenderBlock::Assistant(vec![AssistantSegment::Tools(tools)]));
+            blocks.push(RenderBlock::Assistant(vec![AssistantSegment::LegacyTools(tools)]));
+        }
+    };
+
+    let attach_structured = |blocks: &mut Vec<RenderBlock>,
+                             executions: Vec<StructuredToolExecution>,
+                             truncated: bool| {
+        let segment = AssistantSegment::StructuredTools { executions, truncated };
+        if let Some(RenderBlock::Assistant(segments)) = blocks.last_mut() {
+            segments.push(segment);
+        } else {
+            blocks.push(RenderBlock::Assistant(vec![segment]));
         }
     };
 
     for message in messages {
+        let (anchored, result_anchored) = structured.as_ref().map_or((false, false), |timeline| {
+            (
+                timeline.covered_messages.contains(&message.seq),
+                timeline.result_anchors.contains(&message.seq),
+            )
+        });
+        if anchored {
+            structured_coverage_active = true;
+            structured_result_active = result_anchored;
+        } else if !legacy_user_tool_results {
+            structured_coverage_active = false;
+            structured_result_active = false;
+        }
+        let tool_shaped = is_tool_message(&message.content);
         match message.role {
+            Role::User if suppressed_tool_pending => {
+                suppressed_tool_pending = false;
+            }
             Role::User if !pending_tools.is_empty() => {
                 pending_tools.push(message.content.clone());
             }
             Role::User => {
+                structured_coverage_active = anchored;
+                structured_result_active = result_anchored;
                 blocks.push(RenderBlock::User(message.content.clone()));
             }
-            Role::Assistant if is_tool_message(&message.content) => {
+            Role::Assistant if structured_coverage_active && tool_shaped => {
+                attach_tools(&mut blocks, &mut pending_tools);
+                suppressed_tool_pending = legacy_user_tool_results && structured_result_active;
+                if let Some(RenderBlock::Assistant(segments)) = blocks.last_mut() {
+                    append_assistant_text_segment(segments, message.content.clone(), true);
+                } else {
+                    blocks.push(RenderBlock::Assistant(vec![AssistantSegment::Text {
+                        content: message.content.clone(),
+                        suppress_legacy_logs: true,
+                    }]));
+                }
+            }
+            Role::Assistant if tool_shaped => {
                 pending_tools.push(message.content.clone());
             }
             Role::Assistant => {
                 attach_tools(&mut blocks, &mut pending_tools);
+                suppressed_tool_pending = false;
+                structured_coverage_active = anchored;
+                structured_result_active = result_anchored;
                 if let Some(RenderBlock::Assistant(segments)) = blocks.last_mut() {
-                    append_assistant_text_segment(segments, message.content.clone());
+                    append_assistant_text_segment(segments, message.content.clone(), anchored);
                 } else {
-                    blocks.push(RenderBlock::Assistant(vec![AssistantSegment::Text(
-                        message.content.clone(),
-                    )]));
+                    blocks.push(RenderBlock::Assistant(vec![AssistantSegment::Text {
+                        content: message.content.clone(),
+                        suppress_legacy_logs: anchored,
+                    }]));
                 }
             }
+        }
+        if let Some(timeline) = structured.as_mut()
+            && let Some(executions) = timeline.by_message.remove(&message.seq)
+        {
+            let truncated = timeline.truncated_at == Some(message.seq);
+            attach_structured(&mut blocks, executions, truncated);
         }
     }
     attach_tools(&mut blocks, &mut pending_tools);
     blocks
 }
 
-fn append_assistant_text_segment(segments: &mut Vec<AssistantSegment>, content: String) {
-    if let Some(AssistantSegment::Text(previous)) = segments.last_mut() {
+fn prepare_structured_tool_timeline(
+    messages: &[Message],
+    events: &[SessionEventRecord],
+) -> Option<StructuredToolTimeline> {
+    let message_sequences = messages.iter().map(|message| message.seq).collect::<HashSet<_>>();
+    let mut candidates = events
+        .iter()
+        .filter(|event| is_public_tool_event(event, &message_sequences))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|event| (event.message_seq.unwrap_or_default(), event.event_seq));
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut public_events = Vec::new();
+    let mut text_chars = 0usize;
+    let mut truncated = false;
+    let mut group_start = 0usize;
+    while group_start < candidates.len() {
+        let message_seq = candidates[group_start].message_seq;
+        let group_end = candidates[group_start..]
+            .iter()
+            .position(|event| event.message_seq != message_seq)
+            .map_or(candidates.len(), |offset| group_start + offset);
+        if public_events.len() + group_end - group_start > STRUCTURED_EVENT_LIMIT {
+            truncated = true;
+            break;
+        }
+        let group = candidates[group_start..group_end]
+            .iter()
+            .map(|event| public_tool_event(event))
+            .collect::<Vec<_>>();
+        let group_chars = group.iter().map(public_event_text_chars).sum::<usize>();
+        if text_chars + group_chars > STRUCTURED_TEXT_CHAR_LIMIT {
+            truncated = true;
+            break;
+        }
+        text_chars += group_chars;
+        public_events.extend(group);
+        group_start = group_end;
+    }
+    if public_events.is_empty() {
+        return None;
+    }
+
+    let covered_messages =
+        public_events.iter().map(|event| event.message_seq).collect::<HashSet<_>>();
+    let result_anchors = public_events
+        .iter()
+        .filter(|event| event.kind == "tool_result")
+        .map(|event| event.message_seq)
+        .collect::<HashSet<_>>();
+    let mut relation_shapes: HashMap<String, (bool, bool)> = HashMap::new();
+    for event in &public_events {
+        let Some(tool_call_id) = event.tool_call_id.as_ref() else {
+            continue;
+        };
+        let shape = relation_shapes.entry(tool_call_id.clone()).or_default();
+        if event.kind == "tool_result" {
+            shape.1 = true;
+        } else {
+            shape.0 = true;
+        }
+    }
+    let pairable = relation_shapes
+        .into_iter()
+        .filter_map(|(tool_call_id, (has_call, has_result))| {
+            (has_call && has_result).then_some(tool_call_id)
+        })
+        .collect::<HashSet<_>>();
+
+    let mut executions = Vec::<StructuredToolExecution>::new();
+    let mut paired_indexes = HashMap::<String, usize>::new();
+    for event in public_events {
+        let pair_id = event
+            .tool_call_id
+            .as_ref()
+            .filter(|tool_call_id| pairable.contains(*tool_call_id))
+            .cloned();
+        if let Some(pair_id) = pair_id {
+            if let Some(index) = paired_indexes.get(&pair_id).copied() {
+                executions[index].events.push(event);
+            } else {
+                let index = executions.len();
+                paired_indexes.insert(pair_id, index);
+                executions.push(StructuredToolExecution { paired: true, events: vec![event] });
+            }
+        } else {
+            executions.push(StructuredToolExecution { paired: false, events: vec![event] });
+        }
+    }
+
+    let mut by_message = BTreeMap::<u32, Vec<StructuredToolExecution>>::new();
+    for mut execution in executions {
+        execution.events.sort_by_key(|event| event.event_seq);
+        let message_seq = execution.events[0].message_seq;
+        by_message.entry(message_seq).or_default().push(execution);
+    }
+    let truncated_at = truncated.then(|| *by_message.keys().next_back().unwrap());
+    Some(StructuredToolTimeline { by_message, covered_messages, result_anchors, truncated_at })
+}
+
+fn is_public_tool_event(event: &SessionEventRecord, message_sequences: &HashSet<u32>) -> bool {
+    let positioned = event.message_seq.is_some_and(|seq| message_sequences.contains(&seq));
+    positioned
+        && event.is_meta != Some(true)
+        && !matches!(
+            event.visibility,
+            Some(EvidenceVisibility::Hidden | EvidenceVisibility::Inactive)
+        )
+        && matches!(
+            event.kind.as_str(),
+            "tool_call" | "tool_result" | "command" | "search" | "file_read" | "file_write"
+        )
+}
+
+fn public_tool_event(event: &SessionEventRecord) -> PublicToolEvent {
+    PublicToolEvent {
+        event_seq: event.event_seq,
+        message_seq: event.message_seq.unwrap_or_default(),
+        kind: truncate_display_text(&event.kind, STRUCTURED_FIELD_CHAR_LIMIT),
+        name: public_field(event.name.as_deref(), STRUCTURED_FIELD_CHAR_LIMIT),
+        status: public_field(event.status.as_deref(), STRUCTURED_FIELD_CHAR_LIMIT),
+        target: public_field(event.target.as_deref(), STRUCTURED_FIELD_CHAR_LIMIT),
+        summary: public_event_summary(event),
+        tool_call_id: event
+            .tool_call_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| value.chars().count() <= STRUCTURED_FIELD_CHAR_LIMIT)
+            .map(String::from),
+    }
+}
+
+fn public_event_summary(event: &SessionEventRecord) -> Option<String> {
+    if event.kind == "tool_result" || event.name.is_some() || event.target.is_some() {
+        return None;
+    }
+    let summary = event.summary.as_deref()?.trim();
+    if summary.is_empty()
+        || summary.contains(['\n', '\r', '{', '}', '[', ']'])
+        || summary.starts_with("<oai-")
+    {
+        return None;
+    }
+    Some(truncate_display_text(summary, STRUCTURED_SUMMARY_CHAR_LIMIT))
+}
+
+fn public_field(value: Option<&str>, max_chars: usize) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| truncate_display_text(value, max_chars))
+}
+
+fn public_event_text_chars(event: &PublicToolEvent) -> usize {
+    event.kind.chars().count()
+        + event.name.as_deref().map_or(0, |value| value.chars().count())
+        + event.status.as_deref().map_or(0, |value| value.chars().count())
+        + event.target.as_deref().map_or(0, |value| value.chars().count())
+        + event.summary.as_deref().map_or(0, |value| value.chars().count())
+}
+
+fn append_assistant_text_segment(
+    segments: &mut Vec<AssistantSegment>,
+    content: String,
+    suppress_legacy_logs: bool,
+) {
+    if let Some(AssistantSegment::Text {
+        content: previous,
+        suppress_legacy_logs: previous_suppression,
+    }) = segments.last_mut()
+    {
         let previous_core = assistant_text_core(previous);
         let content_core = assistant_text_core(&content);
         if !previous_core.is_empty() && previous_core == content_core {
             if content.contains("<oai-mem-citation>") && !previous.contains("<oai-mem-citation>") {
                 *previous = content;
             }
+            *previous_suppression |= suppress_legacy_logs;
             return;
         }
     }
-    segments.push(AssistantSegment::Text(content));
+    segments.push(AssistantSegment::Text { content, suppress_legacy_logs });
 }
 
 fn assistant_text_core(text: &str) -> &str {
@@ -241,7 +509,7 @@ fn render_block_html(out: &mut String, block: RenderBlock, user_index: Option<us
             out.push_str("<section class=\"turn user\" id=\"user-");
             out.push_str(&index.to_string());
             out.push_str("\"><span class=\"role-label\">User</span><div class=\"user-block\">");
-            render_content(out, &content);
+            render_content(out, &content, false);
             out.push_str("</div></section>");
         }
         RenderBlock::Assistant(segments) => {
@@ -250,10 +518,22 @@ fn render_block_html(out: &mut String, block: RenderBlock, user_index: Option<us
             );
             for segment in segments {
                 match segment {
-                    AssistantSegment::Text(content) => render_content(out, &content),
-                    AssistantSegment::Tools(logs) => {
+                    AssistantSegment::Text { content, suppress_legacy_logs } => {
+                        render_content(out, &content, suppress_legacy_logs);
+                    }
+                    AssistantSegment::LegacyTools(logs) => {
                         out.push_str("<div class=\"tool-run\">");
                         render_tool_group(out, &logs);
+                        out.push_str("</div>");
+                    }
+                    AssistantSegment::StructuredTools { executions, truncated } => {
+                        out.push_str("<div class=\"tool-run\">");
+                        render_structured_tool_group(out, &executions);
+                        if truncated {
+                            out.push_str(
+                                "<p class=\"tool-timeline-note\">Tool timeline truncated.</p>",
+                            );
+                        }
                         out.push_str("</div>");
                     }
                 }
@@ -263,7 +543,7 @@ fn render_block_html(out: &mut String, block: RenderBlock, user_index: Option<us
     }
 }
 
-fn render_content(out: &mut String, text: &str) {
+fn render_content(out: &mut String, text: &str, suppress_legacy_logs: bool) {
     out.push_str("<div class=\"prose\">");
     let mut prose = String::new();
     let mut pending_logs = Vec::new();
@@ -297,8 +577,12 @@ fn render_content(out: &mut String, text: &str) {
                 render_markdown_text(out, &prose);
                 prose.clear();
             }
-            pending_logs.push(sanitized);
-            rendered = true;
+            if suppress_legacy_logs {
+                rendered = true;
+            } else {
+                pending_logs.push(sanitized);
+                rendered = true;
+            }
         } else {
             flush_logs(out, &mut pending_logs);
             if !prose.is_empty() {
@@ -554,6 +838,97 @@ fn render_tool_group(out: &mut String, logs: &[String]) {
     out.push_str("</div></details>");
 }
 
+fn render_structured_tool_group(out: &mut String, executions: &[StructuredToolExecution]) {
+    if executions.is_empty() {
+        return;
+    }
+    if executions.len() == 1 {
+        render_structured_execution(out, &executions[0]);
+        return;
+    }
+    out.push_str("<details class=\"tool-group\"><summary>");
+    out.push_str(CHEVRON_SVG);
+    out.push_str(&escape_html(&format!("{} tool executions", executions.len())));
+    out.push_str("<span class=\"count\">");
+    out.push_str(&executions.len().to_string());
+    out.push_str("</span></summary><div class=\"tool-group-items\">");
+    for execution in executions {
+        render_structured_execution(out, execution);
+    }
+    out.push_str("</div></details>");
+}
+
+fn render_structured_execution(out: &mut String, execution: &StructuredToolExecution) {
+    let primary = execution
+        .events
+        .iter()
+        .find(|event| event.kind != "tool_result")
+        .unwrap_or(&execution.events[0]);
+    let name = primary.name.as_deref().unwrap_or_else(|| structured_kind_label(&primary.kind));
+    out.push_str("<details class=\"log\"><summary>");
+    out.push_str(CHEVRON_SVG);
+    out.push_str("<span class=\"badge\">");
+    out.push_str(structured_kind_badge(&primary.kind));
+    out.push_str("</span><span class=\"lname\">");
+    out.push_str(&escape_html(name));
+    out.push_str("</span>");
+    if execution.paired {
+        out.push_str("<span class=\"relation\">call + result</span>");
+    }
+    out.push_str("</summary><pre>");
+    for (index, event) in execution.events.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        render_structured_event_text(out, event);
+    }
+    out.push_str("</pre></details>");
+}
+
+fn render_structured_event_text(out: &mut String, event: &PublicToolEvent) {
+    out.push_str(if event.kind == "tool_result" { "Result" } else { "Call" });
+    out.push_str(": ");
+    out.push_str(&escape_html(structured_kind_label(&event.kind)));
+    if let Some(name) = event.name.as_deref() {
+        out.push_str(" · ");
+        out.push_str(&escape_html(name));
+    }
+    if let Some(target) = event.target.as_deref() {
+        out.push_str("\nTarget: ");
+        out.push_str(&escape_html(target));
+    }
+    if let Some(status) = event.status.as_deref() {
+        out.push_str("\nStatus: ");
+        out.push_str(&escape_html(status));
+    }
+    if let Some(summary) = event.summary.as_deref() {
+        out.push_str("\nSummary: ");
+        out.push_str(&escape_html(summary));
+    }
+}
+
+fn structured_kind_badge(kind: &str) -> &'static str {
+    match kind {
+        "command" => "command",
+        "search" => "search",
+        "file_read" => "read",
+        "file_write" => "write",
+        "tool_result" => "result",
+        _ => "tool",
+    }
+}
+
+fn structured_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "command" => "Command",
+        "search" => "Search",
+        "file_read" => "File read",
+        "file_write" => "File write",
+        "tool_result" => "Tool result",
+        _ => "Tool call",
+    }
+}
+
 fn render_log_segment(out: &mut String, text: &str) {
     let (badge, name) = log_badge_and_name(text);
     out.push_str("<details class=\"log\"><summary>");
@@ -750,7 +1125,15 @@ mod tests {
     use crate::types::{Message, Role, Session};
 
     fn render_html(session: &Session, messages: &[Message]) -> String {
-        render_session_html(session, messages, &SessionDisplayMeta::default())
+        render_session_html(session, messages, &[], &SessionDisplayMeta::default())
+    }
+
+    fn render_html_with_events(
+        session: &Session,
+        messages: &[Message],
+        events: &[SessionEventRecord],
+    ) -> String {
+        render_session_html(session, messages, events, &SessionDisplayMeta::default())
     }
 
     fn session(source_id: &str) -> Session {
@@ -773,6 +1156,296 @@ mod tests {
             source_file_path: None,
             is_import: false,
         }
+    }
+
+    fn message(role: Role, content: &str, seq: u32) -> Message {
+        Message {
+            session_id: "local-id".to_string(),
+            role,
+            content: content.to_string(),
+            timestamp: None,
+            seq,
+        }
+    }
+
+    fn event(
+        event_seq: u32,
+        kind: &str,
+        message_seq: Option<u32>,
+        tool_call_id: Option<&str>,
+    ) -> SessionEventRecord {
+        SessionEventRecord {
+            event_seq,
+            timestamp: None,
+            kind: kind.to_string(),
+            actor: if kind == "tool_result" { "tool" } else { "assistant" }.to_string(),
+            name: None,
+            status: None,
+            target: None,
+            message_seq,
+            summary: None,
+            source_path: Some("/private/transcript.jsonl".to_string()),
+            source_event_id: Some(format!("source-{event_seq}")),
+            tool_call_id: tool_call_id.map(String::from),
+            is_meta: None,
+            visibility: None,
+            attrs_json: Some("{\"secret\":true}".to_string()),
+            parser_version: 1,
+        }
+    }
+
+    #[test]
+    fn structured_timeline_pairs_only_source_relations_and_orders_by_event_sequence() {
+        let messages = [
+            message(Role::User, "Question", 0),
+            message(Role::Assistant, "Before tools", 1),
+            message(Role::Assistant, "After tools", 2),
+        ];
+        let mut events = vec![
+            event(4, "tool_result", Some(2), Some("call-1")),
+            event(1, "tool_call", Some(1), None),
+            event(5, "tool_result", Some(2), Some("call-1")),
+            event(0, "tool_call", Some(1), Some("call-1")),
+            event(2, "tool_result", Some(1), None),
+        ];
+        events[0].name = Some("Read".to_string());
+        events[1].name = Some("Independent".to_string());
+        events[2].status = Some("complete".to_string());
+        events[3].name = Some("Read".to_string());
+        events[3].target = Some("src/lib.rs".to_string());
+        events[4].name = Some("Independent".to_string());
+
+        let html = render_html_with_events(&session("s1"), &messages, &events);
+
+        assert!(html.contains("3 tool executions"));
+        assert_eq!(html.matches("call + result").count(), 1);
+        assert_eq!(html.matches("Result: Tool result").count(), 3);
+        assert_eq!(html.matches("class=\"lname\">Independent</span>").count(), 2);
+        let before = html.find("Before tools").unwrap();
+        let call = html.find("Target: src/lib.rs").unwrap();
+        let first_result = html.find("Result: Tool result").unwrap();
+        let after = html.find("After tools").unwrap();
+        assert!(before < call);
+        assert!(call < first_result);
+        assert!(first_result < after);
+    }
+
+    #[test]
+    fn structured_timeline_filters_unpositioned_meta_and_explicitly_hidden_events() {
+        let messages = [message(Role::Assistant, "Visible answer", 10)];
+        let mut events = vec![
+            event(0, "tool_call", Some(10), None),
+            event(1, "tool_call", Some(10), None),
+            event(2, "tool_call", Some(10), None),
+            event(3, "tool_call", Some(10), None),
+            event(4, "tool_call", None, None),
+            event(5, "tool_call", Some(99), None),
+        ];
+        for (event, name) in events.iter_mut().zip([
+            "unknown-visibility",
+            "hidden",
+            "inactive",
+            "meta",
+            "null-anchor",
+            "invalid-anchor",
+        ]) {
+            event.name = Some(name.to_string());
+        }
+        events[1].visibility = Some(EvidenceVisibility::Hidden);
+        events[2].visibility = Some(EvidenceVisibility::Inactive);
+        events[3].is_meta = Some(true);
+
+        let html = render_html_with_events(&session("s1"), &messages, &events);
+
+        assert!(html.contains("unknown-visibility"));
+        for excluded in ["hidden", "inactive", "meta", "null-anchor", "invalid-anchor"] {
+            assert!(!html.contains(&format!(">{excluded}<")));
+        }
+    }
+
+    #[test]
+    fn structured_timeline_deduplicates_claude_tool_only_messages_anchored_to_prior_text() {
+        let mut claude_session = session("s1");
+        claude_session.source = "claude-code".to_string();
+        let messages = [
+            message(Role::User, "Question", 0),
+            message(Role::Assistant, "I will inspect it.", 1),
+            message(Role::Assistant, "[Read] {\"path\":\"src/lib.rs\"}", 2),
+            message(Role::User, "file body", 3),
+        ];
+        let mut call = event(0, "tool_call", Some(1), Some("tool-1"));
+        call.name = Some("Read".to_string());
+        call.target = Some("src/lib.rs".to_string());
+        let result = event(1, "tool_result", Some(1), Some("tool-1"));
+
+        let html = render_html_with_events(&claude_session, &messages, &[call, result]);
+
+        assert_eq!(html.matches("class=\"log\"").count(), 1);
+        assert_eq!(html.matches("class=\"turn user\"").count(), 1);
+        assert!(!html.contains("file body"));
+
+        let unpaired = render_html_with_events(
+            &claude_session,
+            &messages[..3]
+                .iter()
+                .cloned()
+                .chain([message(Role::User, "real follow-up", 3)])
+                .collect::<Vec<_>>(),
+            &[event(0, "tool_call", Some(1), Some("tool-1"))],
+        );
+        assert_eq!(unpaired.matches("class=\"turn user\"").count(), 2);
+        assert!(unpaired.contains("real follow-up"));
+    }
+
+    #[test]
+    fn structured_timeline_keeps_prose_in_claude_tool_first_messages() {
+        let mut claude_session = session("s1");
+        claude_session.source = "claude-code".to_string();
+        let messages = [
+            message(Role::User, "Question", 0),
+            message(
+                Role::Assistant,
+                "[Read] {\"path\":\"Cargo.toml\"}\nI found the manifest.\n[Read] {\"path\":\"src/lib.rs\"}",
+                1,
+            ),
+            message(Role::User, "library body\nmanifest body", 2),
+            message(Role::Assistant, "Continue.", 3),
+        ];
+        let mut first_call = event(0, "tool_call", Some(0), Some("tool-before"));
+        first_call.name = Some("Read".to_string());
+        first_call.target = Some("Cargo.toml".to_string());
+        let mut second_call = event(1, "tool_call", Some(1), Some("tool-after"));
+        second_call.name = Some("Read".to_string());
+        second_call.target = Some("src/lib.rs".to_string());
+        let second_result = event(2, "tool_result", Some(1), Some("tool-after"));
+        let first_result = event(3, "tool_result", Some(1), Some("tool-before"));
+
+        let html = render_html_with_events(
+            &claude_session,
+            &messages,
+            &[first_call, second_call, second_result, first_result],
+        );
+
+        assert_eq!(html.matches("class=\"log\"").count(), 2);
+        assert_eq!(html.matches("class=\"turn user\"").count(), 1);
+        assert!(html.contains("I found the manifest."));
+        assert!(html.contains("Continue."));
+        assert!(!html.contains("library body"));
+        assert!(!html.contains("manifest body"));
+    }
+
+    #[test]
+    fn structured_timeline_preserves_user_prompt_after_cursor_inline_result() {
+        let mut cursor_session = session("s1");
+        cursor_session.source = "cursor".to_string();
+        let messages = [
+            message(
+                Role::Assistant,
+                "[tool:grep] {\"query\":\"needle\"}\n[tool_result:grep] found",
+                0,
+            ),
+            message(Role::User, "Now update the file", 1),
+        ];
+        let mut call = event(0, "tool_call", Some(0), Some("bubble-1"));
+        call.name = Some("grep".to_string());
+        let result = event(1, "tool_result", Some(0), Some("bubble-1"));
+
+        let html = render_html_with_events(&cursor_session, &messages, &[call, result]);
+
+        assert_eq!(html.matches("class=\"log\"").count(), 1);
+        assert_eq!(html.matches("class=\"turn user\"").count(), 1);
+        assert!(html.contains("Now update the file"));
+    }
+
+    #[test]
+    fn structured_timeline_falls_back_without_positioned_events_and_deduplicates_when_present() {
+        let messages = [
+            message(Role::Assistant, "Before\n[tool:Legacy] {\"path\":\"secret\"}\nAfter", 0),
+            message(Role::User, "{\"ordinary\":\"json\"}", 1),
+            message(Role::Assistant, "[tool:Uncovered] {\"path\":\"keep\"}", 2),
+        ];
+        let mut unpositioned = event(0, "tool_call", None, Some("call-1"));
+        unpositioned.name = Some("Structured".to_string());
+        let fallback = render_html_with_events(&session("s1"), &messages, &[unpositioned]);
+        assert!(fallback.contains("Legacy"));
+        assert!(fallback.contains("secret"));
+
+        let mut positioned = event(0, "tool_call", Some(0), Some("call-1"));
+        positioned.name = Some("Structured".to_string());
+        positioned.target = Some("src/lib.rs".to_string());
+        let structured = render_html_with_events(&session("s1"), &messages, &[positioned]);
+        assert!(structured.contains("Before"));
+        assert!(structured.contains("After"));
+        assert!(structured.contains("Structured"));
+        assert!(structured.contains("src/lib.rs"));
+        assert!(!structured.contains("Legacy"));
+        assert!(!structured.contains("secret"));
+        assert!(structured.contains("ordinary"));
+        assert!(structured.contains("Uncovered"));
+        assert!(structured.contains("keep"));
+        assert_eq!(structured.matches("class=\"log\"").count(), 2);
+    }
+
+    #[test]
+    fn structured_timeline_escapes_public_fields_and_omits_private_payloads() {
+        let messages = [message(Role::Assistant, "Answer", 0)];
+        let mut call = event(0, "tool_call", Some(0), Some("hostile"));
+        call.name = Some("<img src=x onerror=alert(1)>".to_string());
+        call.target = Some("**[click](javascript:alert(1))</pre><script>boom</script>".to_string());
+        call.status = Some("ok</pre><script>status</script>".to_string());
+        call.summary = Some("[tool] raw-argument-secret".to_string());
+        call.attrs_json = Some("raw-argument-secret".to_string());
+        call.source_path = Some("source-path-secret".to_string());
+        let mut result = event(1, "tool_result", Some(0), Some("hostile"));
+        result.summary = Some("source-file-content-secret".to_string());
+
+        let html = render_html_with_events(&session("s1"), &messages, &[call, result]);
+
+        assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(html.contains("&lt;script&gt;boom&lt;/script&gt;"));
+        assert!(html.contains("&lt;script&gt;status&lt;/script&gt;"));
+        assert!(!html.contains("<script>boom"));
+        assert!(!html.contains("raw-argument-secret"));
+        assert!(!html.contains("source-file-content-secret"));
+        assert!(!html.contains("source-path-secret"));
+        assert!(!html.contains("hostile"));
+    }
+
+    #[test]
+    fn structured_timeline_applies_event_and_summary_budgets() {
+        let messages =
+            (0..300).map(|seq| message(Role::Assistant, "Answer", seq)).collect::<Vec<_>>();
+        let mut events = (0..300)
+            .map(|event_seq| {
+                let mut event = event(event_seq, "tool_call", Some(event_seq), None);
+                event.name = Some(format!("tool-{event_seq}"));
+                event
+            })
+            .collect::<Vec<_>>();
+        events[0].name = None;
+        events[0].summary = Some("a".repeat(STRUCTURED_SUMMARY_CHAR_LIMIT + 20));
+
+        let html = render_html_with_events(&session("s1"), &messages, &events);
+
+        assert_eq!(html.matches("class=\"log\"").count(), STRUCTURED_EVENT_LIMIT);
+        assert!(html.contains("Tool timeline truncated."));
+        assert!(
+            html.contains(&format!("Summary: {}…", "a".repeat(STRUCTURED_SUMMARY_CHAR_LIMIT - 1)))
+        );
+        assert!(!html.contains("tool-299"));
+
+        let messages =
+            [message(Role::Assistant, "First", 0), message(Role::Assistant, "Second", 1)];
+        let mut grouped_events = (0..255)
+            .map(|event_seq| event(event_seq, "tool_call", Some(0), None))
+            .collect::<Vec<_>>();
+        let mut excluded_call = event(255, "tool_call", Some(1), Some("pair"));
+        excluded_call.name = Some("excluded-call".to_string());
+        grouped_events.push(excluded_call);
+        grouped_events.push(event(256, "tool_result", Some(1), Some("pair")));
+        let grouped = render_html_with_events(&session("s1"), &messages, &grouped_events);
+        assert_eq!(grouped.matches("class=\"log\"").count(), 255);
+        assert!(!grouped.contains("excluded-call"));
     }
 
     #[test]
@@ -799,7 +1472,8 @@ mod tests {
 
     #[test]
     fn local_preview_has_no_render_blocking_network_resources() {
-        let html = render_session_preview_html(&session("s1"), &[], &SessionDisplayMeta::default());
+        let html =
+            render_session_preview_html(&session("s1"), &[], &[], &SessionDisplayMeta::default());
 
         assert!(!html.contains("fonts.googleapis.com"));
         assert!(!html.contains("fonts.gstatic.com"));
@@ -817,6 +1491,7 @@ mod tests {
                 timestamp: None,
                 seq: 0,
             }],
+            &[],
             &SessionDisplayMeta::default(),
             Some("**Query:** <script>alert('x')</script>"),
         );
@@ -1204,6 +1879,7 @@ mod tests {
     fn html_renderer_shows_model_and_thinking_chips() {
         let html = render_session_html(
             &session("s1"),
+            &[],
             &[],
             &SessionDisplayMeta {
                 models: vec!["grok-composer-2.5-fast".to_string()],

@@ -558,6 +558,7 @@ fn cmd_session_share(
     let sources = adapters::source_labels();
     let session = resolve_session_ref(&store, &sources, id, source_filter, source_id)?;
     let messages = store.get_messages(&session.id)?;
+    let events = store.list_session_events_for_session(&session.id)?;
     let usage_events = store.list_usage_events_for_session(&session.id)?;
     let config = AppConfig::load()?;
     let tldr_markdown = tldr_file.and_then(read_tldr_file);
@@ -566,6 +567,7 @@ fn cmd_session_share(
         &config,
         &session,
         &messages,
+        &events,
         &usage_events,
         &render_options,
     )?;
@@ -577,6 +579,7 @@ fn cmd_session_share(
             &config,
             &session,
             &messages,
+            &events,
             &usage_events,
             &render_options,
         )?

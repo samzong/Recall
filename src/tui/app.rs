@@ -33,6 +33,7 @@ use crate::tui::viewing_state::{
 };
 use crate::types::{
     BackgroundJobStatus, MatchSource, Message, SearchResult, SemanticProgress, Session,
+    SessionEventRecord,
 };
 use crate::usage::UsageReport;
 
@@ -133,6 +134,7 @@ pub(crate) struct App {
     pub(crate) preview_selected_msg: usize,
     pub(crate) preview_scroll_offset: usize,
     pub(crate) viewing_messages: Vec<Message>,
+    viewing_events: Vec<SessionEventRecord>,
     pub(crate) viewing_selected_msg: usize,
     pub(crate) viewing_scroll_offset: usize,
     mouse_drag_target: Option<MouseDragTarget>,
@@ -234,6 +236,7 @@ impl App {
             preview_selected_msg: 0,
             preview_scroll_offset: 0,
             viewing_messages: Vec::new(),
+            viewing_events: Vec::new(),
             viewing_selected_msg: 0,
             viewing_scroll_offset: 0,
             mouse_drag_target: None,
@@ -2442,6 +2445,7 @@ impl App {
             return false;
         };
         let usage_events = store.list_usage_events_for_session(&session.id).unwrap_or_default();
+        let events = store.list_session_events_for_session(&session.id).unwrap_or_default();
         self.viewing_session_summary = Some(ViewingSessionSummary::from_session(
             &msgs,
             session.duration_minutes,
@@ -2469,10 +2473,11 @@ impl App {
             store.child_subagents(&session.source, &session.source_id).unwrap_or_default();
         self.viewing_sanitized_lines = build_viewing_caches(&msgs);
         self.local_preview = Some(
-            crate::share::create_session_preview(&session, &msgs, &usage_events)
+            crate::share::create_session_preview(&session, &msgs, &events, &usage_events)
                 .map_err(|error| error.to_string()),
         );
         self.viewing_messages = msgs;
+        self.viewing_events = events;
         self.viewing_session = Some(session);
         self.viewing_selected_msg = 0;
         self.viewing_scroll_offset = 0;
@@ -2571,6 +2576,7 @@ impl App {
     fn exit_viewing_to_search(&mut self) {
         self.mode = AppMode::Search;
         self.viewing_messages.clear();
+        self.viewing_events.clear();
         self.viewing_selected_msg = 0;
         self.viewing_scroll_offset = 0;
         self.viewing_session_summary = None;
@@ -2614,14 +2620,16 @@ impl App {
         }
         let config = self.config.clone();
         let messages = self.viewing_messages.clone();
+        let events = self.viewing_events.clone();
         let session_id = session.id.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let usage_events = crate::db::store::Store::open()
                 .and_then(|store| store.list_usage_events_for_session(&session_id))
                 .unwrap_or_default();
-            let result = crate::share::publish_session(&config, &session, &messages, &usage_events)
-                .map_err(|e| e.to_string());
+            let result =
+                crate::share::publish_session(&config, &session, &messages, &events, &usage_events)
+                    .map_err(|e| e.to_string());
             let _ = tx.send(result);
         });
         self.share_publish_rx = Some(rx);
@@ -2785,6 +2793,7 @@ mod tests {
             preview_selected_msg: 0,
             preview_scroll_offset: 0,
             viewing_messages: Vec::new(),
+            viewing_events: Vec::new(),
             viewing_selected_msg: 0,
             viewing_scroll_offset: 0,
             mouse_drag_target: None,
