@@ -21,6 +21,7 @@ pub(crate) mod kiro;
 pub(crate) mod mimo_code;
 pub(crate) mod omp;
 pub(crate) mod opencode;
+pub(crate) mod openhands;
 pub(crate) mod paths;
 pub(crate) mod pi;
 pub(crate) mod qwen;
@@ -371,6 +372,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(zcode::ZcodeAdapter),
         Box::new(goose::GooseAdapter),
         Box::new(droid::DroidAdapter),
+        Box::new(openhands::OpenHandsAdapter),
     ]
 }
 
@@ -399,6 +401,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "mimo-code"
             | "zcode"
             | "goose"
+            | "openhands"
     )
 }
 
@@ -418,4 +421,15 @@ pub(crate) fn dashboard_source_labels() -> Vec<(String, String)> {
         .filter(|adapter| adapter_supports_usage_dashboard(adapter.as_ref(), true))
         .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_adapters;
+
+    #[test]
+    fn all_adapters_includes_openhands() {
+        let ids: Vec<_> = all_adapters().iter().map(|adapter| adapter.id().to_string()).collect();
+        assert!(ids.iter().any(|id| id == "openhands"), "openhands missing from all_adapters()");
+    }
 }
