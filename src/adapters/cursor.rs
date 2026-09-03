@@ -25,7 +25,7 @@ use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 pub(crate) struct CursorAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 2;
-const EVENT_PARSER_VERSION: u32 = 2;
+const EVENT_PARSER_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 struct ComposerMeta {
@@ -348,7 +348,7 @@ fn parse_composer_session(
             let message_seq = (messages.len() - 1) as u32;
             collect_bubble_tool_events(
                 bubble,
-                bubble_id.unwrap_or("unknown"),
+                bubble_id,
                 &source_path,
                 timestamp,
                 message_seq,
@@ -614,7 +614,7 @@ fn render_bubble_content(bubble: &Value, role: &Role) -> String {
 
 fn collect_bubble_tool_events(
     bubble: &Value,
-    bubble_id: &str,
+    bubble_id: Option<&str>,
     source_path: &str,
     timestamp: Option<i64>,
     message_seq: u32,
@@ -624,10 +624,11 @@ fn collect_bubble_tool_events(
         return;
     };
     let name = tool_data.get("name").and_then(|value| value.as_str()).unwrap_or("tool").to_string();
-    let source_event_id = Some(bubble_id.to_string());
+    let source_event_id = cursor_native_id(bubble_id);
+    let tool_call_id = source_event_id.clone();
 
     if let Some(params) = tool_data.get("params") {
-        events_out.push(events::tool_call_event(
+        let mut event = events::tool_call_event(
             events::EventContext {
                 event_seq: events_out.len() as u32,
                 timestamp,
@@ -638,11 +639,13 @@ fn collect_bubble_tool_events(
             },
             name.clone(),
             Some(params),
-        ));
+        );
+        event.tool_call_id = tool_call_id.clone();
+        events_out.push(event);
     } else if let Some(raw_args) = tool_data.get("rawArgs") {
         match raw_args {
             Value::String(text) => {
-                events_out.push(events::tool_call_event_from_text(
+                let mut event = events::tool_call_event_from_text(
                     events::EventContext {
                         event_seq: events_out.len() as u32,
                         timestamp,
@@ -653,10 +656,12 @@ fn collect_bubble_tool_events(
                     },
                     name.clone(),
                     Some(text.as_str()),
-                ));
+                );
+                event.tool_call_id = tool_call_id.clone();
+                events_out.push(event);
             }
             other => {
-                events_out.push(events::tool_call_event(
+                let mut event = events::tool_call_event(
                     events::EventContext {
                         event_seq: events_out.len() as u32,
                         timestamp,
@@ -667,11 +672,13 @@ fn collect_bubble_tool_events(
                     },
                     name.clone(),
                     Some(other),
-                ));
+                );
+                event.tool_call_id = tool_call_id.clone();
+                events_out.push(event);
             }
         }
     } else {
-        events_out.push(events::tool_call_event(
+        let mut event = events::tool_call_event(
             events::EventContext {
                 event_seq: events_out.len() as u32,
                 timestamp,
@@ -682,12 +689,14 @@ fn collect_bubble_tool_events(
             },
             name.clone(),
             None,
-        ));
+        );
+        event.tool_call_id = tool_call_id.clone();
+        events_out.push(event);
     }
 
     if let Some(result) = tool_data.get("result") {
         let summary = render_json_fragment(result).filter(|text| !text.is_empty());
-        events_out.push(events::tool_result_event(
+        let mut event = events::tool_result_event(
             events::EventContext {
                 event_seq: events_out.len() as u32,
                 timestamp,
@@ -698,8 +707,14 @@ fn collect_bubble_tool_events(
             },
             Some(name),
             summary,
-        ));
+        );
+        event.tool_call_id = tool_call_id;
+        events_out.push(event);
     }
+}
+
+fn cursor_native_id(value: Option<&str>) -> Option<String> {
+    value.map(str::trim).filter(|id| !id.is_empty() && *id != "unknown").map(String::from)
 }
 
 fn render_legacy_bubble(value: &Value, role: &Role) -> String {
@@ -863,6 +878,7 @@ fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<O
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
     let mut session_events = Vec::new();
+    let mut last_visible_message_seq: Option<u32> = None;
     let source_path = path.display().to_string();
 
     for (line_index, line) in reader.lines().enumerate() {
@@ -886,21 +902,26 @@ fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<O
             continue;
         };
         let is_user = matches!(role, Role::User);
+        let content = render_transcript_content_items(items, is_user);
+        let current_message_seq =
+            if content.is_empty() { None } else { Some(messages.len() as u32) };
         if include_events && matches!(role, Role::Assistant) {
-            let message_seq = if messages.is_empty() { None } else { Some(messages.len() as u32) };
             collect_transcript_content_events(
                 items,
                 &source_path,
                 line_index,
-                message_seq,
+                last_visible_message_seq,
+                current_message_seq,
                 &mut session_events,
             );
         }
-        let content = render_transcript_content_items(items, is_user);
         if content.is_empty() {
             continue;
         }
         messages.push(RawMessage { role, content, timestamp: None });
+        if transcript_content_has_visible_text(items) {
+            last_visible_message_seq = current_message_seq;
+        }
     }
 
     if messages.is_empty() && session_events.is_empty() {
@@ -923,31 +944,65 @@ fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<O
     Ok(Some(session))
 }
 
+#[cfg(test)]
+pub(crate) fn parse_conformance_fixture(
+    path: &Path,
+    source_id: &str,
+) -> anyhow::Result<Option<RawSession>> {
+    let mut raw = parse_agent_transcript(path, true)?;
+    if let Some(session) = raw.as_mut() {
+        session.source_id = source_id.to_string();
+    }
+    Ok(raw)
+}
+
 fn collect_transcript_content_events(
     items: &[Value],
     source_path: &str,
     line_index: usize,
-    message_seq: Option<u32>,
+    prior_message_seq: Option<u32>,
+    current_message_seq: Option<u32>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
+    let mut message_seq = prior_message_seq;
     for (item_index, item) in items.iter().enumerate() {
-        if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-            continue;
+        match item.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+                {
+                    message_seq = current_message_seq;
+                }
+            }
+            Some("tool_use") => {
+                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
+                let mut event = events::tool_call_event(
+                    events::EventContext {
+                        event_seq: events_out.len() as u32,
+                        timestamp: None,
+                        source_path: Some(source_path.to_string()),
+                        source_event_id: Some(format!("{line_index}:{item_index}")),
+                        message_seq,
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    name,
+                    item.get("input"),
+                );
+                event.tool_call_id = cursor_native_id(item.get("id").and_then(Value::as_str));
+                events_out.push(event);
+            }
+            _ => {}
         }
-        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
-        events_out.push(events::tool_call_event(
-            events::EventContext {
-                event_seq: events_out.len() as u32,
-                timestamp: None,
-                source_path: Some(source_path.to_string()),
-                source_event_id: Some(format!("{line_index}:{item_index}")),
-                message_seq,
-                parser_version: EVENT_PARSER_VERSION,
-            },
-            name,
-            item.get("input"),
-        ));
     }
+}
+
+fn transcript_content_has_visible_text(items: &[Value]) -> bool {
+    items.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("text")
+            && item.get("text").and_then(Value::as_str).is_some_and(|text| !text.trim().is_empty())
+    })
 }
 
 fn render_transcript_content_items(items: &[Value], is_user: bool) -> String {
@@ -1470,6 +1525,73 @@ mod tests {
     }
 
     #[test]
+    fn incremental_scan_reparses_current_session_with_stale_event_parser() {
+        schema::register_sqlite_vec();
+        let root = temp_root("event-parser-backfill");
+        let composer_id = uuid::Uuid::new_v4().to_string();
+        let bubble_id = uuid::Uuid::new_v4().to_string();
+        let conn = seed_global_db(&root, &composer_id, &bubble_id);
+        let store = Store::open_in_memory().unwrap();
+        let source_updated_at = 1_700_000_100_000_i64;
+        store
+            .insert_session(&Session {
+                id: uuid::Uuid::new_v4().to_string(),
+                source: "cursor".to_string(),
+                source_id: composer_id.clone(),
+                title: "Usage review".to_string(),
+                directory: Some("/Users/x/project".to_string()),
+                repo_remote: None,
+                repo_slug: None,
+                repo_name: None,
+                started_at: 1_700_000_000_000,
+                updated_at: Some(source_updated_at),
+                message_count: 1,
+                entrypoint: Some("chat".to_string()),
+                custom_title: None,
+                summary: None,
+                duration_minutes: None,
+                source_file_path: None,
+                is_import: false,
+            })
+            .unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "cursor",
+                &composer_id,
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(source_updated_at),
+            )
+            .unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "cursor",
+                &composer_id,
+                &[],
+                EVENT_PARSER_VERSION - 1,
+                Some(source_updated_at),
+            )
+            .unwrap();
+
+        let result = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap(),
+            None,
+            true,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.stats.skipped_sessions, 0);
+        assert_eq!(result.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
+        assert_eq!(result.sessions[0].messages.len(), 1);
+        assert_eq!(result.sessions[0].messages[0].content, "hello cursor");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn parse_composer_session_prefers_bubble_usage_over_context_breakdown() {
         let root = temp_root("bubble-usage");
         let composer_id = uuid::Uuid::new_v4().to_string();
@@ -1557,7 +1679,71 @@ mod tests {
         assert_eq!(parsed.events.len(), 2);
         assert_eq!(parsed.events[0].kind, "search");
         assert_eq!(parsed.events[0].name.as_deref(), Some("grep"));
+        assert_eq!(parsed.events[0].source_event_id.as_deref(), Some(bubble_id.as_str()));
+        assert_eq!(parsed.events[0].tool_call_id.as_deref(), Some(bubble_id.as_str()));
         assert_eq!(parsed.events[1].kind, "tool_result");
+        assert_eq!(parsed.events[1].source_event_id.as_deref(), Some(bubble_id.as_str()));
+        assert_eq!(parsed.events[1].tool_call_id.as_deref(), Some(bubble_id.as_str()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn composer_tool_events_do_not_invent_missing_bubble_relationships() {
+        let bubble = serde_json::json!({
+            "toolFormerData": {
+                "name": "grep",
+                "rawArgs": "{\"pattern\":\"usage\"}",
+                "result": "match"
+            }
+        });
+        for bubble_id in [None, Some(""), Some("unknown")] {
+            let mut events = Vec::new();
+            collect_bubble_tool_events(&bubble, bubble_id, "composer:test", None, 0, &mut events);
+            assert_eq!(events.len(), 2);
+            assert!(events.iter().all(|event| event.source_event_id.is_none()));
+            assert!(events.iter().all(|event| event.tool_call_id.is_none()));
+        }
+    }
+
+    #[test]
+    fn parse_composer_legacy_map_preserves_messages_without_guessing_events() {
+        let root = temp_root("legacy-map");
+        let composer_id = uuid::Uuid::new_v4().to_string();
+        let bubble_id = uuid::Uuid::new_v4().to_string();
+        let conn = seed_global_db(&root, &composer_id, &bubble_id);
+        conn.execute(
+            "DELETE FROM cursorDiskKV WHERE key = ?1",
+            [format!("bubbleId:{composer_id}:{bubble_id}")],
+        )
+        .unwrap();
+        let composer_data = serde_json::json!({
+            "composerId": composer_id,
+            "createdAt": 1_700_000_000_000_i64,
+            "lastUpdatedAt": 1_700_000_100_000_i64,
+            "fullConversationHeadersOnly": [{"bubbleId": bubble_id, "type": 2}],
+            "conversationMap": {
+                bubble_id.clone(): {
+                    "text": "Legacy assistant message",
+                    "toolFormerData": {
+                        "name": "grep",
+                        "rawArgs": "{\"pattern\":\"usage\"}"
+                    }
+                }
+            }
+        });
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
+            rusqlite::params![composer_data.to_string(), format!("composerData:{composer_id}")],
+        )
+        .unwrap();
+
+        let meta = load_composer_meta(&conn, &composer_id, &ComposerLookup::load(&conn));
+        let parsed = parse_composer_session(&conn, &composer_id, &meta, true).unwrap().unwrap();
+
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].content, "Legacy assistant message");
+        assert!(parsed.events.is_empty());
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1570,13 +1756,22 @@ mod tests {
             &jsonl_path,
             &[
                 r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nhello\n</user_query>"}]}}"#,
-                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"searching"},{"type":"tool_use","name":"Glob","input":{"glob_pattern":"*.rs"}}]}}"#,
+                r#"{"role":"assistant","message":{"content":[{"type":"tool_use","id":"tool-before","name":"Glob","input":{"glob_pattern":"*.toml"}},{"type":"text","text":"searching"},{"type":"tool_use","id":"tool-after","name":"Glob","input":{"glob_pattern":"*.rs"}},{"type":"tool_use","id":"","name":"Glob","input":{"glob_pattern":"*.md"}},{"type":"tool_use","id":"unknown","name":"Glob","input":{"glob_pattern":"*.json"}},{"type":"tool_use","id":42,"name":"Glob","input":{"glob_pattern":"*.lock"}}]}}"#,
             ],
         );
         let raw = parse_agent_transcript(&jsonl_path, true).unwrap().unwrap();
-        assert_eq!(raw.events.len(), 1);
+        assert_eq!(raw.events.len(), 5);
         assert_eq!(raw.events[0].kind, "search");
         assert_eq!(raw.events[0].name.as_deref(), Some("Glob"));
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1:0"));
+        assert_eq!(raw.events[0].message_seq, Some(0));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("tool-before"));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("1:2"));
+        assert_eq!(raw.events[1].message_seq, Some(1));
+        assert_eq!(raw.events[1].tool_call_id.as_deref(), Some("tool-after"));
+        assert_eq!(raw.events[2].tool_call_id, None);
+        assert_eq!(raw.events[3].tool_call_id, None);
+        assert_eq!(raw.events[4].tool_call_id, None);
         assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
         let _ = fs::remove_dir_all(root);
     }
