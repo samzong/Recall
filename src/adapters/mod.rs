@@ -22,6 +22,7 @@ pub(crate) mod kiro;
 pub(crate) mod mimo_code;
 pub(crate) mod omp;
 pub(crate) mod opencode;
+pub(crate) mod openhands;
 pub(crate) mod paths;
 pub(crate) mod pi;
 pub(crate) mod qwen;
@@ -373,6 +374,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(goose::GooseAdapter),
         Box::new(droid::DroidAdapter),
         Box::new(amp::AmpAdapter),
+        Box::new(openhands::OpenHandsAdapter),
     ]
 }
 
@@ -401,6 +403,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "mimo-code"
             | "zcode"
             | "goose"
+            | "openhands"
     )
 }
 
