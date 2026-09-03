@@ -25,7 +25,7 @@ use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, R
 pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 5;
-const EVENT_PARSER_VERSION: u32 = 3;
+const EVENT_PARSER_VERSION: u32 = 4;
 const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for ClaudeCodeAdapter {
@@ -378,7 +378,7 @@ fn parse_claude_session_file(
         }
     };
 
-    if parsed.messages.is_empty() && parsed.usage_events.is_empty() {
+    if parsed.messages.is_empty() && parsed.usage_events.is_empty() && parsed.events.is_empty() {
         return Ok(None);
     }
 
@@ -387,7 +387,7 @@ fn parse_claude_session_file(
         meta.and_then(|m| m.started_at),
         &parsed.messages,
         &parsed.usage_events,
-        &[],
+        &parsed.events,
     )
     .unwrap_or(0);
     let directory =
@@ -464,6 +464,7 @@ pub(crate) fn parse_conversation_jsonl(
     let mut first_ts: Option<i64> = None;
     let mut last_ts: Option<i64> = None;
     let mut session_id: Option<String> = None;
+    let mut last_visible_message_seq: Option<u32> = None;
     let source_path = path.to_string_lossy().to_string();
 
     for item in jsonl_indexed(reader.lines()) {
@@ -510,9 +511,11 @@ pub(crate) fn parse_conversation_jsonl(
             _ => continue,
         }
 
-        let is_machinery = v.get("isCompactSummary").and_then(|b| b.as_bool()).unwrap_or(false)
-            || v.get("isSidechain").and_then(|b| b.as_bool()).unwrap_or(false)
-            || v.get("isMeta").and_then(|b| b.as_bool()).unwrap_or(false);
+        let is_compact_summary =
+            v.get("isCompactSummary").and_then(Value::as_bool).unwrap_or(false);
+        let is_sidechain = v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false);
+        let is_meta = v.get("isMeta").and_then(Value::as_bool);
+        let is_machinery = is_compact_summary || is_sidechain || is_meta == Some(true);
 
         let role = if msg_type == "user" { Role::User } else { Role::Assistant };
 
@@ -545,7 +548,21 @@ pub(crate) fn parse_conversation_jsonl(
             }
         }
 
-        if is_machinery {
+        if is_compact_summary || is_meta == Some(true) {
+            if include_events {
+                collect_claude_meta_event(
+                    message.get("content"),
+                    role,
+                    timestamp,
+                    &source_path,
+                    line_index,
+                    &mut events,
+                );
+            }
+            continue;
+        }
+
+        if is_sidechain {
             continue;
         }
 
@@ -561,17 +578,24 @@ pub(crate) fn parse_conversation_jsonl(
         if include_events {
             collect_claude_content_events(
                 message.get("content"),
-                role.clone(),
-                timestamp,
-                &source_path,
-                line_index,
-                message_seq,
+                ClaudeContentEventContext {
+                    role: role.clone(),
+                    timestamp,
+                    source_path: &source_path,
+                    line_index,
+                    prior_message_seq: last_visible_message_seq,
+                    current_message_seq: message_seq,
+                    is_meta,
+                },
                 &mut events,
             );
         }
 
         if !text.is_empty() {
             messages.push(RawMessage { role, content: text, timestamp });
+        }
+        if claude_content_has_visible_text(message.get("content")) {
+            last_visible_message_seq = message_seq;
         }
     }
 
@@ -611,55 +635,134 @@ fn claude_topology(
     (Some(ThreadRole::Subagent), parents)
 }
 
-fn collect_claude_content_events(
-    content: Option<&Value>,
+struct ClaudeContentEventContext<'a> {
     role: Role,
     timestamp: Option<i64>,
-    source_path: &str,
+    source_path: &'a str,
     line_index: usize,
-    message_seq: Option<u32>,
+    prior_message_seq: Option<u32>,
+    current_message_seq: Option<u32>,
+    is_meta: Option<bool>,
+}
+
+fn collect_claude_content_events(
+    content: Option<&Value>,
+    context: ClaudeContentEventContext<'_>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
     let Some(Value::Array(arr)) = content else {
         return;
     };
+    let mut message_seq = context.prior_message_seq;
     for (item_index, item) in arr.iter().enumerate() {
         match item.get("type").and_then(|t| t.as_str()) {
-            Some("tool_use") if role == Role::Assistant => {
+            Some("text") => {
+                if item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty()) {
+                    message_seq = context.current_message_seq;
+                }
+            }
+            Some("tool_use") if context.role == Role::Assistant => {
                 let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
-                events_out.push(events::tool_call_event(
+                let mut event = events::tool_call_event(
                     events::EventContext {
                         event_seq: events_out.len() as u32,
-                        timestamp,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: Some(format!("{line_index}:{item_index}")),
+                        timestamp: context.timestamp,
+                        source_path: Some(context.source_path.to_string()),
+                        source_event_id: Some(format!("{}:{item_index}", context.line_index)),
                         message_seq,
                         parser_version: EVENT_PARSER_VERSION,
                     },
                     name,
                     item.get("input"),
-                ));
+                );
+                event.tool_call_id = claude_tool_call_id(item.get("id"));
+                event.is_meta = context.is_meta;
+                events_out.push(event);
             }
             Some("tool_result") => {
                 let summary = item.get("content").map(|content| match content {
                     Value::String(text) => text.to_string(),
                     other => other.to_string(),
                 });
-                events_out.push(events::tool_result_event(
+                let mut event = events::tool_result_event(
                     events::EventContext {
                         event_seq: events_out.len() as u32,
-                        timestamp,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: Some(format!("{line_index}:{item_index}")),
+                        timestamp: context.timestamp,
+                        source_path: Some(context.source_path.to_string()),
+                        source_event_id: Some(format!("{}:{item_index}", context.line_index)),
                         message_seq,
                         parser_version: EVENT_PARSER_VERSION,
                     },
-                    item.get("tool_use_id").and_then(|id| id.as_str()).map(String::from),
+                    item.get("name").and_then(Value::as_str).map(String::from),
                     summary,
-                ));
+                );
+                event.tool_call_id = claude_tool_call_id(item.get("tool_use_id"));
+                event.is_meta = context.is_meta;
+                events_out.push(event);
             }
             _ => {}
         }
+    }
+}
+
+fn claude_tool_call_id(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty()).map(String::from)
+}
+
+fn claude_content_has_visible_text(content: Option<&Value>) -> bool {
+    match content {
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(Value::Array(items)) => items.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("text")
+                && item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+        }),
+        _ => false,
+    }
+}
+
+fn collect_claude_meta_event(
+    content: Option<&Value>,
+    role: Role,
+    timestamp: Option<i64>,
+    source_path: &str,
+    line_index: usize,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let summary = claude_visible_content(content);
+    if summary.is_empty() {
+        return;
+    }
+    events_out.push(RawSessionEvent {
+        event_seq: events_out.len() as u32,
+        timestamp,
+        kind: "message".to_string(),
+        actor: role.as_str().to_string(),
+        name: None,
+        status: None,
+        target: None,
+        message_seq: None,
+        summary: Some(events::bounded_summary(summary)),
+        source_path: Some(source_path.to_string()),
+        source_event_id: Some(line_index.to_string()),
+        tool_call_id: None,
+        is_meta: Some(true),
+        visibility: None,
+        attrs_json: None,
+        parser_version: EVENT_PARSER_VERSION,
+    });
+}
+
+fn claude_visible_content(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -852,10 +955,19 @@ mod tests {
         let raw = parse_claude_session_file(entry, mtime, &indexes, true).unwrap().unwrap();
 
         assert_eq!(raw.events.len(), 2);
+        assert_eq!(raw.messages.len(), 2);
         assert_eq!(raw.events[0].kind, "file_read");
         assert_eq!(raw.events[0].name.as_deref(), Some("Read"));
         assert_eq!(raw.events[0].target.as_deref(), Some("src/main.rs"));
+        assert_eq!(raw.events[0].message_seq, None);
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("0:0"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("tool-1"));
         assert_eq!(raw.events[1].kind, "tool_result");
+        assert_eq!(raw.events[1].name, None);
+        assert_eq!(raw.events[1].message_seq, None);
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("1:0"));
+        assert_eq!(raw.events[1].tool_call_id.as_deref(), Some("tool-1"));
+        assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
 
         let entry = FileScanEntry {
             session_id: "tool-session".to_string(),
@@ -866,6 +978,189 @@ mod tests {
 
         assert!(raw.events.is_empty());
         assert_eq!(raw.event_parser_version, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_claude_session_preserves_relationships_meta_and_source_order_anchors() {
+        let root = temp_claude_root("event-relationships");
+        let project = root.join("projects").join("-tmp-foo");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("event-relationships.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-04-13T10:00:00Z",
+                "message": {"content": "Inspect the repository"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tool-before",
+                            "name": "Read",
+                            "input": {"path": "Cargo.toml"}
+                        },
+                        {"type": "text", "text": "I found the manifest."},
+                        {
+                            "type": "tool_use",
+                            "id": "tool-after",
+                            "name": "Read",
+                            "input": {"path": "src/lib.rs"}
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "   ",
+                            "name": "Read",
+                            "input": {"path": "src/main.rs"}
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": 42,
+                            "name": "Read",
+                            "input": {"path": "src/cli.rs"}
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-04-13T10:00:02Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-after",
+                            "name": "Read result",
+                            "content": "library body"
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-before",
+                            "content": "manifest body"
+                        },
+                        {"type": "tool_result", "tool_use_id": "", "content": "empty id"},
+                        {"type": "tool_result", "tool_use_id": false, "content": "wrong id"}
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "isMeta": false,
+                "timestamp": "2026-04-13T10:00:03Z",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Continue."},
+                        {
+                            "type": "tool_use",
+                            "id": "tool-explicit-false",
+                            "name": "Glob",
+                            "input": {"pattern": "src/**/*.rs"}
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "isMeta": true,
+                "timestamp": "2026-04-13T10:00:04Z",
+                "message": {"content": [{"type": "text", "text": "汉".repeat(5000)}]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "isCompactSummary": true,
+                "timestamp": "2026-04-13T10:00:05Z",
+                "message": {"content": "Compacted context"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "isSidechain": true,
+                "timestamp": "2026-04-13T10:00:06Z",
+                "message": {"content": "Hidden sidechain"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "isMeta": true,
+                "isSidechain": true,
+                "timestamp": "2026-04-13T10:00:07Z",
+                "message": {"content": "Explicit sidechain metadata"}
+            }),
+        ];
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+
+        let parsed = parse_conversation_jsonl(&path, 0, true).unwrap();
+
+        assert_eq!(parsed.messages.len(), 4);
+        assert!(parsed.messages.iter().all(|message| message.content != "Hidden sidechain"));
+        assert_eq!(parsed.usage_events.len(), 0);
+        assert_eq!(parsed.events.len(), 12);
+        assert_eq!(parsed.events[0].message_seq, Some(0));
+        assert_eq!(parsed.events[0].tool_call_id.as_deref(), Some("tool-before"));
+        assert_eq!(parsed.events[1].message_seq, Some(1));
+        assert_eq!(parsed.events[1].tool_call_id.as_deref(), Some("tool-after"));
+        assert_eq!(parsed.events[2].tool_call_id, None);
+        assert_eq!(parsed.events[3].tool_call_id, None);
+        assert_eq!(parsed.events[4].name.as_deref(), Some("Read result"));
+        assert_eq!(parsed.events[4].tool_call_id.as_deref(), Some("tool-after"));
+        assert_eq!(parsed.events[5].name, None);
+        assert_eq!(parsed.events[5].tool_call_id.as_deref(), Some("tool-before"));
+        assert_eq!(parsed.events[6].tool_call_id, None);
+        assert_eq!(parsed.events[7].tool_call_id, None);
+        assert_eq!(parsed.events[8].source_event_id.as_deref(), Some("3:1"));
+        assert_eq!(parsed.events[8].message_seq, Some(3));
+        assert_eq!(parsed.events[8].is_meta, Some(false));
+        assert_eq!(parsed.events[9].source_event_id.as_deref(), Some("4"));
+        assert_eq!(parsed.events[9].is_meta, Some(true));
+        assert_eq!(parsed.events[9].visibility, None);
+        let summary = parsed.events[9].summary.as_deref().unwrap();
+        assert!(summary.ends_with('…'));
+        assert!(summary.len() <= 4099);
+        assert_eq!(parsed.events[10].source_event_id.as_deref(), Some("5"));
+        assert_eq!(parsed.events[10].summary.as_deref(), Some("Compacted context"));
+        assert_eq!(parsed.events[10].is_meta, Some(true));
+        assert_eq!(parsed.events[11].summary.as_deref(), Some("Explicit sidechain metadata"));
+        assert_eq!(parsed.events[11].is_meta, Some(true));
+        assert_eq!(parsed.events[11].visibility, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_claude_session_file_keeps_meta_event_only_transcript() {
+        let root = temp_claude_root("meta-event-only");
+        let project = root.join("projects").join("-tmp-foo");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("meta-event-only.jsonl");
+        let line = serde_json::json!({
+            "type": "assistant",
+            "isCompactSummary": true,
+            "timestamp": "2026-04-13T10:00:00Z",
+            "message": {"content": "Compacted context"}
+        });
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(file, "{line}").unwrap();
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+        let entry = FileScanEntry {
+            session_id: "meta-event-only".to_string(),
+            stat_target: path,
+            directory: Some("/tmp/foo".to_string()),
+        };
+
+        let raw = parse_claude_session_file(entry, mtime, &SessionIndexes::default(), true)
+            .unwrap()
+            .unwrap();
+
+        assert!(raw.messages.is_empty());
+        assert!(raw.usage_events.is_empty());
+        assert_eq!(raw.events.len(), 1);
+        assert_eq!(raw.started_at, 1_776_074_400_000);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1286,6 +1581,63 @@ mod tests {
         .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_reparses_unchanged_session_with_stale_event_parser() {
+        let root = temp_claude_root("event-parser-backfill");
+        let project = root.join("projects").join("-tmp-proj");
+        let path = write_user_jsonl(&project, "sess-event-backfill", "hello");
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let store = setup_store();
+        store.insert_session(&make_existing_session("sess-event-backfill", mtime, 1)).unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "claude-code",
+                "sess-event-backfill",
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "claude-code",
+                "sess-event-backfill",
+                &[],
+                EVENT_PARSER_VERSION - 1,
+                Some(mtime),
+            )
+            .unwrap();
+        store
+            .persist_topology_for_existing_session(
+                "claude-code",
+                "sess-event-backfill",
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION),
+                },
+            )
+            .unwrap();
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.stats.skipped_sessions, 0);
+        assert_eq!(result.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
+        assert_eq!(result.sessions[0].messages.len(), 1);
+        assert_eq!(result.sessions[0].messages[0].content, "hello");
+        assert!(result.sessions[0].usage_events.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
