@@ -13,8 +13,8 @@
 //! ```
 
 use recall::bench_api::{
-    BenchStore, IndexWorkload, RenderWorkload, SearchIndex, Transcript, UsageWorkload,
-    build_embedding_text, normalize_remote_url,
+    BenchStore, IndexWorkload, McpGetSessionWorkload, RenderWorkload, SearchIndex, SyncWorkload,
+    Transcript, UsageWorkload, build_embedding_text, normalize_remote_url,
 };
 
 fn main() {
@@ -99,6 +99,61 @@ mod indexing {
         bencher
             .with_inputs(BenchStore::empty)
             .bench_local_refs(|store| divan::black_box(workload.persist(store)));
+    }
+}
+
+mod incremental_sync_unchanged {
+    use super::*;
+
+    #[divan::bench]
+    fn messages_64_events_16_usage_16(bencher: divan::Bencher) {
+        divan::black_box(SyncWorkload::incremental_sync_unchanged().run());
+        bencher
+            .with_inputs(SyncWorkload::incremental_sync_unchanged)
+            .bench_local_values(|workload| divan::black_box(workload.run()));
+    }
+}
+
+mod refresh_existing_session {
+    use super::*;
+
+    #[divan::bench]
+    fn messages_64_events_16_usage_16(bencher: divan::Bencher) {
+        divan::black_box(SyncWorkload::refresh_existing_session().run());
+        bencher
+            .with_inputs(SyncWorkload::refresh_existing_session)
+            .bench_local_values(|workload| divan::black_box(workload.run()));
+    }
+}
+
+mod mcp_get_session {
+    use super::*;
+
+    fn bench(bencher: divan::Bencher, build: fn() -> McpGetSessionWorkload) {
+        let workload = build();
+        let get = || workload.run();
+        warm_up(&get);
+        bencher.bench_local(get);
+    }
+
+    #[divan::bench]
+    fn short_full_8_messages(bencher: divan::Bencher) {
+        bench(bencher, McpGetSessionWorkload::short_full_8);
+    }
+
+    #[divan::bench]
+    fn medium_full_32_messages(bencher: divan::Bencher) {
+        bench(bencher, McpGetSessionWorkload::medium_full_32);
+    }
+
+    #[divan::bench]
+    fn long_head_response_cap_256_messages(bencher: divan::Bencher) {
+        bench(bencher, McpGetSessionWorkload::long_head_response_cap_256);
+    }
+
+    #[divan::bench]
+    fn long_tail_response_cap_256_messages(bencher: divan::Bencher) {
+        bench(bencher, McpGetSessionWorkload::long_tail_response_cap_256);
     }
 }
 
