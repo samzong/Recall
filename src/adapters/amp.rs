@@ -286,11 +286,7 @@ fn env_cwd(env: Option<&Value>) -> Option<String> {
     }
     let trees = env.get("trees").and_then(Value::as_array)?;
     for tree in trees {
-        if let Some(cwd) = string_path(tree.get("cwd"))
-            .or_else(|| string_path(tree.get("path")))
-            .or_else(|| string_path(tree.get("fsPath")))
-            .or_else(|| file_uri_path(tree.get("uri")))
-        {
+        if let Some(cwd) = string_path(tree.get("cwd")) {
             return Some(cwd);
         }
     }
@@ -305,39 +301,13 @@ fn string_path(value: Option<&Value>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn file_uri_path(value: Option<&Value>) -> Option<String> {
-    match value {
-        Some(Value::String(uri)) => {
-            let text = uri.trim();
-            if text.is_empty() {
-                None
-            } else if let Some(rest) = text.strip_prefix("file://") {
-                Some(rest.to_string())
-            } else {
-                Some(text.to_string())
-            }
-        }
-        Some(Value::Object(map)) => {
-            string_path(map.get("fsPath")).or_else(|| string_path(map.get("path")))
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{schema, store::Store};
-    use crate::types::Session;
     use std::time::{Duration, UNIX_EPOCH};
 
     fn fixtures_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/amp")
-    }
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
     }
 
     #[test]
@@ -439,29 +409,6 @@ mod tests {
         let first = scan_threads(&[root.path().to_path_buf()], None).unwrap();
         assert_eq!(first.sessions.len(), 1);
         assert_eq!(first.sessions[0].messages.len(), 2);
-
-        let store = setup_store();
-        store
-            .insert_session(&Session {
-                id: "local-amp".to_string(),
-                source: SOURCE.to_string(),
-                source_id: "T-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001".to_string(),
-                title: "existing".to_string(),
-                directory: None,
-                repo_remote: None,
-                repo_slug: None,
-                repo_name: None,
-                started_at: first_mtime,
-                updated_at: Some(first_mtime),
-                message_count: 2,
-                entrypoint: None,
-                custom_title: None,
-                summary: None,
-                duration_minutes: None,
-                source_file_path: path.to_str().map(str::to_string),
-                is_import: false,
-            })
-            .unwrap();
 
         let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         value["messages"].as_array_mut().unwrap().push(serde_json::json!({
