@@ -8,6 +8,7 @@ pub(crate) mod crush;
 pub(crate) mod cursor;
 pub(crate) mod deepseek_harness;
 pub(crate) mod events;
+pub(crate) mod factory;
 pub(crate) mod file_scan;
 pub(crate) mod gemini;
 pub(crate) mod goose;
@@ -369,6 +370,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(mimo_code::MimoCodeAdapter),
         Box::new(zcode::ZcodeAdapter),
         Box::new(goose::GooseAdapter),
+        Box::new(factory::FactoryAdapter),
     ]
 }
 
@@ -397,6 +399,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "mimo-code"
             | "zcode"
             | "goose"
+            | "factory"
     )
 }
 
@@ -416,4 +419,15 @@ pub(crate) fn dashboard_source_labels() -> Vec<(String, String)> {
         .filter(|adapter| adapter_supports_usage_dashboard(adapter.as_ref(), true))
         .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_adapters;
+
+    #[test]
+    fn all_adapters_includes_factory() {
+        let ids: Vec<_> = all_adapters().iter().map(|adapter| adapter.id().to_string()).collect();
+        assert!(ids.iter().any(|id| id == "factory"), "factory missing from all_adapters()");
+    }
 }
