@@ -179,7 +179,7 @@ fn parse_sdk_layout(
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let base = read_json(&dir.join("base_state.json")).unwrap_or(Value::Null);
-    let directory = json_string(&base, &["workspace", "cwd", "working_directory"]);
+    let directory = workspace_dir(&base);
     let title = json_string(&base, &["title", "name"]);
     let mut messages = Vec::new();
     let mut events = Vec::new();
@@ -218,7 +218,8 @@ fn parse_sdk_layout(
     if messages.is_empty() && events.is_empty() {
         return Ok(None);
     }
-    let started_at = first_timestamp(event_timestamp(&base), &messages, &[], &events).unwrap_or(0);
+    let started_at =
+        first_timestamp(event_timestamp(&base), &messages, &[], &events).unwrap_or(mtime_ms);
     let updated_at = last_timestamp(Some(mtime_ms), &messages, &[], &events).or(Some(mtime_ms));
     let mut raw = RawSession::search_only(
         source_id.to_string(),
@@ -254,7 +255,7 @@ fn parse_docs_layout(
         first_timestamp(event_timestamp(&value), &messages, &[], &[]).unwrap_or(mtime_ms);
     let mut raw = RawSession::search_only(
         id,
-        json_string(&value, &["workspace", "cwd", "working_directory"]),
+        workspace_dir(&value),
         started_at,
         Some(mtime_ms),
         None,
@@ -319,10 +320,32 @@ fn event_kind(value: &Value) -> &str {
 }
 
 fn event_timestamp(value: &Value) -> Option<i64> {
-    json_i64(value.get("timestamp"))
-        .or_else(|| rfc3339_ms(value.get("timestamp")))
-        .or_else(|| json_i64(value.get("created_at")))
-        .or_else(|| rfc3339_ms(value.get("created_at")))
+    timestamp_field(value.get("timestamp")).or_else(|| timestamp_field(value.get("created_at")))
+}
+
+fn timestamp_field(value: Option<&Value>) -> Option<i64> {
+    json_i64(value).or_else(|| rfc3339_ms(value)).or_else(|| naive_iso8601_utc_ms(value))
+}
+
+fn naive_iso8601_utc_ms(value: Option<&Value>) -> Option<i64> {
+    let text = value?.as_str()?.trim();
+    const FMTS: &[&str] = &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f"];
+    for fmt in FMTS {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(text, fmt) {
+            return Some(naive.and_utc().timestamp_millis());
+        }
+    }
+    None
+}
+
+fn workspace_dir(value: &Value) -> Option<String> {
+    if let Some(text) = json_string(value, &["workspace", "cwd", "working_directory"]) {
+        return Some(text);
+    }
+    json_string(
+        value.get("workspace").unwrap_or(&Value::Null),
+        &["working_dir", "working_directory", "cwd", "path"],
+    )
 }
 
 fn message_role(value: &Value) -> Option<Role> {
@@ -506,6 +529,14 @@ mod tests {
     }
 
     #[test]
+    fn naive_iso8601_timestamp_is_treated_as_utc() {
+        let naive = serde_json::json!({ "timestamp": "2026-01-01T00:00:01" });
+        let zulu = serde_json::json!({ "timestamp": "2026-01-01T00:00:01Z" });
+        assert_eq!(event_timestamp(&naive), Some(1_767_225_601_000));
+        assert_eq!(event_timestamp(&zulu), Some(1_767_225_601_000));
+    }
+
+    #[test]
     fn sdk_layout_sorts_by_numeric_ordinal_not_lex() {
         assert!(
             event_ordinal("event-100000-ddd.json").unwrap()
@@ -521,6 +552,7 @@ mod tests {
                 .unwrap();
         assert_eq!(session.source_id, "sdk-conv-1");
         assert_eq!(session.directory.as_deref(), Some("/tmp/oh-sdk"));
+        assert_eq!(session.started_at, 1_767_225_601_000);
         assert_eq!(session.custom_title.as_deref(), Some("SDK conversation"));
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].content, "first user turn");
