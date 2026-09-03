@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -15,10 +15,9 @@ use crate::adapters::invocation_probe::{
     probe_recent_files,
 };
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
-use crate::adapters::paths::resolve_home_dir;
+use crate::adapters::paths::{self, resolve_home_dir};
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-    first_timestamp,
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
 };
 use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
@@ -26,7 +25,7 @@ pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 5;
 const EVENT_PARSER_VERSION: u32 = 4;
-const METADATA_PARSER_VERSION: u32 = 1;
+const METADATA_PARSER_VERSION: u32 = 2;
 
 impl SourceAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &str {
@@ -48,25 +47,7 @@ impl SourceAdapter for ClaudeCodeAdapter {
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        let Some(claude_dir) = resolve_claude_dir()? else {
-            return Ok(vec![]);
-        };
-        let mut indexes = load_session_indexes(&claude_dir);
-
-        let mut sessions = Vec::new();
-        let mut entries = collect_project_entries(&claude_dir, &mut indexes);
-        entries.extend(collect_transcript_entries(&claude_dir));
-
-        for entry in entries {
-            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
-                continue;
-            };
-            if let Some(raw) = parse_claude_session_file(entry, mtime_ms, &indexes, true)? {
-                sessions.push(raw);
-            }
-        }
-
-        Ok(sessions)
+        scan_claude_dirs(&resolve_claude_dirs()?)
     }
 
     fn scan_for_sync(
@@ -75,16 +56,57 @@ impl SourceAdapter for ClaudeCodeAdapter {
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let Some(claude_dir) = resolve_claude_dir()? else {
-            return Ok(Some(SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            }));
-        };
-        let result = scan_for_sync_impl(&claude_dir, context, since_ts, include_events)?;
-        Ok(Some(result))
+        Ok(Some(scan_claude_dirs_for_sync(
+            &resolve_claude_dirs()?,
+            context,
+            since_ts,
+            include_events,
+        )?))
     }
+}
+
+fn scan_claude_dirs(claude_dirs: &[PathBuf]) -> anyhow::Result<Vec<RawSession>> {
+    let mut sessions = Vec::new();
+    let mut claimed = HashSet::new();
+    for claude_dir in claude_dirs {
+        let mut indexes = load_session_indexes(claude_dir);
+        let mut entries = collect_project_entries(claude_dir, &mut indexes);
+        entries.extend(collect_transcript_entries(claude_dir));
+        claim_session_entries(&mut entries, &mut claimed);
+        for entry in entries {
+            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+                continue;
+            };
+            if let Some(raw) = parse_claude_session_file(entry, mtime_ms, &indexes, true)? {
+                sessions.push(raw);
+            }
+        }
+    }
+    Ok(sessions)
+}
+
+fn scan_claude_dirs_for_sync(
+    claude_dirs: &[PathBuf],
+    context: &AdapterSyncContext,
+    since_ts: Option<i64>,
+    include_events: bool,
+) -> anyhow::Result<SyncScanResult> {
+    let mut combined = SyncScanResult::default();
+    let mut claimed = HashSet::new();
+    for claude_dir in claude_dirs {
+        combined.absorb(scan_for_sync_claimed(
+            claude_dir,
+            context,
+            since_ts,
+            include_events,
+            &mut claimed,
+        )?);
+    }
+    Ok(combined)
+}
+
+fn claim_session_entries(entries: &mut Vec<FileScanEntry>, claimed: &mut HashSet<String>) {
+    entries.retain(|entry| claimed.insert(entry.session_id.clone()));
 }
 
 struct SessionMeta {
@@ -103,36 +125,44 @@ fn load_session_indexes(claude_dir: &Path) -> SessionIndexes {
     SessionIndexes { live: load_session_index(claude_dir), project_summaries: HashMap::new() }
 }
 
-fn resolve_claude_dir() -> anyhow::Result<Option<PathBuf>> {
-    resolve_home_dir(".claude", "~/.claude not found, skipping Claude Code")
+fn resolve_claude_dirs() -> anyhow::Result<Vec<PathBuf>> {
+    if let Some(dir) = paths::env_path_dir("CLAUDE_CONFIG_DIR") {
+        let Some(dir) = paths::existing_dir(dir) else {
+            debug!("CLAUDE_CONFIG_DIR not found, skipping Claude Code");
+            return Ok(Vec::new());
+        };
+        return Ok(vec![dir]);
+    }
+    let mut dirs = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
+        && let Some(dir) = paths::existing_dir(PathBuf::from(xdg).join("claude-code"))
+    {
+        dirs.push(dir);
+    }
+    if let Some(dir) = resolve_home_dir(".claude", "~/.claude not found, skipping Claude Code")?
+        && !dirs.iter().any(|existing| existing == &dir)
+    {
+        dirs.push(dir);
+    }
+    Ok(dirs)
 }
 
 pub(crate) fn probe_invocation_nonce(
     nonce: &str,
     budget: InvocationProbeBudget,
 ) -> anyhow::Result<ProviderInvocationProbe> {
-    let Some(claude_dir) = resolve_claude_dir()? else {
-        return Ok(ProviderInvocationProbe {
-            source_ids: Vec::new(),
-            files_read: 0,
-            bytes_read: 0,
-            complete: true,
-        });
-    };
-    Ok(probe_invocation_nonce_in(&claude_dir, nonce, budget))
+    let claude_dirs = resolve_claude_dirs()?;
+    Ok(probe_invocation_nonce_in(&claude_dirs, nonce, budget))
 }
 
 fn probe_invocation_nonce_in(
-    claude_dir: &Path,
+    claude_dirs: &[PathBuf],
     nonce: &str,
     budget: InvocationProbeBudget,
 ) -> ProviderInvocationProbe {
-    probe_recent_files(
-        nonce,
-        collect_invocation_entries(claude_dir),
-        budget,
-        claude_invocation_input,
-    )
+    let entries =
+        claude_dirs.iter().flat_map(|claude_dir| collect_invocation_entries(claude_dir)).collect();
+    probe_recent_files(nonce, entries, budget, claude_invocation_input)
 }
 
 fn collect_invocation_entries(claude_dir: &Path) -> Vec<FileScanEntry> {
@@ -184,15 +214,27 @@ fn transcript_source_id(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(test)]
 fn scan_for_sync_impl(
     claude_dir: &Path,
     context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
+    scan_for_sync_claimed(claude_dir, context, since_ts, include_events, &mut HashSet::new())
+}
+
+fn scan_for_sync_claimed(
+    claude_dir: &Path,
+    context: &AdapterSyncContext,
+    since_ts: Option<i64>,
+    include_events: bool,
+    claimed: &mut HashSet<String>,
+) -> anyhow::Result<SyncScanResult> {
     let mut indexes = load_session_indexes(claude_dir);
     let mut entries = collect_project_entries(claude_dir, &mut indexes);
     entries.extend(collect_transcript_entries(claude_dir));
+    claim_session_entries(&mut entries, claimed);
 
     file_scan::run_file_scan_with_options(
         context,
@@ -420,6 +462,7 @@ fn parse_claude_session_file(
         thread_role,
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
+        refresh_session_on_metadata_backfill: false,
     }))
 }
 
@@ -486,12 +529,15 @@ pub(crate) fn parse_conversation_jsonl(
 
         let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-        if msg_type == "custom-title"
-            && let Some(title) = v.get("customTitle").and_then(|t| t.as_str())
-        {
-            let trimmed = title.trim();
-            if !trimmed.is_empty() {
-                custom_title = Some(trimmed.to_string());
+        if matches!(msg_type, "custom-title" | "ai-title" | "title") {
+            let title = v
+                .get("customTitle")
+                .or_else(|| v.get("title"))
+                .and_then(|t| t.as_str())
+                .map(str::trim)
+                .filter(|title| !title.is_empty());
+            if let Some(title) = title {
+                custom_title = Some(title.to_string());
             }
             continue;
         }
@@ -1390,6 +1436,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_claude_session_prefers_ai_title_when_present() {
+        let root = temp_claude_root("ai-title");
+        let project = root.join("projects").join("-tmp-ai");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("ai-session.jsonl");
+        let lines = [
+            serde_json::json!({"type":"user","message":{"content":"start"},"timestamp":"2026-04-13T10:00:00Z"}),
+            serde_json::json!({"type":"ai-title","title":"Named by Claude"}),
+            serde_json::json!({"type":"assistant","message":{"content":"done"},"timestamp":"2026-04-13T10:00:01Z"}),
+        ];
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+        let raw = parse_claude_session_file(
+            FileScanEntry {
+                session_id: "ai-session".to_string(),
+                stat_target: path,
+                directory: None,
+            },
+            mtime,
+            &SessionIndexes::default(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(raw.custom_title.as_deref(), Some("Named by Claude"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn scan_for_sync_uses_project_sessions_index_summary() {
         let root = temp_claude_root("project-summary");
         let project = root.join("projects").join("-tmp-index");
@@ -1586,6 +1664,62 @@ mod tests {
     }
 
     #[test]
+    fn scan_for_sync_reparses_unchanged_session_for_ai_title_backfill() {
+        let root = temp_claude_root("ai-title-backfill");
+        let project = root.join("projects").join("-tmp-proj");
+        let path = write_user_jsonl(&project, "sess-ai-title", "hello");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", serde_json::json!({"type":"ai-title","title":"Named by Claude"}))
+            .unwrap();
+        drop(file);
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let store = setup_store();
+        store.insert_session(&make_existing_session("sess-ai-title", mtime, 1)).unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "claude-code",
+                "sess-ai-title",
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "claude-code",
+                "sess-ai-title",
+                &[],
+                EVENT_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+        store
+            .persist_topology_for_existing_session(
+                "claude-code",
+                "sess-ai-title",
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(1),
+                },
+            )
+            .unwrap();
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].custom_title.as_deref(), Some("Named by Claude"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn scan_for_sync_reparses_unchanged_session_with_stale_event_parser() {
         let root = temp_claude_root("event-parser-backfill");
         let project = root.join("projects").join("-tmp-proj");
@@ -1710,13 +1844,16 @@ mod tests {
         writeln!(file, "{call}").unwrap();
         writeln!(file, "{call}").unwrap();
 
-        let result =
-            probe_invocation_nonce_in(&root, "nonce-claude", InvocationProbeBudget::default());
+        let result = probe_invocation_nonce_in(
+            std::slice::from_ref(&root),
+            "nonce-claude",
+            InvocationProbeBudget::default(),
+        );
         assert!(result.complete);
         assert_eq!(result.source_ids, vec!["claude-session".to_string()]);
 
         let normal = probe_invocation_nonce_in(
-            &root,
+            std::slice::from_ref(&root),
             "normal nonce-claude reference",
             InvocationProbeBudget::default(),
         );
@@ -1746,12 +1883,73 @@ mod tests {
             writeln!(file, "{call}").unwrap();
         }
 
-        let result =
-            probe_invocation_nonce_in(&root, "nonce-shared", InvocationProbeBudget::default());
+        let result = probe_invocation_nonce_in(
+            std::slice::from_ref(&root),
+            "nonce-shared",
+            InvocationProbeBudget::default(),
+        );
         assert!(result.complete);
         assert_eq!(result.source_ids.len(), 2);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_shares_budget_across_roots() {
+        let first = temp_claude_root("invocation-probe-budget-first");
+        let second = temp_claude_root("invocation-probe-budget-second");
+        for (root, prefix) in [(&first, "first"), (&second, "second")] {
+            let project = root.join("projects").join("-tmp-probe");
+            for index in 0..40 {
+                write_user_jsonl(&project, &format!("{prefix}-{index}"), "ordinary");
+            }
+        }
+
+        let result = probe_invocation_nonce_in(
+            &[first.clone(), second.clone()],
+            "absent-nonce",
+            InvocationProbeBudget::default(),
+        );
+        assert!(result.files_read <= 64);
+        assert!(!result.complete);
+
+        let _ = fs::remove_dir_all(first);
+        let _ = fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn duplicate_session_ids_prefer_the_first_claude_root() {
+        let preferred = temp_claude_root("duplicate-preferred");
+        let fallback = temp_claude_root("duplicate-fallback");
+        write_user_jsonl(
+            &preferred.join("projects").join("-tmp-probe"),
+            "shared-session",
+            "preferred",
+        );
+        write_user_jsonl(
+            &fallback.join("projects").join("-tmp-probe"),
+            "shared-session",
+            "fallback",
+        );
+        let roots = [preferred.clone(), fallback.clone()];
+
+        let sessions = scan_claude_dirs(&roots).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages[0].content, "preferred");
+
+        let store = setup_store();
+        let result = scan_claude_dirs_for_sync(
+            &roots,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].messages[0].content, "preferred");
+
+        let _ = fs::remove_dir_all(preferred);
+        let _ = fs::remove_dir_all(fallback);
     }
 
     #[test]
