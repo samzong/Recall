@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
-use crate::adapters::paths::resolve_home_dir;
+use crate::adapters::paths::{self, resolve_home_dir};
 use crate::adapters::usage::usage_count;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
@@ -75,28 +75,13 @@ impl SourceAdapter for QwenAdapter {
 }
 
 fn resolve_qwen_runtime_dir() -> anyhow::Result<Option<PathBuf>> {
-    if let Some(dir) = env_path("QWEN_RUNTIME_DIR") {
+    if let Some(dir) = paths::env_path_dir("QWEN_RUNTIME_DIR") {
         return existing_dir(dir, "QWEN_RUNTIME_DIR not found, skipping Qwen Code");
     }
-    if let Some(dir) = env_path("QWEN_HOME") {
+    if let Some(dir) = paths::env_path_dir("QWEN_HOME") {
         return existing_dir(dir, "QWEN_HOME not found, skipping Qwen Code");
     }
     resolve_home_dir(".qwen", "~/.qwen not found, skipping Qwen Code")
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    let raw = std::env::var(name).ok().filter(|value| !value.is_empty())?;
-    expand_user_path(&raw)
-}
-
-fn expand_user_path(raw: &str) -> Option<PathBuf> {
-    if raw == "~" {
-        return dirs::home_dir();
-    }
-    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
-        return dirs::home_dir().map(|home| home.join(rest));
-    }
-    Some(PathBuf::from(raw))
 }
 
 fn existing_dir(dir: PathBuf, missing_message: &str) -> anyhow::Result<Option<PathBuf>> {
@@ -525,13 +510,6 @@ mod tests {
         .unwrap();
         assert_eq!(second.stats.parsed, 0);
         assert!(second.sessions.is_empty());
-    }
-
-    #[test]
-    fn expand_user_path_handles_home_and_absolute() {
-        let expanded = expand_user_path("~/.qwen").unwrap();
-        assert!(expanded.ends_with(".qwen"));
-        assert_eq!(expand_user_path("/tmp/qwen").unwrap(), PathBuf::from("/tmp/qwen"));
     }
 
     #[test]

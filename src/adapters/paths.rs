@@ -23,6 +23,29 @@ pub(crate) fn resolve_home_dir(
     Ok(Some(dir))
 }
 
+pub(crate) fn env_path_dir(name: &str) -> Option<PathBuf> {
+    let raw = std::env::var(name).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    expand_user_path(trimmed)
+}
+
+fn expand_user_path(raw: &str) -> Option<PathBuf> {
+    if raw == "~" {
+        return dirs::home_dir();
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        return dirs::home_dir().map(|home| home.join(rest));
+    }
+    Some(PathBuf::from(raw))
+}
+
+pub(crate) fn existing_dir(path: PathBuf) -> Option<PathBuf> {
+    path.is_dir().then_some(path)
+}
+
 pub(crate) fn file_uri_to_path(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("file://")?;
     let decoded = percent_decode(rest)?;
@@ -176,6 +199,13 @@ mod tests {
             "saoudrizwan.claude-dev",
         );
         assert_eq!(dirs, vec![oss]);
+    }
+
+    #[test]
+    fn expand_user_path_handles_home_and_absolute() {
+        assert!(expand_user_path("~/.qwen").unwrap().ends_with(".qwen"));
+        assert_eq!(expand_user_path("/tmp/qwen").unwrap(), PathBuf::from("/tmp/qwen"));
+        assert_eq!(expand_user_path("~").unwrap(), dirs::home_dir().unwrap());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -10,11 +11,10 @@ use walkdir::WalkDir;
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed};
-use crate::adapters::paths::resolve_home_dir;
+use crate::adapters::paths;
 use crate::adapters::usage::usage_count;
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-    first_timestamp,
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
 };
 use crate::types::{RawUsageEvent, Role};
 
@@ -49,10 +49,7 @@ impl SourceAdapter for KimiCodeAdapter {
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        let Some(sessions_dir) = resolve_kimi_dir()? else {
-            return Ok(vec![]);
-        };
-        scan_kimi_sessions(&sessions_dir)
+        scan_kimi_dirs(&resolve_kimi_dirs()?)
     }
 
     fn scan_for_sync(
@@ -61,42 +58,75 @@ impl SourceAdapter for KimiCodeAdapter {
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let Some(sessions_dir) = resolve_kimi_dir()? else {
-            return Ok(Some(SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            }));
-        };
-        let result = file_scan::run_file_scan_with_options_and_snapshot(
-            context,
-            since_ts,
-            kimi_scan_options(),
-            collect_session_entries(&sessions_dir),
-            kimi_session_snapshot,
-            parse_kimi_session_file,
-        )?;
-        Ok(Some(result))
+        Ok(Some(scan_kimi_dirs_for_sync(&resolve_kimi_dirs()?, context, since_ts)?))
     }
 }
 
-fn resolve_kimi_dir() -> anyhow::Result<Option<PathBuf>> {
-    resolve_home_dir(".kimi-code/sessions", "~/.kimi-code/sessions not found, skipping Kimi Code")
+fn scan_kimi_dirs(sessions_dirs: &[PathBuf]) -> anyhow::Result<Vec<RawSession>> {
+    let mut sessions = Vec::new();
+    let mut claimed = HashSet::new();
+    for sessions_dir in sessions_dirs {
+        sessions.extend(scan_kimi_session_entries_with_parser(
+            claim_session_entries(collect_session_entries(sessions_dir), &mut claimed),
+            parse_kimi_session_file,
+        )?);
+    }
+    Ok(sessions)
 }
 
-fn scan_kimi_sessions(sessions_dir: &Path) -> anyhow::Result<Vec<RawSession>> {
-    scan_kimi_sessions_with_parser(sessions_dir, parse_kimi_session_file)
+fn scan_kimi_dirs_for_sync(
+    sessions_dirs: &[PathBuf],
+    context: &AdapterSyncContext,
+    since_ts: Option<i64>,
+) -> anyhow::Result<SyncScanResult> {
+    let mut combined = SyncScanResult::default();
+    let mut claimed = HashSet::new();
+    for sessions_dir in sessions_dirs {
+        combined.absorb(file_scan::run_file_scan_with_options_and_snapshot(
+            context,
+            since_ts,
+            kimi_scan_options(),
+            claim_session_entries(collect_session_entries(sessions_dir), &mut claimed),
+            kimi_session_snapshot,
+            parse_kimi_session_file,
+        )?);
+    }
+    Ok(combined)
 }
 
-fn scan_kimi_sessions_with_parser<F>(
-    sessions_dir: &Path,
+fn claim_session_entries(
+    entries: Vec<FileScanEntry>,
+    claimed: &mut HashSet<String>,
+) -> Vec<FileScanEntry> {
+    entries.into_iter().filter(|entry| claimed.insert(entry.session_id.clone())).collect()
+}
+
+fn resolve_kimi_dirs() -> anyhow::Result<Vec<PathBuf>> {
+    if let Some(home) = paths::env_path_dir("KIMI_CODE_HOME") {
+        return Ok(paths::existing_dir(home.join("sessions")).into_iter().collect());
+    }
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    let mut dirs = Vec::new();
+    for relative in [".kimi-code/sessions", ".kimi/sessions"] {
+        if let Some(dir) = paths::existing_dir(home.join(relative)) {
+            dirs.push(dir);
+        }
+    }
+    if dirs.is_empty() {
+        warn!("~/.kimi-code/sessions not found, skipping Kimi Code");
+    }
+    Ok(dirs)
+}
+
+fn scan_kimi_session_entries_with_parser<F>(
+    entries: Vec<FileScanEntry>,
     parse_fn: F,
 ) -> anyhow::Result<Vec<RawSession>>
 where
     F: Fn(FileScanEntry, i64) -> anyhow::Result<Option<RawSession>>,
 {
     let mut sessions = Vec::new();
-    for entry in collect_session_entries(sessions_dir) {
+    for entry in entries {
         let Some(snapshot) = kimi_session_snapshot(&entry) else {
             continue;
         };
@@ -693,15 +723,51 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_kimi_fixture(root.path());
 
-        let sessions = scan_kimi_sessions_with_parser(root.path(), |entry, mtime_ms| {
-            let raw = parse_kimi_session_file(entry.clone(), mtime_ms)?;
-            append_wire_change(&entry.stat_target)?;
-            Ok(raw)
-        })
+        let sessions = scan_kimi_session_entries_with_parser(
+            collect_session_entries(root.path()),
+            |entry, mtime_ms| {
+                let raw = parse_kimi_session_file(entry.clone(), mtime_ms)?;
+                append_wire_change(&entry.stat_target)?;
+                Ok(raw)
+            },
+        )
         .unwrap();
 
         assert!(sessions.is_empty());
-        assert_eq!(scan_kimi_sessions(root.path()).unwrap().len(), 1);
+        assert_eq!(
+            scan_kimi_session_entries_with_parser(
+                collect_session_entries(root.path()),
+                parse_kimi_session_file,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_session_ids_prefer_the_first_kimi_root() {
+        let preferred = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        write_kimi_fixture(preferred.path());
+        let (_, fallback_wire) = write_kimi_fixture(fallback.path());
+        fs::write(&fallback_wire, fixture_wire().replace("fix the bug", "fallback")).unwrap();
+        let roots = [preferred.path().to_path_buf(), fallback.path().to_path_buf()];
+
+        let sessions = scan_kimi_dirs(&roots).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages[0].content, "fix the bug");
+
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let result = scan_kimi_dirs_for_sync(
+            &roots,
+            &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].messages[0].content, "fix the bug");
     }
 
     #[test]
@@ -776,7 +842,11 @@ mod tests {
         assert_eq!(result.sessions[0].updated_at, Some(state_mtime));
         assert_eq!(result.sessions[0].custom_title.as_deref(), Some("renamed"));
 
-        let sessions = scan_kimi_sessions(root.path()).unwrap();
+        let sessions = scan_kimi_session_entries_with_parser(
+            collect_session_entries(root.path()),
+            parse_kimi_session_file,
+        )
+        .unwrap();
         assert_eq!(sessions[0].updated_at, Some(state_mtime));
     }
 }

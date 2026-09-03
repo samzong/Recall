@@ -14,7 +14,7 @@ use crate::adapters::invocation_probe::{
     probe_recent_files,
 };
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
-use crate::adapters::paths::resolve_home_dir;
+use crate::adapters::paths::{self, resolve_home_dir};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
@@ -23,7 +23,7 @@ use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, R
 
 pub(crate) struct CodexAdapter;
 
-const USAGE_PARSER_VERSION: u32 = 5;
+const USAGE_PARSER_VERSION: u32 = 6;
 const EVENT_PARSER_VERSION: u32 = 4;
 const METADATA_PARSER_VERSION: u32 = 1;
 
@@ -110,6 +110,13 @@ fn open_url_command(url: String) -> ResumeCommand {
 }
 
 fn resolve_codex_dir() -> anyhow::Result<Option<PathBuf>> {
+    if let Some(dir) = paths::env_path_dir("CODEX_HOME") {
+        if dir.is_dir() {
+            return Ok(Some(dir));
+        }
+        debug!("CODEX_HOME not found, skipping Codex");
+        return Ok(None);
+    }
     resolve_home_dir(".codex", "~/.codex not found, skipping Codex")
 }
 
@@ -446,6 +453,7 @@ pub(crate) fn parse_codex_session_with_options(
     let mut forked_child_inherited_baseline: Option<CodexUsageTotals> = None;
     let mut forked_child_inherited_reported_total: Option<i64> = None;
     let mut last_visible_message_seq: Option<u32> = None;
+    let mut user_dedup = CodexUserDedup::default();
     let source_path = path.to_string_lossy().to_string();
 
     for item in jsonl_indexed(reader.lines()) {
@@ -575,9 +583,10 @@ pub(crate) fn parse_codex_session_with_options(
                                 && !text.is_empty()
                             {
                                 let ts = parse_timestamp(&v);
-                                last_visible_message_seq = push_codex_message(
+                                last_visible_message_seq = push_codex_user(
                                     &mut messages,
-                                    Role::User,
+                                    &mut user_dedup,
+                                    CodexUserStream::EventMsg,
                                     text.to_string(),
                                     ts,
                                 );
@@ -605,7 +614,18 @@ pub(crate) fn parse_codex_session_with_options(
                     let timestamp = parse_timestamp(&v);
                     let payload_type = payload.get("type").and_then(|t| t.as_str());
                     let role = payload.get("role").and_then(|r| r.as_str());
-                    if payload_type == Some("message") && role == Some("assistant") {
+                    if payload_type == Some("message") && role == Some("user") {
+                        let text = extract_content_array(payload.get("content"));
+                        if !text.is_empty() && !is_codex_injected_context(&text) {
+                            last_visible_message_seq = push_codex_user(
+                                &mut messages,
+                                &mut user_dedup,
+                                CodexUserStream::ResponseItem,
+                                text,
+                                timestamp,
+                            );
+                        }
+                    } else if payload_type == Some("message") && role == Some("assistant") {
                         let text = extract_content_array(payload.get("content"));
                         let message_seq = if text.is_empty() {
                             None
@@ -695,6 +715,7 @@ pub(crate) fn parse_codex_session_with_options(
         thread_role,
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
+        refresh_session_on_metadata_backfill: false,
     }))
 }
 
@@ -891,8 +912,10 @@ fn codex_content_has_visible_text(content: Option<&Value>) -> bool {
         return false;
     };
     items.iter().any(|item| {
-        matches!(item.get("type").and_then(Value::as_str), Some("text" | "output_text"))
-            && item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("text" | "output_text" | "input_text")
+        ) && item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
     })
 }
 
@@ -954,7 +977,7 @@ fn extract_content_array(content: Option<&Value>) -> String {
             let mut parts = Vec::new();
             for item in arr {
                 match item.get("type").and_then(|t| t.as_str()) {
-                    Some("text" | "output_text") => {
+                    Some("text" | "output_text" | "input_text") => {
                         if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                             parts.push(text.to_string());
                         }
@@ -1201,6 +1224,55 @@ fn apply_pending_codex_model(
 
 fn parse_timestamp(v: &Value) -> Option<i64> {
     rfc3339_ms(v.get("timestamp"))
+}
+
+const CODEX_INJECTED_CONTEXT_PREFIXES: &[&str] =
+    &["# AGENTS.md instructions", "<environment_context>", "<user_instructions>", "<INSTRUCTIONS>"];
+
+fn is_codex_injected_context(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        CODEX_INJECTED_CONTEXT_PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix))
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodexUserStream {
+    EventMsg,
+    ResponseItem,
+}
+
+#[derive(Default)]
+struct CodexUserDedup {
+    last_seq: Option<u32>,
+    streams_seen: u8,
+}
+
+fn push_codex_user(
+    messages: &mut Vec<RawMessage>,
+    dedup: &mut CodexUserDedup,
+    stream: CodexUserStream,
+    content: String,
+    timestamp: Option<i64>,
+) -> Option<u32> {
+    let stream_bit = match stream {
+        CodexUserStream::EventMsg => 1,
+        CodexUserStream::ResponseItem => 2,
+    };
+    if let Some(seq) = dedup.last_seq
+        && seq as usize + 1 == messages.len()
+        && messages
+            .get(seq as usize)
+            .is_some_and(|message| message.role == Role::User && message.content == content)
+        && dedup.streams_seen & stream_bit == 0
+    {
+        dedup.streams_seen |= stream_bit;
+        return Some(seq);
+    }
+    let seq = push_codex_message(messages, Role::User, content.clone(), timestamp);
+    dedup.last_seq = seq;
+    dedup.streams_seen = stream_bit;
+    seq
 }
 
 fn push_codex_message(
@@ -1484,6 +1556,225 @@ mod tests {
         assert_eq!(raw.events[0].message_seq, None);
         assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1:0"));
         assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call_empty"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_indexes_response_item_users_and_dedups_event_msg() {
+        let root = temp_codex_root("response-user");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2399";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-13T10:00:00Z",
+                "payload": {"id": uuid, "cwd": "/tmp/foo"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "fix the parser"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {"type": "user_message", "message": "fix the parser"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }
+            }),
+        ];
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+        assert_eq!(raw.messages.len(), 2);
+        assert_eq!(raw.messages[0].role, Role::User);
+        assert_eq!(raw.messages[0].content, "fix the parser");
+        assert_eq!(raw.messages[1].content, "ok");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_drops_injected_context_response_items() {
+        let root = temp_codex_root("injected-context");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2401";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let injected = [
+            "# AGENTS.md instructions for /tmp/foo\n\nalways run make check",
+            "<environment_context>\n  <cwd>/tmp/foo</cwd>\n</environment_context>",
+            "<user_instructions>\nbe terse\n</user_instructions>",
+            "wrapper\n<environment_context>\n  <cwd>/tmp/foo</cwd>\n</environment_context>",
+        ];
+        let mut lines = vec![serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "payload": {"id": uuid, "cwd": "/tmp/foo"}
+        })];
+        for text in injected {
+            lines.push(serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                }
+            }));
+        }
+        lines.push(serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:02Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "fix the parser"}]
+            }
+        }));
+        let body = lines.iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+        fs::write(&path, body).unwrap();
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+        let users: Vec<&str> = raw
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(users, vec!["fix the parser"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_keeps_repeated_user_turns() {
+        let root = temp_codex_root("repeat-user");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2400";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let mut lines = vec![serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "payload": {"id": uuid, "cwd": "/tmp/foo"}
+        })];
+        for turn in 0..3 {
+            lines.push(serde_json::json!({
+                "type": "response_item",
+                "timestamp": format!("2026-04-13T10:0{turn}:01Z"),
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }
+            }));
+            lines.push(serde_json::json!({
+                "type": "event_msg",
+                "timestamp": format!("2026-04-13T10:0{turn}:01Z"),
+                "payload": {"type": "user_message", "message": "continue"}
+            }));
+            lines.push(serde_json::json!({
+                "type": "response_item",
+                "timestamp": format!("2026-04-13T10:0{turn}:02Z"),
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": format!("step {turn}")}]
+                }
+            }));
+        }
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+        let users: Vec<&str> = raw
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(users, vec!["continue", "continue", "continue"]);
+        assert_eq!(raw.messages.len(), 6);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_keeps_same_text_from_separate_stream_turns() {
+        let root = temp_codex_root("separate-stream-turns");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2402";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-13T10:00:00Z",
+                "payload": {"id": uuid, "cwd": "/tmp/foo"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {"type": "user_message", "message": "continue"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "first"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:01:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:01:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "second"}]
+                }
+            }),
+        ];
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+        let users: Vec<&str> = raw
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(users, vec!["continue", "continue"]);
+        assert_eq!(raw.messages.len(), 4);
 
         let _ = fs::remove_dir_all(&root);
     }

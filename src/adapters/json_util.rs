@@ -20,7 +20,7 @@ pub(crate) fn jsonl_indexed(
 ) -> impl Iterator<Item = io::Result<(usize, Value)>> {
     lines.into_iter().enumerate().filter_map(|(index, line)| match line {
         Ok(line) => {
-            let trimmed = line.trim();
+            let trimmed = line.trim().trim_start_matches('\u{feff}');
             if trimmed.is_empty() {
                 None
             } else {
@@ -29,4 +29,17 @@ pub(crate) fn jsonl_indexed(
         }
         Err(error) => Some(Err(error)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jsonl_indexed_strips_utf8_bom() {
+        let lines = [Ok("\u{feff}{\"type\":\"user\"}".to_string())];
+        let items: Vec<_> = jsonl_indexed(lines).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].1.get("type").and_then(Value::as_str), Some("user"));
+    }
 }

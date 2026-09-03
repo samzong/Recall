@@ -207,6 +207,7 @@ pub(crate) struct RawSession {
     pub(crate) thread_role: Option<ThreadRole>,
     pub(crate) parent_links: Vec<ParentLink>,
     pub(crate) metadata_parser_version: Option<u32>,
+    pub(crate) refresh_session_on_metadata_backfill: bool,
 }
 
 impl RawSession {
@@ -236,6 +237,7 @@ impl RawSession {
             thread_role: None,
             parent_links: Vec::new(),
             metadata_parser_version: None,
+            refresh_session_on_metadata_backfill: false,
         }
     }
 
@@ -300,10 +302,24 @@ pub(crate) struct SyncScanStats {
     pub(crate) parsed: u32,
 }
 
+#[derive(Default)]
 pub(crate) struct SyncScanResult {
     pub(crate) sessions: Vec<RawSession>,
     pub(crate) stats: SyncScanStats,
     pub(crate) observations: Vec<SourceObservation>,
+}
+
+impl SyncScanResult {
+    pub(crate) fn absorb(&mut self, other: SyncScanResult) {
+        self.sessions.extend(other.sessions);
+        self.observations.extend(other.observations);
+        self.stats.skipped_sessions += other.stats.skipped_sessions;
+        self.stats.filtered_sessions += other.stats.filtered_sessions;
+        self.stats.unstable_sessions += other.stats.unstable_sessions;
+        self.stats.candidates += other.stats.candidates;
+        self.stats.rejected_before_parse += other.stats.rejected_before_parse;
+        self.stats.parsed += other.stats.parsed;
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -1,23 +1,27 @@
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::json_i64;
 use crate::adapters::paths::file_uri_to_path;
+use crate::adapters::sync_state::metadata_state_is_current_for_mtime;
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
+    RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter, SyncScanOutput,
+    SyncScanResult, first_timestamp,
 };
 use crate::types::Role;
 
 pub(crate) struct CopilotChatAdapter;
 
-const HOSTS: &[&str] = &["Code", "Code - Insiders"];
+const HOSTS: &[&str] = &["Code", "Code - Insiders", "VSCodium"];
+const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for CopilotChatAdapter {
     fn id(&self) -> &str {
@@ -45,17 +49,149 @@ impl SourceAdapter for CopilotChatAdapter {
         Ok(sessions)
     }
 
-    fn scan_for_sync(
+    fn scan_for_sync_output(
         &self,
         context: &AdapterSyncContext,
         since_ts: Option<i64>,
         _include_events: bool,
-    ) -> anyhow::Result<Option<SyncScanResult>> {
-        let entries = collect_chat_entries(&vscode_user_roots());
-        let result =
-            file_scan::run_file_scan(context, since_ts, entries, parse_chat_session_for_entry)?;
-        Ok(Some(result))
+        force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
+        Ok(Some(scan_chat_entries_for_sync(
+            collect_chat_entries(&vscode_user_roots()),
+            context,
+            since_ts,
+            force,
+        )?))
     }
+}
+
+fn scan_chat_entries_for_sync(
+    entries: Vec<FileScanEntry>,
+    context: &AdapterSyncContext,
+    since_ts: Option<i64>,
+    force: bool,
+) -> anyhow::Result<SyncScanOutput> {
+    let tombstones = RefCell::new(HashSet::new());
+    let scan = if force {
+        let mut result = SyncScanResult::default();
+        for entry in entries {
+            result.stats.candidates += 1;
+            let Some(snapshot) = file_scan::file_metadata_snapshot(&entry.stat_target) else {
+                result.stats.rejected_before_parse += 1;
+                continue;
+            };
+            let Some(mtime_ms) = snapshot.mtime_ms() else {
+                result.stats.rejected_before_parse += 1;
+                continue;
+            };
+            result.stats.parsed += 1;
+            let Some(parsed) =
+                parse_stable_chat_entry_with(entry, mtime_ms, snapshot, parse_chat_entry)?
+            else {
+                result.stats.unstable_sessions += 1;
+                continue;
+            };
+            if let Some(source_id) = parsed.other_provider {
+                tombstones.borrow_mut().insert(source_id);
+            }
+            if let Some(session) = parsed.session {
+                result.sessions.push(session);
+            }
+        }
+        result
+    } else {
+        let mut migration = SyncScanResult::default();
+        let mut current_entries = Vec::new();
+        let unstable = Cell::new(0);
+        for entry in entries {
+            let Some(snapshot) = file_scan::file_metadata_snapshot(&entry.stat_target) else {
+                current_entries.push(entry);
+                continue;
+            };
+            let Some(mtime_ms) = snapshot.mtime_ms() else {
+                current_entries.push(entry);
+                continue;
+            };
+            let needs_migration = context.session_meta().contains_key(&entry.session_id)
+                && !metadata_state_is_current_for_mtime(
+                    Some(METADATA_PARSER_VERSION),
+                    context.metadata_state().get(&entry.session_id).copied(),
+                    mtime_ms,
+                );
+            if !needs_migration {
+                current_entries.push(entry);
+                continue;
+            }
+            migration.stats.candidates += 1;
+            migration.stats.parsed += 1;
+            let Some(parsed) =
+                parse_stable_chat_entry_with(entry, mtime_ms, snapshot, parse_chat_entry)?
+            else {
+                migration.stats.unstable_sessions += 1;
+                continue;
+            };
+            if let Some(source_id) = parsed.other_provider {
+                tombstones.borrow_mut().insert(source_id);
+            }
+            if let Some(session) = parsed.session {
+                migration.sessions.push(session);
+            }
+        }
+        let mut result = file_scan::run_file_scan_with_options(
+            context,
+            since_ts,
+            file_scan::FileScanOptions {
+                metadata_parser_version: Some(METADATA_PARSER_VERSION),
+                ..Default::default()
+            },
+            current_entries,
+            |entry, mtime_ms| {
+                let Some(snapshot) = file_scan::file_metadata_snapshot(&entry.stat_target) else {
+                    unstable.set(unstable.get() + 1);
+                    return Ok(None);
+                };
+                let Some(parsed) =
+                    parse_stable_chat_entry_with(entry, mtime_ms, snapshot, parse_chat_entry)?
+                else {
+                    unstable.set(unstable.get() + 1);
+                    return Ok(None);
+                };
+                if let Some(source_id) = parsed.other_provider {
+                    tombstones.borrow_mut().insert(source_id);
+                }
+                Ok(parsed.session)
+            },
+        )?;
+        result.stats.unstable_sessions += unstable.get();
+        result.absorb(migration);
+        result
+    };
+    Ok(SyncScanOutput {
+        scan,
+        reconcile: Some(ReconcilePlan::ExactTombstones(tombstones.into_inner())),
+    })
+}
+
+fn parse_stable_chat_entry_with<F>(
+    entry: FileScanEntry,
+    mtime_ms: i64,
+    before: file_scan::FileMetadataSnapshot,
+    parse_fn: F,
+) -> anyhow::Result<Option<ParsedChatEntry>>
+where
+    F: FnOnce(FileScanEntry, i64) -> anyhow::Result<ParsedChatEntry>,
+{
+    let path = entry.stat_target.clone();
+    let source_id = entry.session_id.clone();
+    let parsed = parse_fn(entry, mtime_ms)?;
+    if file_scan::file_metadata_snapshot(&path).as_ref() != Some(&before) {
+        warn!(
+            "skipping unstable Copilot Chat session {source_id}: source file changed while parsing ({})",
+            path.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(parsed))
 }
 
 fn vscode_user_roots() -> Vec<PathBuf> {
@@ -69,6 +205,7 @@ fn collect_chat_entries(user_roots: &[PathBuf]) -> Vec<FileScanEntry> {
     let mut by_id: HashMap<String, FileScanEntry> = HashMap::new();
     for user_root in user_roots {
         collect_empty_window_entries(user_root, &mut by_id);
+        collect_transferred_entries(user_root, &mut by_id);
         collect_workspace_entries(user_root, &mut by_id);
     }
     by_id.into_values().collect()
@@ -76,6 +213,11 @@ fn collect_chat_entries(user_roots: &[PathBuf]) -> Vec<FileScanEntry> {
 
 fn collect_empty_window_entries(user_root: &Path, by_id: &mut HashMap<String, FileScanEntry>) {
     let dir = user_root.join("globalStorage").join("emptyWindowChatSessions");
+    collect_session_files(&dir, None, by_id);
+}
+
+fn collect_transferred_entries(user_root: &Path, by_id: &mut HashMap<String, FileScanEntry>) {
+    let dir = user_root.join("globalStorage").join("transferredChatSessions");
     collect_session_files(&dir, None, by_id);
 }
 
@@ -147,13 +289,33 @@ fn parse_chat_session_for_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
 ) -> anyhow::Result<Option<RawSession>> {
+    Ok(parse_chat_entry(entry, mtime_ms)?.session)
+}
+
+#[derive(Default)]
+struct ParsedChatEntry {
+    session: Option<RawSession>,
+    other_provider: Option<String>,
+}
+
+fn parse_chat_entry(entry: FileScanEntry, mtime_ms: i64) -> anyhow::Result<ParsedChatEntry> {
     let source_file_path = entry.stat_target.to_str().map(str::to_string);
     let Some(doc) = load_chat_document(&entry.stat_target) else {
-        return Ok(None);
+        return Ok(ParsedChatEntry::default());
     };
+    match classify_chat_provider(&doc) {
+        ChatProvider::Copilot => {}
+        ChatProvider::Other => {
+            return Ok(ParsedChatEntry {
+                other_provider: Some(entry.session_id),
+                ..Default::default()
+            });
+        }
+        ChatProvider::Unknown => return Ok(ParsedChatEntry::default()),
+    }
     let parsed = messages_from_doc(&doc);
     if parsed.messages.is_empty() {
-        return Ok(None);
+        return Ok(ParsedChatEntry::default());
     }
     let started_at = first_timestamp(parsed.started_at, &parsed.messages, &[], &[]).unwrap_or(0);
     let updated_at = Some(mtime_ms);
@@ -167,7 +329,8 @@ fn parse_chat_session_for_entry(
     );
     session.source_file_path = source_file_path;
     session.custom_title = parsed.custom_title;
-    Ok(Some(session))
+    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    Ok(ParsedChatEntry { session: Some(session), other_provider: None })
 }
 
 fn load_chat_document(path: &Path) -> Option<Value> {
@@ -198,19 +361,26 @@ fn replay_chat_jsonl(path: &Path) -> Option<Value> {
             return None;
         }
     };
+    let mut lines = BufReader::new(file).lines().map_while(Result::ok).enumerate().peekable();
     let mut doc = None;
-    for line in BufReader::new(file).lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => break,
-        };
-        let line = line.trim();
+    while let Some((index, line)) = lines.next() {
+        let is_last = lines.peek().is_none();
+        let line = line.trim().trim_start_matches('\u{feff}');
         if line.is_empty() {
             continue;
         }
         let event: Value = match serde_json::from_str(line) {
             Ok(event) => event,
-            Err(_) => break,
+            Err(_) => {
+                if !is_last {
+                    debug!(
+                        "skipping malformed copilot chat jsonl line {} in {}",
+                        index + 1,
+                        path.display()
+                    );
+                }
+                continue;
+            }
         };
         match json_i64(event.get("kind")).unwrap_or(-1) {
             0 => doc = event.get("v").cloned(),
@@ -220,6 +390,14 @@ fn replay_chat_jsonl(path: &Path) -> Option<Value> {
                 }
             }
             2 => {
+                if let Some(root) = doc.as_mut() {
+                    let values = event.get("v").and_then(Value::as_array);
+                    let truncate_to =
+                        json_i64(event.get("i")).and_then(|index| usize::try_from(index).ok());
+                    apply_push(root, event.get("k"), values, truncate_to);
+                }
+            }
+            3 => {
                 if let Some(root) = doc.as_mut() {
                     apply_delete(root, event.get("k"));
                 }
@@ -266,6 +444,67 @@ fn apply_set(root: &mut Value, path: Option<&Value>, value: Value) {
     }
     if let Some(last) = segs.last() {
         assign_last(current, last, value);
+    }
+}
+
+fn apply_push(
+    root: &mut Value,
+    path: Option<&Value>,
+    values: Option<&Vec<Value>>,
+    truncate_to: Option<usize>,
+) {
+    let Some(segs) = path_segs(path) else {
+        return;
+    };
+    if segs.is_empty() {
+        return;
+    }
+    let mut current = root;
+    for index in 0..segs.len() - 1 {
+        current = match get_or_create(current, &segs[index], Some(&segs[index + 1])) {
+            Some(next) => next,
+            None => return,
+        };
+    }
+    let Some(last) = segs.last() else {
+        return;
+    };
+    let slot = match last {
+        PathSeg::Key(key) => {
+            if !current.is_object() {
+                *current = Value::Object(Map::new());
+            }
+            let object = match current.as_object_mut() {
+                Some(object) => object,
+                None => return,
+            };
+            object.entry(key.clone()).or_insert_with(|| Value::Array(Vec::new()))
+        }
+        PathSeg::Index(index) => {
+            if !current.is_array() {
+                *current = Value::Array(Vec::new());
+            }
+            let array = match current.as_array_mut() {
+                Some(array) => array,
+                None => return,
+            };
+            while array.len() <= *index {
+                array.push(Value::Null);
+            }
+            &mut array[*index]
+        }
+    };
+    if slot.is_null() {
+        *slot = Value::Array(Vec::new());
+    }
+    let Some(array) = slot.as_array_mut() else {
+        return;
+    };
+    if let Some(len) = truncate_to {
+        array.truncate(len);
+    }
+    if let Some(values) = values {
+        array.extend(values.iter().cloned());
     }
 }
 
@@ -386,19 +625,16 @@ fn messages_from_doc(doc: &Value) -> ParsedChat {
         return ParsedChat { messages, custom_title, started_at };
     };
     for request in requests {
-        if request.get("hiddenFromTranscript").and_then(|value| value.as_bool()) == Some(true) {
+        if request.get("hiddenFromTranscript").and_then(|value| value.as_bool()) == Some(true)
+            || request.get("isHidden").and_then(|value| value.as_bool()) == Some(true)
+        {
             continue;
         }
         let timestamp = json_i64(request.get("timestamp"))
             .or_else(|| json_i64(request.get("responseTimestamp")));
-        if let Some(text) = request
-            .get("message")
-            .and_then(|message| message.get("text"))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            messages.push(RawMessage { role: Role::User, content: text.to_string(), timestamp });
+        let text = request_text(request.get("message"));
+        if !text.is_empty() {
+            messages.push(RawMessage { role: Role::User, content: text, timestamp });
         }
         let assistant = response_text(request.get("response"));
         if !assistant.is_empty() {
@@ -406,6 +642,69 @@ fn messages_from_doc(doc: &Value) -> ParsedChat {
         }
     }
     ParsedChat { messages, custom_title, started_at }
+}
+
+fn request_text(message: Option<&Value>) -> String {
+    let Some(message) = message else {
+        return String::new();
+    };
+    if let Some(text) = message.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+        return text.to_string();
+    }
+    if let Some(text) =
+        message.get("text").and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty())
+    {
+        return text.to_string();
+    }
+    let Some(parts) = message.get("parts").and_then(Value::as_array) else {
+        return String::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatProvider {
+    Copilot,
+    Other,
+    Unknown,
+}
+
+fn classify_chat_provider(session: &Value) -> ChatProvider {
+    let responder = session
+        .get("responderUsername")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    if responder.is_some_and(|name| name.eq_ignore_ascii_case("github copilot")) {
+        return ChatProvider::Copilot;
+    }
+    let mut saw_other = responder.is_some();
+    for id in session
+        .get("requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|request| {
+            request
+                .pointer("/agent/extensionId/value")
+                .or_else(|| request.pointer("/agent/extensionId"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if id.to_ascii_lowercase().starts_with("github.copilot") {
+            return ChatProvider::Copilot;
+        }
+        saw_other = true;
+    }
+    if saw_other { ChatProvider::Other } else { ChatProvider::Unknown }
 }
 
 fn response_text(response: Option<&Value>) -> String {
@@ -417,16 +716,18 @@ fn response_text(response: Option<&Value>) -> String {
         let Some(object) = item.as_object() else {
             continue;
         };
-        if object.get("kind").and_then(|value| value.as_str()).is_some() {
-            continue;
-        }
-        if let Some(text) = object
-            .get("value")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            parts.push(text.to_string());
+        match object.get("kind").and_then(|value| value.as_str()) {
+            None | Some("markdownContent") => {
+                if let Some(text) = object
+                    .get("value")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    parts.push(text.to_string());
+                }
+            }
+            _ => {}
         }
     }
     parts.join("\n")
@@ -506,7 +807,7 @@ mod tests {
         let path = root.join("sess-2.json");
         fs::write(
             &path,
-            r#"{"version":3,"sessionId":"sess-2","creationDate":1700000000000,"customTitle":"Old chat","requests":[{"timestamp":1700000001000,"message":{"text":"translate this"},"response":[{"kind":"toolInvocationSerialized","value":"read"},{"value":"done"}]}]}"#,
+            r#"{"version":3,"sessionId":"sess-2","creationDate":1700000000000,"customTitle":"Old chat","responderUsername":"GitHub Copilot","requests":[{"timestamp":1700000001000,"message":{"text":"translate this"},"response":[{"kind":"toolInvocationSerialized","value":"read"},{"value":"done"}]}]}"#,
         )
         .unwrap();
 
@@ -546,7 +847,7 @@ mod tests {
         write_jsonl(
             &path,
             &[
-                r#"{"kind":0,"v":{"version":3,"creationDate":1,"requests":[{"timestamp":2,"message":{"text":"keep"},"response":[{"value":"ok"}]}]}}"#,
+                r#"{"kind":0,"v":{"version":3,"creationDate":1,"responderUsername":"GitHub Copilot","requests":[{"timestamp":2,"message":{"text":"keep"},"response":[{"value":"ok"}]}]}}"#,
                 r#"{"kind":1,"k":["requests",0,"response""#,
             ],
         );
@@ -587,9 +888,200 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_kind_two_pushes_and_kind_three_deletes() {
+        let root = temp_root("push");
+        let path = root.join("sess-push.jsonl");
+        write_jsonl(
+            &path,
+            &[
+                r#"{"kind":0,"v":{"version":3,"responderUsername":"GitHub Copilot","requests":[{"timestamp":1,"message":{"text":"hello"},"response":[]}]}}"#,
+                r#"{"kind":2,"k":["requests",0,"response"],"v":[{"value":"Hi."}]}"#,
+                r#"{"kind":3,"k":["requests",0,"response",0]}"#,
+                r#"{"kind":2,"k":["requests",0,"response"],"v":[{"value":"Hello."}]}"#,
+            ],
+        );
+        let session = parse_chat_session_for_entry(
+            FileScanEntry {
+                session_id: "sess-push".to_string(),
+                stat_target: path,
+                directory: None,
+            },
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[1].content, "Hello.");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn markdown_content_parts_are_indexed() {
+        let doc = serde_json::json!({
+            "responderUsername": "GitHub Copilot",
+            "requests": [{
+                "message": {"text": "q"},
+                "response": [{"kind":"markdownContent","value":"answer"}]
+            }]
+        });
+        let parsed = messages_from_doc(&doc);
+        assert_eq!(parsed.messages[1].content, "answer");
+    }
+
+    #[test]
+    fn other_chat_providers_are_skipped() {
+        let root = temp_root("other");
+        let path = root.join("other.json");
+        fs::write(
+            &path,
+            r#"{"responderUsername":"Other Agent","requests":[{"message":{"text":"nope"},"response":[{"value":"nope"}]}]}"#,
+        )
+        .unwrap();
+        let session = parse_chat_session_for_entry(
+            FileScanEntry { session_id: "other".to_string(), stat_target: path, directory: None },
+            1,
+        )
+        .unwrap();
+        assert!(session.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_other_provider_is_distinct_from_unknown() {
+        let other = serde_json::json!({"responderUsername": "Other Agent"});
+        let unknown = serde_json::json!({"requests": [{"message": {"text": "hello"}}]});
+
+        assert_ne!(classify_chat_provider(&other), classify_chat_provider(&unknown));
+    }
+
+    #[test]
+    fn unstable_provider_file_produces_no_classification() {
+        let root = temp_root("unstable-provider");
+        let path = root.join("changing.json");
+        fs::write(&path, r#"{"responderUsername":"Other Agent","requests":[]}"#).unwrap();
+        let snapshot = file_scan::file_metadata_snapshot(&path).unwrap();
+        let mtime_ms = snapshot.mtime_ms().unwrap();
+        let parsed = parse_stable_chat_entry_with(
+            FileScanEntry {
+                session_id: "changing".to_string(),
+                stat_target: path.clone(),
+                directory: None,
+            },
+            mtime_ms,
+            snapshot,
+            |entry, mtime_ms| {
+                let parsed = parse_chat_entry(entry, mtime_ms)?;
+                fs::write(
+                    &path,
+                    r#"{"responderUsername":"GitHub Copilot","requests":[{"message":{"text":"changed"}}]}"#,
+                )?;
+                Ok(parsed)
+            },
+        )
+        .unwrap();
+        assert!(parsed.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_tombstones_only_explicit_other_provider_and_can_rebuild() {
+        let root = temp_root("reconcile");
+        let user = root.join("User");
+        let dir = user.join("globalStorage").join("emptyWindowChatSessions");
+        fs::create_dir_all(&dir).unwrap();
+        let other_path = dir.join("other.json");
+        fs::write(
+            &other_path,
+            r#"{"responderUsername":"Other Agent","requests":[{"message":{"text":"other"},"response":[{"value":"answer"}]}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("unknown.json"),
+            r#"{"requests":[{"message":{"text":"unknown"},"response":[{"value":"answer"}]}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("copilot.json"),
+            r#"{"responderUsername":"GitHub Copilot","requests":[{"message":{"text":"copilot"},"response":[{"value":"answer"}]}]}"#,
+        )
+        .unwrap();
+
+        let store = setup_store();
+        for source_id in ["other", "unknown"] {
+            store
+                .insert_session(&Session {
+                    id: format!("internal-{source_id}"),
+                    source: "copilot-chat".to_string(),
+                    source_id: source_id.to_string(),
+                    title: "existing".to_string(),
+                    directory: None,
+                    repo_remote: None,
+                    repo_slug: None,
+                    repo_name: None,
+                    started_at: 0,
+                    updated_at: file_scan::stat_mtime_ms(&dir.join(format!("{source_id}.json"))),
+                    message_count: 2,
+                    entrypoint: None,
+                    custom_title: None,
+                    summary: None,
+                    duration_minutes: None,
+                    source_file_path: None,
+                    is_import: false,
+                })
+                .unwrap();
+        }
+        let context = AdapterSyncContext::from_store_for_test(&store, "copilot-chat").unwrap();
+        let output = scan_chat_entries_for_sync(
+            collect_chat_entries(std::slice::from_ref(&user)),
+            &context,
+            Some(i64::MAX),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            output.reconcile,
+            Some(ReconcilePlan::ExactTombstones(ids)) if ids == HashSet::from(["other".to_string()])
+        ));
+        assert!(output.scan.sessions.is_empty());
+
+        fs::write(
+            &other_path,
+            r#"{"responderUsername":"GitHub Copilot","requests":[{"message":{"text":"restored"},"response":[{"value":"answer"}]}]}"#,
+        )
+        .unwrap();
+        let rebuilt = scan_chat_entries_for_sync(
+            collect_chat_entries(&[user]),
+            &AdapterSyncContext::empty_for_test("copilot-chat"),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            rebuilt.reconcile,
+            Some(ReconcilePlan::ExactTombstones(ids)) if ids.is_empty()
+        ));
+        assert!(rebuilt.scan.sessions.iter().any(|session| session.source_id == "other"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_includes_transferred_chat_sessions() {
+        let root = temp_root("xfer");
+        let user = root.join("User");
+        write_jsonl(
+            &user.join("globalStorage").join("transferredChatSessions").join("moved.jsonl"),
+            &sample_jsonl_lines(),
+        );
+        let entries = collect_chat_entries(&[user]);
+        assert!(entries.iter().any(|entry| entry.session_id == "moved"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn hidden_requests_are_skipped() {
         let doc = serde_json::json!({
             "creationDate": 1,
+            "responderUsername": "GitHub Copilot",
             "requests": [{
                 "hiddenFromTranscript": true,
                 "timestamp": 2,

@@ -9,14 +9,14 @@ use tracing::debug;
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
-use crate::adapters::paths::resolve_home_dir;
+use crate::adapters::paths::{self, resolve_home_dir};
 use crate::adapters::{
     InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
     SyncScanOutput, SyncScanResult, SyncScanStats,
 };
 use crate::types::{RawUsageEvent, Role};
 
-const USAGE_PARSER_VERSION: u32 = 1;
+const USAGE_PARSER_VERSION: u32 = 2;
 
 pub(crate) struct GrokAdapter;
 
@@ -110,6 +110,14 @@ struct PendingAgentMessage {
 }
 
 fn resolve_grok_sessions_dir() -> anyhow::Result<Option<PathBuf>> {
+    if let Some(home) = paths::env_path_dir("GROK_HOME") {
+        let sessions = home.join("sessions");
+        if sessions.is_dir() {
+            return Ok(Some(sessions));
+        }
+        debug!("GROK_HOME/sessions not found, skipping Grok");
+        return Ok(None);
+    }
     resolve_home_dir(".grok/sessions", "~/.grok/sessions not found, skipping Grok")
 }
 
@@ -136,7 +144,7 @@ fn scan_for_sync_impl(
         }
         SyncScanResult { sessions, stats, observations: Vec::new() }
     } else {
-        file_scan::run_file_scan_with_options(
+        file_scan::run_file_scan_with_options_and_snapshot(
             context,
             since_ts,
             FileScanOptions {
@@ -145,10 +153,35 @@ fn scan_for_sync_impl(
                 metadata_parser_version: None,
             },
             entries,
+            grok_session_snapshot,
             |entry, mtime_ms| parse_grok_session_for_entry(&entry, mtime_ms),
         )?
     };
     Ok(SyncScanOutput { scan: result, reconcile: Some(reconcile) })
+}
+
+#[derive(PartialEq)]
+struct GrokSessionSnapshot {
+    updates: Option<file_scan::FileMetadataSnapshot>,
+    chat_history: Option<file_scan::FileMetadataSnapshot>,
+    summary: Option<file_scan::FileMetadataSnapshot>,
+}
+
+fn grok_session_snapshot(
+    entry: &FileScanEntry,
+) -> Option<file_scan::FileScanSnapshot<GrokSessionSnapshot>> {
+    let session_dir = entry.stat_target.parent()?;
+    let snapshot = GrokSessionSnapshot {
+        updates: file_scan::file_metadata_snapshot(&session_dir.join("updates.jsonl")),
+        chat_history: file_scan::file_metadata_snapshot(&session_dir.join("chat_history.jsonl")),
+        summary: file_scan::file_metadata_snapshot(&session_dir.join("summary.json")),
+    };
+    let effective_mtime_ms = [&snapshot.updates, &snapshot.chat_history, &snapshot.summary]
+        .into_iter()
+        .flatten()
+        .filter_map(file_scan::FileMetadataSnapshot::mtime_ms)
+        .max()?;
+    Some(file_scan::FileScanSnapshot::new(effective_mtime_ms, snapshot))
 }
 
 fn collect_grok_entries(sessions_dir: &Path) -> (Vec<FileScanEntry>, ReconcilePlan) {
@@ -260,15 +293,21 @@ fn collect_grok_workspace(
         };
 
         let updates_path = session_path.join("updates.jsonl");
-        match fs::metadata(&updates_path) {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => continue,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+        let chat_history_path = session_path.join("chat_history.jsonl");
+        let has_updates = match fs::metadata(&updates_path) {
+            Ok(metadata) if metadata.is_file() => true,
+            Ok(_) => false,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
             Err(err) => {
-                issues.push(InventoryIssue { path: updates_path, category: err.kind() });
+                issues.push(InventoryIssue { path: updates_path.clone(), category: err.kind() });
                 continue;
             }
+        };
+        let has_history = chat_history_path.is_file();
+        if !has_updates && !has_history {
+            continue;
         }
+        let stat_target = if has_updates { updates_path } else { chat_history_path };
 
         let (summary_directory, session_kind) = load_summary_probe(&session_path);
         if matches!(session_kind.as_deref(), Some("subagent" | "subagent_resume")) {
@@ -277,7 +316,7 @@ fn collect_grok_workspace(
         }
 
         let directory = summary_directory.or(fallback_directory.clone());
-        entries.push(FileScanEntry { session_id, stat_target: updates_path, directory });
+        entries.push(FileScanEntry { session_id, stat_target, directory });
     }
 }
 
@@ -335,37 +374,52 @@ fn parse_grok_session_for_entry(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("grok updates path has no parent"))?;
 
-    let summary = match load_grok_summary(session_dir, &entry.session_id) {
-        Ok(summary) => summary,
-        Err(err) => {
-            debug!("failed to read Grok summary for {}: {err}", entry.session_id);
-            return Ok(None);
+    let summary = load_grok_summary(session_dir, &entry.session_id).unwrap_or(GrokSummary {
+        session_id: entry.session_id.clone(),
+        directory: entry.directory.clone(),
+        started_at: 0,
+        updated_at: None,
+        current_model_id: None,
+    });
+
+    let updates_path = session_dir.join("updates.jsonl");
+    let (mut messages, mut usage_events) = if updates_path.is_file() {
+        match parse_grok_updates(&updates_path) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                debug!("failed to parse Grok updates {}: {err}", updates_path.display());
+                (Vec::new(), Vec::new())
+            }
         }
+    } else {
+        (Vec::new(), Vec::new())
     };
 
-    let (messages, mut usage_events) = match parse_grok_updates(&entry.stat_target) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            debug!("failed to parse Grok updates {}: {err}", entry.stat_target.display());
-            return Ok(None);
+    let usage_source_path = updates_path.to_str().map(str::to_string);
+    let mut source_path = usage_source_path.clone();
+    if messages.is_empty() {
+        let chat_history_path = session_dir.join("chat_history.jsonl");
+        if chat_history_path.is_file() {
+            messages = parse_chat_history_fallback(&chat_history_path);
+            source_path = chat_history_path.to_str().map(str::to_string);
         }
-    };
+    }
 
     if messages.is_empty() {
         return Ok(None);
     }
 
     let fallback_model = summary.current_model_id.clone().unwrap_or_else(|| "grok".to_string());
-    let source_path = entry.stat_target.to_str().map(str::to_string);
     for event in &mut usage_events {
         if event.model.is_empty() {
             event.model = fallback_model.clone();
         }
-        event.source_path = source_path.clone();
+        event.source_path = usage_source_path.clone();
     }
 
     let started_at =
         summary.started_at.max(messages.first().and_then(|message| message.timestamp).unwrap_or(0));
+    let started_at = if started_at == 0 { mtime_ms } else { started_at };
 
     let mut session = RawSession::search_only(
         summary.session_id,
@@ -413,6 +467,82 @@ fn load_grok_summary(session_dir: &Path, fallback_id: &str) -> anyhow::Result<Gr
     let started_at = rfc3339_ms(doc.get("created_at")).unwrap_or(0);
     let updated_at = rfc3339_ms(doc.get("updated_at"));
     Ok(GrokSummary { session_id, directory, started_at, updated_at, current_model_id })
+}
+
+fn parse_chat_history_fallback(path: &Path) -> Vec<RawMessage> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    for item in jsonl_indexed(BufReader::new(file).lines()) {
+        let Ok((_, val)) = item else {
+            continue;
+        };
+        let msg_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+        match msg_type {
+            "user" => {
+                if val.get("synthetic_reason").is_some() || val.get("prompt_index").is_none() {
+                    continue;
+                }
+                let text = grok_history_text(val.get("content"));
+                let queries = extract_user_queries(&text);
+                let body = if queries.is_empty() { text } else { queries.join("\n\n") };
+                if body.is_empty() {
+                    continue;
+                }
+                messages.push(RawMessage { role: Role::User, content: body, timestamp: None });
+            }
+            "assistant" => {
+                let text = grok_history_text(val.get("content"));
+                if text.is_empty() {
+                    continue;
+                }
+                messages.push(RawMessage { role: Role::Assistant, content: text, timestamp: None });
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
+fn grok_history_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .or_else(|| item.get("text").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Value::Object(object)) => {
+            object.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+fn extract_user_queries(text: &str) -> Vec<String> {
+    const OPEN: &str = "<user_query>";
+    const CLOSE: &str = "</user_query>";
+    let mut blocks = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        rest = &rest[start + OPEN.len()..];
+        let Some(end) = rest.find(CLOSE) else {
+            break;
+        };
+        let body = rest[..end].trim();
+        if !body.is_empty() {
+            blocks.push(body.to_string());
+        }
+        rest = &rest[end + CLOSE.len()..];
+    }
+    blocks
 }
 
 fn parse_grok_updates(
@@ -816,6 +946,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_grok_session_falls_back_to_chat_history_without_losing_usage_provenance() {
+        let root = temp_grok_root("history");
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let session_dir = root.join("%2Ftmp").join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+        let updates_path = session_dir.join("updates.jsonl");
+        fs::write(
+            &updates_path,
+            r#"{"timestamp":10,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}},"_meta":{"totalTokens":100,"promptId":"prompt-a"}}}
+"#,
+        )
+        .unwrap();
+        let chat_history_path = session_dir.join("chat_history.jsonl");
+        fs::write(
+            &chat_history_path,
+            r#"{"type":"user","prompt_index":0,"content":"<user_query>hello from history</user_query>"}
+{"type":"user","synthetic_reason":"env","content":"ignore"}
+{"type":"assistant","content":"hi"}
+"#,
+        )
+        .unwrap();
+        let session = parse_grok_session_for_entry(
+            &FileScanEntry {
+                session_id: session_id.to_string(),
+                stat_target: updates_path.clone(),
+                directory: None,
+            },
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "hello from history");
+        assert_eq!(session.messages[1].content, "hi");
+        assert_eq!(session.source_file_path.as_deref(), chat_history_path.to_str());
+        assert_eq!(session.usage_events.len(), 1);
+        assert_eq!(session.usage_events[0].source_path.as_deref(), updates_path.to_str());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn collect_grok_entries_reads_summary_cwd() {
         let root = temp_grok_root("collect");
         let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
@@ -1045,6 +1216,84 @@ mod tests {
             forced.reconcile,
             Some(ReconcilePlan::ExactTombstones(ids)) if ids.is_empty()
         ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_notices_chat_history_growth() {
+        let root = temp_grok_root("history-growth");
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let updates_path = write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            session_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z"}"#,
+            "",
+        );
+        let session_dir = updates_path.parent().unwrap().to_path_buf();
+        let chat_history_path = session_dir.join("chat_history.jsonl");
+        fs::write(
+            &chat_history_path,
+            "{\"type\":\"user\",\"prompt_index\":0,\"content\":\"hey\"}\n",
+        )
+        .unwrap();
+
+        let mtime = grok_session_snapshot(&FileScanEntry {
+            session_id: session_id.to_string(),
+            stat_target: updates_path.clone(),
+            directory: None,
+        })
+        .unwrap()
+        .effective_mtime_ms();
+        let store = setup_store();
+        store.insert_session(&make_existing_session(session_id, mtime, 1)).unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "grok",
+                session_id,
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.scan.sessions.len(), 0);
+        assert_eq!(result.scan.stats.skipped_sessions, 1);
+
+        fs::write(
+            &chat_history_path,
+            "{\"type\":\"user\",\"prompt_index\":0,\"content\":\"hey\"}\n{\"type\":\"user\",\"prompt_index\":1,\"content\":\"again\"}\n",
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&chat_history_path)
+            .unwrap()
+            .set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis((mtime + 60_000) as u64),
+            )
+            .unwrap();
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result.scan.sessions.len(),
+            1,
+            "appending to chat_history.jsonl must re-parse the session"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

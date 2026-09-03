@@ -10,6 +10,7 @@ use walkdir::WalkDir;
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
+use crate::adapters::paths;
 use crate::adapters::usage::{disjoint_output_and_reasoning, usage_count};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
@@ -93,16 +94,28 @@ struct ParsedOmpSession {
 
 fn resolve_omp_session_dirs() -> anyhow::Result<Vec<PathBuf>> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    let session_dirs = resolve_omp_session_dirs_from(&home);
+    let session_dirs = resolve_omp_session_dirs_from(
+        &home,
+        paths::env_path_dir("XDG_DATA_HOME"),
+        paths::env_path_dir("PI_CODING_AGENT_SESSION_DIR"),
+    );
     if session_dirs.is_empty() {
         debug!("OMP session directory not found, skipping OMP");
     }
     Ok(session_dirs)
 }
 
-fn resolve_omp_session_dirs_from(home: &Path) -> Vec<PathBuf> {
+fn resolve_omp_session_dirs_from(
+    home: &Path,
+    xdg_data_home: Option<PathBuf>,
+    session_dir_override: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut session_dirs = Vec::new();
     let mut seen = HashSet::new();
+
+    if let Some(session_dir) = session_dir_override {
+        push_existing_unique_dir(&mut session_dirs, &mut seen, session_dir);
+    }
 
     push_existing_unique_dir(
         &mut session_dirs,
@@ -120,6 +133,18 @@ fn resolve_omp_session_dirs_from(home: &Path) -> Vec<PathBuf> {
                     &mut seen,
                     path.join("agent").join("sessions"),
                 );
+            }
+        }
+    }
+
+    let xdg_root = xdg_data_home.unwrap_or_else(|| home.join(".local").join("share"));
+    push_existing_unique_dir(&mut session_dirs, &mut seen, xdg_root.join("omp").join("sessions"));
+    let xdg_profiles = xdg_root.join("omp").join("profiles");
+    if let Ok(entries) = fs::read_dir(xdg_profiles) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                push_existing_unique_dir(&mut session_dirs, &mut seen, path.join("sessions"));
             }
         }
     }
@@ -275,6 +300,7 @@ fn parse_omp_session_file(
         thread_role: Some(ThreadRole::Primary),
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
+        refresh_session_on_metadata_backfill: false,
     }))
 }
 
@@ -757,7 +783,7 @@ mod tests {
         fs::create_dir_all(&default_sessions).unwrap();
         fs::create_dir_all(&profile_sessions).unwrap();
 
-        let dirs = resolve_omp_session_dirs_from(&root);
+        let dirs = resolve_omp_session_dirs_from(&root, None, None);
         assert!(dirs.iter().any(|dir| dir == &default_sessions));
         assert!(dirs.iter().any(|dir| dir == &profile_sessions));
 
@@ -774,7 +800,7 @@ mod tests {
         fs::create_dir_all(&pi_sessions).unwrap();
         fs::create_dir_all(&custom_sessions).unwrap();
 
-        assert_eq!(resolve_omp_session_dirs_from(&root), vec![omp_sessions]);
+        assert_eq!(resolve_omp_session_dirs_from(&root, None, None), vec![omp_sessions]);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -782,7 +808,21 @@ mod tests {
     #[test]
     fn resolve_session_dirs_skips_missing_roots() {
         let root = temp_omp_root("missing");
-        assert!(resolve_omp_session_dirs_from(&root).is_empty());
+        assert!(resolve_omp_session_dirs_from(&root, None, None).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_session_dirs_includes_xdg_omp_sessions() {
+        let root = temp_omp_root("xdg");
+        let xdg = root.join("xdg-data");
+        let xdg_sessions = xdg.join("omp").join("sessions");
+        let profile_sessions = xdg.join("omp").join("profiles").join("work").join("sessions");
+        fs::create_dir_all(&xdg_sessions).unwrap();
+        fs::create_dir_all(&profile_sessions).unwrap();
+        let dirs = resolve_omp_session_dirs_from(&root, Some(xdg), None);
+        assert!(dirs.iter().any(|dir| dir == &xdg_sessions));
+        assert!(dirs.iter().any(|dir| dir == &profile_sessions));
         let _ = fs::remove_dir_all(&root);
     }
 

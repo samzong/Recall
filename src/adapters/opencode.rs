@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, params_from_iter};
+use rusqlite::{Connection, OpenFlags, params_from_iter, types::ValueRef};
 use serde_json::Value;
 use tracing::debug;
+
+use crate::adapters::json_util::rfc3339_ms;
+use crate::adapters::paths;
 
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
@@ -13,9 +16,9 @@ use crate::adapters::{
 use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
-pub(crate) const USAGE_PARSER_VERSION: u32 = 1;
-pub(crate) const EVENT_PARSER_VERSION: u32 = 4;
-pub(crate) const METADATA_PARSER_VERSION: u32 = 1;
+pub(crate) const USAGE_PARSER_VERSION: u32 = 2;
+pub(crate) const EVENT_PARSER_VERSION: u32 = 5;
+pub(crate) const METADATA_PARSER_VERSION: u32 = 2;
 const PARSED_PART_FILTER_SQL: &str = "
     json_valid(m.data)
     AND json_valid(p.data)
@@ -103,10 +106,32 @@ impl SourceAdapter for OpenCodeAdapter {
 }
 
 fn open_opencode_db() -> anyhow::Result<Option<Connection>> {
-    let db_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("no home dir"))?
-        .join(".local/share/opencode/opencode.db");
-    open_readonly(&db_path)
+    for db_path in opencode_db_candidates() {
+        if let Some(conn) = open_readonly(&db_path)? {
+            return Ok(Some(conn));
+        }
+    }
+    Ok(None)
+}
+
+fn opencode_db_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(explicit) = paths::env_path_dir("OPENCODE_SQLITE_DB") {
+        out.push(explicit);
+    }
+    if let Some(home) = dirs::home_dir() {
+        out.push(home.join(".local/share/opencode/opencode.db"));
+        out.push(home.join(".config/opencode/opencode.db"));
+    }
+    if let Some(data) = dirs::data_local_dir() {
+        out.push(data.join("opencode/opencode.db"));
+    }
+    if let Some(config) = dirs::config_dir() {
+        out.push(config.join("opencode/opencode.db"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|path| seen.insert(path.clone()));
+    out
 }
 
 pub(crate) fn open_readonly(db_path: &Path) -> anyhow::Result<Option<Connection>> {
@@ -129,42 +154,17 @@ pub(crate) fn scan_with_options(
     include_events: bool,
     options: ScanOptions,
 ) -> anyhow::Result<Vec<RawSession>> {
-    let sessions = load_session_rows(conn, None)?;
+    let (sessions, _) = load_session_rows(conn, None)?;
     scan_session_messages(conn, sessions, include_events, options)
 }
 
-fn count_filtered_sessions(conn: &Connection, since_ts: Option<i64>) -> anyhow::Result<u32> {
-    let Some(cutoff) = since_ts else {
-        return Ok(0);
-    };
-
-    conn.query_row(
-        "SELECT COUNT(*)
-         FROM session
-         WHERE COALESCE(time_updated, time_created) < ?1",
-        rusqlite::params![cutoff],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|count| count as u32)
-    .map_err(Into::into)
-}
-
-fn load_session_rows(conn: &Connection, since_ts: Option<i64>) -> anyhow::Result<Vec<SessionRow>> {
-    let sql = if since_ts.is_some() {
-        "SELECT id, directory, time_created, time_updated, title
-         FROM session
-         WHERE COALESCE(time_updated, time_created) >= ?1"
-    } else {
-        "SELECT id, directory, time_created, time_updated, title FROM session"
-    };
-
-    let mut stmt = conn.prepare(sql)?;
-    let rows = if let Some(cutoff) = since_ts {
-        stmt.query_map(rusqlite::params![cutoff], map_session_row)?
-    } else {
-        stmt.query_map([], map_session_row)?
-    };
-
+fn load_session_rows(
+    conn: &Connection,
+    since_ts: Option<i64>,
+) -> anyhow::Result<(Vec<SessionRow>, u32)> {
+    let mut stmt =
+        conn.prepare("SELECT id, directory, time_created, time_updated, title FROM session")?;
+    let rows = stmt.query_map([], map_session_row)?;
     let mut sessions = Vec::new();
     for row in rows {
         match row {
@@ -172,17 +172,57 @@ fn load_session_rows(conn: &Connection, since_ts: Option<i64>) -> anyhow::Result
             Err(err) => debug!("skipping malformed OpenCode session row: {err}"),
         }
     }
-    Ok(sessions)
+    let Some(cutoff) = since_ts else {
+        return Ok((sessions, 0));
+    };
+    let before = sessions.len();
+    sessions.retain(|row| row.time_updated.unwrap_or(row.time_created) >= cutoff);
+    let filtered = (before - sessions.len()) as u32;
+    Ok((sessions, filtered))
 }
 
 fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
         id: row.get(0)?,
         directory: row.get(1)?,
-        time_created: row.get(2)?,
-        time_updated: row.get(3)?,
+        time_created: sqlite_millis(row, 2)?.unwrap_or(0),
+        time_updated: sqlite_millis(row, 3)?,
         title: row.get(4)?,
     })
+}
+
+fn sqlite_millis(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<i64>> {
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Integer(value) => Ok(Some(normalize_opencode_ts(value))),
+        ValueRef::Real(value) => Ok(Some(normalize_opencode_ts(value as i64))),
+        ValueRef::Text(bytes) => {
+            let text = std::str::from_utf8(bytes).unwrap_or("").trim();
+            Ok(parse_opencode_text_millis(text))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_opencode_text_millis(text: &str) -> Option<i64> {
+    if let Ok(value) = text.parse::<i64>() {
+        return Some(normalize_opencode_ts(value));
+    }
+    if let Some(timestamp) = rfc3339_ms(Some(&Value::String(text.to_string()))) {
+        return Some(timestamp);
+    }
+    ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"]
+        .into_iter()
+        .find_map(|format| chrono::NaiveDateTime::parse_from_str(text, format).ok())
+        .map(|timestamp| timestamp.and_utc().timestamp_millis())
+}
+
+fn normalize_opencode_ts(value: i64) -> i64 {
+    if (1_000_000_000..1_000_000_000_000).contains(&value.abs()) {
+        value.saturating_mul(1000)
+    } else {
+        value
+    }
 }
 
 fn scan_session_messages(
@@ -229,6 +269,7 @@ fn scan_session_messages(
         raw.custom_title =
             session.title.map(|title| title.trim().to_string()).filter(|title| !title.is_empty());
         raw.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+        raw.refresh_session_on_metadata_backfill = true;
         raw_sessions.push(if include_events {
             raw.with_events(events, EVENT_PARSER_VERSION)
         } else {
@@ -263,12 +304,14 @@ fn load_event_chunk(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, Option<i64>>(3)?,
+            sqlite_millis(row, 3)?,
         ))
     })?;
+    let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.sort_by_key(|row| row.3);
 
     for row in rows {
-        let (session_id, part_id, part_data, timestamp) = row?;
+        let (session_id, part_id, part_data, timestamp) = row;
         let events = session_events.entry(session_id).or_default();
         let part_events = parse_part_events(&part_id, &part_data, timestamp, events.len() as u32);
         events.extend(part_events);
@@ -435,12 +478,14 @@ fn load_message_chunk(
         let session_id: String = row.get(0)?;
         let role: Option<String> = row.get(1)?;
         let part_data: String = row.get(2)?;
-        let timestamp: Option<i64> = row.get(3)?;
+        let timestamp = sqlite_millis(row, 3)?;
         Ok((session_id, role, part_data, timestamp))
     })?;
+    let mut msg_rows = msg_rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    msg_rows.sort_by_key(|row| row.3);
 
     for row in msg_rows {
-        let (session_id, role_str, part_data, timestamp) = row?;
+        let (session_id, role_str, part_data, timestamp) = row;
         let Some(role) = parse_role(role_str.as_deref()) else {
             continue;
         };
@@ -483,12 +528,14 @@ fn load_usage_chunk(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
+            sqlite_millis(row, 3)?.unwrap_or(0),
         ))
     })?;
+    let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.sort_by_key(|row| row.3);
 
     for row in rows {
-        let (message_id, session_id, data, timestamp) = row?;
+        let (message_id, session_id, data, timestamp) = row;
         let events = session_usage_events.entry(session_id).or_default();
         if let Some(event) = parse_usage_event(&message_id, &data, timestamp, events.len() as u32) {
             events.push(event);
@@ -660,8 +707,7 @@ pub(crate) fn scan_for_sync_conn_with_options(
     include_events: bool,
     options: ScanOptions,
 ) -> anyhow::Result<SyncScanResult> {
-    let filtered_sessions = count_filtered_sessions(conn, since_ts)?;
-    let sessions = load_session_rows(conn, since_ts)?;
+    let (sessions, filtered_sessions) = load_session_rows(conn, since_ts)?;
     let existing = context.session_meta();
     let usage_state = context.usage_state();
     let event_state = context.event_state();
@@ -840,6 +886,285 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn map_session_row_parses_iso_text_timestamps() {
+        let path =
+            std::env::temp_dir().join(format!("recall-opencode-iso-{}.db", uuid::Uuid::new_v4()));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                directory TEXT,
+                time_created TEXT,
+                time_updated TEXT
+            );
+            CREATE TABLE message (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                time_created INTEGER
+            );
+            CREATE TABLE part (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('iso-1', 'Test', '/tmp/project', '2026-04-13T10:00:00Z', '2026-04-13T10:01:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (session_id, data, time_created)
+             VALUES ('iso-1', '{\"role\":\"user\"}', 1)",
+            [],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO part (message_id, data) VALUES (?1, '{\"type\":\"text\",\"text\":\"hello\"}')",
+            rusqlite::params![message_id],
+        )
+        .unwrap();
+        let sessions = scan(&conn, false).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].started_at,
+            rfc3339_ms(Some(&Value::String("2026-04-13T10:00:00Z".into()))).unwrap()
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scan_parses_sqlite_current_timestamp_defaults() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                directory TEXT,
+                time_created TEXT DEFAULT CURRENT_TIMESTAMP,
+                time_updated TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE message (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                time_created TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE part (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            INSERT INTO session (id, title, directory)
+            VALUES ('sqlite-ts', 'Test', '/tmp/project');
+            INSERT INTO message (session_id, data)
+            VALUES ('sqlite-ts', '{"role":"user"}');
+            INSERT INTO part (message_id, data)
+            VALUES (last_insert_rowid(), '{"type":"text","text":"hello"}');
+            "#,
+        )
+        .unwrap();
+
+        let sessions = scan(&conn, false).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].started_at > 0);
+        assert!(sessions[0].messages[0].timestamp.is_some_and(|timestamp| timestamp > 0));
+    }
+
+    #[test]
+    fn text_message_timestamps_do_not_abort_the_scan() {
+        let path =
+            std::env::temp_dir().join(format!("recall-opencode-txt-{}.db", uuid::Uuid::new_v4()));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                directory TEXT,
+                time_created TEXT,
+                time_updated TEXT
+            );
+            CREATE TABLE message (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                time_created TEXT
+            );
+            CREATE TABLE part (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('txt-1', 'Test', '/tmp/project', '2026-04-13T10:00:00Z', '2026-04-13T10:01:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (session_id, data, time_created)
+             VALUES ('txt-1', '{\"role\":\"user\"}', '2026-04-13T10:00:30Z')",
+            [],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO part (message_id, data) VALUES (?1, '{\"type\":\"text\",\"text\":\"hello\"}')",
+            rusqlite::params![message_id],
+        )
+        .unwrap();
+
+        let sessions = scan(&conn, false).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages.len(), 1);
+        assert_eq!(
+            sessions[0].messages[0].timestamp,
+            rfc3339_ms(Some(&Value::String("2026-04-13T10:00:30Z".into())))
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn since_cutoff_compares_normalized_second_granularity_timestamps() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "recent", 1_800_000_000, 1_800_000_000, "hello");
+        insert_session_with_message(&conn, "old", 1_600_000_000, 1_600_000_000, "hello");
+
+        let cutoff = 1_700_000_000_000;
+        let (kept, filtered) = load_session_rows(&conn, Some(cutoff)).unwrap();
+        assert_eq!(kept.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), vec!["recent"]);
+        assert_eq!(filtered, 1);
+
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mixed_timestamp_representations_are_sequenced_after_normalization() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                directory TEXT,
+                time_created INTEGER,
+                time_updated INTEGER
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                time_created INTEGER
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                data TEXT NOT NULL
+            );
+            INSERT INTO session VALUES ('mixed', 'Mixed', '/tmp/project', 1700000000000, 1800000000000);
+            INSERT INTO message VALUES ('later', 'mixed', '{"role":"assistant","providerID":"p","modelID":"m","tokens":{"input":3}}', 1800000000);
+            INSERT INTO message VALUES ('middle', 'mixed', '{"role":"assistant","providerID":"p","modelID":"m","tokens":{"input":2}}', 1750000000000);
+            INSERT INTO message VALUES ('earlier', 'mixed', '{"role":"assistant","providerID":"p","modelID":"m","tokens":{"input":1}}', '2023-11-14 22:13:20');
+            INSERT INTO part VALUES ('later-text', 'later', '{"type":"text","text":"later"}');
+            INSERT INTO part VALUES ('middle-text', 'middle', '{"type":"text","text":"middle"}');
+            INSERT INTO part VALUES ('earlier-text', 'earlier', '{"type":"text","text":"earlier"}');
+            INSERT INTO part VALUES ('later-tool', 'later', '{"type":"tool-invocation","toolName":"read","input":{}}');
+            INSERT INTO part VALUES ('middle-tool', 'middle', '{"type":"tool-invocation","toolName":"read","input":{}}');
+            INSERT INTO part VALUES ('earlier-tool', 'earlier', '{"type":"tool-invocation","toolName":"read","input":{}}');
+            "#,
+        )
+        .unwrap();
+
+        let sessions = scan(&conn, true).unwrap();
+        let session = &sessions[0];
+        assert_eq!(
+            session.messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
+            vec!["earlier", "middle", "later"]
+        );
+        assert_eq!(
+            session.usage_events.iter().map(|event| event.event_key.as_str()).collect::<Vec<_>>(),
+            vec!["message:earlier", "message:middle", "message:later"]
+        );
+        assert_eq!(
+            session
+                .events
+                .iter()
+                .filter_map(|event| event.source_event_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["earlier-tool", "middle-tool", "later-tool"]
+        );
+    }
+
+    #[test]
+    fn timestamp_parser_migration_refreshes_existing_messages() {
+        let (path, conn) = setup_opencode_db();
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('migrate', 'Test', '/tmp/project', 1800000000000, 1800000000000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data, time_created)
+             VALUES (1, 'migrate', '{\"role\":\"user\"}', 1800000000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data)
+             VALUES (1, 1, '{\"type\":\"text\",\"text\":\"hello\"}')",
+            [],
+        )
+        .unwrap();
+
+        let mut old = RawSession::search_only(
+            "migrate",
+            Some("/tmp/project".to_string()),
+            1_800_000_000_000,
+            Some(1_800_000_000_000),
+            None,
+            vec![RawMessage {
+                role: Role::User,
+                content: "hello".to_string(),
+                timestamp: Some(1_800_000_000),
+            }],
+        )
+        .with_usage(Vec::new(), USAGE_PARSER_VERSION)
+        .with_events(Vec::new(), EVENT_PARSER_VERSION);
+        old.metadata_parser_version = Some(METADATA_PARSER_VERSION - 1);
+        let store =
+            crate::sync::persist_raw_session_for_conformance(setup_store(), "opencode", old)
+                .unwrap();
+        let session = store.get_session_by_source_id("opencode", "migrate").unwrap().unwrap();
+        assert_eq!(store.get_messages(&session.id).unwrap()[0].timestamp, Some(1_800_000_000));
+
+        let fresh = scan(&conn, true).unwrap().pop().unwrap();
+        assert!(fresh.refresh_session_on_metadata_backfill);
+        let store =
+            crate::sync::persist_raw_session_for_conformance(store, "opencode", fresh).unwrap();
+        let session = store.get_session_by_source_id("opencode", "migrate").unwrap().unwrap();
+        assert_eq!(store.get_messages(&session.id).unwrap()[0].timestamp, Some(1_800_000_000_000));
+
+        drop(conn);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1041,7 +1366,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = load_session_rows(&conn, None).unwrap();
+        let (sessions, _) = load_session_rows(&conn, None).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "good");
         drop(conn);
@@ -1088,7 +1413,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = load_session_rows(&conn, None).unwrap();
+        let (sessions, _) = load_session_rows(&conn, None).unwrap();
         let raw = scan_session_messages(&conn, sessions, false, ScanOptions::default()).unwrap();
         let titled = raw.iter().find(|session| session.source_id == "s1").unwrap();
         let blank = raw.iter().find(|session| session.source_id == "s2").unwrap();
@@ -1134,7 +1459,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = load_session_rows(&conn, None).unwrap();
+        let (sessions, _) = load_session_rows(&conn, None).unwrap();
         let raw = scan_session_messages(&conn, sessions, true, ScanOptions::default()).unwrap();
 
         assert_eq!(raw.len(), 1);
@@ -1184,7 +1509,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = load_session_rows(&conn, None).unwrap();
+        let (sessions, _) = load_session_rows(&conn, None).unwrap();
         let raw = scan_session_messages(&conn, sessions, true, ScanOptions::default()).unwrap();
 
         assert_eq!(raw.len(), 1);

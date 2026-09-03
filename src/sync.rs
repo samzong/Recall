@@ -753,7 +753,8 @@ impl SyncJob {
                 });
                 let content_changed = old.message_count != msg_count
                     || metadata_changed
-                    || (raw.updated_at.is_some() && raw.updated_at != old.updated_at);
+                    || (raw.updated_at.is_some() && raw.updated_at != old.updated_at)
+                    || (raw.refresh_session_on_metadata_backfill && metadata_backfill_needed);
                 match decide_existing_session_action(
                     self.options.usage_only,
                     self.options.backfill_events,
