@@ -520,7 +520,7 @@ mod tests {
                 > event_ordinal("event-99999-ccc.json").unwrap()
         );
         assert!(
-            "event-100000-ddd.json".to_string() < "event-99999-ccc.json".to_string(),
+            "event-100000-ddd.json" < "event-99999-ccc.json",
             "lex order would invert 100000 vs 99999"
         );
         let session =
