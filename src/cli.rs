@@ -179,6 +179,9 @@ enum ShareCommands {
     },
 }
 
+const MCP_AGENT_HELP: &str =
+    "Target host: claude, codex, or cursor-agent. Repeat for multiple hosts. Use '*' for all.";
+
 #[derive(Subcommand)]
 enum McpCommands {
     #[command(about = "Print the Recall MCP server capabilities and tools")]
@@ -190,7 +193,7 @@ enum McpCommands {
     Install {
         #[arg(
             long = "agent",
-            help = "Target host: claude or codex. Repeat for multiple hosts. Use '*' for all."
+            help = MCP_AGENT_HELP
         )]
         agents: Vec<String>,
         #[arg(long, help = "Print host commands without running them")]
@@ -202,7 +205,7 @@ enum McpCommands {
     Uninstall {
         #[arg(
             long = "agent",
-            help = "Target host: claude or codex. Repeat for multiple hosts. Use '*' for all."
+            help = MCP_AGENT_HELP
         )]
         agents: Vec<String>,
         #[arg(long, help = "Print host commands without running them")]
