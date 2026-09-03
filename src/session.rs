@@ -355,6 +355,7 @@ pub(crate) fn run_session_list(
             time_range,
             scope: scope.clone(),
             thread_role,
+            excluded_session_id: None,
         };
         let results = engine.hybrid_search_page(
             query,

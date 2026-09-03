@@ -9,6 +9,10 @@ use walkdir::WalkDir;
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::invocation_probe::{
+    InvocationProbeBudget, ProviderInvocationProbe, is_discovery_tool, nonce_matches_input,
+    probe_recent_files,
+};
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
@@ -107,6 +111,168 @@ fn open_url_command(url: String) -> ResumeCommand {
 
 fn resolve_codex_dir() -> anyhow::Result<Option<PathBuf>> {
     resolve_home_dir(".codex", "~/.codex not found, skipping Codex")
+}
+
+pub(crate) fn probe_invocation_nonce(
+    nonce: &str,
+    budget: InvocationProbeBudget,
+) -> anyhow::Result<ProviderInvocationProbe> {
+    let Some(codex_dir) = resolve_codex_dir()? else {
+        return Ok(ProviderInvocationProbe {
+            source_ids: Vec::new(),
+            files_read: 0,
+            bytes_read: 0,
+            complete: true,
+        });
+    };
+    Ok(probe_invocation_nonce_in(&codex_dir, nonce, budget))
+}
+
+fn probe_invocation_nonce_in(
+    codex_dir: &Path,
+    nonce: &str,
+    budget: InvocationProbeBudget,
+) -> ProviderInvocationProbe {
+    let sessions_dir = codex_dir.join("sessions");
+    let archived_dir = codex_dir.join("archived_sessions");
+    probe_recent_files(
+        nonce,
+        collect_codex_entries(&[&sessions_dir, &archived_dir]),
+        budget,
+        codex_invocation_input,
+    )
+}
+
+fn codex_invocation_input(value: &Value, nonce: &str) -> anyhow::Result<bool> {
+    let Some(payload) = value.get("payload") else {
+        return Ok(false);
+    };
+    if value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && payload.get("type").and_then(Value::as_str) == Some("item_completed")
+    {
+        let Some(item) = payload.get("item") else {
+            return Ok(false);
+        };
+        return Ok(item.get("type").and_then(Value::as_str) == Some("McpToolCall")
+            && item.get("tool").and_then(Value::as_str).is_some_and(is_discovery_tool)
+            && item.get("arguments").is_some_and(|input| nonce_matches_input(input, nonce)));
+    }
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return Ok(false);
+    }
+    if !matches!(
+        payload.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+    ) {
+        return Ok(false);
+    }
+    let Some(name) = payload.get("name").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    if payload.get("type").and_then(Value::as_str) == Some("custom_tool_call") && name == "exec" {
+        return Ok(payload
+            .get("input")
+            .and_then(Value::as_str)
+            .is_some_and(|input| codex_tool_wrapper_matches(input, nonce)));
+    }
+    if !is_discovery_tool(name) {
+        return Ok(false);
+    }
+    let Some(input) = payload.get("arguments").or_else(|| payload.get("input")) else {
+        return Ok(false);
+    };
+    match input {
+        Value::String(input) => {
+            let input: Value = serde_json::from_str(input)?;
+            Ok(nonce_matches_input(&input, nonce))
+        }
+        input => Ok(nonce_matches_input(input, nonce)),
+    }
+}
+
+fn codex_tool_wrapper_matches(input: &str, nonce: &str) -> bool {
+    let Some(tool_start) = input.find("tools.") else {
+        return false;
+    };
+    let tool = &input[tool_start + "tools.".len()..];
+    let name_end = tool
+        .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .unwrap_or(tool.len());
+    let name = &tool[..name_end];
+    if !is_discovery_tool(name) {
+        return false;
+    }
+    let Some(call) = tool[name_end..].trim_start().strip_prefix('(') else {
+        return false;
+    };
+    let Some(arguments) = call_arguments(call) else {
+        return false;
+    };
+    string_property_matches(arguments, "invocation_nonce", nonce)
+}
+
+fn call_arguments(input: &str) -> Option<&str> {
+    let mut depth = 1_usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in input.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&input[..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn string_property_matches(input: &str, property: &str, expected: &str) -> bool {
+    input.match_indices(property).any(|(start, _)| {
+        let property_end = start + property.len();
+        let before = input[..start].chars().next_back();
+        let after = input[property_end..].chars().next();
+        if before.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+            || after.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return false;
+        }
+        let Some(value) = input[property_end..].trim_start().strip_prefix(':') else {
+            return false;
+        };
+        json_string(value.trim_start()).as_deref() == Some(expected)
+    })
+}
+
+fn json_string(input: &str) -> Option<String> {
+    if !input.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, character) in input.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return serde_json::from_str(&input[..=index]).ok();
+        }
+    }
+    None
 }
 
 fn scan_for_sync_impl(
@@ -1920,6 +2086,123 @@ mod tests {
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].source_file_path.as_deref(), path.to_str());
         assert_eq!(result.stats.skipped_sessions, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_accepts_only_discovery_tool_input_and_deduplicates_a_session() {
+        let root = temp_codex_root("invocation-probe");
+        let sessions_dir = root.join("sessions");
+        let uuid = "019c9c4f-a462-7cc1-99a5-4ab521648c91";
+        let path = write_codex_rollout(&sessions_dir, uuid, "normal nonce-codex reference");
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "mcp__recall__search_sessions",
+                "arguments": serde_json::json!({
+                    "query": "history",
+                    "invocation_nonce": "nonce-codex"
+                }).to_string()
+            }
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{call}").unwrap();
+        writeln!(file, "{call}").unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "server": "recall",
+                        "tool": "search_sessions",
+                        "arguments": {
+                            "query": "history",
+                            "invocation_nonce": "nonce-codex"
+                        }
+                    }
+                }
+            })
+        )
+        .unwrap();
+
+        let result =
+            probe_invocation_nonce_in(&root, "nonce-codex", InvocationProbeBudget::default());
+        assert!(result.complete);
+        assert_eq!(result.source_ids, vec![uuid.to_string()]);
+
+        let normal = probe_invocation_nonce_in(
+            &root,
+            "normal nonce-codex reference",
+            InvocationProbeBudget::default(),
+        );
+        assert!(normal.complete);
+        assert!(normal.source_ids.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_rejects_cross_session_nonce_reuse() {
+        let root = temp_codex_root("invocation-probe-multiple");
+        let sessions_dir = root.join("sessions");
+        for uuid in ["019c9c4f-a462-7cc1-99a5-4ab521648c91", "019c9c4f-a462-7cc1-99a5-4ab521648c92"]
+        {
+            let path = write_codex_rollout(&sessions_dir, uuid, "ordinary");
+            let call = serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "mcp__recall__list_recent_sessions",
+                    "input": {"invocation_nonce": "nonce-shared"}
+                }
+            });
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            writeln!(file, "{call}").unwrap();
+        }
+
+        let result =
+            probe_invocation_nonce_in(&root, "nonce-shared", InvocationProbeBudget::default());
+        assert!(result.complete);
+        assert_eq!(result.source_ids.len(), 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_accepts_codex_tool_wrapper_before_completion_event() {
+        let root = temp_codex_root("invocation-probe-wrapper");
+        let sessions_dir = root.join("sessions");
+        let uuid = "019c9c4f-a462-7cc1-99a5-4ab521648c91";
+        let path = write_codex_rollout(&sessions_dir, uuid, "ordinary");
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "const r = await tools.mcp__recall__search_sessions({\n  query: \"history\",\n  invocation_nonce: \"nonce-wrapper\"\n});\ntext(r);"
+            }
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{call}").unwrap();
+
+        let result =
+            probe_invocation_nonce_in(&root, "nonce-wrapper", InvocationProbeBudget::default());
+        assert!(result.complete);
+        assert_eq!(result.source_ids, vec![uuid.to_string()]);
+        assert!(!codex_tool_wrapper_matches(
+            "const r = await tools.exec_command({cmd: `tools.mcp__recall__search_sessions({invocation_nonce: \\\"nonce-wrapper\\\"})`});",
+            "nonce-wrapper"
+        ));
+        assert!(!codex_tool_wrapper_matches(
+            "const r = await tools.mcp__recall__search_sessions({query: \"history\"}); text(\"nonce-wrapper\");",
+            "nonce-wrapper"
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -515,6 +515,7 @@ impl Store {
             None,
             TimeRange::All,
             &ProjectScope::Global,
+            None,
             limit,
         )
     }
@@ -524,6 +525,7 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
         scope: &ProjectScope,
+        excluded_session_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Session>> {
         let mut sql = format!(
@@ -534,6 +536,11 @@ impl Store {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
         apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, scope);
+        if let Some(excluded_session_id) = excluded_session_id {
+            sql.push_str(&format!(" AND s.id != ?{param_idx}"));
+            params.push(Box::new(excluded_session_id.to_string()));
+            param_idx += 1;
+        }
         sql.push_str(&format!(
             " ORDER BY COALESCE(updated_at, started_at) DESC, started_at DESC, source ASC, source_id ASC LIMIT ?{param_idx}"
         ));
@@ -1197,7 +1204,13 @@ mod topology_tests {
         );
 
         let mut ids = store
-            .list_recent_sessions_for_search_scope(None, TimeRange::All, &ProjectScope::Global, 100)
+            .list_recent_sessions_for_search_scope(
+                None,
+                TimeRange::All,
+                &ProjectScope::Global,
+                None,
+                100,
+            )
             .unwrap()
             .into_iter()
             .map(|s| s.source_id)
@@ -1251,6 +1264,7 @@ mod topology_tests {
                 None,
                 TimeRange::Today,
                 &ProjectScope::Global,
+                None,
                 100,
             )
             .unwrap()

@@ -47,7 +47,13 @@ pub(crate) fn run_search(
     let scope = store.resolve_scope(project_filter, repo_filter)?.announce();
     let embedding = query_embedding(&store, query, |message| println!("{message}"))?;
 
-    let filters = SearchFilters { sources: resolved_source, time_range, scope, thread_role: None };
+    let filters = SearchFilters {
+        sources: resolved_source,
+        time_range,
+        scope,
+        thread_role: None,
+        excluded_session_id: None,
+    };
 
     let results = engine.hybrid_search(query, embedding.as_deref(), &filters, 20, 3)?;
 

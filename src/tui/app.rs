@@ -428,6 +428,7 @@ impl App {
                 source_ids.as_deref(),
                 self.time_filter,
                 &self.scope,
+                None,
                 200,
             )
             .unwrap_or_default();
@@ -2130,6 +2131,7 @@ impl App {
             time_range: self.time_filter,
             scope: self.scope.clone(),
             thread_role: None,
+            excluded_session_id: None,
         }
     }
 

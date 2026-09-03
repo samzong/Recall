@@ -12,6 +12,7 @@ pub(crate) mod file_scan;
 pub(crate) mod gemini;
 pub(crate) mod goose;
 pub(crate) mod grok;
+pub(crate) mod invocation_probe;
 pub(crate) mod json_util;
 pub(crate) mod kilo;
 pub(crate) mod kimi_code;

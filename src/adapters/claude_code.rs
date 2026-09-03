@@ -10,6 +10,10 @@ use walkdir::WalkDir;
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::invocation_probe::{
+    InvocationProbeBudget, ProviderInvocationProbe, is_discovery_tool, nonce_matches_input,
+    probe_recent_files,
+};
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
@@ -101,6 +105,83 @@ fn load_session_indexes(claude_dir: &Path) -> SessionIndexes {
 
 fn resolve_claude_dir() -> anyhow::Result<Option<PathBuf>> {
     resolve_home_dir(".claude", "~/.claude not found, skipping Claude Code")
+}
+
+pub(crate) fn probe_invocation_nonce(
+    nonce: &str,
+    budget: InvocationProbeBudget,
+) -> anyhow::Result<ProviderInvocationProbe> {
+    let Some(claude_dir) = resolve_claude_dir()? else {
+        return Ok(ProviderInvocationProbe {
+            source_ids: Vec::new(),
+            files_read: 0,
+            bytes_read: 0,
+            complete: true,
+        });
+    };
+    Ok(probe_invocation_nonce_in(&claude_dir, nonce, budget))
+}
+
+fn probe_invocation_nonce_in(
+    claude_dir: &Path,
+    nonce: &str,
+    budget: InvocationProbeBudget,
+) -> ProviderInvocationProbe {
+    probe_recent_files(
+        nonce,
+        collect_invocation_entries(claude_dir),
+        budget,
+        claude_invocation_input,
+    )
+}
+
+fn collect_invocation_entries(claude_dir: &Path) -> Vec<FileScanEntry> {
+    let mut entries = Vec::new();
+    for root in [claude_dir.join("projects"), claude_dir.join("transcripts")] {
+        if !root.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+                || !path.is_file()
+            {
+                continue;
+            }
+            let Some(session_id) = transcript_source_id(path) else {
+                continue;
+            };
+            entries.push(FileScanEntry {
+                session_id,
+                stat_target: path.to_path_buf(),
+                directory: None,
+            });
+        }
+    }
+    entries
+}
+
+fn claude_invocation_input(value: &Value, nonce: &str) -> anyhow::Result<bool> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return Ok(false);
+    }
+    let Some(content) =
+        value.get("message").and_then(|message| message.get("content")).and_then(Value::as_array)
+    else {
+        return Ok(false);
+    };
+    Ok(content.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("tool_use")
+            && item.get("name").and_then(Value::as_str).is_some_and(is_discovery_tool)
+            && item.get("input").is_some_and(|input| nonce_matches_input(input, nonce))
+    }))
+}
+
+fn transcript_source_id(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_string)
 }
 
 fn scan_for_sync_impl(
@@ -200,9 +281,8 @@ fn collect_project_entries(claude_dir: &Path, indexes: &mut SessionIndexes) -> V
             if !file_path.is_file() {
                 continue;
             }
-            let session_id = match file_path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => continue,
+            let Some(session_id) = transcript_source_id(file_path) else {
+                continue;
             };
 
             let meta_cwd = indexes.live.get(&session_id).and_then(|m| m.cwd.clone());
@@ -270,9 +350,8 @@ fn collect_transcript_entries(claude_dir: &Path) -> Vec<FileScanEntry> {
         if !path.is_file() {
             continue;
         }
-        let session_id = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => continue,
+        let Some(session_id) = transcript_source_id(path) else {
+            continue;
         };
 
         entries.push(FileScanEntry {
@@ -1256,6 +1335,69 @@ mod tests {
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "sess-fresh");
         assert_eq!(result.stats.skipped_sessions, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_accepts_only_discovery_tool_input_and_deduplicates_a_session() {
+        let root = temp_claude_root("invocation-probe");
+        let project = root.join("projects").join("-tmp-probe");
+        let path = write_user_jsonl(&project, "claude-session", "normal nonce-claude reference");
+        let call = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "name": "mcp__recall__list_recent_sessions",
+                    "input": {"invocation_nonce": "nonce-claude"}
+                }]
+            }
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{call}").unwrap();
+        writeln!(file, "{call}").unwrap();
+
+        let result =
+            probe_invocation_nonce_in(&root, "nonce-claude", InvocationProbeBudget::default());
+        assert!(result.complete);
+        assert_eq!(result.source_ids, vec!["claude-session".to_string()]);
+
+        let normal = probe_invocation_nonce_in(
+            &root,
+            "normal nonce-claude reference",
+            InvocationProbeBudget::default(),
+        );
+        assert!(normal.complete);
+        assert!(normal.source_ids.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_reports_multiple_source_sessions_without_guessing() {
+        let root = temp_claude_root("invocation-probe-multiple");
+        let project = root.join("projects").join("-tmp-probe");
+        for session_id in ["claude-one", "claude-two"] {
+            let path = write_user_jsonl(&project, session_id, "ordinary");
+            let call = serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "mcp__recall__search_sessions",
+                        "input": {"query": "history", "invocation_nonce": "nonce-shared"}
+                    }]
+                }
+            });
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            writeln!(file, "{call}").unwrap();
+        }
+
+        let result =
+            probe_invocation_nonce_in(&root, "nonce-shared", InvocationProbeBudget::default());
+        assert!(result.complete);
+        assert_eq!(result.source_ids.len(), 2);
 
         let _ = fs::remove_dir_all(&root);
     }

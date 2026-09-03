@@ -178,6 +178,7 @@ pub(crate) fn run_search(query: &str) -> Result<()> {
         time_range: TimeRange::All,
         scope: ProjectScope::Global,
         thread_role: None,
+        excluded_session_id: None,
     };
 
     let t_search = Instant::now();
@@ -321,6 +322,7 @@ where
         time_range: TimeRange::All,
         scope: ProjectScope::Global,
         thread_role: None,
+        excluded_session_id: None,
     };
     let mut report = EvalReport { total: entries.len(), ..Default::default() };
 
