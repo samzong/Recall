@@ -207,6 +207,10 @@ fn update_cursor_config(path: &Path, mutate: impl FnOnce(&mut Value) -> Result<(
     write_cursor_config_file(path, &config)
 }
 
+fn uses_non_stdio_transport(entry: &Map<String, Value>) -> bool {
+    entry.contains_key("url") || entry.get("type").is_some_and(|transport| transport != "stdio")
+}
+
 fn write_cursor_config(path: &Path, bin: &str) -> Result<()> {
     update_cursor_config(path, |config| {
         let servers = config
@@ -222,6 +226,12 @@ fn write_cursor_config(path: &Path, bin: &str) -> Result<()> {
             .or_insert_with(|| Value::Object(Map::new()))
             .as_object_mut()
             .context("invalid ~/.cursor/mcp.json: mcpServers.recall must be an object")?;
+        if uses_non_stdio_transport(entry) {
+            bail!(
+                "cannot install cursor-agent: ~/.cursor/mcp.json mcpServers.recall uses a non-stdio transport"
+            );
+        }
+        entry.insert("type".to_string(), Value::String("stdio".to_string()));
         entry.insert("command".to_string(), Value::String(bin.to_string()));
         entry.insert("args".to_string(), serde_json::json!([SERVER_ARG]));
         Ok(())
@@ -234,6 +244,15 @@ fn remove_cursor_config(path: &Path) -> Result<()> {
     }
     update_cursor_config(path, |config| {
         if let Some(servers) = config.get_mut("mcpServers").and_then(Value::as_object_mut) {
+            if servers
+                .get(SERVER_NAME)
+                .and_then(Value::as_object)
+                .is_some_and(uses_non_stdio_transport)
+            {
+                bail!(
+                    "cannot uninstall cursor-agent: ~/.cursor/mcp.json mcpServers.recall uses a non-stdio transport"
+                );
+            }
             servers.remove(SERVER_NAME);
         }
         Ok(())
@@ -252,6 +271,22 @@ fn read_cursor_config(path: &Path) -> Result<Value> {
 }
 
 fn write_cursor_config_file(path: &Path, config: &Value) -> Result<()> {
+    let resolved_path = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = fs::canonicalize(path)
+                .with_context(|| format!("failed to resolve symbolic link {}", path.display()))?;
+            if !target.is_file() {
+                bail!("symbolic link {} does not resolve to a file", path.display());
+            }
+            Some(target)
+        }
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    let path = resolved_path.as_deref().unwrap_or(path);
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("cursor config path has no parent: {}", path.display()))?;
@@ -284,7 +319,9 @@ fn run_host_command(
     }
     let removing = matches!(action, HostAction::Uninstall);
     let output = run(host.id(), args)?;
-    if output.success || (removing && looks_like_not_found(&output.combined())) {
+    if output.success
+        || (removing && looks_like_not_found(&format!("{}\n{}", output.stdout, output.stderr)))
+    {
         println!("{} {}", if removing { "uninstalled" } else { "installed" }, host.id());
         return Ok(());
     }
@@ -298,10 +335,6 @@ struct HostOutput {
 }
 
 impl HostOutput {
-    fn combined(&self) -> String {
-        format!("{}\n{}", self.stdout, self.stderr)
-    }
-
     fn summary(&self) -> String {
         let stderr = self.stderr.trim();
         if !stderr.is_empty() {
@@ -395,8 +428,9 @@ fn is_unix_executable(path: &Path) -> bool {
 mod tests {
     use super::{
         Host, HostAction, HostOutput, SERVER_ARG, SERVER_NAME, add_args, display_command,
-        looks_like_not_found, quote_arg, read_cursor_config, remove_args, resolve_bin,
-        resolve_hosts, run_host_command, write_cursor_config, write_cursor_config_file,
+        looks_like_not_found, quote_arg, read_cursor_config, remove_args, remove_cursor_config,
+        resolve_bin, resolve_hosts, run_host_command, write_cursor_config,
+        write_cursor_config_file,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -492,8 +526,66 @@ mod tests {
 
         let parsed = read_cursor_config(&path).unwrap();
         assert_eq!(parsed["mcpServers"][SERVER_NAME]["command"], "/usr/local/bin/recall");
+        assert_eq!(parsed["mcpServers"][SERVER_NAME]["type"], "stdio");
         assert_eq!(parsed["mcpServers"][SERVER_NAME]["env"]["RECALL_DB"], "/data/recall.db");
         assert_eq!(parsed["mcpServers"]["other"]["command"], "other-bin");
+    }
+
+    #[test]
+    fn remote_server_is_never_mutated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        write_cursor_config_file(
+            &path,
+            &serde_json::json!({
+                "mcpServers": {
+                    SERVER_NAME: {
+                        "type": "http",
+                        "url": "https://example.com/mcp",
+                        "headers": { "Authorization": "Bearer preserved" }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(write_cursor_config(&path, "/usr/local/bin/recall").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert!(remove_cursor_config(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn uninstall_removes_malformed_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        write_cursor_config_file(
+            &path,
+            &serde_json::json!({ "mcpServers": { SERVER_NAME: null } }),
+        )
+        .unwrap();
+
+        remove_cursor_config(&path).unwrap();
+
+        assert!(read_cursor_config(&path).unwrap()["mcpServers"].get(SERVER_NAME).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_config_write_preserves_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("owned-mcp.json");
+        let path = dir.path().join("mcp.json");
+        write_cursor_config_file(&target, &serde_json::json!({ "owner": "user" })).unwrap();
+        symlink(&target, &path).unwrap();
+
+        write_cursor_config_file(&path, &serde_json::json!({ "owner": "recall" })).unwrap();
+
+        assert!(path.is_symlink());
+        assert_eq!(read_cursor_config(&target).unwrap()["owner"], "recall");
     }
 
     #[test]
