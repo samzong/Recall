@@ -76,8 +76,6 @@ struct App {
 
 impl App {
     fn new(action: Action, providers: Vec<ProviderState>) -> Self {
-        let mut providers = providers;
-        sort_provider_states(&mut providers);
         let mut app = Self {
             action,
             step: Step::Provider,
@@ -153,14 +151,15 @@ impl App {
     }
 
     fn handle_provider_key(&mut self, key: KeyEvent) {
-        let count = self.filtered_providers().len();
+        let filtered = self.filtered_providers();
+        let count = filtered.len();
         match key.code {
             KeyCode::Up if count > 0 => {
                 self.cursor = self.cursor.checked_sub(1).unwrap_or(count - 1);
             }
             KeyCode::Down if count > 0 => self.cursor = (self.cursor + 1) % count,
             KeyCode::Enter if count > 0 => {
-                self.selected = self.filtered_providers().get(self.cursor).copied();
+                self.selected = filtered.get(self.cursor).copied();
                 self.api_key.clear();
                 self.validation_error = false;
                 match self.action {
@@ -850,16 +849,15 @@ mod tests {
 
     #[test]
     fn picker_pins_openrouter_and_tokener_then_configured_then_alpha() {
-        let app = App::new(
-            Action::Login,
-            vec![
-                state("zenmux", "Zenmux", true, false),
-                state("tokener", "Tokener", false, false),
-                state("abacus", "Abacus", false, false),
-                state("openrouter", "OpenRouter", false, false),
-                state("deepseek", "DeepSeek", true, false),
-            ],
-        );
+        let mut states = vec![
+            state("zenmux", "Zenmux", true, false),
+            state("tokener", "Tokener", false, false),
+            state("abacus", "Abacus", false, false),
+            state("openrouter", "OpenRouter", false, false),
+            state("deepseek", "DeepSeek", true, false),
+        ];
+        sort_provider_states(&mut states);
+        let app = App::new(Action::Login, states);
         let names = app
             .filtered_providers()
             .into_iter()
