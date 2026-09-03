@@ -19,8 +19,6 @@ pub(crate) struct InvocationProbeCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InvocationProbeResult {
     pub(crate) candidates: Vec<InvocationProbeCandidate>,
-    pub(crate) files_read: usize,
-    pub(crate) bytes_read: usize,
     pub(crate) complete: bool,
 }
 
@@ -64,19 +62,9 @@ impl Default for InvocationProbeBudget {
 
 pub(crate) fn probe_invocation_nonce(nonce: &str) -> InvocationProbeResult {
     if nonce.trim().is_empty() {
-        return InvocationProbeResult {
-            candidates: Vec::new(),
-            files_read: 0,
-            bytes_read: 0,
-            complete: true,
-        };
+        return InvocationProbeResult { candidates: Vec::new(), complete: true };
     }
-    let mut result = InvocationProbeResult {
-        candidates: Vec::new(),
-        files_read: 0,
-        bytes_read: 0,
-        complete: true,
-    };
+    let mut result = InvocationProbeResult { candidates: Vec::new(), complete: true };
     let mut budget = InvocationProbeBudget::default();
     let codex = super::codex::probe_invocation_nonce(nonce, budget);
     merge_provider_probe(&mut result, &mut budget, "codex", codex);
@@ -93,8 +81,6 @@ fn merge_provider_probe(
 ) {
     match probe {
         Ok(probe) => {
-            result.files_read += probe.files_read;
-            result.bytes_read += probe.bytes_read;
             *budget = budget.remaining(probe.files_read, probe.bytes_read);
             result.complete &= probe.complete;
             result.candidates.extend(probe.source_ids.into_iter().map(|source_id| {

@@ -1052,8 +1052,6 @@ mod tests {
                     source_id: (*source_id).to_string(),
                 })
                 .collect(),
-            files_read: candidates.len(),
-            bytes_read: candidates.len() * 100,
             complete,
         }
     }
