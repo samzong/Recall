@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{AppConfig, ShareConfig};
-use crate::types::{Message, Session, SessionUsageEventRecord};
+use crate::types::{Message, Session, SessionEventRecord, SessionUsageEventRecord};
 
 use super::assets::{HEADERS, ROBOTS};
 use super::meta::collect_session_display_meta;
@@ -96,10 +96,11 @@ pub(crate) fn init_cloudflare_pages(
 pub(crate) fn create_session_preview(
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     usage_events: &[SessionUsageEventRecord],
 ) -> Result<tempfile::NamedTempFile> {
     let display_meta = collect_session_display_meta(session, usage_events);
-    let html = render_session_preview_html(session, messages, &display_meta);
+    let html = render_session_preview_html(session, messages, events, &display_meta);
     let mut file = tempfile::Builder::new()
         .prefix("recall-preview-")
         .suffix(".html")
@@ -131,10 +132,12 @@ pub(crate) fn preview_session_with_options(
     config: &AppConfig,
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     usage_events: &[SessionUsageEventRecord],
     options: &ShareRenderOptions,
 ) -> Result<SharePreview> {
-    let (preview, _) = build_publish_preview(config, session, messages, usage_events, options)?;
+    let (preview, _) =
+        build_publish_preview(config, session, messages, events, usage_events, options)?;
     Ok(preview)
 }
 
@@ -142,12 +145,14 @@ pub(crate) fn publish_session(
     config: &AppConfig,
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     usage_events: &[SessionUsageEventRecord],
 ) -> Result<String> {
     publish_session_with_options(
         config,
         session,
         messages,
+        events,
         usage_events,
         &ShareRenderOptions::default(),
     )
@@ -157,10 +162,12 @@ pub(crate) fn publish_session_with_options(
     config: &AppConfig,
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     usage_events: &[SessionUsageEventRecord],
     options: &ShareRenderOptions,
 ) -> Result<String> {
-    let (preview, html) = build_publish_preview(config, session, messages, usage_events, options)?;
+    let (preview, html) =
+        build_publish_preview(config, session, messages, events, usage_events, options)?;
 
     init_publish_dir(&preview.publish_dir)?;
 
@@ -197,6 +204,7 @@ fn build_publish_preview(
     config: &AppConfig,
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     usage_events: &[SessionUsageEventRecord],
     options: &ShareRenderOptions,
 ) -> Result<(SharePreview, String)> {
@@ -208,7 +216,7 @@ fn build_publish_preview(
     let share_id = share_id_for_session(session);
     let display_meta = collect_session_display_meta(session, usage_events);
     let tldr = options.tldr_markdown.as_deref().map(str::trim).filter(|tldr| !tldr.is_empty());
-    let html = render_session_html_with_tldr(session, messages, &display_meta, tldr);
+    let html = render_session_html_with_tldr(session, messages, events, &display_meta, tldr);
     if html.len() > MAX_PAGES_ASSET_BYTES {
         bail!("session page is larger than Cloudflare Pages' 25 MiB asset limit");
     }
@@ -460,7 +468,7 @@ pub(crate) fn validate_project_name(project_name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::share::render::render_session_html;
-    use crate::types::{Message, Role, Session};
+    use crate::types::{Message, Role, Session, SessionEventRecord};
 
     #[test]
     fn share_id_prefers_source_id() {
@@ -514,6 +522,7 @@ mod tests {
                 seq: 0,
             }],
             &[],
+            &[],
         )
         .unwrap();
         let path = file.path().to_path_buf();
@@ -521,6 +530,52 @@ mod tests {
         assert!(fs::read_to_string(&path).unwrap().contains("hello"));
         drop(file);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn local_preview_and_publish_dry_run_share_identical_timeline_semantics() {
+        let session = session("same-timeline");
+        let messages = [Message {
+            session_id: "local-id".to_string(),
+            role: Role::Assistant,
+            content: "Answer".to_string(),
+            timestamp: None,
+            seq: 0,
+        }];
+        let events = [session_event(0, "tool_call"), session_event(1, "tool_result")];
+        let local = create_session_preview(&session, &messages, &events, &[]).unwrap();
+        let local_html = fs::read_to_string(local.path()).unwrap();
+        let publish_dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.share = Some(ShareConfig {
+            provider: PROVIDER_CLOUDFLARE_PAGES.to_string(),
+            project_name: "recall-share-test".to_string(),
+            project_domain: "recall-share-test.pages.dev".to_string(),
+            publish_dir: publish_dir.path().to_string_lossy().to_string(),
+        });
+        let (_, published_html) = build_publish_preview(
+            &config,
+            &session,
+            &messages,
+            &events,
+            &[],
+            &ShareRenderOptions::default(),
+        )
+        .unwrap();
+
+        let normalized = published_html
+            .replace("<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">", "")
+            .replace(
+                "<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>",
+                "",
+            )
+            .replace("<link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=JetBrains+Mono:wght@400;500&display=swap\">", "");
+        assert_eq!(local_html, normalized);
+        assert!(local_html.contains("call + result"));
+        assert!(
+            local_html.find("Target: src/lib.rs").unwrap()
+                < local_html.find("Result: Tool result").unwrap()
+        );
     }
 
     #[test]
@@ -552,7 +607,7 @@ mod tests {
         let meta = collect_session_display_meta(&session, &[]);
         fs::write(
             legacy.path().join("legacy-session.html"),
-            render_session_html(&session, &[], &meta),
+            render_session_html(&session, &[], &[], &meta),
         )
         .unwrap();
         init_publish_dir(legacy.path()).unwrap();
@@ -579,6 +634,27 @@ mod tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+        }
+    }
+
+    fn session_event(event_seq: u32, kind: &str) -> SessionEventRecord {
+        SessionEventRecord {
+            event_seq,
+            timestamp: None,
+            kind: kind.to_string(),
+            actor: if kind == "tool_result" { "tool" } else { "assistant" }.to_string(),
+            name: (kind == "tool_call").then(|| "Read".to_string()),
+            status: None,
+            target: (kind == "tool_call").then(|| "src/lib.rs".to_string()),
+            message_seq: Some(0),
+            summary: None,
+            source_path: None,
+            source_event_id: Some(format!("source-{event_seq}")),
+            tool_call_id: Some("call-1".to_string()),
+            is_meta: None,
+            visibility: None,
+            attrs_json: None,
+            parser_version: 1,
         }
     }
 }

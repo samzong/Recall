@@ -122,8 +122,10 @@ pre.preformatted{background:var(--surface);color:var(--text-secondary)}
 .log summary::-webkit-details-marker{display:none}
 .log summary .badge{flex:none;font:500 10px/1.5 var(--font-mono);letter-spacing:.04em;text-transform:uppercase;padding:1px 7px;border-radius:5px;background:var(--tool-bg);color:var(--text-tertiary)}
 .log summary .lname{font-family:var(--font-mono);font-size:12px;color:var(--text-primary)}
+.log summary .relation{margin-left:auto;font:500 10px/1.5 var(--font-mono);color:var(--accent)}
 .log[open] summary{color:var(--text-primary)}
 .log pre{margin:6px 0 4px;padding:11px 13px;background:var(--tool-bg);border:1px solid var(--rule);border-radius:8px;color:var(--text-secondary);font:12px/1.55 var(--font-mono);white-space:pre-wrap;word-break:break-word;overflow-x:auto}
+.tool-timeline-note{margin:7px 0 0;color:var(--text-tertiary);font:11px/1.5 var(--font-sans)}
 
 .empty{margin:0;color:var(--text-secondary);font:18px/1.65 var(--font-serif)}
 

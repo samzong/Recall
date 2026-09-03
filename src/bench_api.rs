@@ -772,7 +772,7 @@ impl RenderWorkload {
 
     /// `recall session share`: markdown to a self-contained HTML page.
     pub fn render_html(&self) -> usize {
-        render::render_session_html(&self.session, &self.messages, &self.display_meta).len()
+        render::render_session_html(&self.session, &self.messages, &[], &self.display_meta).len()
     }
 }
 
