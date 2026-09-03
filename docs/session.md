@@ -549,10 +549,10 @@ match `excluded_paths` still runs, restricted to the current scope.
   unchanged.
 - Existing `recall export` remains the bulk export command.
 - Existing TUI shortcuts keep using the same internal session operations.
-- Export record schema is `v5`: `session.topology` is additive and does not
-  affect `protocol_version`. Import accepts `v2`-`v5`; pre-topology records
-  default to `thread_role = null` with no parent links, and `v5` round-trips
-  topology losslessly.
+- Export record schema is `v6`: event records add nullable `tool_call_id`,
+  `is_meta`, and `visibility` fields without affecting `protocol_version`.
+  Import accepts `v2`-`v6`; older records default the new event fields to null
+  and pre-topology records default to `thread_role = null` with no parent links.
 - `protocol_version` is `2`: the default scope of `recall search`,
   `recall session list`, and `recall export` now comes from the current
   directory. Scripts and extensions that relied on the flagless global scope

@@ -37,6 +37,9 @@ pub(crate) fn tool_call_event(
         summary,
         source_path: context.source_path,
         source_event_id: context.source_event_id,
+        tool_call_id: None,
+        is_meta: None,
+        visibility: None,
         attrs_json: args.map(|value| value.to_string()),
         parser_version: context.parser_version,
     }
@@ -66,6 +69,9 @@ pub(crate) fn tool_call_event_from_text(
         summary,
         source_path: context.source_path,
         source_event_id: context.source_event_id,
+        tool_call_id: None,
+        is_meta: None,
+        visibility: None,
         attrs_json: parsed.map(|value| value.to_string()),
         parser_version: context.parser_version,
     }
@@ -88,6 +94,9 @@ pub(crate) fn tool_result_event(
         summary: summary.map(cap_tool_result_summary),
         source_path: context.source_path,
         source_event_id: context.source_event_id,
+        tool_call_id: None,
+        is_meta: None,
+        visibility: None,
         attrs_json: None,
         parser_version: context.parser_version,
     }
@@ -111,6 +120,9 @@ pub(crate) fn file_write_event(
         summary: Some(summary),
         source_path: context.source_path,
         source_event_id: context.source_event_id,
+        tool_call_id: None,
+        is_meta: None,
+        visibility: None,
         attrs_json: None,
         parser_version: context.parser_version,
     }

@@ -1820,6 +1820,9 @@ mod tests {
             summary: summary.map(str::to_string),
             source_path: None,
             source_event_id: None,
+            tool_call_id: None,
+            is_meta: None,
+            visibility: None,
             attrs_json: Some(r#"{"token":"secret-value"}"#.to_string()),
             parser_version: 1,
         }

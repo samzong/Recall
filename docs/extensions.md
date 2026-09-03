@@ -116,7 +116,7 @@ Core support in v0.1:
   `recall session list --query ... --format json`;
 - `recall session show` supports `--format json|jsonl`;
 - `recall export` emits JSONL, one session record per line, with export record
-  schema version 5, and supports `--include metadata,messages,usage,events`
+  schema version 6, and supports `--include metadata,messages,usage,events`
   for field projection. Export projections must include `messages`; `usage`
   and `events` are optional add-ons. `recall session list` and `recall export`
   also accept `--thread-role primary|subagent|unknown` to filter by topology;
@@ -124,8 +124,9 @@ Core support in v0.1:
   that need transcript data must pass `--messages` or
   `--include metadata,messages,usage,events`.
 - every session record carries `session.topology` (`thread_role` plus portable
-  `parents[]`); it is additive over schema v4 and does not affect
-  `protocol_version`. Import accepts records from schema v2 through v5.
+  `parents[]`), and event records carry nullable `tool_call_id`, `is_meta`, and
+  `visibility`; both are additive and do not affect `protocol_version`. Import
+  accepts records from schema v2 through v6.
 
 `protocol_version` is `2`. Version 2 changed the default scope: a command
 without `--project` now resolves its scope from the current directory instead

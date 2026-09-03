@@ -101,6 +101,9 @@ fn expected_contract(source: &str, raw: &RawSession) -> Value {
                 "summary": event.summary,
                 "source_path": event.source_path,
                 "source_event_id": event.source_event_id,
+                "tool_call_id": event.tool_call_id,
+                "is_meta": event.is_meta,
+                "visibility": event.visibility,
                 "attrs_json": event.attrs_json,
                 "parser_version": event.parser_version,
             })

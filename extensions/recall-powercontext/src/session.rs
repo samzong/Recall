@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
-pub const RECORD_SCHEMA_VERSION: u32 = 5;
+pub const MIN_RECORD_SCHEMA_VERSION: u32 = 5;
+pub const RECORD_SCHEMA_VERSION: u32 = 6;
 pub const MAX_SOURCE_ID_LENGTH: usize = 256;
 pub const MAX_CONTENT_LENGTH: usize = 200_000;
 
@@ -99,9 +100,9 @@ pub enum CaptureItem {
 pub fn parse_export_line(line: &str, line_no: usize) -> Result<ExportRecord> {
     let record: ExportRecord = serde_json::from_str(line)
         .map_err(|error| anyhow::anyhow!("failed to parse export JSONL line {line_no}: {error}"))?;
-    if record.schema_version != RECORD_SCHEMA_VERSION {
+    if !(MIN_RECORD_SCHEMA_VERSION..=RECORD_SCHEMA_VERSION).contains(&record.schema_version) {
         bail!(
-            "unsupported export schema_version {} on line {line_no}; expected {RECORD_SCHEMA_VERSION}",
+            "unsupported export schema_version {} on line {line_no}; expected {MIN_RECORD_SCHEMA_VERSION}..={RECORD_SCHEMA_VERSION}",
             record.schema_version
         );
     }
@@ -199,10 +200,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_schema_other_than_five() {
-        let line = r#"{"schema_version":4,"record_type":"session","session":{"id":"s","source":"codex"},"messages":[]}"#;
-        let error = parse_export_line(line, 1).unwrap_err().to_string();
-        assert!(error.contains("schema_version 4"), "{error}");
+    fn accepts_five_and_six_but_rejects_versions_outside_the_supported_range() {
+        for version in [5, 6] {
+            let line = format!(
+                r#"{{"schema_version":{version},"record_type":"session","session":{{"id":"s","source":"codex"}},"messages":[]}}"#
+            );
+            parse_export_line(&line, 1).unwrap();
+        }
+        for version in [4, 7] {
+            let line = format!(
+                r#"{{"schema_version":{version},"record_type":"session","session":{{"id":"s","source":"codex"}},"messages":[]}}"#
+            );
+            let error = parse_export_line(&line, 1).unwrap_err().to_string();
+            assert!(error.contains(&format!("schema_version {version}")), "{error}");
+        }
     }
 
     #[test]
