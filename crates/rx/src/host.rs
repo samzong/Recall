@@ -342,6 +342,12 @@ mod tests {
     }
 
     #[test]
+    fn host_entrypoint_rejects_malformed_requests() {
+        let env = EnvLookup::isolated(HashMap::from([(REQUEST_ENV.to_string(), "{".to_string())]));
+        assert!(run(Vec::new(), &env).is_err());
+    }
+
+    #[test]
     fn hosted_request_allows_missing_harness() {
         assert!(parse_request(&request(None)).unwrap().harness.is_none());
         assert_eq!(

@@ -908,6 +908,19 @@ mod tests {
     }
 
     #[test]
+    fn picker_ignores_enter_without_a_matching_provider() {
+        let mut app = App::new(Action::Use, vec![state("openrouter", "OpenRouter", true, true)]);
+        app.query = "missing".to_string();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.exit);
+        assert_eq!(app.step, Step::Provider);
+        assert!(app.selected.is_none());
+        assert!(app.outcome.is_none());
+    }
+
+    #[test]
     fn direct_login_starts_at_the_api_key_step() {
         let mut app = App::login_for_provider(
             vec![

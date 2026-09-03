@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::args::{
     Command, CompletionShell, CompletionsCommand, Harness, LaunchRequest, ProviderIdFilter,
@@ -36,6 +37,25 @@ fn temp_paths() -> (tempfile::TempDir, Paths) {
     (dir, paths)
 }
 
+fn accept_connection(listener: &TcpListener) -> TcpStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return stream;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("test server did not receive a connection: {error}"),
+        }
+    }
+}
+
 fn serve_openai_models(body: &str) -> (String, thread::JoinHandle<()>) {
     serve_openai_models_times(body, 1)
 }
@@ -46,7 +66,7 @@ fn serve_openai_models_times(body: &str, times: usize) -> (String, thread::JoinH
     let body = body.to_string();
     let server = thread::spawn(move || {
         for _ in 0..times {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_connection(&listener);
             let mut request = [0; 2048];
             let size = stream.read(&mut request).unwrap();
             let req = String::from_utf8_lossy(&request[..size]);
@@ -66,7 +86,7 @@ fn serve_openai_error(status: u16) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_connection(&listener);
         let mut request = [0; 2048];
         let _ = stream.read(&mut request);
         write!(
@@ -83,7 +103,7 @@ fn serve_openai_models_then_error(body: &str, status: u16) -> (String, thread::J
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let body = body.to_string();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_connection(&listener);
         let mut request = [0; 2048];
         let size = stream.read(&mut request).unwrap();
         let req = String::from_utf8_lossy(&request[..size]);
@@ -94,7 +114,7 @@ fn serve_openai_models_then_error(body: &str, status: u16) -> (String, thread::J
             body.len()
         )
         .unwrap();
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_connection(&listener);
         let mut request = [0; 2048];
         let _ = stream.read(&mut request);
         write!(
@@ -315,6 +335,27 @@ fn completion_ids_list_configured_and_known() {
     for id in known {
         assert_ne!(id, "none");
     }
+}
+
+#[test]
+fn available_providers_include_only_complete_custom_entries_once() {
+    let config: crate::config::RxConfig = toml::from_str(
+        r#"
+[provider.openrouter]
+base_url = "https://proxy.example.com/v1"
+
+[provider.complete]
+base_url = "https://complete.example.com/v1"
+
+[provider.incomplete]
+env = "INCOMPLETE_API_KEY"
+"#,
+    )
+    .unwrap();
+    let available = crate::provider::available(&config).unwrap();
+    assert_eq!(available.iter().filter(|provider| provider.id == "openrouter").count(), 1);
+    assert!(available.iter().any(|provider| provider.id == "complete"));
+    assert!(!available.iter().any(|provider| provider.id == "incomplete"));
 }
 
 #[test]
@@ -1399,7 +1440,7 @@ fn pi_tokener_writes_recall_cache() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_connection(&listener);
         let mut request = [0; 1024];
         let size = stream.read(&mut request).unwrap();
         assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /v1/models "));
@@ -1695,7 +1736,7 @@ model = "gpt-prod"
     assert_eq!(codex.env_set, vec![("TOKENER_DEV_API_KEY".to_string(), "sk-dev".to_string())]);
 
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_connection(&listener);
         let mut request = [0; 2048];
         let size = stream.read(&mut request).unwrap();
         let req = String::from_utf8_lossy(&request[..size]);
@@ -2190,6 +2231,82 @@ fn claude_seed_uses_openai_models_and_merges_from_cache() {
         serde_json::from_str(&fs::read_to_string(config_dir.path().join(".claude.json")).unwrap())
             .unwrap();
     assert_eq!(document["additionalModelOptionsCache"][0]["value"], "claude-sonnet-5");
+}
+
+#[test]
+fn empty_claude_catalog_does_not_claim_seeded_discovery() {
+    let (_dir, paths) = temp_paths();
+    let config_dir = tempfile::tempdir().unwrap();
+    let (base_url, server) = serve_openai_models(r#"{"data":[]}"#);
+    let env = EnvLookup::isolated(HashMap::from([(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        config_dir.path().display().to_string(),
+    )]));
+    let outcome =
+        crate::claude_catalog::try_seed_user_catalog(&paths, "lab", &base_url, "sk-test", &env);
+    server.join().unwrap();
+    assert_eq!(outcome, crate::claude_catalog::SeedOutcome::Fallback);
+    assert!(!config_dir.path().join(".claude.json").exists());
+}
+
+#[test]
+fn empty_cached_claude_seed_falls_back_without_writing_config() {
+    let (_dir, paths) = temp_paths();
+    let config_dir = tempfile::tempdir().unwrap();
+    let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"claude-test"}]}"#);
+    crate::catalog::prepare_codex_catalog(&paths, "lab", &base_url, "sk-test").unwrap().unwrap();
+    server.join().unwrap();
+    fs::write(
+        paths.dir.join("catalogs/lab.claude.json"),
+        serde_json::to_vec(&crate::claude_catalog::SeedCaches::default()).unwrap(),
+    )
+    .unwrap();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        config_dir.path().display().to_string(),
+    )]));
+
+    let outcome =
+        crate::claude_catalog::try_seed_user_catalog(&paths, "lab", &base_url, "sk-test", &env);
+
+    assert_eq!(outcome, crate::claude_catalog::SeedOutcome::Fallback);
+    assert!(!config_dir.path().join(".claude.json").exists());
+}
+
+#[test]
+fn real_claude_plan_uses_seeded_generated_route() {
+    let (_dir, paths) = temp_paths();
+    let config_dir = tempfile::tempdir().unwrap();
+    let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"claude-test"}]}"#);
+    fs::write(
+        &paths.config,
+        format!(
+            "[provider.lab]\nbase_url = \"{base_url}\"\nenv = \"LAB_API_KEY\"\nauth = \"env\"\n"
+        ),
+    )
+    .unwrap();
+    let env = EnvLookup::real_with(HashMap::from([
+        ("CLAUDE_CONFIG_DIR".to_string(), config_dir.path().display().to_string()),
+        ("LAB_API_KEY".to_string(), "sk-test".to_string()),
+        ("RX_NO_YOLO".to_string(), "1".to_string()),
+    ]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Claude,
+            provider: Some("lab".to_string()),
+            passthrough: os(&["fix it"]),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(plan.args[0], "--settings");
+    assert_eq!(plan.args[2], "fix it");
+    assert!(
+        plan.env_set.iter().any(|(key, value)| key == "ANTHROPIC_AUTH_TOKEN" && value == "sk-test")
+    );
+    assert!(config_dir.path().join(".claude.json").is_file());
 }
 
 #[test]
