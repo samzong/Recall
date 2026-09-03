@@ -1,0 +1,10 @@
+{
+  "model": "claude-sonnet-4",
+  "tokenUsage": {
+    "inputTokens": 100,
+    "outputTokens": 40,
+    "cacheReadTokens": 10,
+    "cacheCreationTokens": 5,
+    "thinkingTokens": 8
+  }
+}

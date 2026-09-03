@@ -70,6 +70,10 @@ One index across every AI coding CLI. Sync once, search everywhere, resume right
 | MiMo Code       |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | ZCode           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Goose           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| Amp             |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
+| OpenHands       |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
+| Factory         |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| Aider           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |      |
 
 ## Acknowledgements
 

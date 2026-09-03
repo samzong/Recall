@@ -1,0 +1,5 @@
+{"sessionId":"11111111-2222-4333-8444-555555555555","title":"Fix auth","cwd":"/Users/alice/Dev/myproject"}
+{"role":"user","content":"fix the login","timestamp":1700000001000}
+{"role":"assistant","content":"looking at auth.py","timestamp":1700000002000}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{"path":"/Users/alice/Dev/myproject/auth.py"}}]},"timestamp":1700000003000}
+{"role":"tool","content":"export function login","timestamp":1700000004000}

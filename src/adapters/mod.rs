@@ -1,3 +1,5 @@
+pub(crate) mod aider;
+pub(crate) mod amp;
 pub(crate) mod antigravity;
 pub(crate) mod claude_code;
 pub(crate) mod cline;
@@ -8,6 +10,7 @@ pub(crate) mod crush;
 pub(crate) mod cursor;
 pub(crate) mod deepseek_harness;
 pub(crate) mod events;
+pub(crate) mod factory;
 pub(crate) mod file_scan;
 pub(crate) mod gemini;
 pub(crate) mod goose;
@@ -20,6 +23,7 @@ pub(crate) mod kiro;
 pub(crate) mod mimo_code;
 pub(crate) mod omp;
 pub(crate) mod opencode;
+pub(crate) mod openhands;
 pub(crate) mod paths;
 pub(crate) mod pi;
 pub(crate) mod qwen;
@@ -369,6 +373,10 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(mimo_code::MimoCodeAdapter),
         Box::new(zcode::ZcodeAdapter),
         Box::new(goose::GooseAdapter),
+        Box::new(amp::AmpAdapter),
+        Box::new(openhands::OpenHandsAdapter),
+        Box::new(factory::FactoryAdapter),
+        Box::new(aider::AiderAdapter),
     ]
 }
 
@@ -397,6 +405,8 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "mimo-code"
             | "zcode"
             | "goose"
+            | "openhands"
+            | "factory"
     )
 }
 
@@ -416,4 +426,17 @@ pub(crate) fn dashboard_source_labels() -> Vec<(String, String)> {
         .filter(|adapter| adapter_supports_usage_dashboard(adapter.as_ref(), true))
         .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_adapters;
+
+    #[test]
+    fn all_adapters_includes_amp_openhands_factory_aider() {
+        let ids: Vec<_> = all_adapters().iter().map(|adapter| adapter.id().to_string()).collect();
+        for id in ["amp", "openhands", "factory", "aider"] {
+            assert!(ids.iter().any(|existing| existing == id), "{id} missing from all_adapters()");
+        }
+    }
 }
