@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as SqlValue;
@@ -6,13 +6,13 @@ use rusqlite::{Connection, Row};
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::opencode;
 use crate::adapters::{
     InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
     SyncScanOutput, SyncScanResult, SyncScanStats, first_timestamp, last_timestamp,
 };
-use crate::db::store::Store;
 use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
 const SOURCE: &str = "goose";
@@ -96,12 +96,12 @@ impl SourceAdapter for GooseAdapter {
 
     fn scan_for_sync_output(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
         force: bool,
     ) -> anyhow::Result<Option<SyncScanOutput>> {
-        Ok(Some(scan_db(open_goose_db()?, Some(store), since_ts, include_events, force)?))
+        Ok(Some(scan_db(open_goose_db()?, Some(context), since_ts, include_events, force)?))
     }
 }
 
@@ -157,38 +157,26 @@ fn resolve_db_path_from(
 
 fn scan_db(
     opened: Option<(Connection, PathBuf)>,
-    store: Option<&Store>,
+    context: Option<&AdapterSyncContext>,
     since_ts: Option<i64>,
     include_events: bool,
     force: bool,
 ) -> anyhow::Result<SyncScanOutput> {
     let Some((conn, db_path)) = opened else {
-        return unavailable_scan_result(store);
+        return Ok(unavailable_scan_result(context));
     };
     let snapshot = conn.unchecked_transaction()?;
     if !has_table(&snapshot, "sessions") || !has_table(&snapshot, "messages") {
         debug!("Goose sessions.db missing required tables, skipping");
-        return unavailable_scan_result(store);
+        return Ok(unavailable_scan_result(context));
     }
 
-    let incremental_store = if force { None } else { store };
+    let incremental_context = if force { None } else { context };
     let since_ts = if force { None } else { since_ts };
-    let existing = match incremental_store {
-        Some(store) => store.session_meta_map(SOURCE)?,
-        None => HashMap::new(),
-    };
-    let usage_state = match incremental_store {
-        Some(store) => store.usage_state_meta_map(SOURCE)?,
-        None => HashMap::new(),
-    };
-    let event_state = match incremental_store {
-        Some(store) if include_events => store.event_state_meta_map(SOURCE)?,
-        _ => HashMap::new(),
-    };
-    let metadata_state = match incremental_store {
-        Some(store) => store.metadata_state_meta_map(SOURCE)?,
-        None => HashMap::new(),
-    };
+    let existing = incremental_context.map(AdapterSyncContext::session_meta);
+    let usage_state = incremental_context.map(AdapterSyncContext::usage_state);
+    let event_state = incremental_context.map(AdapterSyncContext::event_state);
+    let metadata_state = incremental_context.map(AdapterSyncContext::metadata_state);
 
     let (live, inventory_issues) = load_all_session_ids(&snapshot, &db_path)?;
     let rows = load_session_rows(&snapshot)?;
@@ -206,24 +194,24 @@ fn scan_db(
             stats.filtered_sessions += 1;
             continue;
         }
-        if incremental_store.is_some()
-            && existing.get(&row.id).is_some_and(|old| {
+        if existing.is_some_and(|existing| {
+            existing.get(&row.id).is_some_and(|old| {
                 old.updated_at == freshness
                     && crate::adapters::sync_state::session_state_is_current(
                         USAGE_PARSER_VERSION,
                         EVENT_PARSER_VERSION,
-                        usage_state.get(&row.id).copied(),
-                        event_state.get(&row.id).copied(),
+                        usage_state.and_then(|state| state.get(&row.id).copied()),
+                        event_state.and_then(|state| state.get(&row.id).copied()),
                         freshness,
                         include_events,
                     )
                     && crate::adapters::sync_state::metadata_state_is_current(
                         METADATA_PARSER_VERSION,
-                        metadata_state.get(&row.id).copied(),
+                        metadata_state.and_then(|state| state.get(&row.id).copied()),
                         freshness,
                     )
             })
-        {
+        }) {
             stats.skipped_sessions += 1;
             continue;
         }
@@ -249,23 +237,19 @@ fn scan_db(
     })
 }
 
-fn unavailable_scan_result(store: Option<&Store>) -> anyhow::Result<SyncScanOutput> {
+fn unavailable_scan_result(context: Option<&AdapterSyncContext>) -> SyncScanOutput {
     let result = SyncScanResult {
         sessions: Vec::new(),
         stats: SyncScanStats::default(),
         observations: Vec::new(),
     };
-    let has_history = match store {
-        Some(store) => !store.session_meta_map(SOURCE)?.is_empty(),
-        None => false,
-    };
-    if has_history {
-        return Ok(SyncScanOutput {
+    if context.is_some_and(AdapterSyncContext::has_existing_sessions) {
+        return SyncScanOutput {
             scan: result,
             reconcile: Some(ReconcilePlan::UnavailableInventory(Vec::new())),
-        });
+        };
     }
-    Ok(SyncScanOutput { scan: result, reconcile: None })
+    SyncScanOutput { scan: result, reconcile: None }
 }
 
 fn include_session_type(session_type: &str) -> bool {
@@ -1182,12 +1166,26 @@ mod tests {
             .unwrap();
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, Some(&store), None, true, false).unwrap();
+        let result = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(result.scan.stats.skipped_sessions, 1);
         assert!(result.scan.sessions.is_empty());
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
-        let forced = scan_db(opened, Some(&store), None, true, true).unwrap();
+        let forced = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            true,
+        )
+        .unwrap();
         assert_eq!(forced.scan.sessions.len(), 1);
         assert!(matches!(
             forced.reconcile,
@@ -1238,7 +1236,14 @@ mod tests {
             .unwrap();
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, Some(&store), None, true, false).unwrap();
+        let result = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(result.scan.stats.skipped_sessions, 0);
         assert_eq!(result.scan.sessions.len(), 1);
         assert_eq!(result.scan.sessions[0].updated_at, Some(400_000));
@@ -1301,7 +1306,14 @@ mod tests {
         store.insert_session(&make_session("gone", Some(200_000), 1)).unwrap();
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
-        let result = scan_db(opened, Some(&store), None, true, false).unwrap();
+        let result = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
         let remaining = store.session_meta_map(SOURCE).unwrap();
         assert!(remaining.contains_key("keep"));
         assert!(remaining.contains_key("gone"));
@@ -1327,7 +1339,16 @@ mod tests {
         store.insert_session(&make_session("existing", Some(200_000), 1)).unwrap();
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
 
-        assert!(scan_db(opened, Some(&store), None, true, false).is_err());
+        assert!(
+            scan_db(
+                opened,
+                Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+                None,
+                true,
+                false
+            )
+            .is_err()
+        );
         assert!(store.session_meta(SOURCE, "existing").unwrap().is_some());
     }
 
@@ -1350,7 +1371,14 @@ mod tests {
         store.insert_session(&make_session("stale", Some(200_000), 1)).unwrap();
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
 
-        let result = scan_db(opened, Some(&store), None, true, false).unwrap();
+        let result = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
 
         assert!(matches!(result.reconcile, Some(ReconcilePlan::PartialInventory(_))));
         assert!(result.scan.sessions.iter().any(|session| session.source_id == "keep"));
@@ -1362,7 +1390,14 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_session("existing", Some(200_000), 1)).unwrap();
 
-        let result = scan_db(None, Some(&store), None, true, false).unwrap();
+        let result = scan_db(
+            None,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
 
         assert!(matches!(result.reconcile, Some(ReconcilePlan::UnavailableInventory(_))));
         assert!(store.session_meta(SOURCE, "existing").unwrap().is_some());

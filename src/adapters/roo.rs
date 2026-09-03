@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::cline;
 use crate::adapters::paths;
 use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
-use crate::db::store::Store;
 
 const EXTENSION_ID: &str = "rooveterinaryinc.roo-cline";
 
@@ -30,11 +30,11 @@ impl SourceAdapter for RooAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        Ok(Some(cline::scan_task_dirs_for_sync(&resolve_tasks_dirs(), store, since_ts, "roo")?))
+        Ok(Some(cline::scan_task_dirs_for_sync(&resolve_tasks_dirs(), context, since_ts)?))
     }
 }
 
@@ -68,7 +68,12 @@ mod tests {
     fn missing_tasks_dirs_sync_empty() {
         schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
-        let result = cline::scan_task_dirs_for_sync(&[], &store, None, "roo").unwrap();
+        let result = cline::scan_task_dirs_for_sync(
+            &[],
+            &AdapterSyncContext::from_store_for_test(&store, "roo").unwrap(),
+            None,
+        )
+        .unwrap();
         assert!(result.sessions.is_empty());
         assert_eq!(result.stats.candidates, 0);
     }

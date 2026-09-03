@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util;
 use crate::adapters::paths;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SyncScanResult};
-use crate::db::store::Store;
 use crate::types::Role;
 
 pub(super) fn resume_command(source_id: &str) -> Option<ResumeCommand> {
@@ -29,7 +29,7 @@ pub(super) fn scan_uncovered(covered: &HashSet<String>) -> anyhow::Result<Vec<Ra
 }
 
 pub(super) fn scan_for_sync(
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     covered: &HashSet<String>,
 ) -> anyhow::Result<SyncScanResult> {
@@ -42,8 +42,7 @@ pub(super) fn scan_for_sync(
     };
     let entries = collect_session_entries(&sessions_dir, covered);
     file_scan::run_file_scan_with_options_and_mtime(
-        store,
-        "cline",
+        context,
         since_ts,
         Default::default(),
         entries,
@@ -509,8 +508,7 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(session_id, mtime)).unwrap();
         let result = file_scan::run_file_scan_with_options_and_mtime(
-            &store,
-            "cline",
+            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
             None,
             Default::default(),
             collect_session_entries(&root, &HashSet::new()),

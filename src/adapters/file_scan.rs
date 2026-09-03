@@ -9,8 +9,9 @@ use crate::adapters::sync_state::{
     event_state_is_current_for_mtime, metadata_state_is_current_for_mtime,
     usage_state_is_current_for_mtime,
 };
-use crate::adapters::{RawSession, SourceObservation, SyncScanResult, SyncScanStats};
-use crate::db::store::Store;
+use crate::adapters::{
+    AdapterSyncContext, RawSession, SourceObservation, SyncScanResult, SyncScanStats,
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct FileScanOptions {
@@ -56,8 +57,7 @@ impl FileMetadataSnapshot {
 }
 
 pub(crate) fn run_file_scan<I, F>(
-    store: &Store,
-    source_id: &str,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     entries: I,
     parse_fn: F,
@@ -66,19 +66,11 @@ where
     I: IntoIterator<Item = FileScanEntry>,
     F: Fn(FileScanEntry, i64) -> Result<Option<RawSession>>,
 {
-    run_file_scan_with_options(
-        store,
-        source_id,
-        since_ts,
-        FileScanOptions::default(),
-        entries,
-        parse_fn,
-    )
+    run_file_scan_with_options(context, since_ts, FileScanOptions::default(), entries, parse_fn)
 }
 
 pub(crate) fn run_file_scan_with_options<I, F>(
-    store: &Store,
-    source_id: &str,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     options: FileScanOptions,
     entries: I,
@@ -89,8 +81,7 @@ where
     F: Fn(FileScanEntry, i64) -> Result<Option<RawSession>>,
 {
     run_file_scan_with_options_and_mtime(
-        store,
-        source_id,
+        context,
         since_ts,
         options,
         entries,
@@ -100,8 +91,7 @@ where
 }
 
 pub(crate) fn run_file_scan_with_options_and_mtime<I, F, M>(
-    store: &Store,
-    source_id: &str,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     options: FileScanOptions,
     entries: I,
@@ -114,8 +104,7 @@ where
     M: Fn(&FileScanEntry) -> Option<i64>,
 {
     run_file_scan_with_observations(
-        store,
-        source_id,
+        context,
         since_ts,
         options,
         entries,
@@ -125,8 +114,7 @@ where
 }
 
 pub(crate) fn run_file_scan_with_options_and_snapshot<I, F, S, T>(
-    store: &Store,
-    source_id: &str,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     options: FileScanOptions,
     entries: I,
@@ -141,8 +129,7 @@ where
 {
     let snapshot_fn = &snapshot_fn;
     run_file_scan_with_observations(
-        store,
-        source_id,
+        context,
         since_ts,
         options,
         entries,
@@ -153,7 +140,8 @@ where
             let stable = snapshot_fn(&revalidate_entry).as_ref() == Some(&before);
             if !stable {
                 warn!(
-                    "skipping unstable {source_id} session {}: source files changed while parsing ({})",
+                    "skipping unstable {} session {}: source files changed while parsing ({})",
+                    context.source(),
                     revalidate_entry.session_id,
                     revalidate_entry.stat_target.display()
                 );
@@ -164,8 +152,7 @@ where
 }
 
 fn run_file_scan_with_observations<I, F, S, T>(
-    store: &Store,
-    source_id: &str,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     options: FileScanOptions,
     entries: I,
@@ -177,19 +164,10 @@ where
     F: Fn(FileScanEntry, i64, FileScanSnapshot<T>) -> Result<(Option<RawSession>, bool)>,
     S: Fn(&FileScanEntry) -> Option<FileScanSnapshot<T>>,
 {
-    let existing = store.session_meta_map(source_id)?;
-    let usage_state = match options.usage_parser_version {
-        Some(_) => store.usage_state_meta_map(source_id)?,
-        None => Default::default(),
-    };
-    let event_state = match options.event_parser_version {
-        Some(_) => store.event_state_meta_map(source_id)?,
-        None => Default::default(),
-    };
-    let metadata_state = match options.metadata_parser_version {
-        Some(_) => store.metadata_state_meta_map(source_id)?,
-        None => Default::default(),
-    };
+    let existing = context.session_meta();
+    let usage_state = context.usage_state();
+    let event_state = context.event_state();
+    let metadata_state = context.metadata_state();
     let mut sessions = Vec::new();
     let mut observations = Vec::new();
     let mut stats = SyncScanStats::default();
@@ -277,6 +255,10 @@ mod tests {
         Store::open_in_memory().unwrap()
     }
 
+    fn sync_context(store: &Store) -> AdapterSyncContext {
+        AdapterSyncContext::from_store_for_test(store, "test-source").unwrap()
+    }
+
     fn make_session(
         id: &str,
         source_id: &str,
@@ -329,12 +311,11 @@ mod tests {
 
     #[test]
     fn empty_input_returns_empty_result() {
-        let store = setup_store();
-        let result =
-            run_file_scan(&store, "test-source", None, Vec::<FileScanEntry>::new(), |_, _| {
-                panic!("parse should not be called")
-            })
-            .unwrap();
+        let context = AdapterSyncContext::empty_for_test("test-source");
+        let result = run_file_scan(&context, None, Vec::<FileScanEntry>::new(), |_, _| {
+            panic!("parse should not be called")
+        })
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert!(result.observations.is_empty());
         assert_eq!(result.stats.skipped_sessions, 0);
@@ -351,7 +332,7 @@ mod tests {
             directory: None,
         };
 
-        let result = run_file_scan(&store, "test-source", None, vec![entry], |entry, mtime_ms| {
+        let result = run_file_scan(&sync_context(&store), None, vec![entry], |entry, mtime_ms| {
             Ok(Some(stub_raw_session(&entry.session_id, mtime_ms)))
         })
         .unwrap();
@@ -375,8 +356,7 @@ mod tests {
         store.insert_session(&make_session("s1", "sess-changing", Some(0), 1)).unwrap();
 
         let result = run_file_scan_with_options_and_snapshot(
-            &store,
-            "test-source",
+            &sync_context(&store),
             None,
             FileScanOptions::default(),
             vec![entry],
@@ -401,8 +381,7 @@ mod tests {
             directory: None,
         };
         let retry = run_file_scan_with_options_and_snapshot(
-            &store,
-            "test-source",
+            &sync_context(&store),
             None,
             FileScanOptions::default(),
             vec![entry],
@@ -433,7 +412,7 @@ mod tests {
             directory: None,
         };
 
-        let result = run_file_scan(&store, "test-source", None, vec![entry], |_, _| {
+        let result = run_file_scan(&sync_context(&store), None, vec![entry], |_, _| {
             panic!("parse should not be called for skipped entry")
         })
         .unwrap();
@@ -462,7 +441,7 @@ mod tests {
         };
 
         let result =
-            run_file_scan(&store, "test-source", None, vec![entry], |_, _| Ok(None)).unwrap();
+            run_file_scan(&sync_context(&store), None, vec![entry], |_, _| Ok(None)).unwrap();
 
         assert!(result.sessions.is_empty());
         assert!(result.observations.is_empty());
@@ -482,8 +461,7 @@ mod tests {
             directory: None,
         };
         let result = run_file_scan_with_options(
-            &store,
-            "test-source",
+            &sync_context(&store),
             None,
             FileScanOptions {
                 usage_parser_version: Some(1),
@@ -512,8 +490,7 @@ mod tests {
             directory: None,
         };
         let result = run_file_scan_with_options(
-            &store,
-            "test-source",
+            &sync_context(&store),
             None,
             FileScanOptions {
                 usage_parser_version: Some(1),
@@ -542,8 +519,7 @@ mod tests {
             directory: None,
         };
         let result = run_file_scan_with_options(
-            &store,
-            "test-source",
+            &sync_context(&store),
             None,
             FileScanOptions {
                 usage_parser_version: None,
@@ -572,8 +548,7 @@ mod tests {
             directory: None,
         };
         let result = run_file_scan_with_options(
-            &store,
-            "test-source",
+            &sync_context(&store),
             None,
             FileScanOptions {
                 usage_parser_version: None,
@@ -605,8 +580,7 @@ mod tests {
             directory: None,
         };
         let result = run_file_scan_with_options(
-            &store,
-            "test-source",
+            &sync_context(&store),
             None,
             FileScanOptions {
                 usage_parser_version: None,
@@ -633,8 +607,7 @@ mod tests {
             directory: None,
         };
         let result = run_file_scan_with_options(
-            &store,
-            "test-source",
+            &sync_context(&store),
             None,
             FileScanOptions {
                 usage_parser_version: None,
@@ -664,7 +637,7 @@ mod tests {
             directory: None,
         };
 
-        let result = run_file_scan(&store, "test-source", None, vec![entry], |entry, mtime_ms| {
+        let result = run_file_scan(&sync_context(&store), None, vec![entry], |entry, mtime_ms| {
             assert_eq!(mtime_ms, actual_mtime);
             Ok(Some(stub_raw_session(&entry.session_id, mtime_ms)))
         })
@@ -690,7 +663,7 @@ mod tests {
         };
 
         let result =
-            run_file_scan(&store, "test-source", Some(future_cutoff), vec![entry], |_, _| {
+            run_file_scan(&sync_context(&store), Some(future_cutoff), vec![entry], |_, _| {
                 panic!("parse should not be called for filtered entry")
             })
             .unwrap();
@@ -714,7 +687,7 @@ mod tests {
             directory: None,
         };
 
-        let result = run_file_scan(&store, "test-source", None, vec![entry], |_, _| {
+        let result = run_file_scan(&sync_context(&store), None, vec![entry], |_, _| {
             panic!("parse should not be called for missing stat target")
         })
         .unwrap();

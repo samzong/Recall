@@ -375,7 +375,8 @@ impl SyncJob {
             self.stats.excluded_out += n;
         }
 
-        let Some(scan_result) = self.scan_sessions(adapter, label)? else {
+        let context = self.load_adapter_sync_context(source_id)?;
+        let Some(scan_result) = self.scan_sessions(adapter, label, &context)? else {
             return Ok(());
         };
         let adapters::SyncScanOutput {
@@ -383,7 +384,7 @@ impl SyncJob {
             reconcile,
         } = scan_result;
 
-        let mut existing = self.load_existing_state(source_id)?;
+        let mut existing = self.prepare_existing_state(source_id, context)?;
         let found = raw_sessions.len();
         for (done, raw) in raw_sessions.into_iter().enumerate() {
             self.progress.indexing(label, done, found);
@@ -400,7 +401,10 @@ impl SyncJob {
             )?;
             self.stats.excluded_out += n;
         }
-        self.reconcile_source(source_id, label, reconcile)?;
+        for source_id in &purged_excluded_ids {
+            existing.remove(source_id);
+        }
+        self.reconcile_source(source_id, label, reconcile, &mut existing)?;
 
         let touched = self.stats.touched() - touched_before;
         let elapsed_ms = started.elapsed().as_millis();
@@ -421,13 +425,14 @@ impl SyncJob {
         &mut self,
         adapter: &dyn adapters::SourceAdapter,
         label: &str,
+        context: &adapters::AdapterSyncContext,
     ) -> Result<Option<adapters::SyncScanOutput>> {
         if self.options.verbose {
             println!("Scanning {label}...");
         }
         let include_events = !self.options.usage_only || self.options.backfill_events;
         let optimized = match adapter.scan_for_sync_output(
-            &self.store,
+            context,
             self.since_ts,
             include_events,
             self.options.force,
@@ -526,10 +531,11 @@ impl SyncJob {
     }
 
     fn reconcile_source(
-        &self,
+        &mut self,
         source_id: &str,
         label: &str,
         reconcile: Option<adapters::ReconcilePlan>,
+        existing: &mut ExistingState,
     ) -> Result<()> {
         if !matches!(self.options.scope, ProjectScope::Global) {
             return Ok(());
@@ -545,17 +551,22 @@ impl SyncJob {
                 self.report_incomplete_inventory(label, "unavailable", &issues);
             }
             adapters::ReconcilePlan::CompleteLiveSet(live) => {
-                let existing = self.store.session_meta_map(source_id)?;
-                for source_id_to_delete in existing.keys().filter(|id| !live.contains(*id)) {
-                    self.store.delete_session_data(source_id, source_id_to_delete)?;
+                let stale = existing
+                    .meta
+                    .keys()
+                    .filter(|id| !live.contains(*id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for source_id_to_delete in stale {
+                    self.store.delete_session_data(source_id, &source_id_to_delete)?;
+                    existing.remove(&source_id_to_delete);
                 }
             }
             adapters::ReconcilePlan::ExactTombstones(source_ids) => {
-                let existing = self.store.session_meta_map(source_id)?;
-                for source_id_to_delete in
-                    source_ids.into_iter().filter(|id| existing.contains_key(id))
-                {
-                    self.store.delete_session_data(source_id, &source_id_to_delete)?;
+                for source_id_to_delete in source_ids {
+                    if existing.remove(&source_id_to_delete) {
+                        self.store.delete_session_data(source_id, &source_id_to_delete)?;
+                    }
                 }
             }
         }
@@ -583,14 +594,40 @@ impl SyncJob {
         }
     }
 
-    fn load_existing_state(&mut self, source_id: &str) -> Result<ExistingState> {
-        let meta = self.store.session_meta_map(source_id)?;
-        let mut paths = HashMap::new();
+    fn load_adapter_sync_context(&self, source_id: &str) -> Result<adapters::AdapterSyncContext> {
+        Ok(adapters::AdapterSyncContext::new(
+            source_id.to_string(),
+            self.store.session_meta_map(source_id)?,
+            self.store
+                .session_paths_for_source(source_id)?
+                .into_iter()
+                .map(|path| (path.source_id.clone(), path))
+                .collect(),
+            self.store.imported_source_ids(source_id)?,
+            self.store.usage_state_meta_map(source_id)?,
+            self.store.event_state_meta_map(source_id)?,
+            self.store.metadata_state_meta_map(source_id)?,
+        ))
+    }
+
+    fn prepare_existing_state(
+        &mut self,
+        source_id: &str,
+        context: adapters::AdapterSyncContext,
+    ) -> Result<ExistingState> {
+        let adapters::AdapterSyncContextParts {
+            session_meta: meta,
+            session_paths: mut paths,
+            imported_ids,
+            usage_state: usage_meta,
+            event_state: event_meta,
+            metadata_state: metadata_meta,
+        } = context.into_parts();
         // Backfilling identity for every session of a source is global
         // maintenance; a scoped run only writes identity for the sessions it
         // actually processes.
         let backfill_identity = matches!(self.options.scope, ProjectScope::Global);
-        for mut path in self.store.session_paths_for_source(source_id)? {
+        for path in paths.values_mut() {
             if backfill_identity
                 && path.directory.is_some()
                 && (path.repo_remote.is_none()
@@ -605,20 +642,7 @@ impl SyncJob {
                     path.repo_name = Some(repo.name.clone());
                 }
             }
-            paths.insert(path.source_id.clone(), path);
         }
-        let imported_ids = self.store.imported_source_ids(source_id)?;
-        let usage_meta = self.store.usage_state_meta_map(source_id)?;
-        let event_meta = if self.options.usage_only && !self.options.backfill_events {
-            Default::default()
-        } else {
-            self.store.event_state_meta_map(source_id)?
-        };
-        let metadata_meta = if self.options.usage_only {
-            Default::default()
-        } else {
-            self.store.metadata_state_meta_map(source_id)?
-        };
         Ok(ExistingState { meta, paths, imported_ids, usage_meta, event_meta, metadata_meta })
     }
 
@@ -1063,7 +1087,8 @@ pub(crate) fn persist_raw_session_for_conformance(
         AppConfig::default(),
         &[],
     )?;
-    let mut existing = job.load_existing_state(source)?;
+    let context = job.load_adapter_sync_context(source)?;
+    let mut existing = job.prepare_existing_state(source, context)?;
     job.process_raw_session(source, raw, &mut existing, &mut HashSet::new())?;
     Ok(job.store)
 }
@@ -1184,8 +1209,8 @@ mod tests {
 
     use crate::adapters::file_scan::{self, FileScanEntry};
     use crate::adapters::{
-        InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
-        SourceObservation, SyncScanOutput, SyncScanResult,
+        AdapterSyncContext, InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand,
+        SourceAdapter, SourceObservation, SyncScanOutput, SyncScanResult,
     };
     use crate::config::AppConfig;
     use crate::db::{
@@ -1269,7 +1294,7 @@ mod tests {
 
         fn scan_for_sync_output(
             &self,
-            _store: &Store,
+            _context: &AdapterSyncContext,
             _since_ts: Option<i64>,
             _include_events: bool,
             _force: bool,
@@ -1318,7 +1343,7 @@ mod tests {
 
         fn scan_for_sync_output(
             &self,
-            store: &Store,
+            context: &AdapterSyncContext,
             since_ts: Option<i64>,
             _include_events: bool,
             _force: bool,
@@ -1329,10 +1354,9 @@ mod tests {
                     stat_target: path.clone(),
                     directory: None,
                 };
-                let scan =
-                    file_scan::run_file_scan(store, "test", since_ts, vec![entry], |_, _| {
-                        anyhow::bail!("injected parse failure")
-                    })?;
+                let scan = file_scan::run_file_scan(context, since_ts, vec![entry], |_, _| {
+                    anyhow::bail!("injected parse failure")
+                })?;
                 return Ok(Some(SyncScanOutput { scan, reconcile: None }));
             }
             Ok(Some(SyncScanOutput {
@@ -1381,7 +1405,7 @@ mod tests {
 
         fn scan_for_sync(
             &self,
-            _store: &Store,
+            _context: &AdapterSyncContext,
             _since_ts: Option<i64>,
             _include_events: bool,
         ) -> anyhow::Result<Option<crate::adapters::SyncScanResult>> {
@@ -1751,6 +1775,7 @@ mod tests {
 
     #[test]
     fn skipped_observation_applies_path_exclusion_after_success() {
+        schema::register_sqlite_vec();
         let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ObservationAdapter {
             directory: None,
             include_session: false,
@@ -1837,6 +1862,21 @@ mod tests {
             assert!(job.store.session_meta("test", "keep").unwrap().is_some());
             assert!(job.store.session_meta("test", "stale").unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn complete_live_set_keeps_session_written_during_same_source_run() {
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ReconcileAdapter {
+            plan: ReconcilePlan::CompleteLiveSet(HashSet::from(["new".to_string()])),
+            include_session: true,
+        })];
+        let (mut job, _) = scoped_job(ProjectScope::Global);
+        job.store.insert_session(&session("stale", "test", "stale")).unwrap();
+
+        job.run_with(&adapters, None).unwrap();
+
+        assert!(job.store.session_meta("test", "new").unwrap().is_some());
+        assert!(job.store.session_meta("test", "stale").unwrap().is_none());
     }
 
     #[test]

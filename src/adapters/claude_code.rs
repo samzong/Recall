@@ -7,6 +7,7 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
@@ -15,7 +16,6 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp,
 };
-use crate::db::store::Store;
 use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) struct ClaudeCodeAdapter;
@@ -67,7 +67,7 @@ impl SourceAdapter for ClaudeCodeAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -78,7 +78,7 @@ impl SourceAdapter for ClaudeCodeAdapter {
                 observations: Vec::new(),
             }));
         };
-        let result = scan_for_sync_impl(&claude_dir, store, since_ts, include_events)?;
+        let result = scan_for_sync_impl(&claude_dir, context, since_ts, include_events)?;
         Ok(Some(result))
     }
 }
@@ -105,7 +105,7 @@ fn resolve_claude_dir() -> anyhow::Result<Option<PathBuf>> {
 
 fn scan_for_sync_impl(
     claude_dir: &Path,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
@@ -114,8 +114,7 @@ fn scan_for_sync_impl(
     entries.extend(collect_transcript_entries(claude_dir));
 
     file_scan::run_file_scan_with_options(
-        store,
-        "claude-code",
+        context,
         since_ts,
         file_scan::FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
@@ -1033,7 +1032,13 @@ mod tests {
         fs::write(project.join("sessions-index.json"), index.to_string()).unwrap();
 
         let store = setup_store();
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].summary.as_deref(), Some("Project index summary"));
@@ -1193,7 +1198,13 @@ mod tests {
             )
             .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 
@@ -1212,7 +1223,13 @@ mod tests {
             .insert_session(&make_existing_session("sess-stale", actual_mtime - 1_000, 1))
             .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "sess-stale");
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -1229,7 +1246,13 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "sess-fresh");
         assert_eq!(result.stats.skipped_sessions, 0);

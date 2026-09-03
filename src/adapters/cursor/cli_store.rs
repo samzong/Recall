@@ -6,11 +6,11 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::json_i64;
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SyncScanResult};
-use crate::db::store::Store;
 use crate::types::{ParentLink, ParentRelation, Role, ThreadRole};
 
 const METADATA_PARSER_VERSION: u32 = 1;
@@ -47,7 +47,7 @@ pub(super) fn scan_uncovered(
 }
 
 pub(super) fn scan_for_sync(
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     covered: &HashSet<String>,
     usage_parser_version: u32,
@@ -61,8 +61,7 @@ pub(super) fn scan_for_sync(
     };
     let entries = collect_store_entries(&chats_dir, covered);
     file_scan::run_file_scan_with_options_and_mtime(
-        store,
-        "cursor",
+        context,
         since_ts,
         FileScanOptions {
             usage_parser_version: Some(usage_parser_version),

@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util;
 use crate::adapters::paths;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
-use crate::db::store::Store;
 use crate::types::Role;
 
 const CLINE_EXTENSION_ID: &str = "saoudrizwan.claude-dev";
@@ -36,13 +36,13 @@ impl SourceAdapter for ClineAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let mut result = scan_task_dirs_for_sync(&resolve_tasks_dirs(), store, since_ts, "cline")?;
-        let covered = ids_covered_by_plugin(store, &result.sessions);
-        merge_scan_results(&mut result, cli_store::scan_for_sync(store, since_ts, &covered)?);
+        let mut result = scan_task_dirs_for_sync(&resolve_tasks_dirs(), context, since_ts)?;
+        let covered = ids_covered_by_plugin(context, &result.sessions);
+        merge_scan_results(&mut result, cli_store::scan_for_sync(context, since_ts, &covered)?);
         Ok(Some(result))
     }
 }
@@ -62,12 +62,11 @@ pub(crate) fn scan_task_dirs(tasks_dirs: &[PathBuf]) -> anyhow::Result<Vec<RawSe
 
 pub(crate) fn scan_task_dirs_for_sync(
     tasks_dirs: &[PathBuf],
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
-    source: &str,
 ) -> anyhow::Result<SyncScanResult> {
     let entries = collect_all_entries(tasks_dirs);
-    file_scan::run_file_scan(store, source, since_ts, entries, |entry, mtime_ms| {
+    file_scan::run_file_scan(context, since_ts, entries, |entry, mtime_ms| {
         parse_cline_task(entry, mtime_ms)
     })
 }
@@ -338,13 +337,11 @@ fn append_cli_store_sessions(mut sessions: Vec<RawSession>) -> anyhow::Result<Ve
     Ok(sessions)
 }
 
-fn ids_covered_by_plugin(store: &Store, emitted: &[RawSession]) -> HashSet<String> {
+fn ids_covered_by_plugin(context: &AdapterSyncContext, emitted: &[RawSession]) -> HashSet<String> {
     let mut ids = emitted.iter().map(|session| session.source_id.clone()).collect::<HashSet<_>>();
-    if let Ok(paths) = store.session_paths_for_source("cline") {
-        for path in paths {
-            if !is_cli_source_path(path.source_file_path.as_deref()) {
-                ids.insert(path.source_id);
-            }
+    for path in context.session_paths() {
+        if !is_cli_source_path(path.source_file_path.as_deref()) {
+            ids.insert(path.source_id.clone());
         }
     }
     ids
@@ -666,8 +663,12 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session("1765706891317", mtime, 1)).unwrap();
 
-        let result =
-            scan_task_dirs_for_sync(std::slice::from_ref(&root), &store, None, "cline").unwrap();
+        let result = scan_task_dirs_for_sync(
+            std::slice::from_ref(&root),
+            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
+            None,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 
@@ -688,8 +689,12 @@ mod tests {
             .insert_session(&make_existing_session("1765706891317", actual_mtime - 1_000, 1))
             .unwrap();
 
-        let result =
-            scan_task_dirs_for_sync(std::slice::from_ref(&root), &store, None, "cline").unwrap();
+        let result = scan_task_dirs_for_sync(
+            std::slice::from_ref(&root),
+            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
+            None,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "1765706891317");
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -708,8 +713,12 @@ mod tests {
 
         let store = setup_store();
 
-        let result =
-            scan_task_dirs_for_sync(std::slice::from_ref(&root), &store, None, "cline").unwrap();
+        let result = scan_task_dirs_for_sync(
+            std::slice::from_ref(&root),
+            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
+            None,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "1765706891317");
         assert_eq!(result.stats.skipped_sessions, 0);
@@ -791,8 +800,12 @@ mod tests {
         .unwrap();
 
         let store = setup_store();
-        let result =
-            scan_task_dirs_for_sync(std::slice::from_ref(&root), &store, None, "roo").unwrap();
+        let result = scan_task_dirs_for_sync(
+            std::slice::from_ref(&root),
+            &AdapterSyncContext::from_store_for_test(&store, "roo").unwrap(),
+            None,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "1765706891317");
         assert_eq!(result.sessions[0].directory.as_deref(), Some("/work/roo-project"));

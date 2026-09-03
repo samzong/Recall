@@ -11,12 +11,12 @@ use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 use crate::{
+    adapters::AdapterSyncContext,
     adapters::{
         RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult,
         file_scan::{self, FileScanEntry},
         usage::usage_count,
     },
-    db::store::Store,
     types::{RawUsageEvent, Role},
 };
 
@@ -57,7 +57,7 @@ impl SourceAdapter for DeepSeekHarnessAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> Result<Option<SyncScanResult>> {
@@ -70,8 +70,7 @@ impl SourceAdapter for DeepSeekHarnessAdapter {
         };
 
         Ok(Some(file_scan::run_file_scan_with_options(
-            store,
-            self.id(),
+            context,
             since_ts,
             file_scan::FileScanOptions {
                 usage_parser_version: Some(USAGE_PARSER_VERSION),

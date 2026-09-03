@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
@@ -6,12 +5,12 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::opencode;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
-use crate::db::store::Store;
 use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
 const USAGE_PARSER_VERSION: u32 = 1;
@@ -78,11 +77,11 @@ impl SourceAdapter for CrushAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        Ok(Some(scan_projects(&load_projects()?, Some(store), since_ts, include_events)?))
+        Ok(Some(scan_projects(&load_projects()?, Some(context), since_ts, include_events)?))
     }
 }
 
@@ -139,26 +138,14 @@ fn load_projects_from(path: Option<PathBuf>) -> anyhow::Result<Vec<ProjectRef>> 
 
 fn scan_projects(
     projects: &[ProjectRef],
-    store: Option<&Store>,
+    context: Option<&AdapterSyncContext>,
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
-    let existing = match store {
-        Some(store) => store.session_meta_map("crush")?,
-        None => HashMap::new(),
-    };
-    let usage_state = match store {
-        Some(store) => store.usage_state_meta_map("crush")?,
-        None => HashMap::new(),
-    };
-    let event_state = match store {
-        Some(store) if include_events => store.event_state_meta_map("crush")?,
-        _ => HashMap::new(),
-    };
-    let metadata_state = match store {
-        Some(store) => store.metadata_state_meta_map("crush")?,
-        None => HashMap::new(),
-    };
+    let existing = context.map(AdapterSyncContext::session_meta);
+    let usage_state = context.map(AdapterSyncContext::usage_state);
+    let event_state = context.map(AdapterSyncContext::event_state);
+    let metadata_state = context.map(AdapterSyncContext::metadata_state);
 
     let mut sessions = Vec::new();
     let mut stats = SyncScanStats::default();
@@ -187,24 +174,24 @@ fn scan_projects(
                 stats.filtered_sessions += 1;
                 continue;
             }
-            if store.is_some()
-                && existing.get(&row.id).is_some_and(|old| {
+            if existing.is_some_and(|existing| {
+                existing.get(&row.id).is_some_and(|old| {
                     old.updated_at == Some(updated_at)
                         && crate::adapters::sync_state::session_state_is_current(
                             USAGE_PARSER_VERSION,
                             EVENT_PARSER_VERSION,
-                            usage_state.get(&row.id).copied(),
-                            event_state.get(&row.id).copied(),
+                            usage_state.and_then(|state| state.get(&row.id).copied()),
+                            event_state.and_then(|state| state.get(&row.id).copied()),
                             Some(updated_at),
                             include_events,
                         )
                         && crate::adapters::sync_state::metadata_state_is_current(
                             METADATA_PARSER_VERSION,
-                            metadata_state.get(&row.id).copied(),
+                            metadata_state.and_then(|state| state.get(&row.id).copied()),
                             Some(updated_at),
                         )
                 })
-            {
+            }) {
                 stats.skipped_sessions += 1;
                 continue;
             }
@@ -844,7 +831,7 @@ mod tests {
                 path: project.to_string_lossy().into_owned(),
                 data_dir: data_dir.to_string_lossy().into_owned(),
             }],
-            Some(&store),
+            Some(&AdapterSyncContext::from_store_for_test(&store, "crush").unwrap()),
             None,
             true,
         )
@@ -923,7 +910,7 @@ mod tests {
                 path: project.to_string_lossy().into_owned(),
                 data_dir: data_dir.to_string_lossy().into_owned(),
             }],
-            Some(&store),
+            Some(&AdapterSyncContext::from_store_for_test(&store, "crush").unwrap()),
             None,
             true,
         )

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tracing::warn;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::resolve_home_dir;
@@ -13,7 +14,6 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp,
 };
-use crate::db::store::Store;
 use crate::types::{RawUsageEvent, Role};
 
 const USAGE_PARSER_VERSION: u32 = 2;
@@ -49,7 +49,7 @@ impl SourceAdapter for QwenAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -61,8 +61,7 @@ impl SourceAdapter for QwenAdapter {
             }));
         };
         Ok(Some(file_scan::run_file_scan_with_options(
-            store,
-            "qwen-code",
+            context,
             since_ts,
             FileScanOptions {
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
@@ -354,6 +353,7 @@ fn parse_qwen_session(jsonl: &str, session_id: &str) -> Option<RawSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::store::Store;
 
     const SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -472,8 +472,7 @@ mod tests {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let first = file_scan::run_file_scan_with_options(
-            &store,
-            "qwen-code",
+            &AdapterSyncContext::from_store_for_test(&store, "qwen-code").unwrap(),
             None,
             FileScanOptions {
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
@@ -513,8 +512,7 @@ mod tests {
             .unwrap();
 
         let second = file_scan::run_file_scan_with_options(
-            &store,
-            "qwen-code",
+            &AdapterSyncContext::from_store_for_test(&store, "qwen-code").unwrap(),
             None,
             FileScanOptions {
                 usage_parser_version: Some(USAGE_PARSER_VERSION),

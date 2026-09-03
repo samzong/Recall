@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::json_i64;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
 };
-use crate::db::store::Store;
 use crate::types::Role;
 
 pub(crate) struct CopilotChatAdapter;
@@ -46,18 +46,13 @@ impl SourceAdapter for CopilotChatAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let entries = collect_chat_entries(&vscode_user_roots());
-        let result = file_scan::run_file_scan(
-            store,
-            "copilot-chat",
-            since_ts,
-            entries,
-            parse_chat_session_for_entry,
-        )?;
+        let result =
+            file_scan::run_file_scan(context, since_ts, entries, parse_chat_session_for_entry)?;
         Ok(Some(result))
     }
 }
@@ -695,8 +690,7 @@ mod tests {
 
         let entries = collect_chat_entries(&[user]);
         let result = file_scan::run_file_scan(
-            &store,
-            "copilot-chat",
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-chat").unwrap(),
             None,
             entries,
             parse_chat_session_for_entry,
@@ -762,8 +756,7 @@ mod tests {
 
         let entries = collect_chat_entries(&[user]);
         let result = file_scan::run_file_scan(
-            &store,
-            "copilot-chat",
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-chat").unwrap(),
             None,
             entries,
             parse_chat_session_for_entry,

@@ -27,11 +27,14 @@ pub(crate) mod sync_state;
 pub(crate) mod usage;
 pub(crate) mod zcode;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
-use crate::db::store::Store;
+use crate::db::store::{
+    EventSessionStateMeta, IndexedSessionMeta, MetadataSessionStateMeta, SessionPath,
+    UsageSessionStateMeta,
+};
 use crate::types::{ParentLink, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) trait SourceAdapter {
@@ -43,7 +46,7 @@ pub(crate) trait SourceAdapter {
     }
     fn scan_for_sync(
         &self,
-        _store: &Store,
+        _context: &AdapterSyncContext,
         _since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -51,7 +54,7 @@ pub(crate) trait SourceAdapter {
     }
     fn scan_for_sync_output(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
         force: bool,
@@ -60,12 +63,125 @@ pub(crate) trait SourceAdapter {
             return Ok(None);
         }
         Ok(self
-            .scan_for_sync(store, since_ts, include_events)?
+            .scan_for_sync(context, since_ts, include_events)?
             .map(|scan| SyncScanOutput { scan, reconcile: None }))
     }
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand>;
     fn app_command(&self, _source_id: &str) -> Option<ResumeCommand> {
         None
+    }
+}
+
+pub(crate) struct AdapterSyncContext {
+    source: String,
+    session_meta: HashMap<String, IndexedSessionMeta>,
+    session_paths: HashMap<String, SessionPath>,
+    imported_ids: HashSet<String>,
+    usage_state: HashMap<String, UsageSessionStateMeta>,
+    event_state: HashMap<String, EventSessionStateMeta>,
+    metadata_state: HashMap<String, MetadataSessionStateMeta>,
+}
+
+pub(crate) struct AdapterSyncContextParts {
+    pub(crate) session_meta: HashMap<String, IndexedSessionMeta>,
+    pub(crate) session_paths: HashMap<String, SessionPath>,
+    pub(crate) imported_ids: HashSet<String>,
+    pub(crate) usage_state: HashMap<String, UsageSessionStateMeta>,
+    pub(crate) event_state: HashMap<String, EventSessionStateMeta>,
+    pub(crate) metadata_state: HashMap<String, MetadataSessionStateMeta>,
+}
+
+impl AdapterSyncContext {
+    pub(crate) fn new(
+        source: String,
+        session_meta: HashMap<String, IndexedSessionMeta>,
+        session_paths: HashMap<String, SessionPath>,
+        imported_ids: HashSet<String>,
+        usage_state: HashMap<String, UsageSessionStateMeta>,
+        event_state: HashMap<String, EventSessionStateMeta>,
+        metadata_state: HashMap<String, MetadataSessionStateMeta>,
+    ) -> Self {
+        Self {
+            source,
+            session_meta,
+            session_paths,
+            imported_ids,
+            usage_state,
+            event_state,
+            metadata_state,
+        }
+    }
+
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn session_meta(&self) -> &HashMap<String, IndexedSessionMeta> {
+        &self.session_meta
+    }
+
+    pub(crate) fn session_paths(&self) -> impl Iterator<Item = &SessionPath> {
+        self.session_paths.values()
+    }
+
+    pub(crate) fn has_existing_sessions(&self) -> bool {
+        !self.session_meta.is_empty()
+    }
+
+    pub(crate) fn usage_state(&self) -> &HashMap<String, UsageSessionStateMeta> {
+        &self.usage_state
+    }
+
+    pub(crate) fn event_state(&self) -> &HashMap<String, EventSessionStateMeta> {
+        &self.event_state
+    }
+
+    pub(crate) fn metadata_state(&self) -> &HashMap<String, MetadataSessionStateMeta> {
+        &self.metadata_state
+    }
+
+    pub(crate) fn into_parts(self) -> AdapterSyncContextParts {
+        AdapterSyncContextParts {
+            session_meta: self.session_meta,
+            session_paths: self.session_paths,
+            imported_ids: self.imported_ids,
+            usage_state: self.usage_state,
+            event_state: self.event_state,
+            metadata_state: self.metadata_state,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(source: &str) -> Self {
+        Self::new(
+            source.to_string(),
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_store_for_test(
+        store: &crate::db::store::Store,
+        source: &str,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::new(
+            source.to_string(),
+            store.session_meta_map(source)?,
+            store
+                .session_paths_for_source(source)?
+                .into_iter()
+                .map(|path| (path.source_id.clone(), path))
+                .collect(),
+            store.imported_source_ids(source)?,
+            store.usage_state_meta_map(source)?,
+            store.event_state_meta_map(source)?,
+            store.metadata_state_meta_map(source)?,
+        ))
     }
 }
 
