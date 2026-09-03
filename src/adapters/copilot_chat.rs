@@ -9,6 +9,7 @@ use tracing::debug;
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::json_i64;
+use crate::adapters::paths::file_uri_to_path;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
 };
@@ -140,49 +141,6 @@ fn workspace_folder(path: &Path) -> Option<String> {
     let content = fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&content).ok()?;
     file_uri_to_path(value.get("folder").and_then(|folder| folder.as_str())?)
-}
-
-fn file_uri_to_path(uri: &str) -> Option<String> {
-    let rest = uri.strip_prefix("file://")?;
-    let decoded = percent_decode(rest)?;
-    if cfg!(windows)
-        && let Some(drive) = decoded.strip_prefix('/')
-        && drive.len() >= 2
-        && drive.as_bytes()[1] == b':'
-    {
-        return Some(drive.to_string());
-    }
-    Some(decoded)
-}
-
-fn percent_decode(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                return None;
-            }
-            let hi = from_hex(bytes[index + 1])?;
-            let lo = from_hex(bytes[index + 2])?;
-            out.push((hi << 4) | lo);
-            index += 3;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn from_hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn parse_chat_session_for_entry(
@@ -626,15 +584,6 @@ mod tests {
         assert_eq!(sess.directory.as_deref(), Some("/Users/x/git/foo bar"));
 
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn file_uri_to_path_decodes_and_keeps_posix_absolute() {
-        assert_eq!(
-            file_uri_to_path("file:///Users/x/git/foo%20bar").as_deref(),
-            Some("/Users/x/git/foo bar")
-        );
-        assert_eq!(file_uri_to_path("https://example.com"), None);
     }
 
     #[test]
