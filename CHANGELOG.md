@@ -1,5 +1,46 @@
 # Changelog
 
+
+## [0.5.9](https://github.com/samzong/Recall/compare/v0.5.8...v0.5.9) (2026-09-03)
+
+
+### Features
+
+* **share:** add list and unpublish for published pages ([#210](https://github.com/samzong/Recall/issues/210))
+* **recall:** add session continuation fallback ([#212](https://github.com/samzong/Recall/issues/212))
+* **mcp:** expose session provenance ([#215](https://github.com/samzong/Recall/issues/215))
+* **share:** improve session preview experience ([#219](https://github.com/samzong/Recall/issues/219))
+* **mcp:** exclude the current session from discovery ([#224](https://github.com/samzong/Recall/issues/224))
+* **events:** preserve structured tool event relationships ([#226](https://github.com/samzong/Recall/issues/226))
+* **share:** render structured tool timelines ([#227](https://github.com/samzong/Recall/issues/227))
+* **adapters:** add droid source adapter ([#232](https://github.com/samzong/Recall/issues/232))
+* **adapters:** add Amp source adapter ([#231](https://github.com/samzong/Recall/issues/231))
+* **adapters:** add OpenHands source adapter ([#229](https://github.com/samzong/Recall/issues/229))
+* **mcp:** add cursor-agent MCP host ([#235](https://github.com/samzong/Recall/issues/235))
+
+
+### Fixes
+
+* **search:** preserve tokenizer migration compatibility ([#181](https://github.com/samzong/Recall/issues/181))
+* **wrapped:** align metrics with indexed session data ([#214](https://github.com/samzong/Recall/issues/214))
+* **kimi:** reject unstable composite snapshots ([#216](https://github.com/samzong/Recall/issues/216))
+* **sync:** reconcile stale sessions safely ([#217](https://github.com/samzong/Recall/issues/217))
+* **sync:** preserve session ids across refreshes ([#218](https://github.com/samzong/Recall/issues/218))
+* **sync:** defer file-scan metadata writes ([#221](https://github.com/samzong/Recall/issues/221))
+* **acceptance:** enforce search and release invariants ([#233](https://github.com/samzong/Recall/issues/233))
+* **adapters:** recover sessions across storage formats ([#234](https://github.com/samzong/Recall/issues/234))
+
+
+### Performance
+
+* **sync:** stop event payload write amplification and show progress ([#211](https://github.com/samzong/Recall/issues/211))
+
+
+### Refactors
+
+* **sync:** restrict adapters to immutable sync context ([#222](https://github.com/samzong/Recall/issues/222))
+* **rx:** simplify launcher internals ([#225](https://github.com/samzong/Recall/issues/225))
+
 ## Upgrade note
 
 Before using `recall powercontext backfill` with a Recall release that exports
