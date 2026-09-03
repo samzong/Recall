@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
 };
 
-use crate::args::{ModelsCommand, ProvidersCommand};
+use crate::args::ProvidersCommand;
 use crate::catalog;
 use crate::config::{AuthMode, Paths};
 use crate::launch::{self, EnvLookup};
@@ -76,8 +76,6 @@ struct App {
 
 impl App {
     fn new(action: Action, providers: Vec<ProviderState>) -> Self {
-        let mut providers = providers;
-        sort_provider_states(&mut providers);
         let mut app = Self {
             action,
             step: Step::Provider,
@@ -153,14 +151,15 @@ impl App {
     }
 
     fn handle_provider_key(&mut self, key: KeyEvent) {
-        let count = self.filtered_providers().len();
+        let filtered = self.filtered_providers();
+        let count = filtered.len();
         match key.code {
             KeyCode::Up if count > 0 => {
                 self.cursor = self.cursor.checked_sub(1).unwrap_or(count - 1);
             }
             KeyCode::Down if count > 0 => self.cursor = (self.cursor + 1) % count,
             KeyCode::Enter if count > 0 => {
-                self.selected = self.filtered_providers().get(self.cursor).copied();
+                self.selected = filtered.get(self.cursor).copied();
                 self.api_key.clear();
                 self.validation_error = false;
                 match self.action {
@@ -301,7 +300,13 @@ pub(crate) fn run(command: ProvidersCommand, paths: &Paths, env: &EnvLookup) -> 
         ProvidersCommand::Login { provider } => login(paths, env, provider.as_deref()),
         ProvidersCommand::Logout { provider } => logout(paths, env, provider.as_deref()),
         ProvidersCommand::Use { provider } => use_provider(paths, env, provider.as_deref()),
-        ProvidersCommand::Models(command) => models(command, paths, env),
+        ProvidersCommand::ModelsHelp => {
+            print!("{}", models_help());
+            Ok(())
+        }
+        ProvidersCommand::ModelsUpdate { provider } => {
+            update_models(paths, env, provider.as_deref())
+        }
     }
 }
 
@@ -323,16 +328,6 @@ pub(crate) fn models_help() -> &'static str {
         "Usage:\n",
         "  rx providers models update [provider]\n\n",
     )
-}
-
-fn models(command: ModelsCommand, paths: &Paths, env: &EnvLookup) -> Result<()> {
-    match command {
-        ModelsCommand::Help => {
-            print!("{}", models_help());
-            Ok(())
-        }
-        ModelsCommand::Update { provider } => update_models(paths, env, provider.as_deref()),
-    }
 }
 
 fn update_models(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Result<()> {
@@ -360,9 +355,13 @@ fn update_models(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Res
                 bail!("no API key for provider '{id}'; run: rx providers login {id}")
             }
         };
-        let count =
-            catalog::update_models(paths, &target.provider_id, &target.base_url, &target.key)?;
-        println!("{}: {count} models", target.provider_id);
+        let count = catalog::update_models(
+            paths,
+            &target.provider.id,
+            &target.provider.endpoint,
+            &target.key,
+        )?;
+        println!("{}: {count} models", target.provider.id);
     }
     Ok(())
 }
@@ -846,16 +845,15 @@ mod tests {
 
     #[test]
     fn picker_pins_openrouter_and_tokener_then_configured_then_alpha() {
-        let app = App::new(
-            Action::Login,
-            vec![
-                state("zenmux", "Zenmux", true, false),
-                state("tokener", "Tokener", false, false),
-                state("abacus", "Abacus", false, false),
-                state("openrouter", "OpenRouter", false, false),
-                state("deepseek", "DeepSeek", true, false),
-            ],
-        );
+        let mut states = vec![
+            state("zenmux", "Zenmux", true, false),
+            state("tokener", "Tokener", false, false),
+            state("abacus", "Abacus", false, false),
+            state("openrouter", "OpenRouter", false, false),
+            state("deepseek", "DeepSeek", true, false),
+        ];
+        sort_provider_states(&mut states);
+        let app = App::new(Action::Login, states);
         let names = app
             .filtered_providers()
             .into_iter()
@@ -907,6 +905,19 @@ mod tests {
         assert!(app.exit);
         assert_eq!(app.step, Step::Provider);
         assert!(matches!(app.outcome, Some(Outcome::Use { index: 1 })));
+    }
+
+    #[test]
+    fn picker_ignores_enter_without_a_matching_provider() {
+        let mut app = App::new(Action::Use, vec![state("openrouter", "OpenRouter", true, true)]);
+        app.query = "missing".to_string();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.exit);
+        assert_eq!(app.step, Step::Provider);
+        assert!(app.selected.is_none());
+        assert!(app.outcome.is_none());
     }
 
     #[test]

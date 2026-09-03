@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::args::{
-    Command, CompletionShell, CompletionsCommand, Harness, LaunchRequest, ModelsCommand,
-    ProviderIdFilter, ProvidersCommand, UpdateCommand, parse, rewrite_argv0,
+    Command, CompletionShell, CompletionsCommand, Harness, LaunchRequest, ProviderIdFilter,
+    ProvidersCommand, UpdateCommand, parse, rewrite_argv0,
 };
 use crate::config::{self, Paths};
 use crate::launch::{self, EnvLookup};
@@ -36,6 +37,25 @@ fn temp_paths() -> (tempfile::TempDir, Paths) {
     (dir, paths)
 }
 
+fn accept_connection(listener: &TcpListener) -> TcpStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return stream;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("test server did not receive a connection: {error}"),
+        }
+    }
+}
+
 fn serve_openai_models(body: &str) -> (String, thread::JoinHandle<()>) {
     serve_openai_models_times(body, 1)
 }
@@ -46,7 +66,7 @@ fn serve_openai_models_times(body: &str, times: usize) -> (String, thread::JoinH
     let body = body.to_string();
     let server = thread::spawn(move || {
         for _ in 0..times {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_connection(&listener);
             let mut request = [0; 2048];
             let size = stream.read(&mut request).unwrap();
             let req = String::from_utf8_lossy(&request[..size]);
@@ -66,7 +86,7 @@ fn serve_openai_error(status: u16) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_connection(&listener);
         let mut request = [0; 2048];
         let _ = stream.read(&mut request);
         write!(
@@ -83,7 +103,7 @@ fn serve_openai_models_then_error(body: &str, status: u16) -> (String, thread::J
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let body = body.to_string();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_connection(&listener);
         let mut request = [0; 2048];
         let size = stream.read(&mut request).unwrap();
         let req = String::from_utf8_lossy(&request[..size]);
@@ -94,7 +114,7 @@ fn serve_openai_models_then_error(body: &str, status: u16) -> (String, thread::J
             body.len()
         )
         .unwrap();
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_connection(&listener);
         let mut request = [0; 2048];
         let _ = stream.read(&mut request);
         write!(
@@ -318,6 +338,27 @@ fn completion_ids_list_configured_and_known() {
 }
 
 #[test]
+fn available_providers_include_only_complete_custom_entries_once() {
+    let config: crate::config::RxConfig = toml::from_str(
+        r#"
+[provider.openrouter]
+base_url = "https://proxy.example.com/v1"
+
+[provider.complete]
+base_url = "https://complete.example.com/v1"
+
+[provider.incomplete]
+env = "INCOMPLETE_API_KEY"
+"#,
+    )
+    .unwrap();
+    let available = crate::provider::available(&config).unwrap();
+    assert_eq!(available.iter().filter(|provider| provider.id == "openrouter").count(), 1);
+    assert!(available.iter().any(|provider| provider.id == "complete"));
+    assert!(!available.iter().any(|provider| provider.id == "incomplete"));
+}
+
+#[test]
 fn update_parses_yes_flag() {
     assert_eq!(parse_line(&["rx", "update"]), Command::Update(UpdateCommand::Run { yes: false }));
     assert_eq!(
@@ -364,18 +405,13 @@ fn homebrew_managed_rx_requires_brew_upgrade() {
         "/srv/custom-brew/Cellar/recall/0.5.1/bin/rx",
     ] {
         assert_eq!(
-            crate::update::self_update_blocker_for_test(Path::new(path)),
+            crate::update::self_update_blocker(Path::new(path)),
             Some(crate::update::HOMEBREW_UPDATE_HINT)
         );
     }
+    assert_eq!(crate::update::self_update_blocker(Path::new("/Users/x/.cargo/bin/rx")), None);
     assert_eq!(
-        crate::update::self_update_blocker_for_test(Path::new("/Users/x/.cargo/bin/rx")),
-        None
-    );
-    assert_eq!(
-        crate::update::self_update_blocker_for_test(Path::new(
-            "/opt/homebrew/Cellar/other/0.5.1/bin/rx"
-        )),
+        crate::update::self_update_blocker(Path::new("/opt/homebrew/Cellar/other/0.5.1/bin/rx")),
         None
     );
 }
@@ -392,11 +428,11 @@ fn homebrew_managed_rx_is_detected_through_bin_symlink() {
     std::os::unix::fs::symlink(&cellar_rx, &linked_rx).unwrap();
 
     assert_eq!(
-        crate::update::self_update_blocker_for_test(&linked_rx),
+        crate::update::self_update_blocker(&linked_rx),
         Some(crate::update::HOMEBREW_UPDATE_HINT)
     );
     assert_eq!(
-        crate::update::homebrew_launch_update_notice_for_test(&linked_rx, "0.6.0"),
+        crate::update::homebrew_launch_update_notice(&linked_rx, "0.6.0"),
         Some("rx 0.6.0 is available — run `brew upgrade recall`".to_string())
     );
 }
@@ -418,7 +454,7 @@ fn claude_seed_replaces_wrong_typed_growthbook_cache() {
     let config_path = dir.path().join(".claude.json");
     fs::write(&config_path, r#"{"cachedGrowthBookFeatures": null}"#).unwrap();
     let caches = crate::claude_catalog::SeedCaches::default();
-    crate::claude_catalog::write_seed_for_test(&config_path, &caches).unwrap();
+    crate::claude_catalog::write_seed(&config_path, &caches).unwrap();
     let document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     assert!(document["cachedGrowthBookFeatures"].is_object());
@@ -553,17 +589,17 @@ fn providers_commands_parse() {
     );
     assert_eq!(
         parse_line(&["rx", "providers", "models"]),
-        Command::Providers(ProvidersCommand::Models(ModelsCommand::Help))
+        Command::Providers(ProvidersCommand::ModelsHelp)
     );
     assert_eq!(
         parse_line(&["rx", "providers", "models", "update"]),
-        Command::Providers(ProvidersCommand::Models(ModelsCommand::Update { provider: None }))
+        Command::Providers(ProvidersCommand::ModelsUpdate { provider: None })
     );
     assert_eq!(
         parse_line(&["rx", "providers", "models", "update", "openrouter"]),
-        Command::Providers(ProvidersCommand::Models(ModelsCommand::Update {
+        Command::Providers(ProvidersCommand::ModelsUpdate {
             provider: Some("openrouter".to_string()),
-        }))
+        })
     );
 }
 
@@ -643,7 +679,7 @@ fn bundled_providers_match_the_admission_list() {
     assert_eq!(zai.env, "ZHIPU_API_KEY");
     assert_eq!(zai.anthropic_base.as_deref(), Some("https://api.z.ai/api/anthropic"));
     assert_eq!(crate::provider::claude_base(zai), "https://api.z.ai/api/anthropic");
-    assert_eq!(launch::openai_base(&zai.endpoint), "https://api.z.ai/api/paas/v4");
+    assert_eq!(crate::catalog::openai_base(&zai.endpoint), "https://api.z.ai/api/paas/v4");
     let zhipu = crate::provider::find("zhipuai").unwrap();
     assert_eq!(zhipu.endpoint, "https://open.bigmodel.cn/api/paas/v4");
     assert_eq!(zhipu.anthropic_base.as_deref(), Some("https://open.bigmodel.cn/api/anthropic"));
@@ -947,7 +983,7 @@ fn use_none_skips_implicit_openrouter() {
 fn models_update_rejects_none_provider() {
     let (_dir, paths) = temp_paths();
     let error = crate::providers::run(
-        ProvidersCommand::Models(ModelsCommand::Update { provider: Some("none".to_string()) }),
+        ProvidersCommand::ModelsUpdate { provider: Some("none".to_string()) },
         &paths,
         &EnvLookup::isolated(HashMap::new()),
     )
@@ -1404,7 +1440,7 @@ fn pi_tokener_writes_recall_cache() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_connection(&listener);
         let mut request = [0; 1024];
         let size = stream.read(&mut request).unwrap();
         assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /v1/models "));
@@ -1700,7 +1736,7 @@ model = "gpt-prod"
     assert_eq!(codex.env_set, vec![("TOKENER_DEV_API_KEY".to_string(), "sk-dev".to_string())]);
 
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_connection(&listener);
         let mut request = [0; 2048];
         let size = stream.read(&mut request).unwrap();
         let req = String::from_utf8_lossy(&request[..size]);
@@ -1800,14 +1836,23 @@ base_url = "https://provider.test/v1"
 #[test]
 fn url_helpers_strip_or_add_v1() {
     assert_eq!(
-        launch::anthropic_base("https://openrouter.ai/api/v1/"),
+        crate::catalog::anthropic_base("https://openrouter.ai/api/v1/"),
         "https://openrouter.ai/api"
     );
-    assert_eq!(launch::openai_base("https://api.tokener.dev"), "https://api.tokener.dev/v1");
-    assert_eq!(launch::openai_base("https://openrouter.ai/api/v1"), "https://openrouter.ai/api/v1");
-    assert_eq!(launch::openai_base("https://api.z.ai/api/paas/v4"), "https://api.z.ai/api/paas/v4");
     assert_eq!(
-        launch::openai_base("https://api.z.ai/api/coding/paas/v4/"),
+        crate::catalog::openai_base("https://api.tokener.dev"),
+        "https://api.tokener.dev/v1"
+    );
+    assert_eq!(
+        crate::catalog::openai_base("https://openrouter.ai/api/v1"),
+        "https://openrouter.ai/api/v1"
+    );
+    assert_eq!(
+        crate::catalog::openai_base("https://api.z.ai/api/paas/v4"),
+        "https://api.z.ai/api/paas/v4"
+    );
+    assert_eq!(
+        crate::catalog::openai_base("https://api.z.ai/api/coding/paas/v4/"),
         "https://api.z.ai/api/coding/paas/v4"
     );
 }
@@ -2026,7 +2071,7 @@ fn providers_models_update_command_fetches_configured_provider() {
     fs::write(&paths.config, format!("[provider.lab]\nbase_url = \"{base_url}\"\n")).unwrap();
     config::login(&paths, "lab", "sk-test".to_string()).unwrap();
     crate::providers::run(
-        ProvidersCommand::Models(ModelsCommand::Update { provider: Some("lab".to_string()) }),
+        ProvidersCommand::ModelsUpdate { provider: Some("lab".to_string()) },
         &paths,
         &EnvLookup::isolated(HashMap::new()),
     )
@@ -2166,10 +2211,9 @@ fn claude_seed_uses_openai_models_and_merges_from_cache() {
         &base_url,
         "sk-test",
         &env,
-    )
-    .unwrap();
+    );
     server.join().unwrap();
-    assert!(matches!(first, crate::claude_catalog::SeedOutcome::Seeded { model_count: 1 }));
+    assert_eq!(first, crate::claude_catalog::SeedOutcome::Seeded);
     let cached: crate::claude_catalog::SeedCaches = serde_json::from_str(
         &fs::read_to_string(paths.dir.join("catalogs/openrouter.claude.json")).unwrap(),
     )
@@ -2181,13 +2225,88 @@ fn claude_seed_uses_openai_models_and_merges_from_cache() {
         &base_url,
         "sk-test",
         &env,
-    )
-    .unwrap();
-    assert!(matches!(second, crate::claude_catalog::SeedOutcome::Seeded { model_count: 1 }));
+    );
+    assert_eq!(second, crate::claude_catalog::SeedOutcome::Seeded);
     let document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(config_dir.path().join(".claude.json")).unwrap())
             .unwrap();
     assert_eq!(document["additionalModelOptionsCache"][0]["value"], "claude-sonnet-5");
+}
+
+#[test]
+fn empty_claude_catalog_does_not_claim_seeded_discovery() {
+    let (_dir, paths) = temp_paths();
+    let config_dir = tempfile::tempdir().unwrap();
+    let (base_url, server) = serve_openai_models(r#"{"data":[]}"#);
+    let env = EnvLookup::isolated(HashMap::from([(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        config_dir.path().display().to_string(),
+    )]));
+    let outcome =
+        crate::claude_catalog::try_seed_user_catalog(&paths, "lab", &base_url, "sk-test", &env);
+    server.join().unwrap();
+    assert_eq!(outcome, crate::claude_catalog::SeedOutcome::Fallback);
+    assert!(!config_dir.path().join(".claude.json").exists());
+}
+
+#[test]
+fn empty_cached_claude_seed_falls_back_without_writing_config() {
+    let (_dir, paths) = temp_paths();
+    let config_dir = tempfile::tempdir().unwrap();
+    let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"claude-test"}]}"#);
+    crate::catalog::prepare_codex_catalog(&paths, "lab", &base_url, "sk-test").unwrap().unwrap();
+    server.join().unwrap();
+    fs::write(
+        paths.dir.join("catalogs/lab.claude.json"),
+        serde_json::to_vec(&crate::claude_catalog::SeedCaches::default()).unwrap(),
+    )
+    .unwrap();
+    let env = EnvLookup::isolated(HashMap::from([(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        config_dir.path().display().to_string(),
+    )]));
+
+    let outcome =
+        crate::claude_catalog::try_seed_user_catalog(&paths, "lab", &base_url, "sk-test", &env);
+
+    assert_eq!(outcome, crate::claude_catalog::SeedOutcome::Fallback);
+    assert!(!config_dir.path().join(".claude.json").exists());
+}
+
+#[test]
+fn real_claude_plan_uses_seeded_generated_route() {
+    let (_dir, paths) = temp_paths();
+    let config_dir = tempfile::tempdir().unwrap();
+    let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"claude-test"}]}"#);
+    fs::write(
+        &paths.config,
+        format!(
+            "[provider.lab]\nbase_url = \"{base_url}\"\nenv = \"LAB_API_KEY\"\nauth = \"env\"\n"
+        ),
+    )
+    .unwrap();
+    let env = EnvLookup::real_with(HashMap::from([
+        ("CLAUDE_CONFIG_DIR".to_string(), config_dir.path().display().to_string()),
+        ("LAB_API_KEY".to_string(), "sk-test".to_string()),
+        ("RX_NO_YOLO".to_string(), "1".to_string()),
+    ]));
+    let plan = launch::plan(
+        &LaunchRequest {
+            harness: Harness::Claude,
+            provider: Some("lab".to_string()),
+            passthrough: os(&["fix it"]),
+        },
+        &paths,
+        &env,
+    )
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(plan.args[0], "--settings");
+    assert_eq!(plan.args[2], "fix it");
+    assert!(
+        plan.env_set.iter().any(|(key, value)| key == "ANTHROPIC_AUTH_TOKEN" && value == "sk-test")
+    );
+    assert!(config_dir.path().join(".claude.json").is_file());
 }
 
 #[test]
@@ -2198,7 +2317,7 @@ fn debug_is_not_a_harness() {
 
 #[test]
 fn generated_provider_seeded_plan_uses_auth_token_and_settings() {
-    let plan = launch::inject_claude_generated_seeded_for_test(
+    let plan = launch::inject_claude_generated_seeded(
         &LaunchRequest {
             harness: Harness::Claude,
             provider: Some("tokener".to_string()),
@@ -2267,7 +2386,7 @@ fn openrouter_seed_writes_claude_json() {
         supported_efforts: vec![],
         pricing: None,
     }]);
-    crate::claude_catalog::write_seed_for_test(&config_path, &caches).unwrap();
+    crate::claude_catalog::write_seed(&config_path, &caches).unwrap();
     let document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     let options = document["additionalModelOptionsCache"].as_array().unwrap();
@@ -2291,7 +2410,7 @@ fn claude_seed_replaces_previous_provider_catalog_without_dropping_unowned_entri
         r#"{"data":[{"id":"google/gemini-3.7-flash","name":"Gemini","context_length":200000}]}"#,
     )
     .unwrap();
-    crate::claude_catalog::write_seed_for_test(
+    crate::claude_catalog::write_seed(
         &config_path,
         &crate::claude_catalog::seed_from_listed("openrouter", &openrouter),
     )
@@ -2321,7 +2440,7 @@ fn claude_seed_replaces_previous_provider_catalog_without_dropping_unowned_entri
         r#"{"data":[{"id":"claude-sonnet-5","name":"Sonnet 5","context_length":200000}]}"#,
     )
     .unwrap();
-    crate::claude_catalog::write_seed_for_test(
+    crate::claude_catalog::write_seed(
         &config_path,
         &crate::claude_catalog::seed_from_listed("tokener", &tokener),
     )
@@ -2365,7 +2484,7 @@ fn claude_seed_first_run_preserves_preexisting_catalog_entries() {
         r#"{"data":[{"id":"claude-sonnet-5","name":"Sonnet 5","context_length":200000}]}"#,
     )
     .unwrap();
-    crate::claude_catalog::write_seed_for_test(
+    crate::claude_catalog::write_seed(
         &config_path,
         &crate::claude_catalog::seed_from_listed("openrouter", &models),
     )
@@ -2426,7 +2545,7 @@ fn claude_seed_refreshes_and_removes_unmodified_owned_payloads() {
             }),
         },
     ]);
-    crate::claude_catalog::write_seed_for_test(&config_path, &first_seed).unwrap();
+    crate::claude_catalog::write_seed(&config_path, &first_seed).unwrap();
 
     let second_seed = crate::claude_catalog::build_seed(&[crate::claude_catalog::UserModel {
         id: "anthropic/claude-current".to_string(),
@@ -2442,7 +2561,7 @@ fn claude_seed_refreshes_and_removes_unmodified_owned_payloads() {
             web_search: None,
         }),
     }]);
-    crate::claude_catalog::write_seed_for_test(&config_path, &second_seed).unwrap();
+    crate::claude_catalog::write_seed(&config_path, &second_seed).unwrap();
 
     let document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -2490,7 +2609,7 @@ fn claude_seed_reclaims_modified_owned_payloads_and_preserves_unowned() {
             web_search: None,
         }),
     }]);
-    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
+    crate::claude_catalog::write_seed(&config_path, &seed).unwrap();
 
     let mut document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -2512,12 +2631,9 @@ fn claude_seed_reclaims_modified_owned_payloads_and_preserves_unowned() {
     document["autoCompactWindowsCache"]["claude-edited"] = serde_json::json!(123_456);
     fs::write(&config_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
 
-    crate::claude_catalog::write_seed_for_test(
-        &config_path,
-        &crate::claude_catalog::SeedCaches::default(),
-    )
-    .unwrap();
-    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
+    crate::claude_catalog::write_seed(&config_path, &crate::claude_catalog::SeedCaches::default())
+        .unwrap();
+    crate::claude_catalog::write_seed(&config_path, &seed).unwrap();
 
     let document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -2555,7 +2671,7 @@ fn claude_seed_recreates_deleted_owned_payloads() {
             web_search: None,
         }),
     }]);
-    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
+    crate::claude_catalog::write_seed(&config_path, &seed).unwrap();
 
     let mut document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -2575,8 +2691,8 @@ fn claude_seed_recreates_deleted_owned_payloads() {
         .retain(|entry| entry != "openai/deleted");
     fs::write(&config_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
 
-    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
-    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
+    crate::claude_catalog::write_seed(&config_path, &seed).unwrap();
+    crate::claude_catalog::write_seed(&config_path, &seed).unwrap();
 
     let document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -2622,12 +2738,9 @@ fn claude_seed_does_not_claim_unmarked_matching_identity() {
         supported_efforts: vec![],
         pricing: None,
     }]);
-    crate::claude_catalog::write_seed_for_test(&config_path, &seed).unwrap();
-    crate::claude_catalog::write_seed_for_test(
-        &config_path,
-        &crate::claude_catalog::SeedCaches::default(),
-    )
-    .unwrap();
+    crate::claude_catalog::write_seed(&config_path, &seed).unwrap();
+    crate::claude_catalog::write_seed(&config_path, &crate::claude_catalog::SeedCaches::default())
+        .unwrap();
 
     let document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -2665,7 +2778,7 @@ fn concurrent_claude_seed_writes_leave_one_complete_catalog() {
         }]);
         writers.push(thread::spawn(move || {
             barrier.wait();
-            crate::claude_catalog::write_seed_for_test(&path, &caches).unwrap();
+            crate::claude_catalog::write_seed(&path, &caches).unwrap();
         }));
     }
     for writer in writers {
@@ -2710,7 +2823,7 @@ fn claude_seed_remerges_external_config_changes() {
         pricing: None,
     }]);
     let external_path = config_path.clone();
-    crate::claude_catalog::write_seed_with_hook_for_test(&config_path, &caches, |attempt| {
+    crate::claude_catalog::write_seed_with_hook(&config_path, &caches, |attempt| {
         if attempt == 0 {
             fs::write(&external_path, r#"{"external":"keep"}"#).unwrap();
         }
@@ -2734,7 +2847,7 @@ fn claude_seed_errors_on_non_object_config_root_instead_of_panicking() {
     let config_path = dir.path().join(".claude.json");
     fs::write(&config_path, r#"["not", "an", "object"]"#).unwrap();
     let caches = crate::claude_catalog::SeedCaches::default();
-    let error = crate::claude_catalog::write_seed_for_test(&config_path, &caches).unwrap_err();
+    let error = crate::claude_catalog::write_seed(&config_path, &caches).unwrap_err();
     assert!(error.to_string().contains("not a JSON object"));
     // The original file is preserved.
     assert_eq!(fs::read_to_string(&config_path).unwrap(), r#"["not", "an", "object"]"#);
@@ -2742,7 +2855,7 @@ fn claude_seed_errors_on_non_object_config_root_instead_of_panicking() {
 
 #[test]
 fn openrouter_seeded_plan_injects_settings() {
-    let plan = launch::inject_claude_openrouter_for_test(
+    let plan = launch::inject_claude_openrouter(
         &LaunchRequest {
             harness: Harness::Claude,
             provider: Some("openrouter".to_string()),
@@ -2751,7 +2864,7 @@ fn openrouter_seeded_plan_injects_settings() {
         "https://openrouter.ai/api",
         "sk-or-test",
         Some("~anthropic/claude-sonnet-latest"),
-        crate::claude_catalog::SeedOutcome::Seeded { model_count: 2 },
+        crate::claude_catalog::SeedOutcome::Seeded,
     );
     assert_eq!(plan.args[0], "--settings");
     assert!(arg_str(&plan.args[1]).contains("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"));
@@ -2792,9 +2905,8 @@ fn live_openrouter_seed_populates_claude_json() {
         "https://openrouter.ai/api",
         &env.get("OPENROUTER_API_KEY").unwrap(),
         &env,
-    )
-    .unwrap();
-    assert!(matches!(outcome, crate::claude_catalog::SeedOutcome::Seeded { .. }));
+    );
+    assert_eq!(outcome, crate::claude_catalog::SeedOutcome::Seeded);
     let document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join(".claude.json")).unwrap())
             .unwrap();

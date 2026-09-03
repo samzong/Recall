@@ -146,7 +146,7 @@ fn executable_extensions() -> Option<OsString> {
     None
 }
 
-pub(crate) fn extra_bin_dirs() -> Vec<PathBuf> {
+fn extra_bin_dirs() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
@@ -199,19 +199,6 @@ fn ensure_dsh(env: &EnvLookup) -> Result<PathBuf> {
     }
     offer_install("DeepSeek Harness", &crate::dsh::install_hint(), env)?;
     ensure_pnpm()?;
-    install_dsh_packages()?;
-    let path = lookup_program("dsh").ok_or_else(|| {
-        anyhow::anyhow!(
-            "DeepSeek Harness finished installing but dsh was not found. Add npm's global bin to PATH, then retry."
-        )
-    })?;
-    if !crate::dsh::profile_ready(env) {
-        install_dsh_profile(&path, env)?;
-    }
-    Ok(path)
-}
-
-fn install_dsh_packages() -> Result<()> {
     let cmd = crate::dsh::npm_install_cmd();
     eprintln!("[rx] {cmd}");
     run_npm(
@@ -224,7 +211,15 @@ fn install_dsh_packages() -> Result<()> {
         ],
         &cmd,
     )?;
-    Ok(())
+    let path = lookup_program("dsh").ok_or_else(|| {
+        anyhow::anyhow!(
+            "DeepSeek Harness finished installing but dsh was not found. Add npm's global bin to PATH, then retry."
+        )
+    })?;
+    if !crate::dsh::profile_ready(env) {
+        install_dsh_profile(&path, env)?;
+    }
+    Ok(path)
 }
 
 fn ensure_pnpm() -> Result<()> {

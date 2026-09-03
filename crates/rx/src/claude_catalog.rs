@@ -95,7 +95,7 @@ pub(crate) struct SeedCaches {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SeedOutcome {
-    Seeded { model_count: usize },
+    Seeded,
     Fallback,
 }
 
@@ -105,17 +105,17 @@ pub(crate) fn try_seed_user_catalog(
     base_url: &str,
     api_key: &str,
     env: &EnvLookup,
-) -> Result<SeedOutcome> {
+) -> SeedOutcome {
     let caches = match catalog::load_claude_seed(paths, provider_id, base_url, api_key) {
         Ok(Some(caches)) if !caches.additional_model_options.is_empty() => caches,
-        _ => return Ok(SeedOutcome::Fallback),
+        _ => return SeedOutcome::Fallback,
     };
     let config_path = claude_config_path(env);
     match write_seed(&config_path, &caches) {
-        Ok(()) => Ok(SeedOutcome::Seeded { model_count: caches.additional_model_options.len() }),
+        Ok(()) => SeedOutcome::Seeded,
         Err(error) => {
             eprintln!("[rx] catalog seed skipped: {error:#}");
-            Ok(SeedOutcome::Fallback)
+            SeedOutcome::Fallback
         }
     }
 }
@@ -132,24 +132,20 @@ pub(crate) fn seed_from_openai_body(
     if let Ok(models) = parse_user_catalog(body)
         && !models.is_empty()
     {
-        let models = apply_fallback_context(provider_id, models);
+        let fallback_context = catalog::fallback_context(provider_id);
+        let models = models
+            .into_iter()
+            .map(|model| UserModel {
+                context_length: Some(model.context_length.unwrap_or(fallback_context)),
+                ..model
+            })
+            .collect::<Vec<_>>();
         let seed = with_provider(provider_id, build_seed(&models));
         if !seed.additional_model_options.is_empty() {
             return seed;
         }
     }
     seed_from_listed(provider_id, fallback)
-}
-
-fn apply_fallback_context(provider_id: &str, models: Vec<UserModel>) -> Vec<UserModel> {
-    let fallback = catalog::fallback_context(provider_id);
-    models
-        .into_iter()
-        .map(|model| UserModel {
-            context_length: Some(model.context_length.unwrap_or(fallback)),
-            ..model
-        })
-        .collect()
 }
 
 fn with_provider(provider_id: &str, mut caches: SeedCaches) -> SeedCaches {
@@ -173,12 +169,12 @@ fn from_listed_models(provider_id: &str, models: &[ListedModel]) -> Vec<UserMode
         .collect()
 }
 
-pub(crate) fn parse_user_catalog(body: &str) -> Result<Vec<UserModel>> {
+fn parse_user_catalog(body: &str) -> Result<Vec<UserModel>> {
     let value: Value = serde_json::from_str(body).context("catalog response is not JSON")?;
     parse_user_catalog_value(&value)
 }
 
-pub(crate) fn parse_user_catalog_value(value: &Value) -> Result<Vec<UserModel>> {
+fn parse_user_catalog_value(value: &Value) -> Result<Vec<UserModel>> {
     let Some(data) = value.get("data").and_then(Value::as_array) else {
         bail!("catalog JSON has no data array");
     };
@@ -323,11 +319,15 @@ fn claude_config_path(env: &EnvLookup) -> PathBuf {
     }
 }
 
-fn write_seed(path: &Path, caches: &SeedCaches) -> Result<()> {
+pub(crate) fn write_seed(path: &Path, caches: &SeedCaches) -> Result<()> {
     write_seed_with_hook(path, caches, |_| {})
 }
 
-fn write_seed_with_hook<F>(path: &Path, caches: &SeedCaches, mut after_read: F) -> Result<()>
+pub(crate) fn write_seed_with_hook<F>(
+    path: &Path,
+    caches: &SeedCaches,
+    mut after_read: F,
+) -> Result<()>
 where
     F: FnMut(usize),
 {
@@ -358,23 +358,6 @@ where
     bail!("{} changed repeatedly while seeding catalog", path.display())
 }
 
-#[cfg(test)]
-pub(crate) fn write_seed_for_test(path: &Path, caches: &SeedCaches) -> Result<()> {
-    write_seed(path, caches)
-}
-
-#[cfg(test)]
-pub(crate) fn write_seed_with_hook_for_test<F>(
-    path: &Path,
-    caches: &SeedCaches,
-    after_read: F,
-) -> Result<()>
-where
-    F: FnMut(usize),
-{
-    write_seed_with_hook(path, caches, after_read)
-}
-
 fn read_config_document(path: &Path) -> Result<(Value, Option<Vec<u8>>)> {
     match read_config_bytes(path)? {
         Some(contents) => {
@@ -402,9 +385,26 @@ fn merge_seed(document: &mut Value, caches: &SeedCaches) {
     let mut catalog_marker =
         object.get(RX_SEEDED_CATALOG_KEY).and_then(Value::as_object).cloned().unwrap_or_default();
     merge_tool_search_denylist(object, caches, &mut catalog_marker);
-    merge_model_options(object, caches, &mut catalog_marker);
-    merge_model_access(object, caches, &mut catalog_marker);
-    merge_costs(object, caches, &mut catalog_marker);
+    reconcile_array_cache(
+        object,
+        &mut catalog_marker,
+        MODEL_OPTIONS_CACHE_KEY,
+        "value",
+        model_option_values(caches),
+    );
+    reconcile_array_cache(
+        object,
+        &mut catalog_marker,
+        MODEL_ACCESS_CACHE_KEY,
+        "apiName",
+        model_access_values(caches),
+    );
+    reconcile_object_cache(
+        object,
+        &mut catalog_marker,
+        MODEL_COSTS_CACHE_KEY,
+        &caches.additional_model_costs,
+    );
     merge_compact_windows(object, caches, &mut catalog_marker);
     catalog_marker.insert("provider_id".to_string(), json!(caches.provider_id));
     catalog_marker.insert("version".to_string(), json!(1));
@@ -504,42 +504,6 @@ fn merge_tool_search_denylist(
     legacy_owned.sort();
     object.insert(RX_SEEDED_DENYLIST_KEY.to_string(), json!(legacy_owned));
     marker.insert(TOOL_SEARCH_DENYLIST_MARKER_KEY.to_string(), Value::Object(next_marker));
-}
-
-fn merge_model_options(
-    object: &mut serde_json::Map<String, Value>,
-    caches: &SeedCaches,
-    marker: &mut serde_json::Map<String, Value>,
-) {
-    reconcile_array_cache(
-        object,
-        marker,
-        MODEL_OPTIONS_CACHE_KEY,
-        "value",
-        model_option_values(caches),
-    );
-}
-
-fn merge_model_access(
-    object: &mut serde_json::Map<String, Value>,
-    caches: &SeedCaches,
-    marker: &mut serde_json::Map<String, Value>,
-) {
-    reconcile_array_cache(
-        object,
-        marker,
-        MODEL_ACCESS_CACHE_KEY,
-        "apiName",
-        model_access_values(caches),
-    );
-}
-
-fn merge_costs(
-    object: &mut serde_json::Map<String, Value>,
-    caches: &SeedCaches,
-    marker: &mut serde_json::Map<String, Value>,
-) {
-    reconcile_object_cache(object, marker, MODEL_COSTS_CACHE_KEY, &caches.additional_model_costs);
 }
 
 fn merge_compact_windows(

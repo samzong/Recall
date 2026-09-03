@@ -84,7 +84,7 @@ pub(crate) fn run(passthrough: Vec<OsString>, env: &EnvLookup) -> Result<()> {
                 request.gateway.credential_env
             )
         })?;
-    let target = target(&request.gateway, key)?;
+    let target = target(&request.gateway, key);
     let paths = Paths::in_dir(request.state_dir);
     let launch_request = LaunchRequest { harness, provider: None, passthrough };
     let install_env = EnvLookup::real_with(install_overrides(request.install_policy));
@@ -199,7 +199,7 @@ fn prepare_state(environment: &HashMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-fn target(profile: &GatewayProfile, key: String) -> Result<ProviderTarget> {
+fn target(profile: &GatewayProfile, key: String) -> ProviderTarget {
     let provider = Provider {
         id: profile.provider_id.clone(),
         name: profile.name.clone(),
@@ -211,14 +211,7 @@ fn target(profile: &GatewayProfile, key: String) -> Result<ProviderTarget> {
         default_model: None,
         claude_default_model: None,
     };
-    Ok(ProviderTarget {
-        provider_id: profile.provider_id.clone(),
-        base_url: profile.endpoint.clone(),
-        claude_url: crate::provider::claude_base(&provider),
-        provider,
-        key,
-        model: None,
-    })
+    ProviderTarget { provider, key, model: None }
 }
 
 fn validate_route_args(harness: Harness, passthrough: &[OsString]) -> Result<()> {
@@ -346,6 +339,12 @@ mod tests {
             serde_json::json!(["claude", "codex", "opencode", "pi", "dsh", "kimi"])
         );
         assert_eq!(value["version"], crate::RELEASE_VERSION);
+    }
+
+    #[test]
+    fn host_entrypoint_rejects_malformed_requests() {
+        let env = EnvLookup::isolated(HashMap::from([(REQUEST_ENV.to_string(), "{".to_string())]));
+        assert!(run(Vec::new(), &env).is_err());
     }
 
     #[test]

@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 
 use crate::args;
 use crate::catalog;
+use crate::catalog::openai_base;
 use crate::config::Paths;
-use crate::launch::{EnvLookup, openai_base};
+use crate::launch::EnvLookup;
 use crate::opencode;
 use crate::provider::{Provider, Setup};
 
@@ -22,7 +23,7 @@ const PI_ENV_CLEAR: &[&str] = &[
     "GEMINI_API_KEY",
 ];
 
-pub(crate) fn global_agent_dir(env: &EnvLookup) -> Result<PathBuf> {
+fn global_agent_dir(env: &EnvLookup) -> Result<PathBuf> {
     // PI_CODING_AGENT_DIR is authoritative for pi's configuration location
     // (see src/adapters/pi.rs); providers must land where the launched
     // process will actually read them.
@@ -52,10 +53,6 @@ pub(crate) fn global_agent_dir(env: &EnvLookup) -> Result<PathBuf> {
     Ok(home.join(".pi").join("agent"))
 }
 
-pub(crate) fn recall_pi_dir(paths: &Paths) -> PathBuf {
-    paths.dir.join("pi")
-}
-
 pub(crate) fn prepare(
     provider_id: &str,
     provider: &Provider,
@@ -72,7 +69,7 @@ pub(crate) fn prepare(
         }
         return Ok(());
     }
-    let recall_dir = recall_pi_dir(paths);
+    let recall_dir = paths.dir.join("pi");
     fs::create_dir_all(&recall_dir)
         .with_context(|| format!("failed to create {}", recall_dir.display()))?;
     write_json_atomic(&recall_dir.join(format!("{provider_id}-provider.json")), &document)?;

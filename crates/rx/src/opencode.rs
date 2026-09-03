@@ -5,8 +5,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::catalog;
+use crate::catalog::openai_base;
 use crate::config::Paths;
-use crate::launch::{EnvLookup, openai_base};
+use crate::launch::EnvLookup;
 use crate::provider::{Provider, Setup};
 
 pub(crate) fn config_content(

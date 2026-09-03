@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
@@ -190,9 +190,8 @@ pub(crate) fn claude_base(provider: &Provider) -> String {
 
 pub(crate) fn available(config: &RxConfig) -> Result<Vec<Provider>> {
     let mut providers = catalog().to_vec();
-    let known: BTreeSet<String> = providers.iter().map(|provider| provider.id.clone()).collect();
     for (id, entry) in &config.provider {
-        if !known.contains(id.as_str()) && entry.base_url.is_some() {
+        if find(id).is_none() && entry.base_url.is_some() {
             providers.push(resolve(id, Some(entry))?);
         }
     }
@@ -220,7 +219,6 @@ fn from_snapshot(provider: SnapshotProvider) -> Provider {
         "openrouter" => {
             (Setup::OpenRouter, Some("~openai/gpt-latest"), Some("~anthropic/claude-sonnet-latest"))
         }
-        "tokener" => (Setup::Generated, None, None),
         _ => (Setup::Generated, None, None),
     };
     Provider {

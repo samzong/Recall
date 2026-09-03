@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_yaml::{Mapping, Value};
 
-use crate::catalog;
+use crate::catalog::{self, openai_base};
 use crate::config::Paths;
-use crate::launch::{EnvLookup, openai_base};
+use crate::launch::EnvLookup;
 use crate::provider::{ModelProtocol, Provider, ReasoningControl, Setup};
 
 pub(crate) const PROFILE: &str = "dsh-tui";

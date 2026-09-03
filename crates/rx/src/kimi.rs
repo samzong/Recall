@@ -48,7 +48,7 @@ pub(crate) fn prepare(
     env: &EnvLookup,
     passthrough: &[OsString],
 ) -> Result<LaunchPlan> {
-    let provider_id = target.provider_id.as_str();
+    let provider_id = target.provider.id.as_str();
     let provider_alias = format!("rx-{provider_id}");
     let model_prefix = format!("{provider_alias}/");
     let (requested_model, mut args) = take_model(passthrough)?;
@@ -60,7 +60,7 @@ pub(crate) fn prepare(
     let mut models = match catalog::load_listed_models(
         paths,
         provider_id,
-        &target.base_url,
+        &target.provider.endpoint,
         &target.key,
         allow_fetch,
     ) {
@@ -166,7 +166,7 @@ fn desired_catalog(
 ) -> OwnedCatalog {
     let provider = OwnedProvider {
         alias: provider_alias.to_string(),
-        base_url: catalog::openai_base(&target.base_url),
+        base_url: catalog::openai_base(&target.provider.endpoint),
         api_key_sha256: key_hash(&target.key),
     };
     let models = models
@@ -178,7 +178,7 @@ fn desired_catalog(
                 model: model.id.clone(),
                 max_context_size: model
                     .context_length
-                    .unwrap_or_else(|| catalog::fallback_context(&target.provider_id)),
+                    .unwrap_or_else(|| catalog::fallback_context(&target.provider.id)),
                 display_name: model.name.clone(),
             };
             (alias, entry)
@@ -441,15 +441,9 @@ mod tests {
     use super::*;
 
     fn target(key: &str) -> ProviderTarget {
-        let provider = crate::provider::find("tokener").unwrap().clone();
-        ProviderTarget {
-            provider_id: "tokener".to_string(),
-            base_url: "https://provider.test".to_string(),
-            claude_url: "https://provider.test".to_string(),
-            provider,
-            key: key.to_string(),
-            model: None,
-        }
+        let mut provider = crate::provider::find("tokener").unwrap().clone();
+        provider.endpoint = "https://provider.test".to_string();
+        ProviderTarget { provider, key: key.to_string(), model: None }
     }
 
     fn listed(id: &str, name: &str, context: i64) -> ListedModel {

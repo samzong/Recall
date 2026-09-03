@@ -7,10 +7,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
-pub struct Paths {
-    pub dir: PathBuf,
-    pub config: PathBuf,
-    pub keys: PathBuf,
+pub(crate) struct Paths {
+    pub(crate) dir: PathBuf,
+    pub(crate) config: PathBuf,
+    pub(crate) keys: PathBuf,
 }
 
 impl Paths {
@@ -85,10 +85,6 @@ pub(crate) fn load_or_default(paths: &Paths) -> Result<RxConfig> {
     Ok(load(paths)?.unwrap_or_default())
 }
 
-fn ensure_provider_entry<'a>(config: &'a mut RxConfig, id: &str) -> &'a mut ProviderConfig {
-    config.provider.entry(id.to_string()).or_default()
-}
-
 pub(crate) fn stored_providers(paths: &Paths) -> Result<BTreeSet<String>> {
     Ok(load_keys(paths)?.values.keys().cloned().collect())
 }
@@ -110,7 +106,7 @@ pub(crate) fn login(paths: &Paths, provider: &str, key: String) -> Result<()> {
     let mut config = load_or_default(paths)?;
     crate::provider::resolve(provider, config.provider.get(provider))?;
     let mut keys = load_keys(paths)?;
-    let entry = ensure_provider_entry(&mut config, provider);
+    let entry = config.provider.entry(provider.to_string()).or_default();
     entry.auth = AuthMode::ApiKey;
     keys.values.insert(provider.to_string(), key);
     config.default_provider = Some(provider.to_string());
