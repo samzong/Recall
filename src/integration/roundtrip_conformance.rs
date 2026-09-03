@@ -214,6 +214,25 @@ fn codex_single_file_round_trip() {
                 "timestamp": "2026-04-13T10:00:02Z",
                 "payload": {"type": "agent_message", "message": "The mapping is intact."}
             }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:03Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"src/db/events.rs\"}",
+                    "call_id": "call_conformance"
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:04Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_conformance",
+                    "output": "event store mapping"
+                }
+            }),
         ],
     );
 
