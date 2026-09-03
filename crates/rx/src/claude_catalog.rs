@@ -389,9 +389,26 @@ fn merge_seed(document: &mut Value, caches: &SeedCaches) {
     let mut catalog_marker =
         object.get(RX_SEEDED_CATALOG_KEY).and_then(Value::as_object).cloned().unwrap_or_default();
     merge_tool_search_denylist(object, caches, &mut catalog_marker);
-    merge_model_options(object, caches, &mut catalog_marker);
-    merge_model_access(object, caches, &mut catalog_marker);
-    merge_costs(object, caches, &mut catalog_marker);
+    reconcile_array_cache(
+        object,
+        &mut catalog_marker,
+        MODEL_OPTIONS_CACHE_KEY,
+        "value",
+        model_option_values(caches),
+    );
+    reconcile_array_cache(
+        object,
+        &mut catalog_marker,
+        MODEL_ACCESS_CACHE_KEY,
+        "apiName",
+        model_access_values(caches),
+    );
+    reconcile_object_cache(
+        object,
+        &mut catalog_marker,
+        MODEL_COSTS_CACHE_KEY,
+        &caches.additional_model_costs,
+    );
     merge_compact_windows(object, caches, &mut catalog_marker);
     catalog_marker.insert("provider_id".to_string(), json!(caches.provider_id));
     catalog_marker.insert("version".to_string(), json!(1));
@@ -491,42 +508,6 @@ fn merge_tool_search_denylist(
     legacy_owned.sort();
     object.insert(RX_SEEDED_DENYLIST_KEY.to_string(), json!(legacy_owned));
     marker.insert(TOOL_SEARCH_DENYLIST_MARKER_KEY.to_string(), Value::Object(next_marker));
-}
-
-fn merge_model_options(
-    object: &mut serde_json::Map<String, Value>,
-    caches: &SeedCaches,
-    marker: &mut serde_json::Map<String, Value>,
-) {
-    reconcile_array_cache(
-        object,
-        marker,
-        MODEL_OPTIONS_CACHE_KEY,
-        "value",
-        model_option_values(caches),
-    );
-}
-
-fn merge_model_access(
-    object: &mut serde_json::Map<String, Value>,
-    caches: &SeedCaches,
-    marker: &mut serde_json::Map<String, Value>,
-) {
-    reconcile_array_cache(
-        object,
-        marker,
-        MODEL_ACCESS_CACHE_KEY,
-        "apiName",
-        model_access_values(caches),
-    );
-}
-
-fn merge_costs(
-    object: &mut serde_json::Map<String, Value>,
-    caches: &SeedCaches,
-    marker: &mut serde_json::Map<String, Value>,
-) {
-    reconcile_object_cache(object, marker, MODEL_COSTS_CACHE_KEY, &caches.additional_model_costs);
 }
 
 fn merge_compact_windows(
