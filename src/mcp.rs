@@ -1148,7 +1148,8 @@ where
 mod tests {
     use super::*;
     use crate::db::schema;
-    use crate::types::{RawSessionEvent, Session};
+    use crate::db::store::SessionTopologyWrite;
+    use crate::types::{ParentLink, ParentRelation, RawSessionEvent, Session, ThreadRole};
 
     fn setup() -> Store {
         schema::register_sqlite_vec();
@@ -1394,13 +1395,40 @@ mod tests {
         current.message_count = 1;
         store.insert_session(&current).unwrap();
         store.insert_messages(&[message("000-current", Role::User, "identityneedle", 0)]).unwrap();
-        for index in 0..50 {
+        for index in 0..51 {
             let id = format!("history-{index:02}");
             let mut stored = session(&id, "codex", "history", 50_000 - index);
             stored.message_count = 1;
             store.insert_session(&stored).unwrap();
             store.insert_messages(&[message(&id, Role::User, "identityneedle", 0)]).unwrap();
         }
+        store
+            .persist_topology_for_existing_session(
+                "codex",
+                "src-history-00",
+                &SessionTopologyWrite {
+                    thread_role: Some(ThreadRole::Primary),
+                    parents: &[],
+                    parser_version: Some(1),
+                },
+            )
+            .unwrap();
+        let spawn = ParentLink {
+            relation: ParentRelation::Spawn,
+            source: "codex".to_string(),
+            source_id: "src-history-00".to_string(),
+        };
+        store
+            .persist_topology_for_existing_session(
+                "codex",
+                "src-history-01",
+                &SessionTopologyWrite {
+                    thread_role: Some(ThreadRole::Subagent),
+                    parents: std::slice::from_ref(&spawn),
+                    parser_version: Some(1),
+                },
+            )
+            .unwrap();
         let index = ready(store);
         let current_context = context("codex", "src-000-current");
 
