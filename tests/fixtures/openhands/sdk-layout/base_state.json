@@ -1,0 +1,8 @@
+{
+  "id": "sdk-conv-1",
+  "title": "SDK conversation",
+  "workspace": {
+    "kind": "LocalWorkspace",
+    "working_dir": "/tmp/oh-sdk"
+  }
+}

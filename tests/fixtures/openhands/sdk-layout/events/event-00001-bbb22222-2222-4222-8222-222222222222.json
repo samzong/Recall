@@ -1,0 +1,10 @@
+{
+  "kind": "MessageEvent",
+  "id": "msg-user-1",
+  "timestamp": "2026-01-01T00:00:01Z",
+  "source": "user",
+  "llm_message": {
+    "role": "user",
+    "content": [{ "type": "text", "text": "first user turn" }]
+  }
+}

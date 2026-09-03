@@ -528,6 +528,9 @@ impl Store {
         excluded_session_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Session>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut sql = format!(
             "SELECT {SESSION_COLUMNS}
              FROM sessions s
@@ -542,25 +545,35 @@ impl Store {
             param_idx += 1;
         }
         sql.push_str(&format!(
-            " ORDER BY COALESCE(updated_at, started_at) DESC, started_at DESC, source ASC, source_id ASC LIMIT ?{param_idx}"
+            " ORDER BY COALESCE(updated_at, started_at) DESC, started_at DESC, source ASC, source_id ASC LIMIT ?{param_idx} OFFSET ?{}",
+            param_idx + 1
         ));
-        params.push(Box::new(limit as i64));
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), session_from_row)?;
-        let mut sessions = Vec::new();
-        for row in rows {
-            sessions.push(row?);
+        let page_size = limit as i64;
+        let mut offset = 0_i64;
+        let mut sessions = Vec::with_capacity(limit);
+        loop {
+            let mut param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            param_refs.push(&page_size);
+            param_refs.push(&offset);
+            let rows = stmt.query_map(param_refs.as_slice(), session_from_row)?;
+            let page = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            let fetched = page.len();
+            offset += fetched as i64;
+            let mut page = page.into_iter();
+            while !page.as_slice().is_empty() {
+                let needed = limit - sessions.len();
+                sessions.extend(page.by_ref().take(needed));
+                self.retain_visible_subagents(&mut sessions)?;
+                if sessions.len() == limit {
+                    return Ok(sessions);
+                }
+            }
+            if fetched < limit {
+                return Ok(sessions);
+            }
         }
-        drop(stmt);
-
-        // Hide a subagent only when its spawn parent is present in this same
-        // scoped result set — then it is reachable through the parent's picker.
-        // Orphaned subagents, and children whose parent falls outside the active
-        // scope or the result limit, stay visible so nothing becomes unreachable.
-        self.retain_visible_subagents(&mut sessions)?;
-        Ok(sessions)
     }
 
     fn retain_visible_subagents(&self, sessions: &mut Vec<Session>) -> Result<()> {
@@ -1221,6 +1234,64 @@ mod topology_tests {
             vec!["orphan".to_string(), "primary".to_string(), "unknown".to_string()],
             "reachable child hidden; orphaned subagent stays visible"
         );
+    }
+
+    #[test]
+    fn recent_sessions_keeps_subagent_when_parent_is_beyond_result_limit() {
+        let store = store();
+        let spawn = ParentLink {
+            relation: ParentRelation::Spawn,
+            source: "codex".to_string(),
+            source_id: "primary".to_string(),
+        };
+        let mut child = sess("child");
+        child.updated_at = Some(100);
+        persist(
+            &store,
+            &child,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Subagent),
+                parents: std::slice::from_ref(&spawn),
+                parser_version: Some(1),
+            },
+        );
+        let mut visible = sess("visible");
+        visible.updated_at = Some(90);
+        persist(
+            &store,
+            &visible,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Primary),
+                parents: &[],
+                parser_version: Some(1),
+            },
+        );
+        let mut primary = sess("primary");
+        primary.updated_at = Some(80);
+        persist(
+            &store,
+            &primary,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Primary),
+                parents: &[],
+                parser_version: Some(1),
+            },
+        );
+
+        let ids = store
+            .list_recent_sessions_for_search_scope(
+                None,
+                TimeRange::All,
+                &ProjectScope::Global,
+                None,
+                2,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|session| session.source_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["child", "visible"]);
     }
 
     #[test]

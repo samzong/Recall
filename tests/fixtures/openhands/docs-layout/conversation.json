@@ -1,0 +1,18 @@
+{
+  "id": "abc123def456",
+  "title": "Fix the login bug",
+  "created_at": "2026-01-01T00:00:00Z",
+  "workspace": "/tmp/oh-docs",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Fix the login bug in auth.py",
+      "timestamp": "2026-01-01T00:00:01Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Looking at auth.py now",
+      "timestamp": "2026-01-01T00:00:02Z"
+    }
+  ]
+}

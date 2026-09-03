@@ -1,0 +1,29 @@
+{
+  "v": 3,
+  "id": "T-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+  "created": 1700000000000,
+  "title": "Amp thread title",
+  "env": {
+    "initial": {
+      "workingDirectory": "file:///tmp/amp-project",
+      "trees": [
+        { "uri": "file:///tmp/amp-project" }
+      ]
+    }
+  },
+  "messages": [
+    {
+      "role": "human",
+      "content": [{ "type": "text", "text": "hello from amp" }],
+      "created": 1700000001000
+    },
+    {
+      "role": "agent",
+      "content": [
+        { "type": "text", "text": "hi back" },
+        { "type": "tool_use", "name": "bash", "input": { "cmd": "ls" } }
+      ],
+      "created": 1700000002000
+    }
+  ]
+}

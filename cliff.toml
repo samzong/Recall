@@ -21,9 +21,10 @@ footer = ""
 
 [git]
 conventional_commits = true
-filter_unconventional = true
+require_conventional = true
 protect_breaking_commits = true
 commit_preprocessors = [
+  { pattern = '^Preserve structured tool event relationships', replace = "feat(events): preserve structured tool event relationships" },
   { pattern = '\(#(\d+)\)', replace = "([#${1}](https://github.com/samzong/Recall/issues/${1}))" },
 ]
 commit_parsers = [

@@ -545,7 +545,7 @@ mod tests {
         let meta = collect_session_display_meta(&session, &[]);
         fs::write(
             dir.path().join("019e6d8d-588b-7fd2-a326-c525469ed120.html"),
-            render_session_html(&session, &[], &meta),
+            render_session_html(&session, &[], &[], &meta),
         )
         .unwrap();
 
@@ -583,7 +583,7 @@ mod tests {
         init_publish_dir(dir.path()).unwrap();
         let session = session("keep-me");
         let meta = collect_session_display_meta(&session, &[]);
-        let html = render_session_html(&session, &[], &meta);
+        let html = render_session_html(&session, &[], &[], &meta);
         let path = dir.path().join("keep-me.html");
         fs::write(&path, &html).unwrap();
         let share = share_config(dir.path());
