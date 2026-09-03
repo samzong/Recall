@@ -1,5 +1,11 @@
 # Changelog
 
+## Upgrade note
+
+Before using `recall powercontext backfill` with a Recall release that exports
+schema v6, run `recall ext upgrade powercontext` and verify that
+`recall ext list` shows version 0.1.1 or later. `recall-powercontext` 0.1.0
+accepts only schema v5.
 
 ## [0.5.8](https://github.com/samzong/Recall/compare/v0.5.7...v0.5.8) (2026-09-01)
 

@@ -24,7 +24,7 @@ use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, R
 pub(crate) struct CodexAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 5;
-const EVENT_PARSER_VERSION: u32 = 3;
+const EVENT_PARSER_VERSION: u32 = 4;
 const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for CodexAdapter {
@@ -445,6 +445,7 @@ pub(crate) fn parse_codex_session_with_options(
     let mut forked_child_waiting_for_turn_context = false;
     let mut forked_child_inherited_baseline: Option<CodexUsageTotals> = None;
     let mut forked_child_inherited_reported_total: Option<i64> = None;
+    let mut last_visible_message_seq: Option<u32> = None;
     let source_path = path.to_string_lossy().to_string();
 
     for item in jsonl_indexed(reader.lines()) {
@@ -574,7 +575,12 @@ pub(crate) fn parse_codex_session_with_options(
                                 && !text.is_empty()
                             {
                                 let ts = parse_timestamp(&v);
-                                push_codex_message(&mut messages, Role::User, text.to_string(), ts);
+                                last_visible_message_seq = push_codex_message(
+                                    &mut messages,
+                                    Role::User,
+                                    text.to_string(),
+                                    ts,
+                                );
                             }
                         }
                         "agent_message" => {
@@ -582,7 +588,7 @@ pub(crate) fn parse_codex_session_with_options(
                                 && !text.is_empty()
                             {
                                 let ts = parse_timestamp(&v);
-                                push_codex_message(
+                                last_visible_message_seq = push_codex_message(
                                     &mut messages,
                                     Role::Assistant,
                                     text.to_string(),
@@ -595,36 +601,52 @@ pub(crate) fn parse_codex_session_with_options(
                 }
             }
             "response_item" => {
-                if let Some(payload) = v.get("payload")
-                    && payload.get("type").and_then(|t| t.as_str()) == Some("message")
-                    && payload.get("role").and_then(|r| r.as_str()) == Some("assistant")
-                {
-                    let text = extract_content_array(payload.get("content"));
-                    let message_seq =
-                        if text.is_empty() { None } else { Some(messages.len() as u32) };
-                    if include_events {
-                        collect_codex_content_events(
-                            payload.get("content"),
-                            parse_timestamp(&v),
+                if let Some(payload) = v.get("payload") {
+                    let timestamp = parse_timestamp(&v);
+                    let payload_type = payload.get("type").and_then(|t| t.as_str());
+                    let role = payload.get("role").and_then(|r| r.as_str());
+                    if payload_type == Some("message") && role == Some("assistant") {
+                        let text = extract_content_array(payload.get("content"));
+                        let message_seq = if text.is_empty() {
+                            None
+                        } else {
+                            push_codex_message(&mut messages, Role::Assistant, text, timestamp)
+                        };
+                        if include_events {
+                            collect_codex_content_events(
+                                payload.get("content"),
+                                timestamp,
+                                &source_path,
+                                line_index,
+                                last_visible_message_seq,
+                                message_seq,
+                                &mut events,
+                            );
+                        }
+                        if codex_content_has_visible_text(payload.get("content")) {
+                            last_visible_message_seq = message_seq;
+                        }
+                    } else if include_events
+                        && payload_type == Some("message")
+                        && matches!(role, Some("developer" | "system"))
+                    {
+                        collect_codex_meta_event(
+                            payload,
+                            timestamp,
                             &source_path,
                             line_index,
-                            message_seq,
+                            &mut events,
+                        );
+                    } else if include_events {
+                        collect_codex_response_item_event(
+                            payload,
+                            timestamp,
+                            &source_path,
+                            line_index,
+                            last_visible_message_seq,
                             &mut events,
                         );
                     }
-                    if !text.is_empty() {
-                        let ts = parse_timestamp(&v);
-                        push_codex_message(&mut messages, Role::Assistant, text, ts);
-                    }
-                }
-                if include_events && let Some(payload) = v.get("payload") {
-                    collect_codex_response_item_event(
-                        payload,
-                        parse_timestamp(&v),
-                        &source_path,
-                        line_index,
-                        &mut events,
-                    );
                 }
             }
             _ => {}
@@ -681,16 +703,14 @@ fn collect_codex_response_item_event(
     timestamp: Option<i64>,
     source_path: &str,
     line_index: usize,
+    message_seq: Option<u32>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
     let Some(payload_type) = payload.get("type").and_then(|t| t.as_str()) else {
         return;
     };
-    let source_event_id = payload
-        .get("call_id")
-        .and_then(|id| id.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| line_index.to_string());
+    let source_event_id = Some(line_index.to_string());
+    let tool_call_id = codex_tool_call_id(payload);
 
     if payload_type.ends_with("_output") {
         let mut event = events::tool_result_event(
@@ -698,14 +718,15 @@ fn collect_codex_response_item_event(
                 event_seq: events_out.len() as u32,
                 timestamp,
                 source_path: Some(source_path.to_string()),
-                source_event_id: Some(source_event_id),
-                message_seq: None,
+                source_event_id,
+                message_seq,
                 parser_version: EVENT_PARSER_VERSION,
             },
             payload.get("name").and_then(|name| name.as_str()).map(String::from),
             codex_output_summary(payload),
         );
         event.status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
+        event.tool_call_id = tool_call_id;
         events_out.push(event);
         return;
     }
@@ -722,14 +743,15 @@ fn collect_codex_response_item_event(
                             event_seq: events_out.len() as u32,
                             timestamp,
                             source_path: Some(source_path.to_string()),
-                            source_event_id: Some(source_event_id.clone()),
-                            message_seq: None,
+                            source_event_id: source_event_id.clone(),
+                            message_seq,
                             parser_version: EVENT_PARSER_VERSION,
                         },
                         name.clone(),
                         target,
                     );
                     event.status = status.clone();
+                    event.tool_call_id = tool_call_id.clone();
                     events_out.push(event);
                 }
                 return;
@@ -741,8 +763,8 @@ fn collect_codex_response_item_event(
                     event_seq: events_out.len() as u32,
                     timestamp,
                     source_path: Some(source_path.to_string()),
-                    source_event_id: Some(source_event_id.clone()),
-                    message_seq: None,
+                    source_event_id: source_event_id.clone(),
+                    message_seq,
                     parser_version: EVENT_PARSER_VERSION,
                 },
                 name,
@@ -753,8 +775,8 @@ fn collect_codex_response_item_event(
                     event_seq: events_out.len() as u32,
                     timestamp,
                     source_path: Some(source_path.to_string()),
-                    source_event_id: Some(source_event_id),
-                    message_seq: None,
+                    source_event_id,
+                    message_seq,
                     parser_version: EVENT_PARSER_VERSION,
                 },
                 name,
@@ -762,8 +784,18 @@ fn collect_codex_response_item_event(
             ),
         };
         event.status = status;
+        event.tool_call_id = tool_call_id;
         events_out.push(event);
     }
+}
+
+fn codex_tool_call_id(payload: &Value) -> Option<String> {
+    payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(String::from)
 }
 
 fn codex_call_name(payload_type: &str, payload: &Value) -> String {
@@ -799,18 +831,25 @@ fn collect_codex_content_events(
     timestamp: Option<i64>,
     source_path: &str,
     line_index: usize,
-    message_seq: Option<u32>,
+    prior_message_seq: Option<u32>,
+    current_message_seq: Option<u32>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
     let Some(Value::Array(arr)) = content else {
         return;
     };
+    let mut message_seq = prior_message_seq;
     for (item_index, item) in arr.iter().enumerate() {
         match item.get("type").and_then(|t| t.as_str()) {
+            Some("text" | "output_text") => {
+                if item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty()) {
+                    message_seq = current_message_seq;
+                }
+            }
             Some("function_call") => {
                 let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
                 let args = item.get("arguments").and_then(|a| a.as_str());
-                events_out.push(events::tool_call_event_from_text(
+                let mut event = events::tool_call_event_from_text(
                     events::EventContext {
                         event_seq: events_out.len() as u32,
                         timestamp,
@@ -821,11 +860,13 @@ fn collect_codex_content_events(
                     },
                     name,
                     args,
-                ));
+                );
+                event.tool_call_id = codex_tool_call_id(item);
+                events_out.push(event);
             }
             Some("function_call_output") => {
                 let output = item.get("output").and_then(|o| o.as_str()).map(String::from);
-                events_out.push(events::tool_result_event(
+                let mut event = events::tool_result_event(
                     events::EventContext {
                         event_seq: events_out.len() as u32,
                         timestamp,
@@ -836,11 +877,75 @@ fn collect_codex_content_events(
                     },
                     None,
                     output,
-                ));
+                );
+                event.tool_call_id = codex_tool_call_id(item);
+                events_out.push(event);
             }
             _ => {}
         }
     }
+}
+
+fn codex_content_has_visible_text(content: Option<&Value>) -> bool {
+    let Some(Value::Array(items)) = content else {
+        return false;
+    };
+    items.iter().any(|item| {
+        matches!(item.get("type").and_then(Value::as_str), Some("text" | "output_text"))
+            && item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+    })
+}
+
+fn collect_codex_meta_event(
+    payload: &Value,
+    timestamp: Option<i64>,
+    source_path: &str,
+    line_index: usize,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let Some(actor) = payload.get("role").and_then(Value::as_str) else {
+        return;
+    };
+    let summary = codex_visible_content(payload.get("content"));
+    if summary.is_empty() {
+        return;
+    }
+    events_out.push(RawSessionEvent {
+        event_seq: events_out.len() as u32,
+        timestamp,
+        kind: "message".to_string(),
+        actor: actor.to_string(),
+        name: None,
+        status: None,
+        target: None,
+        message_seq: None,
+        summary: Some(events::bounded_summary(summary)),
+        source_path: Some(source_path.to_string()),
+        source_event_id: Some(line_index.to_string()),
+        tool_call_id: None,
+        is_meta: Some(true),
+        visibility: None,
+        attrs_json: None,
+        parser_version: EVENT_PARSER_VERSION,
+    });
+}
+
+fn codex_visible_content(content: Option<&Value>) -> String {
+    let Some(Value::Array(items)) = content else {
+        return String::new();
+    };
+    items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("text" | "output_text" | "input_text")
+            )
+        })
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn extract_content_array(content: Option<&Value>) -> String {
@@ -1103,13 +1208,15 @@ fn push_codex_message(
     role: Role,
     content: String,
     timestamp: Option<i64>,
-) {
+) -> Option<u32> {
     if role == Role::Assistant
         && messages.last().is_some_and(|m| m.role == Role::Assistant && m.content == content)
     {
-        return;
+        return messages.len().checked_sub(1).map(|seq| seq as u32);
     }
+    let seq = messages.len() as u32;
     messages.push(RawMessage { role, content, timestamp });
+    Some(seq)
 }
 
 #[cfg(test)]
@@ -1273,20 +1380,26 @@ mod tests {
         assert_eq!(raw.events[0].kind, "command");
         assert_eq!(raw.events[0].name.as_deref(), Some("exec_command"));
         assert_eq!(raw.events[0].target.as_deref(), Some("sed -n '1,220p' CLAUDE.md"));
-        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("call_123"));
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call_123"));
         assert_eq!(raw.events[1].kind, "tool_result");
-        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("call_123"));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("2"));
+        assert_eq!(raw.events[1].tool_call_id.as_deref(), Some("call_123"));
         assert_eq!(raw.events[2].kind, "file_write");
         assert_eq!(raw.events[2].name.as_deref(), Some("apply_patch"));
         assert_eq!(raw.events[2].status.as_deref(), Some("completed"));
         assert_eq!(raw.events[2].target.as_deref(), Some("src/lib.rs"));
-        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("call_patch"));
+        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("3"));
+        assert_eq!(raw.events[2].tool_call_id.as_deref(), Some("call_patch"));
         assert_eq!(raw.events[3].kind, "file_write");
         assert_eq!(raw.events[3].name.as_deref(), Some("apply_patch"));
         assert_eq!(raw.events[3].target.as_deref(), Some("docs/new.md"));
         assert_eq!(raw.events[3].event_seq, 3);
+        assert_eq!(raw.events[3].source_event_id.as_deref(), Some("3"));
+        assert_eq!(raw.events[3].tool_call_id.as_deref(), Some("call_patch"));
         assert_eq!(raw.events[4].kind, "tool_result");
-        assert_eq!(raw.events[4].source_event_id.as_deref(), Some("call_patch"));
+        assert_eq!(raw.events[4].source_event_id.as_deref(), Some("4"));
+        assert_eq!(raw.events[4].tool_call_id.as_deref(), Some("call_patch"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1369,6 +1482,141 @@ mod tests {
         assert!(raw.messages.is_empty());
         assert_eq!(raw.events[0].kind, "command");
         assert_eq!(raw.events[0].message_seq, None);
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1:0"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call_empty"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_preserves_event_relationships_and_source_order_anchors() {
+        let root = temp_codex_root("event-relationships");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2395";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-13T10:00:00Z",
+                "payload": {"id": uuid, "cwd": "/tmp/foo"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"pwd\"}",
+                    "call_id": "call_start"
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:02Z",
+                "payload": {"type": "user_message", "message": "Inspect the repository"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:03Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_start",
+                    "output": "/tmp/foo"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:04Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "function_call",
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"Cargo.toml\"}",
+                            "call_id": "call_before"
+                        },
+                        {"type": "output_text", "text": "I found the manifest."},
+                        {
+                            "type": "function_call",
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"src/lib.rs\"}",
+                            "call_id": "call_after"
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_after",
+                            "output": "library body"
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:05Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"git status\"}"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:06Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"git diff\"}",
+                    "call_id": "   "
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:07Z",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "汉".repeat(5000)}]
+                }
+            }),
+        ];
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+
+        assert_eq!(raw.messages.len(), 2);
+        assert_eq!(raw.usage_events.len(), 0);
+        assert_eq!(raw.events.len(), 8);
+        assert_eq!(raw.events[0].message_seq, None);
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call_start"));
+        assert_eq!(raw.events[1].message_seq, Some(0));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("3"));
+        assert_eq!(raw.events[1].tool_call_id.as_deref(), Some("call_start"));
+        assert_eq!(raw.events[2].message_seq, Some(0));
+        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("4:0"));
+        assert_eq!(raw.events[2].tool_call_id.as_deref(), Some("call_before"));
+        assert_eq!(raw.events[3].message_seq, Some(1));
+        assert_eq!(raw.events[3].tool_call_id.as_deref(), Some("call_after"));
+        assert_eq!(raw.events[4].message_seq, Some(1));
+        assert_eq!(raw.events[4].tool_call_id.as_deref(), Some("call_after"));
+        assert_eq!(raw.events[5].source_event_id.as_deref(), Some("5"));
+        assert_eq!(raw.events[5].tool_call_id, None);
+        assert_eq!(raw.events[6].source_event_id.as_deref(), Some("6"));
+        assert_eq!(raw.events[6].tool_call_id, None);
+        assert_eq!(raw.events[7].kind, "message");
+        assert_eq!(raw.events[7].actor, "developer");
+        assert_eq!(raw.events[7].message_seq, None);
+        assert_eq!(raw.events[7].is_meta, Some(true));
+        assert_eq!(raw.events[7].visibility, None);
+        let summary = raw.events[7].summary.as_deref().unwrap();
+        assert!(summary.ends_with('…'));
+        assert!(summary.len() <= 4099);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1455,13 +1703,16 @@ mod tests {
         assert_eq!(raw.events[0].name.as_deref(), Some("web_search"));
         assert_eq!(raw.events[0].target.as_deref(), Some("rust sqlite json_extract"));
         assert_eq!(raw.events[0].status.as_deref(), Some("completed"));
-        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("web_123"));
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("web_123"));
         assert_eq!(raw.events[1].kind, "search");
         assert_eq!(raw.events[1].name.as_deref(), Some("tool_search"));
         assert_eq!(raw.events[1].target.as_deref(), Some("serena initial_instructions"));
-        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("tool_search_123"));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("2"));
+        assert_eq!(raw.events[1].tool_call_id.as_deref(), Some("tool_search_123"));
         assert_eq!(raw.events[2].kind, "tool_result");
-        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("tool_search_123"));
+        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("3"));
+        assert_eq!(raw.events[2].tool_call_id.as_deref(), Some("tool_search_123"));
         assert!(raw.events[2].summary.as_deref().unwrap_or("").contains("mcp__serena"));
 
         let _ = fs::remove_dir_all(&root);
@@ -1940,6 +2191,64 @@ mod tests {
         .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_reparses_unchanged_session_with_stale_event_parser() {
+        let root = temp_codex_root("event-parser-backfill");
+        let sessions_dir = root.join("sessions");
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b237d";
+        let path = write_codex_rollout(&sessions_dir, uuid, "hello");
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let store = setup_store();
+        store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "codex",
+                uuid,
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "codex",
+                uuid,
+                &[],
+                EVENT_PARSER_VERSION - 1,
+                Some(mtime),
+            )
+            .unwrap();
+        store
+            .persist_topology_for_existing_session(
+                "codex",
+                uuid,
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION),
+                },
+            )
+            .unwrap();
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.stats.skipped_sessions, 0);
+        assert_eq!(result.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
+        assert_eq!(result.sessions[0].messages.len(), 1);
+        assert_eq!(result.sessions[0].messages[0].content, "hello");
+        assert!(result.sessions[0].usage_events.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }

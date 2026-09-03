@@ -180,6 +180,33 @@ pub(crate) struct RawUsageEvent {
     pub(crate) raw_usage_json: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EvidenceVisibility {
+    Visible,
+    Hidden,
+    Inactive,
+}
+
+impl EvidenceVisibility {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
+            Self::Inactive => "inactive",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "visible" => Some(Self::Visible),
+            "hidden" => Some(Self::Hidden),
+            "inactive" => Some(Self::Inactive),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RawSessionEvent {
     pub(crate) event_seq: u32,
@@ -193,6 +220,9 @@ pub(crate) struct RawSessionEvent {
     pub(crate) summary: Option<String>,
     pub(crate) source_path: Option<String>,
     pub(crate) source_event_id: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
+    pub(crate) is_meta: Option<bool>,
+    pub(crate) visibility: Option<EvidenceVisibility>,
     pub(crate) attrs_json: Option<String>,
     pub(crate) parser_version: u32,
 }
@@ -228,6 +258,9 @@ pub(crate) struct SessionEventRecord {
     pub(crate) summary: Option<String>,
     pub(crate) source_path: Option<String>,
     pub(crate) source_event_id: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
+    pub(crate) is_meta: Option<bool>,
+    pub(crate) visibility: Option<EvidenceVisibility>,
     pub(crate) attrs_json: Option<String>,
     pub(crate) parser_version: u32,
 }

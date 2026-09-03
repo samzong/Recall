@@ -5,7 +5,7 @@ use chrono::Utc;
 use rusqlite::OptionalExtension;
 
 use super::store::{EventSessionStateMeta, Store};
-use crate::types::{RawSessionEvent, SessionEventRecord};
+use crate::types::{EvidenceVisibility, RawSessionEvent, SessionEventRecord};
 
 impl Store {
     pub(crate) fn event_state_meta_map(
@@ -72,7 +72,8 @@ impl Store {
     ) -> Result<Vec<SessionEventRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_seq, timestamp, kind, actor, name, status, target,
-                    message_seq, summary, source_path, source_event_id, attrs_json, parser_version
+                    message_seq, summary, source_path, source_event_id, tool_call_id,
+                    is_meta, visibility, attrs_json, parser_version
              FROM session_events
              WHERE session_id = ?1
              ORDER BY event_seq ASC",
@@ -90,8 +91,14 @@ impl Store {
                 summary: row.get(8)?,
                 source_path: row.get(9)?,
                 source_event_id: row.get(10)?,
-                attrs_json: row.get(11)?,
-                parser_version: row.get(12)?,
+                tool_call_id: row.get(11)?,
+                is_meta: row.get(12)?,
+                visibility: row
+                    .get::<_, Option<String>>(13)?
+                    .as_deref()
+                    .and_then(EvidenceVisibility::parse),
+                attrs_json: row.get(14)?,
+                parser_version: row.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -114,11 +121,12 @@ pub(crate) fn replace_session_events(
         "INSERT INTO session_events (
             session_id, source, source_id, event_seq, timestamp,
             kind, actor, name, status, target, message_seq, summary,
-            source_path, source_event_id, attrs_json, parser_version, created_at
+            source_path, source_event_id, tool_call_id, is_meta, visibility,
+            attrs_json, parser_version, created_at
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-            ?12, ?13, ?14, ?15, ?16, ?17
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
          )",
     )?;
     for event in session_events {
@@ -137,6 +145,9 @@ pub(crate) fn replace_session_events(
             event.summary,
             event.source_path,
             event.source_event_id,
+            event.tool_call_id,
+            event.is_meta,
+            event.visibility.map(EvidenceVisibility::as_str),
             event.attrs_json,
             event.parser_version,
             created_at,

@@ -516,6 +516,9 @@ mod tests {
             summary: None,
             source_path: None,
             source_event_id: None,
+            tool_call_id: None,
+            is_meta: None,
+            visibility: None,
             attrs_json: None,
             parser_version: 1,
         };
@@ -571,6 +574,9 @@ mod tests {
             summary: None,
             source_path: None,
             source_event_id: None,
+            tool_call_id: None,
+            is_meta: None,
+            visibility: None,
             attrs_json: Some(r#"{"skill":"commit"}"#.to_string()),
             parser_version: 1,
         };

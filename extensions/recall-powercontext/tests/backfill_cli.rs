@@ -13,7 +13,7 @@ fn adapter_jsonl() -> String {
         .enumerate()
         .map(|(idx, adapter)| {
             format!(
-                r#"{{"schema_version":5,"record_type":"session","session":{{"id":"s{idx}","source":"{adapter}","source_id":"raw-{idx}","title":"{adapter}","started_at":1000,"updated_at":1100,"message_count":1,"topology":{{"thread_role":"primary","parents":[]}}}},"messages":[{{"seq":0,"role":"user","content":"prompt from {adapter}"}}]}}"#
+                r#"{{"schema_version":6,"record_type":"session","session":{{"id":"s{idx}","source":"{adapter}","source_id":"raw-{idx}","title":"{adapter}","started_at":1000,"updated_at":1100,"message_count":1,"topology":{{"thread_role":"primary","parents":[]}}}},"messages":[{{"seq":0,"role":"user","content":"prompt from {adapter}"}}]}}"#
             )
         })
         .collect::<Vec<_>>()

@@ -6,7 +6,8 @@ use serde::Deserialize;
 
 use crate::db::store::{SessionTopologyWrite, Store};
 use crate::types::{
-    Message, ParentLink, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource,
+    EvidenceVisibility, Message, ParentLink, RawSessionEvent, RawUsageEvent, Role, Session,
+    TokenSource,
 };
 
 const RECORD_TYPE: &str = "session";
@@ -148,6 +149,12 @@ struct ImportEvent {
     #[serde(default)]
     source_event_id: Option<String>,
     #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    is_meta: Option<bool>,
+    #[serde(default)]
+    visibility: Option<EvidenceVisibility>,
+    #[serde(default)]
     attrs_json: Option<String>,
     #[serde(default)]
     parser_version: u32,
@@ -173,7 +180,7 @@ pub(crate) fn import_jsonl<R: BufRead>(
         if record.record_type != RECORD_TYPE {
             bail!("line {line_no}: unsupported record_type '{}'", record.record_type);
         }
-        if !matches!(record.schema_version, 2..=5) {
+        if !matches!(record.schema_version, 2..=6) {
             bail!("line {line_no}: unsupported schema_version {}", record.schema_version);
         }
 
@@ -282,6 +289,9 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
             summary: e.summary,
             source_path: e.source_path,
             source_event_id: e.source_event_id,
+            tool_call_id: e.tool_call_id,
+            is_meta: e.is_meta,
+            visibility: e.visibility,
             attrs_json: e.attrs_json,
             parser_version: e.parser_version,
         })
@@ -404,6 +414,9 @@ mod tests {
             summary: Some("ran ls".to_string()),
             source_path: Some("/home/origin/raw.jsonl".to_string()),
             source_event_id: Some("ev-1".to_string()),
+            tool_call_id: Some("call-1".to_string()),
+            is_meta: Some(false),
+            visibility: Some(EvidenceVisibility::Visible),
             attrs_json: Some("{\"exit_code\":0}".to_string()),
             parser_version: 5,
         }
@@ -606,6 +619,10 @@ mod tests {
         let bad_type = r#"{"schema_version":3,"record_type":"snapshot","session":{"source":"codex","source_id":"x","title":"t","started_at":0}}"#;
         let err = import_jsonl(&store, false, bad_type.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("record_type"), "unexpected error: {err}");
+
+        let bad_visibility = r#"{"schema_version":6,"record_type":"session","session":{"source":"codex","source_id":"x","title":"t","started_at":0},"events":[{"event_seq":0,"kind":"tool","actor":"assistant","visibility":"unknown"}]}"#;
+        let err = import_jsonl(&store, false, bad_visibility.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "unexpected error: {err}");
     }
 
     #[test]
@@ -620,6 +637,30 @@ mod tests {
             .query_row("SELECT parser_version FROM usage_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(parser_version, 0, "missing v3 fields must default to 0");
+        let events = store
+            .list_session_events_for_session(
+                &store.get_session_by_source_id("codex", "v2-1").unwrap().unwrap().id,
+            )
+            .unwrap();
+        assert_eq!(events[0].tool_call_id, None);
+        assert_eq!(events[0].is_meta, None);
+        assert_eq!(events[0].visibility, None);
+    }
+
+    #[test]
+    fn accepts_schema_version_5_without_v6_event_fields() {
+        let store = setup();
+        let v5 = r#"{"schema_version":5,"record_type":"session","session":{"source":"claude-code","source_id":"v5-1","title":"V5","started_at":100},"events":[{"event_seq":0,"timestamp":101,"kind":"tool_result","actor":"tool","source_event_id":"2:0","parser_version":3}]}"#;
+        let summary = import_jsonl(&store, false, v5.as_bytes()).unwrap();
+        assert_eq!(summary, ImportSummary { total: 1, imported: 1, skipped: 0 });
+
+        let session = store.get_session_by_source_id("claude-code", "v5-1").unwrap().unwrap();
+        let events = store.list_session_events_for_session(&session.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_event_id.as_deref(), Some("2:0"));
+        assert_eq!(events[0].tool_call_id, None);
+        assert_eq!(events[0].is_meta, None);
+        assert_eq!(events[0].visibility, None);
     }
 
     #[test]

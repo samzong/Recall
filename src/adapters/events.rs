@@ -37,6 +37,9 @@ pub(crate) fn tool_call_event(
         summary,
         source_path: context.source_path,
         source_event_id: context.source_event_id,
+        tool_call_id: None,
+        is_meta: None,
+        visibility: None,
         attrs_json: args.map(|value| value.to_string()),
         parser_version: context.parser_version,
     }
@@ -66,6 +69,9 @@ pub(crate) fn tool_call_event_from_text(
         summary,
         source_path: context.source_path,
         source_event_id: context.source_event_id,
+        tool_call_id: None,
+        is_meta: None,
+        visibility: None,
         attrs_json: parsed.map(|value| value.to_string()),
         parser_version: context.parser_version,
     }
@@ -85,9 +91,12 @@ pub(crate) fn tool_result_event(
         status: None,
         target: None,
         message_seq: context.message_seq,
-        summary: summary.map(cap_tool_result_summary),
+        summary: summary.map(bounded_summary),
         source_path: context.source_path,
         source_event_id: context.source_event_id,
+        tool_call_id: None,
+        is_meta: None,
+        visibility: None,
         attrs_json: None,
         parser_version: context.parser_version,
     }
@@ -111,6 +120,9 @@ pub(crate) fn file_write_event(
         summary: Some(summary),
         source_path: context.source_path,
         source_event_id: context.source_event_id,
+        tool_call_id: None,
+        is_meta: None,
+        visibility: None,
         attrs_json: None,
         parser_version: context.parser_version,
     }
@@ -220,7 +232,7 @@ fn non_empty(text: &str) -> Option<String> {
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
 }
 
-fn cap_tool_result_summary(summary: String) -> String {
+pub(crate) fn bounded_summary(summary: String) -> String {
     if summary.len() <= TOOL_RESULT_SUMMARY_MAX_BYTES {
         return summary;
     }

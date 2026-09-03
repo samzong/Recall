@@ -83,6 +83,9 @@ fn make_session_event(kind: &str, name: Option<&str>, target: Option<&str>) -> R
         summary: Some("event summary".to_string()),
         source_path: Some("/tmp/source.jsonl".to_string()),
         source_event_id: Some("42".to_string()),
+        tool_call_id: Some("call-42".to_string()),
+        is_meta: Some(false),
+        visibility: Some(crate::types::EvidenceVisibility::Visible),
         attrs_json: Some(r#"{"path":"src/main.rs"}"#.to_string()),
         parser_version: 1,
     }
@@ -281,6 +284,10 @@ fn persist_session_writes_session_events_and_state() {
     assert_eq!(loaded[0].kind, "file_read");
     assert_eq!(loaded[0].name.as_deref(), Some("read_file"));
     assert_eq!(loaded[0].target.as_deref(), Some("src/main.rs"));
+    assert_eq!(loaded[0].source_event_id.as_deref(), Some("42"));
+    assert_eq!(loaded[0].tool_call_id.as_deref(), Some("call-42"));
+    assert_eq!(loaded[0].is_meta, Some(false));
+    assert_eq!(loaded[0].visibility, Some(crate::types::EvidenceVisibility::Visible));
 }
 
 #[test]
@@ -330,7 +337,7 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     let lines: Vec<_> = text.lines().collect();
     assert_eq!(lines.len(), 1);
     let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(value["schema_version"], 5);
+    assert_eq!(value["schema_version"], 6);
     assert_eq!(value["record_type"], "session");
     assert_eq!(value["session"]["source"], "codex");
     assert_eq!(value["session"]["source_id"], "raw1");
@@ -360,6 +367,10 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     assert_eq!(value["events"][0]["name"], "read_file");
     assert_eq!(value["events"][0]["target"], "src/main.rs");
     assert_eq!(value["events"][0]["message_seq"], 1);
+    assert_eq!(value["events"][0]["source_event_id"], "42");
+    assert_eq!(value["events"][0]["tool_call_id"], "call-42");
+    assert_eq!(value["events"][0]["is_meta"], false);
+    assert_eq!(value["events"][0]["visibility"], "visible");
     assert_eq!(value["events"][0]["parser_version"], 1);
     assert_eq!(value["events"][0]["attrs_json"], r#"{"path":"src/main.rs"}"#);
 }

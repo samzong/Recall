@@ -378,6 +378,9 @@ fn parse_part_events(
                     summary: None,
                     source_path: None,
                     source_event_id: Some(part_id.to_string()),
+                    tool_call_id: None,
+                    is_meta: None,
+                    visibility: None,
                     attrs_json,
                     parser_version: EVENT_PARSER_VERSION,
                 }];
@@ -397,6 +400,9 @@ fn parse_part_events(
                     message_seq: None,
                     source_path: None,
                     source_event_id: Some(part_id.to_string()),
+                    tool_call_id: None,
+                    is_meta: None,
+                    visibility: None,
                     attrs_json: attrs_json.clone(),
                     parser_version: EVENT_PARSER_VERSION,
                 })

@@ -675,6 +675,9 @@ mod tests {
             summary: Some(format!("{kind} {target}")),
             source_path: None,
             source_event_id: None,
+            tool_call_id: None,
+            is_meta: None,
+            visibility: None,
             attrs_json: Some(r#"{"secret":"nope"}"#.to_string()),
             parser_version: 1,
         }

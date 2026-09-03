@@ -12,7 +12,7 @@ use crate::types::{
     Message, Role, Session, SessionEventRecord, SessionTopology, SessionUsageEventRecord,
 };
 
-pub(crate) const RECORD_SCHEMA_VERSION: u32 = 5;
+pub(crate) const RECORD_SCHEMA_VERSION: u32 = 6;
 const RECORD_TYPE: &str = "session";
 const EXPORT_IN_MEMORY_DB_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -168,6 +168,9 @@ struct ExportEvent {
     summary: Option<String>,
     source_path: Option<String>,
     source_event_id: Option<String>,
+    tool_call_id: Option<String>,
+    is_meta: Option<bool>,
+    visibility: Option<crate::types::EvidenceVisibility>,
     attrs_json: Option<String>,
     parser_version: u32,
 }
@@ -363,6 +366,9 @@ impl From<SessionEventRecord> for ExportEvent {
             summary: event.summary,
             source_path: event.source_path,
             source_event_id: event.source_event_id,
+            tool_call_id: event.tool_call_id,
+            is_meta: event.is_meta,
+            visibility: event.visibility,
             attrs_json: event.attrs_json,
             parser_version: event.parser_version,
         }

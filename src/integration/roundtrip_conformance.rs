@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::adapters::{RawSession, claude_code, codex, kimi_code};
+use crate::adapters::{RawSession, claude_code, codex, cursor, kimi_code};
 use crate::db::schema;
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
@@ -101,6 +101,9 @@ fn expected_contract(source: &str, raw: &RawSession) -> Value {
                 "summary": event.summary,
                 "source_path": event.source_path,
                 "source_event_id": event.source_event_id,
+                "tool_call_id": event.tool_call_id,
+                "is_meta": event.is_meta,
+                "visibility": event.visibility,
                 "attrs_json": event.attrs_json,
                 "parser_version": event.parser_version,
             })
@@ -211,12 +214,68 @@ fn codex_single_file_round_trip() {
                 "timestamp": "2026-04-13T10:00:02Z",
                 "payload": {"type": "agent_message", "message": "The mapping is intact."}
             }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:03Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"src/db/events.rs\"}",
+                    "call_id": "call_conformance"
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:04Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_conformance",
+                    "output": "event store mapping"
+                }
+            }),
         ],
     );
 
     assert_roundtrip("codex", || {
         codex::parse_codex_session_with_options(&path, true)?
             .context("Codex fixture was not parsed")
+    });
+}
+
+#[test]
+fn cursor_agent_transcript_round_trip() {
+    let root = tempfile::tempdir().unwrap();
+    let source_id = "019a4c01-e8f4-7270-bdab-7f19273b2502";
+    let path = root.path().join(format!("{source_id}.jsonl"));
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "role": "user",
+                "message": {
+                    "content": [{"type": "text", "text": "Inspect the Cursor transcript"}]
+                }
+            }),
+            json!({
+                "role": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Reading the parser."},
+                        {
+                            "type": "tool_use",
+                            "id": "cursor-tool-contract",
+                            "name": "Read",
+                            "input": {"path": "src/adapters/cursor.rs"}
+                        }
+                    ]
+                }
+            }),
+        ],
+    );
+
+    assert_roundtrip("cursor", || {
+        cursor::parse_conformance_fixture(&path, source_id)?
+            .context("Cursor fixture was not parsed")
     });
 }
 

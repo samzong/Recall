@@ -1,6 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 12;
+const V12_SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -46,8 +47,12 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 11 {
         migrate_v11(conn)?;
     }
-    if version < SCHEMA_VERSION || fts_needs_trigram_rebuild(conn)? {
+    if version < V12_SCHEMA_VERSION || fts_needs_trigram_rebuild(conn)? {
         migrate_v12(conn)?;
+    }
+    let version = read_schema_version(conn)?;
+    if version < SCHEMA_VERSION {
+        migrate_v13(conn)?;
     }
     Ok(())
 }
@@ -414,7 +419,7 @@ fn migrate_v12_with_lock<T>(
     acquire_lock: impl FnOnce() -> anyhow::Result<Option<T>>,
 ) -> anyhow::Result<()> {
     if !fts_needs_trigram_rebuild(conn)? {
-        if read_schema_version(conn)? < SCHEMA_VERSION {
+        if read_schema_version(conn)? < V12_SCHEMA_VERSION {
             conn.execute_batch("PRAGMA user_version = 12;")?;
         }
         return Ok(());
@@ -433,7 +438,7 @@ fn migrate_v12_with_lock<T>(
     };
 
     if !fts_needs_trigram_rebuild(conn)? {
-        if read_schema_version(conn)? < SCHEMA_VERSION {
+        if read_schema_version(conn)? < V12_SCHEMA_VERSION {
             conn.execute_batch("PRAGMA user_version = 12;")?;
         }
         return Ok(());
@@ -442,7 +447,8 @@ fn migrate_v12_with_lock<T>(
     eprintln!("Upgrading search index (one-time; may take a minute on large databases)...");
     let started = std::time::Instant::now();
     let version = read_schema_version(conn)?;
-    let version_update = if version < SCHEMA_VERSION { "PRAGMA user_version = 12;" } else { "" };
+    let version_update =
+        if version < V12_SCHEMA_VERSION { "PRAGMA user_version = 12;" } else { "" };
     add_column_if_missing(
         conn,
         "ALTER TABLE messages ADD COLUMN trigram_indexed INTEGER
@@ -456,6 +462,23 @@ fn migrate_v12_with_lock<T>(
     if file_backed {
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         eprintln!("Search index upgraded in {:.0?}.", started.elapsed());
+    }
+    Ok(())
+}
+
+fn migrate_v13(conn: &Connection) -> anyhow::Result<()> {
+    let version = read_schema_version(conn)?;
+    for stmt in [
+        "ALTER TABLE session_events ADD COLUMN tool_call_id TEXT",
+        "ALTER TABLE session_events ADD COLUMN is_meta INTEGER
+         CHECK (is_meta IN (0, 1) OR is_meta IS NULL)",
+        "ALTER TABLE session_events ADD COLUMN visibility TEXT
+         CHECK (visibility IN ('visible', 'hidden', 'inactive') OR visibility IS NULL)",
+    ] {
+        add_column_if_missing(conn, stmt)?;
+    }
+    if version >= V12_SCHEMA_VERSION {
+        conn.execute_batch("PRAGMA user_version = 13;")?;
     }
     Ok(())
 }
@@ -560,6 +583,7 @@ mod tests {
             PRAGMA user_version = 5;",
         )
         .unwrap();
+        migrate_v5(&conn).unwrap();
 
         init(&conn).unwrap();
 
@@ -585,6 +609,8 @@ mod tests {
             PRAGMA user_version = 6;",
         )
         .unwrap();
+        migrate_v5(&conn).unwrap();
+        conn.execute_batch("PRAGMA user_version = 6;").unwrap();
 
         init(&conn).unwrap();
 
@@ -609,6 +635,8 @@ mod tests {
             PRAGMA user_version = 7;",
         )
         .unwrap();
+        migrate_v5(&conn).unwrap();
+        conn.execute_batch("PRAGMA user_version = 7;").unwrap();
 
         init(&conn).unwrap();
 
@@ -636,6 +664,8 @@ mod tests {
             PRAGMA user_version = 8;",
         )
         .unwrap();
+        migrate_v5(&conn).unwrap();
+        conn.execute_batch("PRAGMA user_version = 8;").unwrap();
 
         init(&conn).unwrap();
 
@@ -906,6 +936,18 @@ mod tests {
         assert_eq!(schema_version(&conn).unwrap(), 11);
         assert!(!has_trigram_fts(&conn).unwrap());
 
+        migrate_v13(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 11);
+        let structured_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('session_events')
+                 WHERE name IN ('tool_call_id', 'is_meta', 'visibility')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(structured_columns, 3);
+
         conn.execute_batch(
             "INSERT INTO sessions (id, source, source_id, title, started_at)
              VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);",
@@ -926,6 +968,8 @@ mod tests {
 
         migrate_v12_with_lock(&store.conn, true, || Ok::<Option<()>, anyhow::Error>(Some(())))
             .unwrap();
+        assert_eq!(schema_version(&store.conn).unwrap(), V12_SCHEMA_VERSION);
+        migrate_v13(&store.conn).unwrap();
         assert_eq!(schema_version(&store.conn).unwrap(), SCHEMA_VERSION);
         assert!(has_trigram_fts(&store.conn).unwrap());
         let hits: i64 = store
@@ -938,6 +982,119 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 1, "messages written during deferral must join the rebuilt index");
+    }
+
+    #[test]
+    fn migrate_v13_adds_structured_event_columns_to_existing_v12_db() {
+        type EventRow = (
+            i64,
+            Option<i64>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        );
+
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        migrate_v10(&conn).unwrap();
+        migrate_v11(&conn).unwrap();
+        migrate_v12(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES ('s1', 'codex', 'source-1', 'existing', 1000);
+             INSERT INTO session_events (
+                session_id, source, source_id, event_seq, timestamp, kind, actor,
+                name, status, target, message_seq, summary, source_path,
+                source_event_id, attrs_json, parser_version, created_at
+             ) VALUES (
+                's1', 'codex', 'source-1', 7, 1234, 'file_write', 'assistant',
+                'apply_patch', 'completed', 'src/lib.rs', 3, 'updated file',
+                '/tmp/session.jsonl', 'line:7', '{\"path\":\"src/lib.rs\"}', 4, 2000
+             );",
+        )
+        .unwrap();
+        let before: EventRow = conn
+            .query_row(
+                "SELECT event_seq, timestamp, kind, actor, name, status, target,
+                        message_seq, summary, source_path, source_event_id, parser_version
+                 FROM session_events WHERE session_id = 's1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        init(&conn).unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let after: EventRow = conn
+            .query_row(
+                "SELECT event_seq, timestamp, kind, actor, name, status, target,
+                        message_seq, summary, source_path, source_event_id, parser_version
+                 FROM session_events WHERE session_id = 's1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        let structured: (Option<String>, Option<bool>, Option<String>) = conn
+            .query_row(
+                "SELECT tool_call_id, is_meta, visibility FROM session_events WHERE session_id = 's1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(structured, (None, None, None));
+        assert!(conn.execute("UPDATE session_events SET is_meta = 2", []).is_err());
+        assert!(conn.execute("UPDATE session_events SET visibility = 'unknown'", []).is_err());
+
+        init(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

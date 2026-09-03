@@ -18,7 +18,7 @@ use crate::db::search::{SearchEngine, SearchFilters, SessionEventQuery, TimeRang
 use crate::db::store::Store;
 use crate::project_scope::ProjectScope;
 use crate::query::{query_embedding, resolve_source_filter};
-use crate::types::{Message, Role, Session};
+use crate::types::{EvidenceVisibility, Message, Role, Session, SessionEventRecord};
 
 const SEARCH_LIMIT_DEFAULT: u32 = 10;
 const SEARCH_LIMIT_MAX: u32 = 50;
@@ -30,6 +30,9 @@ const FILE_HISTORY_KINDS: [&str; 2] = ["file_write", "file_read"];
 const GET_MAX_MESSAGES_DEFAULT: u32 = 50;
 const GET_MESSAGE_CHAR_CAP: usize = 2_000;
 const GET_RESPONSE_CHAR_CAP: usize = 32_000;
+const GET_EVENT_LIMIT: usize = 50;
+const GET_EVENT_FIELD_CHAR_CAP: usize = 200;
+const GET_EVENT_TEXT_CHAR_CAP: usize = 10_000;
 const EXCERPT_CHAR_CAP: usize = 200;
 
 const MISSING_INDEX: &str =
@@ -76,6 +79,11 @@ struct GetSessionArgs {
         description = "Return the newest messages instead of the oldest, preserving sequence order."
     )]
     tail: bool,
+    #[serde(default)]
+    #[schemars(
+        description = "Include up to 50 structured events anchored to the returned message range, plus unanchored events. Each event string field is capped at 200 characters and all event string fields at 10000 characters total. Defaults to false."
+    )]
+    include_events: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -301,6 +309,29 @@ struct SessionDetail {
     last_message_seq: Option<u32>,
     truncated: bool,
     messages: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events: Option<Vec<SessionEventDetail>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    returned_events: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events_truncated: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+struct SessionEventDetail {
+    event_seq: u32,
+    timestamp: Option<String>,
+    kind: String,
+    actor: String,
+    name: Option<String>,
+    status: Option<String>,
+    target: Option<String>,
+    message_seq: Option<u32>,
+    source_event_id: Option<String>,
+    tool_call_id: Option<String>,
+    is_meta: Option<bool>,
+    visibility: Option<EvidenceVisibility>,
+    summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -423,7 +454,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Load one indexed session by Recall session_id. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 characters. Returns metadata, including source-native source_session_id and the first_message_seq and last_message_seq represented by the response, plus messages as plain text in sequence order.",
+        description = "Load one indexed session by Recall session_id. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 characters. Set include_events only when structured evidence is needed; it returns at most 50 events anchored to the returned message range plus unanchored events, caps each event string field at 200 characters and all event string fields at 10000 characters total, and never returns raw arguments, results, source paths, or parser internals. Returns metadata, including source-native source_session_id and the first_message_seq and last_message_seq represented by the response, plus messages as plain text in sequence order.",
         annotations(
             title = "Get session",
             read_only_hint = true,
@@ -506,6 +537,7 @@ impl GetSessionBenchmark {
                 session_id: "claude-code:session-0".to_string(),
                 max_messages: Some(self.max_messages),
                 tail: self.tail,
+                include_events: false,
             }))
             .expect("benchmark get_session");
         serde_json::to_vec(&result).expect("serialize benchmark get_session")
@@ -809,6 +841,17 @@ fn get_ready(store: &Store, args: &GetSessionArgs) -> std::result::Result<Sessio
     let messages = store.get_messages(&session.id).map_err(|error| error.to_string())?;
     let (text, returned, truncated, first_message_seq, last_message_seq) =
         render_messages(&messages, max_messages, args.tail);
+    let (events, returned_events, events_truncated) = if args.include_events {
+        let records = store
+            .list_session_events_for_session(&session.id)
+            .map_err(|error| error.to_string())?;
+        let (events, truncated) =
+            render_session_events(records, first_message_seq, last_message_seq, args.tail);
+        let returned = events.len();
+        (Some(events), Some(returned), Some(truncated))
+    } else {
+        (None, None, None)
+    };
     Ok(SessionDetail {
         message: None,
         session_id: Some(session.id.clone()),
@@ -824,6 +867,9 @@ fn get_ready(store: &Store, args: &GetSessionArgs) -> std::result::Result<Sessio
         last_message_seq,
         truncated,
         messages: text,
+        events,
+        returned_events,
+        events_truncated,
     })
 }
 
@@ -843,7 +889,121 @@ fn empty_detail(message: Option<String>) -> SessionDetail {
         last_message_seq: None,
         truncated: false,
         messages: String::new(),
+        events: None,
+        returned_events: None,
+        events_truncated: None,
     }
+}
+
+fn render_session_events(
+    records: Vec<SessionEventRecord>,
+    first_message_seq: Option<u32>,
+    last_message_seq: Option<u32>,
+    tail: bool,
+) -> (Vec<SessionEventDetail>, bool) {
+    let total_records = records.len();
+    let filtered = records
+        .iter()
+        .filter(|event| match event.message_seq {
+            None => true,
+            Some(message_seq) => first_message_seq
+                .zip(last_message_seq)
+                .is_some_and(|(first, last)| message_seq >= first && message_seq <= last),
+        })
+        .collect::<Vec<_>>();
+    let mut truncated = filtered.len() != total_records;
+    let selected = if tail {
+        filtered.iter().rev().take(GET_EVENT_LIMIT).copied().collect::<Vec<_>>()
+    } else {
+        filtered.iter().take(GET_EVENT_LIMIT).copied().collect::<Vec<_>>()
+    };
+    if selected.len() != filtered.len() {
+        truncated = true;
+    }
+
+    let mut details = Vec::new();
+    let mut text_chars = 0;
+    for record in selected {
+        let (detail, fields_truncated) = session_event_detail(record);
+        let detail_chars = session_event_text_chars(&detail);
+        if text_chars + detail_chars > GET_EVENT_TEXT_CHAR_CAP {
+            truncated = true;
+            break;
+        }
+        text_chars += detail_chars;
+        truncated |= fields_truncated;
+        details.push(detail);
+    }
+    details.sort_by_key(|event| match event.message_seq {
+        Some(message_seq) => (0_u8, message_seq, event.event_seq),
+        None => (1_u8, 0, event.event_seq),
+    });
+    (details, truncated)
+}
+
+fn session_event_detail(record: &SessionEventRecord) -> (SessionEventDetail, bool) {
+    let (kind, kind_truncated) = truncate_chars(&record.kind, GET_EVENT_FIELD_CHAR_CAP);
+    let (actor, actor_truncated) = truncate_chars(&record.actor, GET_EVENT_FIELD_CHAR_CAP);
+    let (name, name_truncated) = truncate_event_field(record.name.as_deref());
+    let (status, status_truncated) = truncate_event_field(record.status.as_deref());
+    let (target, target_truncated) = truncate_event_field(record.target.as_deref());
+    let (source_event_id, source_event_id_truncated) =
+        truncate_event_field(record.source_event_id.as_deref());
+    let (tool_call_id, tool_call_id_truncated) =
+        truncate_event_field(record.tool_call_id.as_deref());
+    let (summary, summary_truncated) = truncate_event_field(record.summary.as_deref());
+    (
+        SessionEventDetail {
+            event_seq: record.event_seq,
+            timestamp: record.timestamp.map(iso8601),
+            kind,
+            actor,
+            name,
+            status,
+            target,
+            message_seq: record.message_seq,
+            source_event_id,
+            tool_call_id,
+            is_meta: record.is_meta,
+            visibility: record.visibility,
+            summary,
+        },
+        kind_truncated
+            || actor_truncated
+            || name_truncated
+            || status_truncated
+            || target_truncated
+            || source_event_id_truncated
+            || tool_call_id_truncated
+            || summary_truncated,
+    )
+}
+
+fn truncate_event_field(value: Option<&str>) -> (Option<String>, bool) {
+    match value {
+        Some(value) => {
+            let (value, truncated) = truncate_chars(value, GET_EVENT_FIELD_CHAR_CAP);
+            (Some(value), truncated)
+        }
+        None => (None, false),
+    }
+}
+
+fn session_event_text_chars(event: &SessionEventDetail) -> usize {
+    event.kind.chars().count()
+        + event.actor.chars().count()
+        + optional_text_chars(event.timestamp.as_deref())
+        + optional_text_chars(event.name.as_deref())
+        + optional_text_chars(event.status.as_deref())
+        + optional_text_chars(event.target.as_deref())
+        + optional_text_chars(event.source_event_id.as_deref())
+        + optional_text_chars(event.tool_call_id.as_deref())
+        + event.visibility.map(|value| value.as_str().chars().count()).unwrap_or(0)
+        + optional_text_chars(event.summary.as_deref())
+}
+
+fn optional_text_chars(value: Option<&str>) -> usize {
+    value.map(|value| value.chars().count()).unwrap_or(0)
 }
 
 fn resolve_filters(
@@ -1379,7 +1539,12 @@ mod tests {
 
         let detail = get_session(
             &index,
-            &GetSessionArgs { session_id: "current".into(), max_messages: None, tail: false },
+            &GetSessionArgs {
+                session_id: "current".into(),
+                max_messages: None,
+                tail: false,
+                include_events: false,
+            },
         )
         .unwrap();
         assert_eq!(detail.messages, "[user] exact transcript");
@@ -1473,7 +1638,12 @@ mod tests {
 
         let detail = get_session(
             &index,
-            &GetSessionArgs { session_id: "s1".into(), max_messages: Some(1), tail: false },
+            &GetSessionArgs {
+                session_id: "s1".into(),
+                max_messages: Some(1),
+                tail: false,
+                include_events: false,
+            },
         )
         .unwrap();
         assert_eq!(detail.session_id.as_deref(), Some("s1"));
@@ -1504,7 +1674,12 @@ mod tests {
             .unwrap();
         let detail = get_session(
             &ready(store),
-            &GetSessionArgs { session_id: "s1".into(), max_messages: None, tail: false },
+            &GetSessionArgs {
+                session_id: "s1".into(),
+                max_messages: None,
+                tail: false,
+                include_events: false,
+            },
         )
         .unwrap();
 
@@ -1540,7 +1715,12 @@ mod tests {
         store.insert_session(&stored).unwrap();
         let detail = get_session(
             &ready(store),
-            &GetSessionArgs { session_id: "s1".into(), max_messages: None, tail: false },
+            &GetSessionArgs {
+                session_id: "s1".into(),
+                max_messages: None,
+                tail: false,
+                include_events: false,
+            },
         )
         .unwrap();
 
@@ -1570,7 +1750,12 @@ mod tests {
 
         let detail = get_session(
             &index,
-            &GetSessionArgs { session_id: "s1".into(), max_messages: Some(2), tail: true },
+            &GetSessionArgs {
+                session_id: "s1".into(),
+                max_messages: Some(2),
+                tail: true,
+                include_events: false,
+            },
         )
         .unwrap();
 
@@ -1602,7 +1787,12 @@ mod tests {
 
         let detail = get_session(
             &index,
-            &GetSessionArgs { session_id: "s1".into(), max_messages: Some(20), tail: true },
+            &GetSessionArgs {
+                session_id: "s1".into(),
+                max_messages: Some(20),
+                tail: true,
+                include_events: false,
+            },
         )
         .unwrap();
 
@@ -1618,11 +1808,220 @@ mod tests {
     }
 
     #[test]
+    fn get_session_without_events_preserves_json_bytes_and_skips_event_read() {
+        let store = setup();
+        store.insert_session(&session("s1", "codex", "title", 1_000)).unwrap();
+        store.insert_messages(&[message("s1", Role::User, "hello", 0)]).unwrap();
+        store.conn.execute_batch("DROP TABLE session_events").unwrap();
+        let args = GetSessionArgs {
+            session_id: "s1".into(),
+            max_messages: None,
+            tail: false,
+            include_events: false,
+        };
+
+        let index = ready(store);
+        let detail = get_session(&index, &args).unwrap();
+        let bytes = serde_json::to_vec(&detail).unwrap();
+
+        assert_eq!(
+            bytes,
+            br#"{"message":null,"session_id":"s1","source_session_id":"src-s1","source":"codex","project":"/tmp/demo","title":"title","summary":"title summary","timestamp":"1970-01-01T00:00:01.000Z","message_count":1,"returned_messages":1,"first_message_seq":0,"last_message_seq":0,"truncated":false,"messages":"[user] hello"}"#
+        );
+        assert!(detail.events.is_none());
+        assert!(detail.returned_events.is_none());
+        assert!(detail.events_truncated.is_none());
+        let event_error = get_session(&index, &GetSessionArgs { include_events: true, ..args })
+            .expect_err("include_events must read the event table");
+        assert!(event_error.contains("session_events"));
+    }
+
+    #[test]
+    fn get_session_events_follow_returned_message_range_and_preserve_null_anchors() {
+        let store = setup();
+        let mut stored = session("s1", "codex", "events", 1_000);
+        stored.message_count = 4;
+        store.insert_session(&stored).unwrap();
+        store
+            .insert_messages(&[
+                message("s1", Role::User, "zero", 0),
+                message("s1", Role::Assistant, "one", 1),
+                message("s1", Role::User, "two", 2),
+                message("s1", Role::Assistant, "three", 3),
+            ])
+            .unwrap();
+        let mut events = (0..5)
+            .map(|seq| event(seq, "tool_call", None, Some(1_700_000_000_000), None, None))
+            .collect::<Vec<_>>();
+        events[0].message_seq = Some(0);
+        events[1].message_seq = None;
+        events[2].message_seq = Some(2);
+        events[2].source_event_id = Some("line:2".to_string());
+        events[2].tool_call_id = Some("call-2".to_string());
+        events[2].is_meta = Some(false);
+        events[2].visibility = Some(EvidenceVisibility::Visible);
+        events[3].message_seq = Some(3);
+        events[4].message_seq = None;
+        persist_events(&store, "codex", "s1", &events);
+        let index = ready(store);
+
+        let head = get_session(
+            &index,
+            &GetSessionArgs {
+                session_id: "s1".into(),
+                max_messages: Some(2),
+                tail: false,
+                include_events: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            head.events.as_ref().unwrap().iter().map(|event| event.event_seq).collect::<Vec<_>>(),
+            vec![0, 1, 4]
+        );
+        assert_eq!(head.returned_events, Some(3));
+        assert_eq!(head.events_truncated, Some(true));
+
+        let tail = get_session(
+            &index,
+            &GetSessionArgs {
+                session_id: "s1".into(),
+                max_messages: Some(2),
+                tail: true,
+                include_events: true,
+            },
+        )
+        .unwrap();
+        let returned = tail.events.as_ref().unwrap();
+        assert_eq!(
+            returned.iter().map(|event| event.event_seq).collect::<Vec<_>>(),
+            vec![2, 3, 1, 4]
+        );
+        assert_eq!(returned[0].timestamp.as_deref(), Some("2023-11-14T22:13:20.000Z"));
+        assert_eq!(returned[0].source_event_id.as_deref(), Some("line:2"));
+        assert_eq!(returned[0].tool_call_id.as_deref(), Some("call-2"));
+        assert_eq!(returned[0].is_meta, Some(false));
+        assert_eq!(returned[0].visibility, Some(EvidenceVisibility::Visible));
+        assert_eq!(tail.returned_events, Some(4));
+        assert_eq!(tail.events_truncated, Some(true));
+        let value = serde_json::to_value(&tail).unwrap();
+        let serialized = value.to_string();
+        assert!(!serialized.contains("attrs_json"));
+        assert!(!serialized.contains("source_path"));
+        assert!(!serialized.contains("parser_version"));
+        assert!(!serialized.contains("secret-value"));
+    }
+
+    #[test]
+    fn get_session_events_apply_head_and_tail_event_caps() {
+        let store = setup();
+        let mut stored = session("s1", "codex", "event cap", 1_000);
+        stored.message_count = 0;
+        store.insert_session(&stored).unwrap();
+        let events = (0..55)
+            .map(|seq| {
+                let mut event = event(seq, "tool_call", None, None, None, None);
+                event.message_seq = None;
+                event
+            })
+            .collect::<Vec<_>>();
+        persist_events(&store, "codex", "s1", &events);
+        let index = ready(store);
+
+        for (tail, first, last) in [(false, 0, 49), (true, 5, 54)] {
+            let detail = get_session(
+                &index,
+                &GetSessionArgs {
+                    session_id: "s1".into(),
+                    max_messages: None,
+                    tail,
+                    include_events: true,
+                },
+            )
+            .unwrap();
+            let events = detail.events.unwrap();
+            assert_eq!(events.len(), GET_EVENT_LIMIT);
+            assert_eq!(events.first().unwrap().event_seq, first);
+            assert_eq!(events.last().unwrap().event_seq, last);
+            assert_eq!(detail.returned_events, Some(GET_EVENT_LIMIT));
+            assert_eq!(detail.events_truncated, Some(true));
+        }
+    }
+
+    #[test]
+    fn get_session_events_bound_unicode_fields_and_total_text() {
+        let store = setup();
+        let mut stored = session("s1", "codex", "event text cap", 1_000);
+        stored.message_count = 0;
+        store.insert_session(&stored).unwrap();
+        let long = "汉".repeat(GET_EVENT_FIELD_CHAR_CAP + 50);
+        let events = (0..GET_EVENT_LIMIT as u32)
+            .map(|seq| {
+                let mut event = event(seq, "tool_call", None, None, Some(&long), None);
+                event.message_seq = None;
+                event.target = Some(long.clone());
+                event
+            })
+            .collect::<Vec<_>>();
+        persist_events(&store, "codex", "s1", &events);
+
+        let detail = get_session(
+            &ready(store),
+            &GetSessionArgs {
+                session_id: "s1".into(),
+                max_messages: None,
+                tail: false,
+                include_events: true,
+            },
+        )
+        .unwrap();
+        let events = detail.events.unwrap();
+        assert!(events.len() < GET_EVENT_LIMIT);
+        assert_eq!(detail.returned_events, Some(events.len()));
+        assert_eq!(detail.events_truncated, Some(true));
+        assert!(events.iter().all(|event| {
+            let summary = event.summary.as_deref().unwrap();
+            summary.chars().count() == GET_EVENT_FIELD_CHAR_CAP && summary.ends_with('…')
+        }));
+        assert!(
+            events.iter().map(session_event_text_chars).sum::<usize>() <= GET_EVENT_TEXT_CHAR_CAP
+        );
+    }
+
+    #[test]
+    fn get_session_include_events_returns_explicit_empty_payload() {
+        let store = setup();
+        let mut stored = session("s1", "codex", "no events", 1_000);
+        stored.message_count = 0;
+        store.insert_session(&stored).unwrap();
+
+        let detail = get_session(
+            &ready(store),
+            &GetSessionArgs {
+                session_id: "s1".into(),
+                max_messages: None,
+                tail: false,
+                include_events: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(detail.events, Some(Vec::new()));
+        assert_eq!(detail.returned_events, Some(0));
+        assert_eq!(detail.events_truncated, Some(false));
+    }
+
+    #[test]
     fn get_session_missing_id_is_a_tool_error() {
         let store = setup();
         store.insert_session(&session("s1", "codex", "title", 1_000)).unwrap();
         let index = ready(store);
-        let args = GetSessionArgs { session_id: "missing".into(), max_messages: None, tail: false };
+        let args = GetSessionArgs {
+            session_id: "missing".into(),
+            max_messages: None,
+            tail: false,
+            include_events: false,
+        };
         let error = get_session(&index, &args).expect_err("missing session");
         assert!(error.contains(SESSION_NOT_FOUND));
         assert_eq!(
@@ -1729,7 +2128,12 @@ mod tests {
         let index = ready(store);
         let detail = get_session(
             &index,
-            &GetSessionArgs { session_id: "s1".into(), max_messages: None, tail: false },
+            &GetSessionArgs {
+                session_id: "s1".into(),
+                max_messages: None,
+                tail: false,
+                include_events: false,
+            },
         )
         .unwrap();
         assert!(detail.truncated);
@@ -1752,6 +2156,9 @@ mod tests {
         assert_eq!(clamp_limit(None, 10, 50), 10);
         assert_eq!(clamp_limit(Some(80), EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX), 50);
         assert_eq!(clamp_limit(None, EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX), 20);
+        let get_args: GetSessionArgs =
+            serde_json::from_value(serde_json::json!({"session_id": "s1"})).unwrap();
+        assert!(!get_args.include_events);
     }
 
     #[test]
@@ -1787,15 +2194,22 @@ mod tests {
             .expect("list_recent_sessions capability");
 
         assert!(get_session["inputSchema"]["properties"]["tail"].is_object());
+        assert!(get_session["inputSchema"]["properties"]["include_events"].is_object());
         assert!(search_sessions["inputSchema"]["properties"]["invocation_nonce"].is_object());
         assert!(list_recent_sessions["inputSchema"]["properties"]["invocation_nonce"].is_object());
         assert!(get_session["description"].as_str().unwrap().contains("source_session_id"));
         assert!(get_session["description"].as_str().unwrap().contains("first_message_seq"));
+        let description = get_session["description"].as_str().unwrap();
+        assert!(description.contains("50 events"));
+        assert!(description.contains("200 characters"));
+        assert!(description.contains("10000 characters"));
+        assert!(description.contains("never returns raw arguments"));
         assert!(report.server.capabilities.tools.is_some());
         let text = render_capabilities(&report);
         assert!(text.contains("get_session"));
         assert!(text.contains("Inputs: "));
         assert!(text.contains("tail"));
+        assert!(text.contains("include_events"));
         assert!(text.contains("invocation_nonce"));
         assert!(text.contains("current_session.resolution"));
     }
@@ -1820,6 +2234,9 @@ mod tests {
             summary: summary.map(str::to_string),
             source_path: None,
             source_event_id: None,
+            tool_call_id: None,
+            is_meta: None,
+            visibility: None,
             attrs_json: Some(r#"{"token":"secret-value"}"#.to_string()),
             parser_version: 1,
         }
