@@ -6,9 +6,7 @@ use tracing::warn;
 
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
-use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-};
+use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
 use crate::types::Role;
 
 const SOURCE: &str = "aider";
@@ -213,16 +211,16 @@ fn split_chat_history_markdown(text: &str) -> Vec<RawMessage> {
         if line.starts_with("# ") {
             continue;
         }
-        if line.starts_with("> ") {
+        if let Some(rest) = line.strip_prefix("> ") {
             flush(Role::Assistant, &mut assistant, &mut messages);
             flush(Role::User, &mut user, &mut messages);
-            tool.push(line[2..].to_string());
+            tool.push(rest.to_string());
             continue;
         }
-        if line.starts_with("#### ") {
+        if let Some(rest) = line.strip_prefix("#### ") {
             flush(Role::Assistant, &mut assistant, &mut messages);
             tool.clear();
-            user.push(line[5..].to_string());
+            user.push(rest.to_string());
             continue;
         }
         flush(Role::User, &mut user, &mut messages);

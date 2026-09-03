@@ -358,12 +358,10 @@ fn session_usage(
     let output_tokens = usage_count(usage, &["outputTokens", "output_tokens", "output"]);
     let cache_read_tokens =
         usage_count(usage, &["cacheReadTokens", "cache_read_tokens", "cache", "cacheRead"]);
-    let cache_write_tokens = usage_count(usage, &[
-        "cacheCreationTokens",
-        "cache_creation_tokens",
-        "cacheWriteTokens",
-        "cache_write",
-    ]);
+    let cache_write_tokens = usage_count(
+        usage,
+        &["cacheCreationTokens", "cache_creation_tokens", "cacheWriteTokens", "cache_write"],
+    );
     let reasoning_tokens =
         usage_count(usage, &["thinkingTokens", "thinking_tokens", "thinking", "reasoning"]);
     if input_tokens == 0

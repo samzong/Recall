@@ -159,7 +159,7 @@ fn is_amp_thread_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    if !name.ends_with(".json") || SKIP_NAMES.iter().any(|skip| *skip == name) {
+    if !name.ends_with(".json") || SKIP_NAMES.contains(&name) {
         return false;
     }
     let parent = path.parent().and_then(|parent| parent.file_name()).and_then(|name| name.to_str());
@@ -281,7 +281,7 @@ fn env_cwd(env: Option<&Value>) -> Option<String> {
     if let Some(cwd) = string_path(env.get("cwd")) {
         return Some(cwd);
     }
-    if let Some(cwd) = env.get("initial").and_then(env_cwd) {
+    if let Some(cwd) = env_cwd(env.get("initial")) {
         return Some(cwd);
     }
     let trees = env.get("trees").and_then(Value::as_array)?;
@@ -344,11 +344,10 @@ mod tests {
     fn resume_uses_threads_continue_and_json_id() {
         let command = AmpAdapter.resume_command("T-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001").unwrap();
         assert_eq!(command.program, "amp");
-        assert_eq!(command.args, vec![
-            "threads",
-            "continue",
-            "T-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001"
-        ]);
+        assert_eq!(
+            command.args,
+            vec!["threads", "continue", "T-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001"]
+        );
     }
 
     #[test]

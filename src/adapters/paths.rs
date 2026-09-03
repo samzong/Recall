@@ -27,10 +27,6 @@ pub(crate) fn vscode_extension_task_dirs(extension_id: &str) -> Vec<PathBuf> {
     vscode_extension_task_dirs_from(dirs::config_dir(), extension_id)
 }
 
-pub(crate) fn vscode_extension_storage_dirs(extension_id: &str) -> Vec<PathBuf> {
-    vscode_extension_storage_dirs_from(dirs::config_dir(), extension_id)
-}
-
 pub(crate) fn vscode_extension_storage_dirs_from(
     config_dir: Option<PathBuf>,
     extension_id: &str,

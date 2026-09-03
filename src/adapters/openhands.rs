@@ -142,12 +142,7 @@ fn parse_conversation_entry(
     mtime_ms: i64,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    let dir = if entry.stat_target.file_name().and_then(|name| name.to_str()) == Some("events") {
-        entry.stat_target.parent().map(Path::to_path_buf)
-    } else {
-        entry.stat_target.parent().map(Path::to_path_buf)
-    };
-    let Some(dir) = dir else {
+    let Some(dir) = entry.stat_target.parent().map(Path::to_path_buf) else {
         return Ok(None);
     };
     match parse_conversation_dir(&dir, &entry.session_id, mtime_ms, include_events) {
@@ -278,10 +273,9 @@ fn parse_docs_messages(value: &Value) -> Vec<RawMessage> {
         let Some(role) = parse_role(item.get("role").and_then(Value::as_str).unwrap_or("")) else {
             continue;
         };
-        let content = extract_text(item.get("content"));
-        if content.is_empty() {
+        let Some(content) = extract_text(item.get("content")) else {
             continue;
-        }
+        };
         messages.push(RawMessage { role, content, timestamp: event_timestamp(item) });
     }
     messages
