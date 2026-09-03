@@ -1,7 +1,10 @@
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use serde_json::{Map, Value};
 
 const SERVER_NAME: &str = "recall";
 const DEFAULT_BIN: &str = "recall";
@@ -11,27 +14,28 @@ const SERVER_ARG: &str = "mcp";
 enum Host {
     Claude,
     Codex,
+    Cursor,
 }
 
 impl Host {
-    const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+    const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Cursor];
 
     fn id(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Cursor => "cursor-agent",
         }
-    }
-
-    fn binary(self) -> &'static str {
-        self.id()
     }
 
     fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "claude" | "claude-code" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
-            other => bail!("unknown MCP host '{other}'; supported hosts: claude, codex"),
+            "cursor" | "cursor-agent" => Ok(Self::Cursor),
+            other => {
+                bail!("unknown MCP host '{other}'; supported hosts: claude, codex, cursor-agent")
+            }
         }
     }
 }
@@ -95,9 +99,9 @@ fn ensure_bin_file(path: &Path) -> Result<()> {
     bail!("--bin {} is not a file", path.display());
 }
 
-fn add_args(host: Host, bin: &str) -> Vec<String> {
+fn add_args(host: Host, bin: &str) -> Option<Vec<String>> {
     match host {
-        Host::Claude => vec![
+        Host::Claude => Some(vec![
             "mcp".into(),
             "add".into(),
             "--scope".into(),
@@ -106,26 +110,30 @@ fn add_args(host: Host, bin: &str) -> Vec<String> {
             "--".into(),
             bin.into(),
             SERVER_ARG.into(),
-        ],
-        Host::Codex => {
-            vec![
-                "mcp".into(),
-                "add".into(),
-                SERVER_NAME.into(),
-                "--".into(),
-                bin.into(),
-                SERVER_ARG.into(),
-            ]
-        }
+        ]),
+        Host::Codex => Some(vec![
+            "mcp".into(),
+            "add".into(),
+            SERVER_NAME.into(),
+            "--".into(),
+            bin.into(),
+            SERVER_ARG.into(),
+        ]),
+        Host::Cursor => None,
     }
 }
 
-fn remove_args(host: Host) -> Vec<String> {
+fn remove_args(host: Host) -> Option<Vec<String>> {
     match host {
-        Host::Claude => {
-            vec!["mcp".into(), "remove".into(), SERVER_NAME.into(), "-s".into(), "user".into()]
-        }
-        Host::Codex => vec!["mcp".into(), "remove".into(), SERVER_NAME.into()],
+        Host::Claude => Some(vec![
+            "mcp".into(),
+            "remove".into(),
+            SERVER_NAME.into(),
+            "-s".into(),
+            "user".into(),
+        ]),
+        Host::Codex => Some(vec!["mcp".into(), "remove".into(), SERVER_NAME.into()]),
+        Host::Cursor => None,
     }
 }
 
@@ -134,8 +142,8 @@ fn run_hosts(hosts: Vec<Host>, dry_run: bool, action: HostAction) -> Result<()> 
     let mut errors = Vec::new();
 
     for host in hosts {
-        if !binary_on_path(host.binary()) {
-            eprintln!("skipped {}: `{}` is not on PATH", host.id(), host.binary());
+        if !binary_on_path(host.id()) {
+            eprintln!("skipped {}: `{}` is not on PATH", host.id(), host.id());
             continue;
         }
         match apply_host(host, dry_run, &action) {
@@ -145,7 +153,7 @@ fn run_hosts(hosts: Vec<Host>, dry_run: bool, action: HostAction) -> Result<()> 
     }
 
     if changed == 0 && errors.is_empty() {
-        bail!("no supported MCP hosts found on PATH (claude, codex)");
+        bail!("no supported MCP hosts found on PATH (claude, codex, cursor-agent)");
     }
     if !errors.is_empty() {
         let detail = errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
@@ -159,63 +167,165 @@ fn run_hosts(hosts: Vec<Host>, dry_run: bool, action: HostAction) -> Result<()> 
 
 fn apply_host(host: Host, dry_run: bool, action: &HostAction) -> Result<()> {
     match action {
-        HostAction::Install { bin } => {
-            let args = add_args(host, bin);
-            if dry_run {
-                println!("{}", display_command(host.binary(), &args));
-                return Ok(());
+        HostAction::Install { bin } => match add_args(host, bin) {
+            Some(args) => run_host_command(host, &args, dry_run, action, &mut run_host),
+            None => {
+                let path = cursor_config_path()?;
+                if dry_run {
+                    println!("write {} ({})", path.display(), SERVER_NAME);
+                    return Ok(());
+                }
+                write_cursor_config(&path, bin)?;
+                println!("installed {}", host.id());
+                Ok(())
             }
-            install_host(host, bin)
-        }
-        HostAction::Uninstall => {
-            let args = remove_args(host);
-            if dry_run {
-                println!("{}", display_command(host.binary(), &args));
-                return Ok(());
+        },
+        HostAction::Uninstall => match remove_args(host) {
+            Some(args) => run_host_command(host, &args, dry_run, action, &mut run_host),
+            None => {
+                let path = cursor_config_path()?;
+                if dry_run {
+                    println!("remove {} ({})", path.display(), SERVER_NAME);
+                    return Ok(());
+                }
+                remove_cursor_config(&path)?;
+                println!("uninstalled {}", host.id());
+                Ok(())
             }
-            uninstall_host(host)
-        }
+        },
     }
 }
 
-fn install_host(host: Host, bin: &str) -> Result<()> {
-    install_host_with_runner(host, bin, &mut run_host)
+fn cursor_config_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    Ok(home.join(".cursor").join("mcp.json"))
 }
 
-fn install_host_with_runner(
-    host: Host,
-    bin: &str,
-    run: &mut impl FnMut(&str, &[String]) -> Result<HostOutput>,
-) -> Result<()> {
-    let args = add_args(host, bin);
-    let add = run(host.binary(), &args)?;
-    if add.success {
-        println!("installed {}", host.id());
+fn update_cursor_config(path: &Path, mutate: impl FnOnce(&mut Value) -> Result<()>) -> Result<()> {
+    let mut config = read_cursor_config(path)?;
+    mutate(&mut config)?;
+    write_cursor_config_file(path, &config)
+}
+
+fn uses_non_stdio_transport(entry: &Map<String, Value>) -> bool {
+    entry.contains_key("url") || entry.get("type").is_some_and(|transport| transport != "stdio")
+}
+
+fn write_cursor_config(path: &Path, bin: &str) -> Result<()> {
+    update_cursor_config(path, |config| {
+        let servers = config
+            .as_object_mut()
+            .and_then(|root| {
+                root.entry("mcpServers")
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+            })
+            .context("invalid ~/.cursor/mcp.json: mcpServers must be an object")?;
+        let entry = servers
+            .entry(SERVER_NAME)
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .context("invalid ~/.cursor/mcp.json: mcpServers.recall must be an object")?;
+        if uses_non_stdio_transport(entry) {
+            bail!(
+                "cannot install cursor-agent: ~/.cursor/mcp.json mcpServers.recall uses a non-stdio transport"
+            );
+        }
+        entry.insert("type".to_string(), Value::String("stdio".to_string()));
+        entry.insert("command".to_string(), Value::String(bin.to_string()));
+        entry.insert("args".to_string(), serde_json::json!([SERVER_ARG]));
+        Ok(())
+    })
+}
+
+fn remove_cursor_config(path: &Path) -> Result<()> {
+    if !path.is_file() {
         return Ok(());
     }
-    bail!("{}: {}", display_command(host.binary(), &args), add.summary())
+    update_cursor_config(path, |config| {
+        if let Some(servers) = config.get_mut("mcpServers").and_then(Value::as_object_mut) {
+            if servers
+                .get(SERVER_NAME)
+                .and_then(Value::as_object)
+                .is_some_and(uses_non_stdio_transport)
+            {
+                bail!(
+                    "cannot uninstall cursor-agent: ~/.cursor/mcp.json mcpServers.recall uses a non-stdio transport"
+                );
+            }
+            servers.remove(SERVER_NAME);
+        }
+        Ok(())
+    })
 }
 
-fn uninstall_host(host: Host) -> Result<()> {
-    remove_host(host)?;
-    println!("uninstalled {}", host.id());
+fn read_cursor_config(path: &Path) -> Result<Value> {
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(serde_json::json!({ "mcpServers": {} }))
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+fn write_cursor_config_file(path: &Path, config: &Value) -> Result<()> {
+    let resolved_path = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = fs::canonicalize(path)
+                .with_context(|| format!("failed to resolve symbolic link {}", path.display()))?;
+            if !target.is_file() {
+                bail!("symbolic link {} does not resolve to a file", path.display());
+            }
+            Some(target)
+        }
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    let path = resolved_path.as_deref().unwrap_or(path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cursor config path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let body = format!("{}\n", serde_json::to_string_pretty(config)?);
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+    temp.write_all(body.as_bytes())
+        .with_context(|| format!("failed to write temporary config in {}", parent.display()))?;
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync temporary config in {}", parent.display()))?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
     Ok(())
 }
 
-fn remove_host(host: Host) -> Result<()> {
-    remove_host_with_runner(host, &mut run_host)
-}
-
-fn remove_host_with_runner(
+fn run_host_command(
     host: Host,
+    args: &[String],
+    dry_run: bool,
+    action: &HostAction,
     run: &mut impl FnMut(&str, &[String]) -> Result<HostOutput>,
 ) -> Result<()> {
-    let args = remove_args(host);
-    let output = run(host.binary(), &args)?;
-    if output.success || looks_like_not_found(&output.combined()) {
+    if dry_run {
+        println!("{}", display_command(host.id(), args));
         return Ok(());
     }
-    bail!("{}: {}", display_command(host.binary(), &args), output.summary())
+    let removing = matches!(action, HostAction::Uninstall);
+    let output = run(host.id(), args)?;
+    if output.success
+        || (removing && looks_like_not_found(&format!("{}\n{}", output.stdout, output.stderr)))
+    {
+        println!("{} {}", if removing { "uninstalled" } else { "installed" }, host.id());
+        return Ok(());
+    }
+    bail!("{}: {}", display_command(host.id(), args), output.summary())
 }
 
 struct HostOutput {
@@ -225,10 +335,6 @@ struct HostOutput {
 }
 
 impl HostOutput {
-    fn combined(&self) -> String {
-        format!("{}\n{}", self.stdout, self.stderr)
-    }
-
     fn summary(&self) -> String {
         let stderr = self.stderr.trim();
         if !stderr.is_empty() {
@@ -321,8 +427,10 @@ fn is_unix_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Host, HostOutput, add_args, display_command, install_host_with_runner,
-        looks_like_not_found, quote_arg, remove_args, resolve_bin, resolve_hosts,
+        Host, HostAction, HostOutput, SERVER_ARG, SERVER_NAME, add_args, display_command,
+        looks_like_not_found, quote_arg, read_cursor_config, remove_args, remove_cursor_config,
+        resolve_bin, resolve_hosts, run_host_command, write_cursor_config,
+        write_cursor_config_file,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -339,34 +447,145 @@ mod tests {
             resolve_hosts(&["claude-code".into(), "CLAUDE".into(), "codex".into()]).unwrap(),
             vec![Host::Claude, Host::Codex]
         );
+        assert_eq!(
+            resolve_hosts(&["cursor".into(), "cursor-agent".into()]).unwrap(),
+            vec![Host::Cursor]
+        );
     }
 
     #[test]
     fn resolve_hosts_rejects_unknown() {
-        let error = resolve_hosts(&["cursor".into()]).unwrap_err().to_string();
-        assert!(error.contains("unknown MCP host 'cursor'"));
+        let error = resolve_hosts(&["pi".into()]).unwrap_err().to_string();
+        assert!(error.contains("unknown MCP host 'pi'"));
     }
 
     #[test]
     fn add_args_match_host_clis() {
         assert_eq!(
-            add_args(Host::Claude, "recall"),
+            add_args(Host::Claude, "recall").unwrap(),
             ["mcp", "add", "--scope", "user", "recall", "--", "recall", "mcp"]
         );
         assert_eq!(
-            add_args(Host::Codex, "recall"),
+            add_args(Host::Codex, "recall").unwrap(),
             ["mcp", "add", "recall", "--", "recall", "mcp"]
         );
+        assert!(add_args(Host::Cursor, "recall").is_none());
         assert_eq!(
-            add_args(Host::Claude, "/tmp/recall"),
+            add_args(Host::Claude, "/tmp/recall").unwrap(),
             ["mcp", "add", "--scope", "user", "recall", "--", "/tmp/recall", "mcp"]
         );
     }
 
     #[test]
     fn remove_args_match_host_clis() {
-        assert_eq!(remove_args(Host::Claude), ["mcp", "remove", "recall", "-s", "user"]);
-        assert_eq!(remove_args(Host::Codex), ["mcp", "remove", "recall"]);
+        assert_eq!(remove_args(Host::Claude).unwrap(), ["mcp", "remove", "recall", "-s", "user"]);
+        assert_eq!(remove_args(Host::Codex).unwrap(), ["mcp", "remove", "recall"]);
+        assert!(remove_args(Host::Cursor).is_none());
+    }
+
+    #[test]
+    fn cursor_config_read_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        assert_eq!(read_cursor_config(&path).unwrap()["mcpServers"], serde_json::json!({}));
+
+        write_cursor_config_file(
+            &path,
+            &serde_json::json!({
+                "mcpServers": {
+                    SERVER_NAME: { "command": "/tmp/recall", "args": [SERVER_ARG] }
+                }
+            }),
+        )
+        .unwrap();
+        let parsed = read_cursor_config(&path).unwrap();
+        assert_eq!(parsed["mcpServers"][SERVER_NAME]["command"], "/tmp/recall");
+        assert_eq!(parsed["mcpServers"][SERVER_NAME]["args"], serde_json::json!([SERVER_ARG]));
+    }
+
+    #[test]
+    fn install_preserves_user_owned_server_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        write_cursor_config_file(
+            &path,
+            &serde_json::json!({
+                "mcpServers": {
+                    "other": { "command": "other-bin" },
+                    SERVER_NAME: {
+                        "command": "/opt/recall",
+                        "args": [SERVER_ARG],
+                        "env": { "RECALL_DB": "/data/recall.db" }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        write_cursor_config(&path, "/usr/local/bin/recall").unwrap();
+
+        let parsed = read_cursor_config(&path).unwrap();
+        assert_eq!(parsed["mcpServers"][SERVER_NAME]["command"], "/usr/local/bin/recall");
+        assert_eq!(parsed["mcpServers"][SERVER_NAME]["type"], "stdio");
+        assert_eq!(parsed["mcpServers"][SERVER_NAME]["env"]["RECALL_DB"], "/data/recall.db");
+        assert_eq!(parsed["mcpServers"]["other"]["command"], "other-bin");
+    }
+
+    #[test]
+    fn remote_server_is_never_mutated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        write_cursor_config_file(
+            &path,
+            &serde_json::json!({
+                "mcpServers": {
+                    SERVER_NAME: {
+                        "type": "http",
+                        "url": "https://example.com/mcp",
+                        "headers": { "Authorization": "Bearer preserved" }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(write_cursor_config(&path, "/usr/local/bin/recall").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert!(remove_cursor_config(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn uninstall_removes_malformed_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        write_cursor_config_file(
+            &path,
+            &serde_json::json!({ "mcpServers": { SERVER_NAME: null } }),
+        )
+        .unwrap();
+
+        remove_cursor_config(&path).unwrap();
+
+        assert!(read_cursor_config(&path).unwrap()["mcpServers"].get(SERVER_NAME).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_config_write_preserves_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("owned-mcp.json");
+        let path = dir.path().join("mcp.json");
+        write_cursor_config_file(&target, &serde_json::json!({ "owner": "user" })).unwrap();
+        symlink(&target, &path).unwrap();
+
+        write_cursor_config_file(&path, &serde_json::json!({ "owner": "recall" })).unwrap();
+
+        assert!(path.is_symlink());
+        assert_eq!(read_cursor_config(&target).unwrap()["owner"], "recall");
     }
 
     #[test]
@@ -392,7 +611,7 @@ mod tests {
     #[test]
     fn display_command_quotes_whitespace() {
         assert_eq!(
-            display_command("claude", &add_args(Host::Claude, "/tmp/My Recall/recall")),
+            display_command("claude", &add_args(Host::Claude, "/tmp/My Recall/recall").unwrap()),
             "claude mcp add --scope user recall -- '/tmp/My Recall/recall' mcp"
         );
         assert_eq!(quote_arg("plain"), "plain");
@@ -407,26 +626,29 @@ mod tests {
     #[test]
     fn failed_install_keeps_existing_registration() {
         let mut registered = true;
-        let error = install_host_with_runner(Host::Claude, "recall", &mut |_, args| match args[1]
-            .as_str()
-        {
-            "add" if registered => Ok(HostOutput {
-                success: false,
-                stdout: String::new(),
-                stderr: "MCP server recall already exists".into(),
-            }),
-            "add" => Ok(HostOutput {
-                success: false,
-                stdout: String::new(),
-                stderr: "simulated transient add failure".into(),
-            }),
-            "remove" => {
-                registered = false;
-                Ok(HostOutput { success: true, stdout: String::new(), stderr: String::new() })
-            }
-            action => panic!("unexpected host action: {action}"),
-        })
-        .unwrap_err();
+        let args = add_args(Host::Claude, "recall").unwrap();
+        let action = HostAction::Install { bin: "recall".into() };
+        let error =
+            run_host_command(Host::Claude, &args, false, &action, &mut |_, args| match args[1]
+                .as_str()
+            {
+                "add" if registered => Ok(HostOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "MCP server recall already exists".into(),
+                }),
+                "add" => Ok(HostOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "simulated transient add failure".into(),
+                }),
+                "remove" => {
+                    registered = false;
+                    Ok(HostOutput { success: true, stdout: String::new(), stderr: String::new() })
+                }
+                action => panic!("unexpected host action: {action}"),
+            })
+            .unwrap_err();
 
         assert!(registered, "existing registration was removed: {error}");
     }
