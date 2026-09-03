@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::opencode;
 use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats};
-use crate::db::store::Store;
 
 pub(crate) struct ZcodeAdapter;
 
@@ -41,7 +41,7 @@ impl SourceAdapter for ZcodeAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -54,9 +54,8 @@ impl SourceAdapter for ZcodeAdapter {
         };
         Ok(Some(opencode::scan_for_sync_conn_with_options(
             &conn,
-            store,
+            context,
             since_ts,
-            "zcode",
             include_events,
             opencode::ScanOptions::ZCODE,
         )?))

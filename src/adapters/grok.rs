@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::resolve_home_dir;
@@ -13,7 +14,6 @@ use crate::adapters::{
     InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
     SyncScanOutput, SyncScanResult, SyncScanStats,
 };
-use crate::db::store::Store;
 use crate::types::{RawUsageEvent, Role};
 
 const USAGE_PARSER_VERSION: u32 = 1;
@@ -60,7 +60,7 @@ impl SourceAdapter for GrokAdapter {
 
     fn scan_for_sync_output(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         _include_events: bool,
         force: bool,
@@ -71,7 +71,7 @@ impl SourceAdapter for GrokAdapter {
                 stats: SyncScanStats::default(),
                 observations: Vec::new(),
             };
-            if store.session_meta_map("grok")?.is_empty() {
+            if !context.has_existing_sessions() {
                 return Ok(Some(SyncScanOutput { scan: result, reconcile: None }));
             }
             return Ok(Some(SyncScanOutput {
@@ -79,7 +79,7 @@ impl SourceAdapter for GrokAdapter {
                 reconcile: Some(ReconcilePlan::UnavailableInventory(Vec::new())),
             }));
         };
-        Ok(Some(scan_for_sync_impl(&sessions_dir, store, since_ts, force)?))
+        Ok(Some(scan_for_sync_impl(&sessions_dir, context, since_ts, force)?))
     }
 }
 
@@ -115,7 +115,7 @@ fn resolve_grok_sessions_dir() -> anyhow::Result<Option<PathBuf>> {
 
 fn scan_for_sync_impl(
     sessions_dir: &Path,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     force: bool,
 ) -> anyhow::Result<SyncScanOutput> {
@@ -137,8 +137,7 @@ fn scan_for_sync_impl(
         SyncScanResult { sessions, stats, observations: Vec::new() }
     } else {
         file_scan::run_file_scan_with_options(
-            store,
-            "grok",
+            context,
             since_ts,
             FileScanOptions {
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
@@ -887,7 +886,13 @@ mod tests {
         fs::write(&not_directory, "not a directory").unwrap();
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&not_directory, &store, None, false).unwrap();
+        let result = scan_for_sync_impl(
+            &not_directory,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
 
         assert!(matches!(result.reconcile, Some(ReconcilePlan::UnavailableInventory(_))));
     }
@@ -921,7 +926,13 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(session_id, 1, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
 
         assert!(result.scan.sessions.is_empty());
         assert!(store.session_meta("grok", session_id).unwrap().is_some());
@@ -955,7 +966,13 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(subagent_id, 1, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
 
         assert!(store.session_meta_map("grok").unwrap().contains_key(subagent_id));
         assert_eq!(result.scan.sessions.len(), 1);
@@ -983,7 +1000,13 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(session_id, mtime, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             result.scan.sessions.len(),
             1,
@@ -1000,11 +1023,23 @@ mod tests {
             )
             .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(result.scan.sessions.len(), 0);
         assert_eq!(result.scan.stats.skipped_sessions, 1);
 
-        let forced = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let forced = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(forced.scan.sessions.len(), 1);
         assert!(matches!(
             forced.reconcile,

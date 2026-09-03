@@ -7,6 +7,7 @@ use serde_json::Value;
 use tracing::warn;
 use walkdir::WalkDir;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed};
 use crate::adapters::paths::resolve_home_dir;
@@ -15,7 +16,6 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp,
 };
-use crate::db::store::Store;
 use crate::types::{RawUsageEvent, Role};
 
 pub(crate) struct KimiCodeAdapter;
@@ -57,7 +57,7 @@ impl SourceAdapter for KimiCodeAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -69,8 +69,7 @@ impl SourceAdapter for KimiCodeAdapter {
             }));
         };
         let result = file_scan::run_file_scan_with_options_and_snapshot(
-            store,
-            "kimi-code",
+            context,
             since_ts,
             kimi_scan_options(),
             collect_session_entries(&sessions_dir),
@@ -418,6 +417,7 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+    use crate::db::store::Store;
 
     fn fixture_state() -> &'static str {
         r#"{"id":"session_abc","cwd":"/repo","createdAt":1700000000000,"updatedAt":1700000060000,"title":"fix the bug","isCustomTitle":false,"archived":false}"#
@@ -471,13 +471,12 @@ mod tests {
     }
 
     fn run_kimi_snapshot_scan(
-        store: &Store,
+        context: &AdapterSyncContext,
         root: &Path,
         mutation: Option<SnapshotMutation>,
     ) -> SyncScanResult {
         file_scan::run_file_scan_with_options_and_snapshot(
-            store,
-            "kimi-code",
+            context,
             None,
             kimi_scan_options(),
             collect_session_entries(root),
@@ -600,7 +599,11 @@ mod tests {
                 )
                 .unwrap();
 
-            let result = run_kimi_snapshot_scan(&store, root.path(), Some(mutation));
+            let result = run_kimi_snapshot_scan(
+                &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
+                root.path(),
+                Some(mutation),
+            );
             assert!(result.sessions.is_empty(), "{mutation:?}");
             assert_eq!(result.stats.unstable_sessions, 1, "{mutation:?}");
             let indexed = store.list_recent_sessions(10).unwrap();
@@ -608,7 +611,11 @@ mod tests {
             assert_eq!(indexed[0].title, "prior indexed title", "{mutation:?}");
             assert_eq!(indexed[0].updated_at, Some(initial_mtime - 1), "{mutation:?}");
 
-            let retry = run_kimi_snapshot_scan(&store, root.path(), None);
+            let retry = run_kimi_snapshot_scan(
+                &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
+                root.path(),
+                None,
+            );
             assert_eq!(retry.sessions.len(), 1, "{mutation:?}");
             assert_eq!(retry.stats.unstable_sessions, 0, "{mutation:?}");
         }
@@ -648,8 +655,7 @@ mod tests {
             .unwrap();
 
         let backfill = file_scan::run_file_scan_with_options_and_snapshot(
-            &store,
-            "kimi-code",
+            &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
             None,
             kimi_scan_options(),
             collect_session_entries(root.path()),
@@ -670,8 +676,7 @@ mod tests {
             )
             .unwrap();
         let skipped = file_scan::run_file_scan_with_options_and_snapshot(
-            &store,
-            "kimi-code",
+            &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
             None,
             kimi_scan_options(),
             collect_session_entries(root.path()),
@@ -757,8 +762,7 @@ mod tests {
             .unwrap();
 
         let result = file_scan::run_file_scan_with_options_and_snapshot(
-            &store,
-            "kimi-code",
+            &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
             None,
             kimi_scan_options(),
             collect_session_entries(root.path()),

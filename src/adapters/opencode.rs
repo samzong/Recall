@@ -5,11 +5,11 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde_json::Value;
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
-use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
@@ -86,7 +86,7 @@ impl SourceAdapter for OpenCodeAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -98,7 +98,7 @@ impl SourceAdapter for OpenCodeAdapter {
             }));
         };
 
-        Ok(Some(scan_for_sync_conn(&conn, store, since_ts, self.id(), include_events)?))
+        Ok(Some(scan_for_sync_conn(&conn, context, since_ts, include_events)?))
     }
 }
 
@@ -640,36 +640,26 @@ fn display_json_value(value: &Value) -> String {
 
 pub(crate) fn scan_for_sync_conn(
     conn: &Connection,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
-    source_id: &str,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
-    scan_for_sync_conn_with_options(
-        conn,
-        store,
-        since_ts,
-        source_id,
-        include_events,
-        ScanOptions::default(),
-    )
+    scan_for_sync_conn_with_options(conn, context, since_ts, include_events, ScanOptions::default())
 }
 
 pub(crate) fn scan_for_sync_conn_with_options(
     conn: &Connection,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
-    source_id: &str,
     include_events: bool,
     options: ScanOptions,
 ) -> anyhow::Result<SyncScanResult> {
     let filtered_sessions = count_filtered_sessions(conn, since_ts)?;
     let sessions = load_session_rows(conn, since_ts)?;
-    let existing = store.session_meta_map(source_id)?;
-    let usage_state = store.usage_state_meta_map(source_id)?;
-    let event_state =
-        if include_events { store.event_state_meta_map(source_id)? } else { Default::default() };
-    let metadata_state = store.metadata_state_meta_map(source_id)?;
+    let existing = context.session_meta();
+    let usage_state = context.usage_state();
+    let event_state = context.event_state();
+    let metadata_state = context.metadata_state();
     let current_counts = load_message_counts(
         conn,
         &sessions.iter().map(|session| session.id.clone()).collect::<Vec<_>>(),
@@ -857,7 +847,13 @@ mod tests {
         mark_event_current(&store, "s1", Some(200));
         mark_metadata_current(&store, "s1");
 
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
+        let result = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert!(result.sessions.is_empty());
         assert_eq!(result.stats.skipped_sessions, 1);
         drop(conn);
@@ -874,7 +870,13 @@ mod tests {
         mark_usage_current(&store, "s1", Some(200));
         mark_event_current(&store, "s1", Some(200));
 
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
+        let result = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.stats.skipped_sessions, 0);
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].custom_title.as_deref(), Some("Test"));
@@ -893,7 +895,13 @@ mod tests {
         mark_usage_current(&store, "s1", Some(200));
         mark_metadata_current(&store, "s1");
 
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode", false).unwrap();
+        let result = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(result.sessions.is_empty());
         assert_eq!(result.stats.skipped_sessions, 1);
         drop(conn);
@@ -912,7 +920,13 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
 
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
+        let result = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.stats.skipped_sessions, 0);
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "s1");
@@ -934,7 +948,13 @@ mod tests {
         mark_event_current(&store, "s2", Some(150));
         mark_metadata_current(&store, "s2");
 
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
+        let result = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.stats.skipped_sessions, 1);
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "s1");
@@ -950,7 +970,13 @@ mod tests {
         insert_session_with_message(&conn, "new", 220, 200, "new");
 
         let store = setup_store();
-        let result = scan_for_sync_conn(&conn, &store, Some(200), "opencode", true).unwrap();
+        let result = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            Some(200),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(result.stats.filtered_sessions, 1);
         assert_eq!(result.sessions.len(), 1);
@@ -984,7 +1010,13 @@ mod tests {
         .unwrap();
 
         let store = setup_store();
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode", true).unwrap();
+        let result = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "good");
@@ -1210,7 +1242,13 @@ mod tests {
         .unwrap();
         let store = setup_store();
 
-        let result = scan_for_sync_conn(&conn, &store, None, "opencode", false).unwrap();
+        let result = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].messages.len(), 1);

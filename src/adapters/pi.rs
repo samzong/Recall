@@ -7,6 +7,7 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
 use crate::adapters::usage::{disjoint_output_and_reasoning, usage_count};
@@ -14,7 +15,6 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp,
 };
-use crate::db::store::Store;
 use crate::types::{ParentLink, ParentRelation, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) struct PiAdapter;
@@ -64,7 +64,7 @@ impl SourceAdapter for PiAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -77,7 +77,7 @@ impl SourceAdapter for PiAdapter {
             }));
         }
 
-        Ok(Some(scan_for_sync_impl(&session_dirs, store, since_ts, include_events)?))
+        Ok(Some(scan_for_sync_impl(&session_dirs, context, since_ts, include_events)?))
     }
 }
 
@@ -181,14 +181,13 @@ fn push_existing_unique_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<String>,
 
 fn scan_for_sync_impl(
     session_dirs: &[PathBuf],
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let entries = collect_pi_entries(session_dirs);
     file_scan::run_file_scan_with_options(
-        store,
-        "pi",
+        context,
         since_ts,
         file_scan::FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
@@ -1199,8 +1198,13 @@ mod tests {
             )
             .unwrap();
 
-        let result =
-            scan_for_sync_impl(&[root.join("--tmp-pi-project--")], &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &[root.join("--tmp-pi-project--")],
+            &AdapterSyncContext::from_store_for_test(&store, "pi").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 

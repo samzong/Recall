@@ -7,12 +7,12 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
-use crate::db::store::Store;
 use crate::types::Role;
 
 const TRANSCRIPT_RELATIVE_PATH: &[&str] = &[".system_generated", "logs", "transcript.jsonl"];
@@ -54,7 +54,7 @@ impl SourceAdapter for AntigravityAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -65,7 +65,7 @@ impl SourceAdapter for AntigravityAdapter {
                 observations: Vec::new(),
             }));
         };
-        Ok(Some(scan_for_sync_impl(&cli_dir, store, since_ts)?))
+        Ok(Some(scan_for_sync_impl(&cli_dir, context, since_ts)?))
     }
 }
 
@@ -78,17 +78,11 @@ fn resolve_antigravity_dir() -> anyhow::Result<Option<PathBuf>> {
 
 fn scan_for_sync_impl(
     cli_dir: &Path,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
 ) -> anyhow::Result<SyncScanResult> {
     let entries = collect_antigravity_entries(cli_dir)?;
-    file_scan::run_file_scan(
-        store,
-        "antigravity-cli",
-        since_ts,
-        entries,
-        parse_antigravity_session_for_entry,
-    )
+    file_scan::run_file_scan(context, since_ts, entries, parse_antigravity_session_for_entry)
 }
 
 fn collect_antigravity_entries(cli_dir: &Path) -> anyhow::Result<Vec<FileScanEntry>> {
@@ -383,12 +377,22 @@ mod tests {
         let mtime = file_scan::stat_mtime_ms(&transcript).unwrap();
         let store = setup_store();
 
-        let fresh = scan_for_sync_impl(&root, &store, None).unwrap();
+        let fresh = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "antigravity-cli").unwrap(),
+            None,
+        )
+        .unwrap();
         assert_eq!(fresh.sessions[0].source_file_path.as_deref(), transcript.to_str());
 
         store.insert_session(&make_existing_session(conversation_id, mtime, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "antigravity-cli").unwrap(),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);

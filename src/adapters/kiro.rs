@@ -6,13 +6,14 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SourceObservation, SyncScanResult,
     SyncScanStats, first_timestamp, last_timestamp,
 };
-use crate::db::store::{SessionPath, Store};
+use crate::db::store::SessionPath;
 use crate::types::Role;
 
 pub(crate) struct KiroAdapter;
@@ -46,14 +47,13 @@ impl SourceAdapter for KiroAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let mut result = if let Some(sessions_dir) = resolve_sessions_dir() {
             file_scan::run_file_scan_with_options(
-                store,
-                "kiro-cli",
+                context,
                 since_ts,
                 file_scan::FileScanOptions::default(),
                 collect_file_entries(&sessions_dir),
@@ -67,7 +67,7 @@ impl SourceAdapter for KiroAdapter {
             }
         };
 
-        let paths = store.session_paths_for_source("kiro-cli").unwrap_or_default();
+        let paths = context.session_paths().cloned().collect::<Vec<_>>();
         reconcile_file_source_ids(&mut result.sessions, &paths);
         let mut covered = covered_for_sqlite(&result.sessions, &result.observations, &paths);
         for session in scan_sqlite_sessions() {

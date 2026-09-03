@@ -8,6 +8,7 @@ use tracing::debug;
 
 use rusqlite::params;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
@@ -17,7 +18,6 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
 };
-use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 pub(crate) struct CopilotAdapter;
@@ -68,7 +68,7 @@ impl SourceAdapter for CopilotAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -81,7 +81,7 @@ impl SourceAdapter for CopilotAdapter {
         };
         let result = scan_for_sync_impl(
             &sessions_dir,
-            store,
+            context,
             since_ts,
             include_events,
             resolve_session_store_db().as_deref(),
@@ -275,7 +275,7 @@ fn attach_usage(raw: RawSession, usage: &CopilotUsageIndex) -> RawSession {
 
 fn scan_for_sync_impl(
     sessions_dir: &Path,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
     usage_db: Option<&Path>,
@@ -283,8 +283,7 @@ fn scan_for_sync_impl(
     let entries = collect_copilot_entries(sessions_dir);
     let usage = load_copilot_usage_index(usage_db);
     file_scan::run_file_scan_with_options_and_mtime(
-        store,
-        "copilot-cli",
+        context,
         since_ts,
         FileScanOptions {
             usage_parser_version: usage.is_available().then_some(USAGE_PARSER_VERSION),
@@ -791,7 +790,14 @@ mod tests {
             )
             .unwrap();
 
-        let result = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 
@@ -809,7 +815,14 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, actual_mtime - 1_000, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -827,7 +840,14 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].source_file_path.as_deref(), events_path.to_str());
@@ -855,7 +875,14 @@ mod tests {
         writeln!(f, "{user}").unwrap();
 
         let store = setup_store();
-        let result = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, dir_name);
 
@@ -877,7 +904,14 @@ mod tests {
         f.write_all(&[0xFF, 0xFE, 0xFD, 0xFC]).unwrap();
 
         let store = setup_store();
-        let result = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, good_uuid);
 
@@ -926,8 +960,14 @@ mod tests {
         write_usage_db(&usage_db, uuid, "2026-08-27T19:12:13.186Z");
 
         let store = setup_store();
-        let result =
-            scan_for_sync_impl(&sessions_dir, &store, None, true, Some(&usage_db)).unwrap();
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            Some(&usage_db),
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].usage_parser_version, Some(USAGE_PARSER_VERSION));
         assert_eq!(result.sessions[0].usage_events.len(), 1);
@@ -960,8 +1000,14 @@ mod tests {
         .unwrap();
 
         let store = setup_store();
-        let result =
-            scan_for_sync_impl(&sessions_dir, &store, None, true, Some(&usage_db)).unwrap();
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            Some(&usage_db),
+        )
+        .unwrap();
         assert_eq!(result.sessions[0].usage_events[0].input_tokens, 2);
         assert_eq!(result.sessions[0].usage_events[0].cache_read_tokens, 30_612);
         assert_eq!(result.sessions[0].usage_events[0].cache_write_tokens, 1_120);
@@ -979,8 +1025,14 @@ mod tests {
         write_usage_schema(&usage_db);
 
         let store = setup_store();
-        let result =
-            scan_for_sync_impl(&sessions_dir, &store, None, true, Some(&usage_db)).unwrap();
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            Some(&usage_db),
+        )
+        .unwrap();
         assert_eq!(result.sessions[0].usage_parser_version, Some(USAGE_PARSER_VERSION));
         assert!(result.sessions[0].usage_events.is_empty());
 
@@ -1007,15 +1059,28 @@ mod tests {
             )
             .unwrap();
 
-        let skipped = scan_for_sync_impl(&sessions_dir, &store, None, true, None).unwrap();
+        let skipped = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(skipped.sessions.len(), 0);
         assert_eq!(skipped.stats.skipped_sessions, 1);
 
         let usage_db = root.join("session-store.db");
         write_usage_db(&usage_db, uuid, "2020-01-01T00:00:00.000Z");
 
-        let result =
-            scan_for_sync_impl(&sessions_dir, &store, None, true, Some(&usage_db)).unwrap();
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            Some(&usage_db),
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].usage_events.len(), 1);
         assert_eq!(result.sessions[0].usage_events[0].input_tokens, 95);

@@ -11,6 +11,7 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::json_util::json_i64;
 use crate::adapters::paths::resolve_home_dir;
@@ -19,7 +20,6 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
 };
-use crate::db::store::Store;
 use crate::types::{RawSessionEvent, RawUsageEvent, Role};
 
 pub(crate) struct CursorAdapter;
@@ -76,13 +76,13 @@ impl SourceAdapter for CursorAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let transcript_paths = collect_agent_transcript_paths();
         let mut result = if let Some(conn) = open_global_db()? {
-            scan_for_sync_conn(&conn, store, since_ts, include_events, &transcript_paths)?
+            scan_for_sync_conn(&conn, context, since_ts, include_events, &transcript_paths)?
         } else {
             SyncScanResult {
                 sessions: vec![],
@@ -90,9 +90,9 @@ impl SourceAdapter for CursorAdapter {
                 observations: Vec::new(),
             }
         };
-        let covered = ids_covered_by_ide(store, &result.sessions);
+        let covered = ids_covered_by_ide(context, &result.sessions);
         let store_result =
-            cli_store::scan_for_sync(store, since_ts, &covered, USAGE_PARSER_VERSION)?;
+            cli_store::scan_for_sync(context, since_ts, &covered, USAGE_PARSER_VERSION)?;
         merge_scan_results(&mut result, store_result);
         Ok(Some(result))
     }
@@ -100,20 +100,19 @@ impl SourceAdapter for CursorAdapter {
 
 fn scan_for_sync_conn(
     conn: &Connection,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
     transcript_paths: &HashMap<String, AgentTranscriptPath>,
 ) -> anyhow::Result<SyncScanResult> {
-    let existing = store.session_meta_map("cursor")?;
-    let existing_paths = store
-        .session_paths_for_source("cursor")?
-        .into_iter()
-        .map(|path| (path.source_id, path.source_file_path))
+    debug_assert_eq!(context.source(), "cursor");
+    let existing = context.session_meta();
+    let existing_paths = context
+        .session_paths()
+        .map(|path| (path.source_id.clone(), path.source_file_path.clone()))
         .collect::<HashMap<_, _>>();
-    let usage_state = store.usage_state_meta_map("cursor")?;
-    let event_state =
-        if include_events { store.event_state_meta_map("cursor")? } else { HashMap::new() };
+    let usage_state = context.usage_state();
+    let event_state = context.event_state();
     let global_mtime = global_db_mtime();
     let lookup = ComposerLookup::load(conn);
     let composer_ids = discover_composer_ids(conn)?;
@@ -1089,15 +1088,13 @@ fn append_cli_store_sessions(mut sessions: Vec<RawSession>) -> anyhow::Result<Ve
     Ok(sessions)
 }
 
-fn ids_covered_by_ide(store: &Store, emitted: &[RawSession]) -> HashSet<String> {
+fn ids_covered_by_ide(context: &AdapterSyncContext, emitted: &[RawSession]) -> HashSet<String> {
     let mut ids = emitted.iter().map(|session| session.source_id.clone()).collect::<HashSet<_>>();
-    if let Ok(paths) = store.session_paths_for_source("cursor") {
-        for path in paths {
-            let store_owned =
-                path.source_file_path.as_deref().is_some_and(|value| value.ends_with("store.db"));
-            if !store_owned {
-                ids.insert(path.source_id);
-            }
+    for path in context.session_paths() {
+        let store_owned =
+            path.source_file_path.as_deref().is_some_and(|value| value.ends_with("store.db"));
+        if !store_owned {
+            ids.insert(path.source_id.clone());
         }
     }
     ids
@@ -1245,6 +1242,7 @@ mod tests {
 
     use super::*;
     use crate::db::schema;
+    use crate::db::store::Store;
     use crate::types::{Session, TokenSource};
 
     fn temp_root(label: &str) -> PathBuf {
@@ -1458,7 +1456,7 @@ mod tests {
 
         let result = scan_for_sync_conn(
             &conn,
-            &store,
+            &AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap(),
             Some(source_updated_at + 1),
             false,
             &transcript_paths,

@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::opencode;
 use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats};
-use crate::db::store::Store;
 
 pub(crate) struct KiloCodeAdapter;
 
@@ -37,7 +37,7 @@ impl SourceAdapter for KiloCodeAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -48,7 +48,7 @@ impl SourceAdapter for KiloCodeAdapter {
                 observations: Vec::new(),
             }));
         };
-        Ok(Some(opencode::scan_for_sync_conn(&conn, store, since_ts, "kilo-code", include_events)?))
+        Ok(Some(opencode::scan_for_sync_conn(&conn, context, since_ts, include_events)?))
     }
 }
 

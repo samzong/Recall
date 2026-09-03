@@ -6,6 +6,7 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
@@ -14,7 +15,6 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
 };
-use crate::db::store::Store;
 use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) struct CodexAdapter;
@@ -67,7 +67,7 @@ impl SourceAdapter for CodexAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
@@ -78,7 +78,7 @@ impl SourceAdapter for CodexAdapter {
                 observations: Vec::new(),
             }));
         };
-        let result = scan_for_sync_impl(&codex_dir, store, since_ts, include_events)?;
+        let result = scan_for_sync_impl(&codex_dir, context, since_ts, include_events)?;
         Ok(Some(result))
     }
 }
@@ -111,7 +111,7 @@ fn resolve_codex_dir() -> anyhow::Result<Option<PathBuf>> {
 
 fn scan_for_sync_impl(
     codex_dir: &Path,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
@@ -119,8 +119,7 @@ fn scan_for_sync_impl(
     let archived_dir = codex_dir.join("archived_sessions");
     let entries = collect_codex_entries(&[&sessions_dir, &archived_dir]);
     file_scan::run_file_scan_with_options(
-        store,
-        "codex",
+        context,
         since_ts,
         file_scan::FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
@@ -1766,7 +1765,13 @@ mod tests {
             )
             .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 
@@ -1793,7 +1798,13 @@ mod tests {
             )
             .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 
@@ -1808,10 +1819,22 @@ mod tests {
         write_codex_event_only_rollout(&sessions_dir, uuid);
         let store = setup_store();
 
-        let usage_result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        let usage_result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(usage_result.sessions.is_empty());
 
-        let full_result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let full_result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(full_result.sessions.len(), 1);
         assert!(full_result.sessions[0].messages.is_empty());
         assert!(full_result.sessions[0].usage_events.is_empty());
@@ -1831,7 +1854,13 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, actual_mtime - 1_000, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -1858,7 +1887,13 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, good_uuid);
 
@@ -1874,7 +1909,13 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].source_file_path.as_deref(), path.to_str());
