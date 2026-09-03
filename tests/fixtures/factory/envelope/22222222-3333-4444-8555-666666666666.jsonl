@@ -1,0 +1,4 @@
+{"type":"session_start","id":"22222222-3333-4444-8555-666666666666","title":"Envelope session","cwd":"/tmp/droid-proj"}
+{"type":"message","timestamp":1700000101000,"message":{"role":"user","content":"use the envelope"}}
+{"type":"message","timestamp":1700000102000,"message":{"role":"assistant","content":[{"type":"text","text":"reading file"},{"type":"tool_use","id":"call-e1","name":"read","input":{"path":"/tmp/droid-proj/main.rs"}}]}}
+{"type":"message","timestamp":1700000103000,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-e1","content":"fn main() {}"}]}}

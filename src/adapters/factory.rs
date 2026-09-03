@@ -46,10 +46,19 @@ impl SourceAdapter for FactoryAdapter {
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let mut sessions = Vec::new();
         for entry in collect_session_entries(&sessions_dir()) {
-            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+            let Some(before) = factory_session_snapshot(&entry) else {
                 continue;
             };
-            if let Some(raw) = parse_session_entry(entry, mtime_ms, true)? {
+            let revalidate = entry.clone();
+            if let Some(raw) = parse_session_entry(entry, before.effective_mtime_ms(), true)? {
+                if factory_session_snapshot(&revalidate).as_ref() != Some(&before) {
+                    warn!(
+                        "skipping unstable Factory session {}: source files changed while parsing ({})",
+                        revalidate.session_id,
+                        revalidate.stat_target.display()
+                    );
+                    continue;
+                }
                 sessions.push(raw);
             }
         }
@@ -69,7 +78,7 @@ impl SourceAdapter for FactoryAdapter {
                 observations: Vec::new(),
             }));
         };
-        Ok(Some(file_scan::run_file_scan_with_options(
+        Ok(Some(file_scan::run_file_scan_with_options_and_snapshot(
             context,
             since_ts,
             FileScanOptions {
@@ -78,6 +87,7 @@ impl SourceAdapter for FactoryAdapter {
                 metadata_parser_version: None,
             },
             collect_session_entries(&Some(root)),
+            factory_session_snapshot,
             |entry, mtime_ms| parse_session_entry(entry, mtime_ms, include_events),
         )?))
     }
@@ -115,6 +125,31 @@ fn collect_session_entries(root: &Option<PathBuf>) -> Vec<FileScanEntry> {
     entries
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct FactorySessionSnapshot {
+    jsonl: file_scan::FileMetadataSnapshot,
+    settings: Option<file_scan::FileMetadataSnapshot>,
+}
+
+fn settings_sidecar(jsonl: &Path) -> PathBuf {
+    let stem = jsonl.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+    jsonl.with_file_name(format!("{stem}.settings.json"))
+}
+
+fn factory_session_snapshot(
+    entry: &FileScanEntry,
+) -> Option<file_scan::FileScanSnapshot<FactorySessionSnapshot>> {
+    let jsonl = file_scan::file_metadata_snapshot(&entry.stat_target)?;
+    let settings = file_scan::file_metadata_snapshot(&settings_sidecar(&entry.stat_target));
+    let jsonl_mtime = jsonl.mtime_ms()?;
+    let effective = settings
+        .as_ref()
+        .and_then(file_scan::FileMetadataSnapshot::mtime_ms)
+        .map(|mtime| mtime.max(jsonl_mtime))
+        .unwrap_or(jsonl_mtime);
+    Some(file_scan::FileScanSnapshot::new(effective, FactorySessionSnapshot { jsonl, settings }))
+}
+
 fn parse_session_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
@@ -147,8 +182,7 @@ fn parse_factory_jsonl(
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let file = fs::File::open(path)?;
-    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
-    let settings = read_settings(&path.with_file_name(format!("{stem}.settings.json")));
+    let settings = read_settings(&settings_sidecar(path));
     let source_path = path.to_str().map(str::to_string);
     let mut messages = Vec::new();
     let mut events = Vec::new();
@@ -163,6 +197,39 @@ fn parse_factory_jsonl(
         let timestamp =
             json_i64(record.get("timestamp")).or_else(|| rfc3339_ms(record.get("timestamp")));
         match kind {
+            "session_start" => {}
+            "message" => {
+                let nested = record.get("message").unwrap_or(&Value::Null);
+                match nested.get("role").and_then(Value::as_str).unwrap_or("") {
+                    "user" | "human" => {
+                        if let Some(content) = extract_text(nested.get("content")) {
+                            messages.push(RawMessage { role: Role::User, content, timestamp });
+                        }
+                        if include_events {
+                            collect_tool_results(
+                                &record,
+                                timestamp,
+                                source_path.as_deref(),
+                                &mut events,
+                            );
+                        }
+                    }
+                    "assistant" | "agent" => {
+                        if let Some(content) = extract_text(nested.get("content")) {
+                            messages.push(RawMessage { role: Role::Assistant, content, timestamp });
+                        }
+                        if include_events {
+                            collect_tool_calls(
+                                &record,
+                                timestamp,
+                                source_path.as_deref(),
+                                &mut events,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
             "user" | "human" => {
                 if let Some(content) = record_text(&record) {
                     messages.push(RawMessage { role: Role::User, content, timestamp });
@@ -228,8 +295,9 @@ fn take_meta(
     directory: &mut Option<String>,
     custom_title: &mut Option<String>,
 ) {
+    let kind = record_kind(record);
     if let Some(id) = json_opt(record, &["sessionId", "session_id", "id"])
-        && record_kind(record).is_empty()
+        && (kind.is_empty() || kind == "session_start")
     {
         *source_id = id;
     }
@@ -321,6 +389,35 @@ fn collect_tool_calls(
             },
             name,
             block.get("input").or_else(|| block.get("arguments")),
+        ));
+    }
+}
+
+fn collect_tool_results(
+    record: &Value,
+    timestamp: Option<i64>,
+    source_path: Option<&str>,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let content = record.get("content").or_else(|| record.pointer("/message/content"));
+    let Some(Value::Array(blocks)) = content else {
+        return;
+    };
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        events_out.push(events::tool_result_event(
+            events::EventContext {
+                event_seq: events_out.len() as u32,
+                timestamp,
+                source_path: source_path.map(str::to_string),
+                source_event_id: json_opt(block, &["id", "tool_use_id"]),
+                message_seq: None,
+                parser_version: EVENT_PARSER_VERSION,
+            },
+            json_opt(block, &["name", "tool"]),
+            extract_text(block.get("content")).or_else(|| extract_text(Some(block))),
         ));
     }
 }
@@ -473,5 +570,122 @@ mod tests {
         )
         .unwrap();
         assert!(collect_session_entries(&Some(home.path().join(".factory/sessions"))).is_empty());
+    }
+
+    #[test]
+    fn envelope_session_start_and_nested_message_are_parsed() {
+        let path =
+            fixtures_dir().join("envelope").join("22222222-3333-4444-8555-666666666666.jsonl");
+        let session = parse_factory_jsonl(&path, "fallback", 99, true).unwrap().unwrap();
+        assert_eq!(session.source_id, "22222222-3333-4444-8555-666666666666");
+        assert_eq!(session.directory.as_deref(), Some("/tmp/droid-proj"));
+        assert_eq!(session.custom_title.as_deref(), Some("Envelope session"));
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].role, Role::User);
+        assert_eq!(session.messages[0].content, "use the envelope");
+        assert_eq!(session.messages[1].role, Role::Assistant);
+        assert_eq!(session.messages[1].content, "reading file");
+        assert_eq!(session.events.len(), 2);
+        assert_eq!(session.events[0].name.as_deref(), Some("read"));
+        assert_eq!(session.events[0].target.as_deref(), Some("/tmp/droid-proj/main.rs"));
+        assert_eq!(session.events[1].kind, "tool_result");
+    }
+
+    #[test]
+    fn incremental_scan_reparses_when_only_settings_change() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join(".factory/sessions/proj");
+        fs::create_dir_all(&dest).unwrap();
+        let jsonl = dest.join("sess.jsonl");
+        let settings = dest.join("sess.settings.json");
+        fs::write(
+            &jsonl,
+            "{\"sessionId\":\"sess\",\"cwd\":\"/p\"}\n{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1700000001000}\n",
+        )
+        .unwrap();
+        fs::write(
+            &settings,
+            r#"{"model":"m","title":"old","tokenUsage":{"inputTokens":1,"outputTokens":1}}"#,
+        )
+        .unwrap();
+
+        let jsonl_mtime = 1_700_000_002_000i64;
+        let settings_mtime = jsonl_mtime + 1_000;
+        fs::File::open(&jsonl)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_millis(jsonl_mtime as u64))
+            .unwrap();
+        fs::File::open(&settings)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_millis(jsonl_mtime as u64))
+            .unwrap();
+
+        crate::db::schema::register_sqlite_vec();
+        let store = crate::db::store::Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (id, source, source_id, title, started_at, updated_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "stored",
+                    SOURCE,
+                    "sess",
+                    "old",
+                    1_700_000_000_000_i64,
+                    jsonl_mtime,
+                    1
+                ],
+            )
+            .unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                SOURCE,
+                "sess",
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(jsonl_mtime),
+            )
+            .unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                SOURCE,
+                "sess",
+                &[],
+                EVENT_PARSER_VERSION,
+                Some(jsonl_mtime),
+            )
+            .unwrap();
+
+        fs::write(
+            &settings,
+            r#"{"model":"m","title":"renamed","tokenUsage":{"inputTokens":9,"outputTokens":3}}"#,
+        )
+        .unwrap();
+        fs::File::open(&settings)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_millis(settings_mtime as u64))
+            .unwrap();
+
+        let result = file_scan::run_file_scan_with_options_and_snapshot(
+            &AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap(),
+            None,
+            FileScanOptions {
+                usage_parser_version: Some(USAGE_PARSER_VERSION),
+                event_parser_version: Some(EVENT_PARSER_VERSION),
+                metadata_parser_version: None,
+            },
+            collect_session_entries(&sessions_dir_from(Some(home.path().to_path_buf()))),
+            factory_session_snapshot,
+            |entry, mtime_ms| parse_session_entry(entry, mtime_ms, true),
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.parsed, 1);
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].custom_title.as_deref(), Some("renamed"));
+        assert_eq!(result.sessions[0].usage_events[0].input_tokens, 9);
+        assert_eq!(result.sessions[0].updated_at, Some(settings_mtime));
     }
 }
