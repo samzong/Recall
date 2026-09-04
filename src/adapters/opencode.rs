@@ -76,6 +76,13 @@ impl SourceAdapter for OpenCodeAdapter {
         })
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(ResumeCommand {
+            program: "opencode".to_string(),
+            args: vec!["run".to_string(), "-i".to_string(), prompt],
+        })
+    }
+
     fn usage_parser_version(&self) -> Option<u32> {
         Some(USAGE_PARSER_VERSION)
     }

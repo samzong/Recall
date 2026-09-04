@@ -39,6 +39,10 @@ impl SourceAdapter for PiAdapter {
         })
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("pi", prompt))
+    }
+
     fn usage_parser_version(&self) -> Option<u32> {
         Some(USAGE_PARSER_VERSION)
     }

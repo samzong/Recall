@@ -5,7 +5,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::handoff;
 use crate::tui::app::App;
 use crate::tui::search_state::{PanelFocus, ProjectPickerRow, SourcePickerRow};
 use crate::tui::share_state::PendingCommandAction;
@@ -114,8 +113,11 @@ pub(super) fn render_subagents_picker(f: &mut Frame, app: &App) {
 
 pub(super) fn render_handoff_target_picker(f: &mut Frame, app: &App) {
     let area = f.area();
-    let width = area.width.clamp(36, 56);
-    let height = (handoff::TARGETS.len() as u16 + 5).max(8);
+    let width = area.width.clamp(36, 56).min(area.width);
+    let count = app.handoff_targets.len();
+    let desired_height = count as u16 + 5;
+    let max_height = area.height.max(1);
+    let height = if max_height < 8 { max_height } else { desired_height.clamp(8, max_height) };
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let rect = Rect::new(x, y, width, height);
@@ -126,9 +128,14 @@ pub(super) fn render_handoff_target_picker(f: &mut Frame, app: &App) {
         .border_style(Style::default().fg(THEME.accent))
         .style(Style::default().bg(THEME.popup_bg));
 
-    let mut lines = Vec::new();
-    lines.push(Line::from(""));
-    for (index, target) in handoff::TARGETS.iter().enumerate() {
+    let visible_rows = (height as usize).saturating_sub(5).max(1);
+    let selected = app.handoff_target_selected.min(count.saturating_sub(1));
+    let start = if count == 0 || selected < visible_rows { 0 } else { selected + 1 - visible_rows };
+    let end = (start + visible_rows).min(count);
+
+    let mut lines = vec![Line::from("")];
+    for (offset, target) in app.handoff_targets[start..end].iter().enumerate() {
+        let index = start + offset;
         let selected = index == app.handoff_target_selected;
         let marker = if selected { ">" } else { " " };
         let style = if selected {
@@ -141,7 +148,7 @@ pub(super) fn render_handoff_target_picker(f: &mut Frame, app: &App) {
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {marker} "), style),
-            Span::styled(target.label, style),
+            Span::styled(target.label.as_str(), style),
             Span::styled(format!(" ({})", target.id), style),
         ]));
     }

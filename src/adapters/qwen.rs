@@ -40,6 +40,10 @@ impl SourceAdapter for QwenAdapter {
         })
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("qwen", prompt))
+    }
+
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let Some(runtime_dir) = resolve_qwen_runtime_dir()? else {
             return Ok(vec![]);

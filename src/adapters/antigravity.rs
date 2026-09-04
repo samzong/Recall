@@ -35,6 +35,10 @@ impl SourceAdapter for AntigravityAdapter {
         })
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(ResumeCommand { program: "agy".to_string(), args: vec!["-i".to_string(), prompt] })
+    }
+
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let Some(cli_dir) = resolve_antigravity_dir()? else {
             return Ok(vec![]);

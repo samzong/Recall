@@ -28,6 +28,10 @@ impl SourceAdapter for ZcodeAdapter {
         })
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("zcode", prompt))
+    }
+
     fn app_command(&self, _source_id: &str) -> Option<ResumeCommand> {
         open_zcode_app()
     }

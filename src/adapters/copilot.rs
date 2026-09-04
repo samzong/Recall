@@ -40,6 +40,10 @@ impl SourceAdapter for CopilotAdapter {
         })
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("copilot", prompt))
+    }
+
     fn app_command(&self, source_id: &str) -> Option<ResumeCommand> {
         Some(open_url_command(copilot_session_url(source_id)))
     }
