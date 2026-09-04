@@ -180,7 +180,7 @@ enum ShareCommands {
 }
 
 const MCP_AGENT_HELP: &str =
-    "Target host: claude, codex, or cursor-agent. Repeat for multiple hosts. Use '*' for all.";
+    "Target host: claude, codex, cursor-agent, or agy. Repeat for multiple hosts. Use '*' for all.";
 
 #[derive(Subcommand)]
 enum McpCommands {
