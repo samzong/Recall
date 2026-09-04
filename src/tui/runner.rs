@@ -6,6 +6,7 @@ use crate::db::search::TimeRange;
 use crate::db::store::Store;
 use crate::semantic;
 use crate::tui::search_worker::SearchWorker;
+use crate::tui::sync_worker::SyncWorker;
 use crate::tui::usage_worker::UsageWorker;
 
 pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Result<()> {
@@ -76,6 +77,7 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
             Some("Debug builds do not start semantic indexing; run cargo run -- sync first".into());
     }
     let search_worker = SearchWorker::spawn();
+    let sync_worker = SyncWorker::spawn();
     let usage_worker = UsageWorker::spawn();
     if let Some((source_filter, time_filter)) = usage_start {
         app.source_filter_selection = source_filter.unwrap_or_default();
@@ -92,6 +94,9 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
         app.poll_share_publish();
         while let Some(response) = search_worker.try_recv() {
             app.apply_search_response(&store, response);
+        }
+        while let Some(response) = sync_worker.try_recv() {
+            app.apply_sync_response(&store, response);
         }
         while let Some(response) = usage_worker.try_recv() {
             app.apply_usage_response(response);
@@ -116,6 +121,11 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
             break;
         }
 
+        if let Some(request) = app.take_sync_request()
+            && !sync_worker.refresh(request)
+        {
+            app.fail_sync("Sync worker unavailable");
+        }
         if let Some(request) = app.take_usage_request(usage_sync_pending) {
             usage_sync_pending = false;
             if !usage_worker.refresh(request) {
@@ -125,6 +135,9 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
         app.try_search(&store, &search_worker);
         while let Some(response) = search_worker.try_recv() {
             app.apply_search_response(&store, response);
+        }
+        while let Some(response) = sync_worker.try_recv() {
+            app.apply_sync_response(&store, response);
         }
         while let Some(response) = usage_worker.try_recv() {
             app.apply_usage_response(response);

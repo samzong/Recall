@@ -56,25 +56,47 @@ pub(crate) fn text_needs_trigram(text: &str) -> bool {
 }
 
 pub(crate) fn try_acquire_worker_lock() -> anyhow::Result<Option<File>> {
-    let path = worker_lock_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file =
-        OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+    try_acquire_lock(&recall_lock_path("background-worker.lock")?)
+}
+
+pub(crate) fn acquire_sync_lock() -> anyhow::Result<File> {
+    acquire_lock(&recall_lock_path("sync.lock")?)
+}
+
+fn acquire_lock(path: &Path) -> anyhow::Result<File> {
+    let mut file = open_lock_file(path)?;
+    file.lock_exclusive()?;
+    write_lock_owner(&mut file)?;
+    Ok(file)
+}
+
+fn try_acquire_lock(path: &Path) -> anyhow::Result<Option<File>> {
+    let mut file = open_lock_file(path)?;
     match file.try_lock_exclusive() {
         Ok(()) => {
-            file.set_len(0)?;
-            writeln!(file, "{}", std::process::id())?;
+            write_lock_owner(&mut file)?;
             Ok(Some(file))
         }
         Err(_) => Ok(None),
     }
 }
 
-fn worker_lock_path() -> anyhow::Result<std::path::PathBuf> {
+fn open_lock_file(path: &Path) -> anyhow::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?)
+}
+
+fn write_lock_owner(file: &mut File) -> anyhow::Result<()> {
+    file.set_len(0)?;
+    writeln!(file, "{}", std::process::id())?;
+    Ok(())
+}
+
+fn recall_lock_path(name: &str) -> anyhow::Result<std::path::PathBuf> {
     let dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
-    Ok(dir.join("recall").join("background-worker.lock"))
+    Ok(dir.join("recall").join(name))
 }
 
 pub(crate) fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
@@ -260,6 +282,16 @@ fn is_noise_first_message(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_file_excludes_parallel_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.lock");
+        let first = acquire_lock(&path).unwrap();
+
+        assert!(try_acquire_lock(&path).unwrap().is_none());
+        drop(first);
+    }
 
     #[test]
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

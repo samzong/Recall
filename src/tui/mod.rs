@@ -5,6 +5,7 @@ pub(crate) mod runner;
 pub(crate) mod search_state;
 pub(crate) mod search_worker;
 pub(crate) mod share_state;
+pub(crate) mod sync_worker;
 pub(crate) mod text_layout;
 pub(crate) mod theme;
 pub(crate) mod ui;

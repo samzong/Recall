@@ -37,19 +37,24 @@ pub(crate) fn run_cli(
     source_filter: Option<&str>,
     project_filter: Option<&str>,
 ) -> Result<()> {
-    let labels = adapters::source_labels();
-    let sources = resolve_source_filter(source_filter, &labels)?;
-    let scope = Store::open()?.resolve_scope(project_filter, None)?.announce();
-    run_sync_job_inner(SyncRunOptions {
-        force,
-        verbose,
-        emit: true,
-        usage_only: false,
-        backfill_events: false,
-        sources,
-        scope,
+    run_with_sync_lock(|| {
+        let labels = adapters::source_labels();
+        let sources = resolve_source_filter(source_filter, &labels)?;
+        let scope = Store::open()?.resolve_scope(project_filter, None)?.announce();
+        run_sync_job_with(
+            SyncRunOptions {
+                force,
+                verbose,
+                emit: true,
+                usage_only: false,
+                backfill_events: false,
+                sources,
+                scope,
+            },
+            None,
+        )?;
+        compact_database_if_bloated()
     })?;
-    compact_database_if_bloated()?;
     semantic::ensure_background_worker(false)?;
     Ok(())
 }
@@ -101,7 +106,7 @@ pub(crate) fn run_usage_sync_job() -> Result<()> {
 }
 
 pub(crate) fn run_usage_sync_job_with_progress(on_source: &mut dyn FnMut(&str)) -> Result<()> {
-    run_sync_job_with(usage_sync_options(), Some(on_source))
+    run_with_sync_lock(|| run_sync_job_with(usage_sync_options(), Some(on_source)))
 }
 
 pub(crate) fn run_dashboard_sync_job() -> Result<()> {
@@ -243,7 +248,12 @@ impl ExistingState {
 }
 
 pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
-    run_sync_job_with(options, None)
+    run_with_sync_lock(|| run_sync_job_with(options, None))
+}
+
+fn run_with_sync_lock<T>(run: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _lock = utils::acquire_sync_lock()?;
+    run()
 }
 
 fn run_sync_job_with(

@@ -161,6 +161,8 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         help_spans.push(Span::styled(" subs  ", Style::default().fg(THEME.text_muted)));
     }
     help_spans.extend([
+        Span::styled("Ctrl+S", Style::default().fg(THEME.accent)),
+        Span::styled(" sync  ", Style::default().fg(THEME.text_muted)),
         Span::styled("Ctrl+R", Style::default().fg(THEME.accent)),
         Span::styled(" resume  ", Style::default().fg(THEME.text_muted)),
         Span::styled("Ctrl+O", Style::default().fg(THEME.accent)),
@@ -174,6 +176,8 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
             Span::styled(" /", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
             Span::styled(input.clone(), Style::default().fg(THEME.text)),
         ])
+    } else if app.sync_requested || app.sync_in_flight {
+        Line::from(vec![Span::styled(" Syncing...", Style::default().fg(THEME.info))])
     } else if let Some(ref msg) = app.status_message {
         Line::from(vec![Span::styled(format!(" {msg}"), Style::default().fg(THEME.success))])
     } else if let Some(ref note) = app.viewing_search_status {
