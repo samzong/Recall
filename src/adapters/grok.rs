@@ -40,6 +40,10 @@ impl SourceAdapter for GrokAdapter {
         })
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("grok", prompt))
+    }
+
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let Some(sessions_dir) = resolve_grok_sessions_dir()? else {
             return Ok(vec![]);

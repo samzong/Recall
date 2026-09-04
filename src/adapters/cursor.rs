@@ -66,6 +66,10 @@ impl SourceAdapter for CursorAdapter {
         cli_store::resume_command(source_id)
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("agent", prompt))
+    }
+
     fn usage_parser_version(&self) -> Option<u32> {
         Some(USAGE_PARSER_VERSION)
     }

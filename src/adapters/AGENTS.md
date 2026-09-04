@@ -9,7 +9,11 @@ apply when working here.
 - The `SourceAdapter` trait in `mod.rs` is the authoritative contract, not the
   DEVELOPMENT.md example. `id()`, `label()`, `scan()`, and `resume_command()`
   are required; `scan_for_sync()`, `scan_for_sync_output()`, `app_command()`,
-  and `usage_parser_version()` are optional overrides.
+  `usage_parser_version()`, and `start_command()` are optional overrides.
+  `start_command()` is how an adapter becomes a handoff target: implement it
+  when the CLI can start a new session from an initial prompt. Registration
+  plus a present binary on PATH is what the TUI/CLI list; do not keep a
+  parallel target table.
 - Adapters never delete from `Store`. An adapter with a complete source
   inventory may return a bounded `ReconcilePlan`; sync owns applying it after
   the source run succeeds and only in global scope.

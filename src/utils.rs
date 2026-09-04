@@ -1,8 +1,38 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use fs2::FileExt;
+
+pub(crate) fn binary_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| binary_in(&dir, name))
+}
+
+#[cfg(unix)]
+fn binary_in(dir: &Path, name: &str) -> bool {
+    is_unix_executable(&dir.join(name))
+}
+
+#[cfg(windows)]
+fn binary_in(dir: &Path, name: &str) -> bool {
+    dir.join(name).is_file() || dir.join(format!("{name}.exe")).is_file()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn binary_in(dir: &Path, name: &str) -> bool {
+    dir.join(name).is_file()
+}
+
+#[cfg(unix)]
+fn is_unix_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && path.metadata().ok().is_some_and(|meta| meta.permissions().mode() & 0o111 != 0)
+}
 
 pub(crate) fn text_needs_trigram(text: &str) -> bool {
     if text.is_ascii() {

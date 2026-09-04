@@ -684,7 +684,8 @@ fn cmd_session_handoff(
         return Ok(());
     }
 
-    let command = handoff::command_for_target(target, prompt);
+    let command = handoff::command_for_target(&target, prompt)?;
+    handoff::require_installed(&command)?;
     session_action::run(&command, handoff_working_directory(session.directory.as_deref()))
 }
 

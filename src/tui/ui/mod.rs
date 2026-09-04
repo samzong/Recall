@@ -575,6 +575,12 @@ mod tests {
         let mut app =
             App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
         app.mode = AppMode::HandoffTarget;
+        app.handoff_targets = vec![
+            crate::handoff::HandoffTarget { id: "codex".into(), label: "Codex".into() },
+            crate::handoff::HandoffTarget { id: "grok".into(), label: "Grok".into() },
+            crate::handoff::HandoffTarget { id: "claude-code".into(), label: "Claude Code".into() },
+            crate::handoff::HandoffTarget { id: "opencode".into(), label: "OpenCode".into() },
+        ];
         app.handoff_target_selected = 3;
         app.results = vec![SearchResult {
             session: Session {
@@ -623,13 +629,41 @@ mod tests {
         assert!(rendered.contains("[Enter]"));
         assert!(rendered.contains("select"));
 
-        let width = 90u16.clamp(36, 56);
-        let height = (crate::handoff::TARGETS.len() as u16 + 5).max(8);
+        let width = 90u16.clamp(36, 56).min(90);
+        let desired = app.handoff_targets.len() as u16 + 5;
+        let height = desired.clamp(8, 18);
         let rect = Rect::new((90 - width) / 2, (18 - height) / 2, width, height);
         let selected = &terminal.backend().buffer()
             [(rect.x + 1, rect.y + 2 + app.handoff_target_selected as u16)];
         assert_eq!(selected.fg, THEME.selected_fg);
         assert_eq!(selected.bg, THEME.selected_bg);
+    }
+
+    #[test]
+    fn render_handoff_target_picker_fits_short_terminal() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.mode = AppMode::HandoffTarget;
+        app.handoff_targets = (0..17)
+            .map(|index| crate::handoff::HandoffTarget {
+                id: format!("t{index}"),
+                label: format!("Target{index}"),
+            })
+            .collect();
+        app.handoff_target_selected = 16;
+
+        let backend = TestBackend::new(90, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let rendered = (0..18)
+            .map(|y| buffer_row(terminal.backend().buffer(), y, 90))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Target16 (t16)"));
+        assert!(!rendered.contains("Target0 (t0)"));
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {

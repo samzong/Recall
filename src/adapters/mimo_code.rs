@@ -30,6 +30,13 @@ impl SourceAdapter for MimoCodeAdapter {
         })
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(ResumeCommand {
+            program: "mimo".to_string(),
+            args: vec!["--prompt".to_string(), prompt],
+        })
+    }
+
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let Some(conn) = open_mimo_db()? else {
             return Ok(vec![]);

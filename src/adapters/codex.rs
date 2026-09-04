@@ -42,6 +42,10 @@ impl SourceAdapter for CodexAdapter {
         })
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("codex", prompt))
+    }
+
     fn app_command(&self, source_id: &str) -> Option<ResumeCommand> {
         Some(open_url_command(codex_thread_url(source_id)))
     }

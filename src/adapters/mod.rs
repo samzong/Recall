@@ -74,6 +74,9 @@ pub(crate) trait SourceAdapter {
     fn app_command(&self, _source_id: &str) -> Option<ResumeCommand> {
         None
     }
+    fn start_command(&self, _prompt: String) -> Option<ResumeCommand> {
+        None
+    }
 }
 
 pub(crate) struct AdapterSyncContext {
@@ -362,6 +365,10 @@ impl ResumeCommand {
         }
         out
     }
+}
+
+pub(crate) fn prompt_start(program: &str, prompt: String) -> ResumeCommand {
+    ResumeCommand { program: program.to_string(), args: vec![prompt] }
 }
 
 pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {

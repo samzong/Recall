@@ -6,6 +6,8 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
 
+use crate::utils::binary_on_path;
+
 const SERVER_NAME: &str = "recall";
 const DEFAULT_BIN: &str = "recall";
 const SERVER_ARG: &str = "mcp";
@@ -393,35 +395,6 @@ fn quote_arg(arg: &str) -> String {
     } else {
         arg.to_string()
     }
-}
-
-fn binary_on_path(name: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|dir| host_binary_in(&dir, name))
-}
-
-#[cfg(unix)]
-fn host_binary_in(dir: &Path, name: &str) -> bool {
-    is_unix_executable(&dir.join(name))
-}
-
-#[cfg(windows)]
-fn host_binary_in(dir: &Path, name: &str) -> bool {
-    dir.join(name).is_file() || dir.join(format!("{name}.exe")).is_file()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn host_binary_in(dir: &Path, name: &str) -> bool {
-    dir.join(name).is_file()
-}
-
-#[cfg(unix)]
-fn is_unix_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.is_file()
-        && path.metadata().ok().is_some_and(|meta| meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(test)]

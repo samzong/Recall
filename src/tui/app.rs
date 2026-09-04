@@ -178,6 +178,7 @@ pub(crate) struct App {
     pub(crate) semantic_last_refresh: Instant,
     pub(crate) settings_selected: usize,
     pub(crate) pending_resume: Option<PendingResume>,
+    pub(crate) handoff_targets: Vec<handoff::HandoffTarget>,
     pub(crate) handoff_target_selected: usize,
     pub(crate) share_popup: Option<SharePopup>,
     pub(crate) share_publish_rx: Option<mpsc::Receiver<Result<String, String>>>,
@@ -275,6 +276,7 @@ impl App {
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
             pending_resume: None,
+            handoff_targets: Vec::new(),
             handoff_target_selected: 0,
             share_popup: None,
             share_publish_rx: None,
@@ -1490,6 +1492,15 @@ impl App {
     }
 
     fn open_handoff_target_picker(&mut self) {
+        self.present_handoff_targets(handoff::available_targets());
+    }
+
+    fn present_handoff_targets(&mut self, targets: Vec<handoff::HandoffTarget>) {
+        if targets.is_empty() {
+            self.status_message = Some("No handoff targets found on PATH".to_string());
+            return;
+        }
+        self.handoff_targets = targets;
         self.handoff_target_selected = 0;
         self.mode = AppMode::HandoffTarget;
     }
@@ -1503,13 +1514,16 @@ impl App {
                 self.handoff_target_selected -= 1;
             }
             KeyCode::Down | KeyCode::Char('j')
-                if self.handoff_target_selected + 1 < handoff::TARGETS.len() =>
+                if self.handoff_target_selected + 1 < self.handoff_targets.len() =>
             {
                 self.handoff_target_selected += 1;
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                let target = &handoff::TARGETS[self.handoff_target_selected];
-                self.start_handoff_confirmation(target);
+                let Some(target) = self.handoff_targets.get(self.handoff_target_selected).cloned()
+                else {
+                    return;
+                };
+                self.start_handoff_confirmation(&target);
             }
             _ => {}
         }
@@ -1520,11 +1534,18 @@ impl App {
             return;
         };
         let prompt = handoff::build_prompt(session, &self.viewing_messages);
-        let command = handoff::command_for_target(target, prompt);
+        let command = match handoff::command_for_target(target, prompt) {
+            Ok(command) => command,
+            Err(error) => {
+                self.status_message = Some(error.to_string());
+                self.mode = AppMode::Viewing;
+                return;
+            }
+        };
         self.pending_resume = Some(PendingResume {
             command,
             action: PendingCommandAction::Handoff,
-            source_label: target.label.to_string(),
+            source_label: target.label.clone(),
             session_title: session.title.clone(),
             cwd: session.directory.clone(),
             origin: ResumeOrigin::Viewing,
@@ -2838,6 +2859,7 @@ mod tests {
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
             pending_resume: None,
+            handoff_targets: Vec::new(),
             handoff_target_selected: 0,
             share_popup: None,
             share_publish_rx: None,
@@ -3520,8 +3542,6 @@ mod tests {
 
     #[test]
     fn imported_session_can_handoff_from_detail_view() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
         let mut app = app_with_sources();
         let mut result = codex_search_result();
         result.session.is_import = true;
@@ -3530,7 +3550,10 @@ mod tests {
         app.viewing_messages = vec![message(Role::User, None, 0)];
         app.mode = AppMode::Viewing;
 
-        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), &store);
+        app.present_handoff_targets(vec![handoff::HandoffTarget {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+        }]);
         assert!(matches!(app.mode, AppMode::HandoffTarget));
 
         app.handle_handoff_target_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -3540,6 +3563,20 @@ mod tests {
         assert_eq!(pending.action, PendingCommandAction::Handoff);
         assert_eq!(pending.command.program, "codex");
         assert!(pending.command.args[0].contains("This is a handoff, not a native resume."));
+        assert!(pending.command.args[0].contains("Use Recall session"));
+    }
+
+    #[test]
+    fn missing_handoff_targets_stay_in_viewing() {
+        let mut app = app_with_sources();
+        app.mode = AppMode::Viewing;
+
+        app.present_handoff_targets(Vec::new());
+
+        assert!(matches!(app.mode, AppMode::Viewing));
+        assert!(
+            app.status_message.as_deref().unwrap_or_default().contains("No handoff targets found")
+        );
     }
 
     #[test]

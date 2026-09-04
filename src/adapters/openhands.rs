@@ -54,6 +54,10 @@ impl SourceAdapter for OpenHandsAdapter {
         })
     }
 
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("openhands", prompt))
+    }
+
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         scan_conversations(conversations_dir())
     }
