@@ -15,16 +15,18 @@ enum Host {
     Claude,
     Codex,
     Cursor,
+    Antigravity,
 }
 
 impl Host {
-    const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Cursor];
+    const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::Cursor, Self::Antigravity];
 
     fn id(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Cursor => "cursor-agent",
+            Self::Antigravity => "agy",
         }
     }
 
@@ -33,8 +35,11 @@ impl Host {
             "claude" | "claude-code" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "cursor" | "cursor-agent" => Ok(Self::Cursor),
+            "agy" | "antigravity" | "antigravity-cli" => Ok(Self::Antigravity),
             other => {
-                bail!("unknown MCP host '{other}'; supported hosts: claude, codex, cursor-agent")
+                bail!(
+                    "unknown MCP host '{other}'; supported hosts: claude, codex, cursor-agent, agy"
+                )
             }
         }
     }
@@ -119,6 +124,14 @@ fn add_args(host: Host, bin: &str) -> Option<Vec<String>> {
             bin.into(),
             SERVER_ARG.into(),
         ]),
+        Host::Antigravity => Some(vec![
+            "mcp".into(),
+            "add".into(),
+            SERVER_NAME.into(),
+            "--".into(),
+            bin.into(),
+            SERVER_ARG.into(),
+        ]),
         Host::Cursor => None,
     }
 }
@@ -133,6 +146,7 @@ fn remove_args(host: Host) -> Option<Vec<String>> {
             "user".into(),
         ]),
         Host::Codex => Some(vec!["mcp".into(), "remove".into(), SERVER_NAME.into()]),
+        Host::Antigravity => Some(vec!["mcp".into(), "remove".into(), SERVER_NAME.into()]),
         Host::Cursor => None,
     }
 }
@@ -153,7 +167,7 @@ fn run_hosts(hosts: Vec<Host>, dry_run: bool, action: HostAction) -> Result<()> 
     }
 
     if changed == 0 && errors.is_empty() {
-        bail!("no supported MCP hosts found on PATH (claude, codex, cursor-agent)");
+        bail!("no supported MCP hosts found on PATH (claude, codex, cursor-agent, agy)");
     }
     if !errors.is_empty() {
         let detail = errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
@@ -451,6 +465,10 @@ mod tests {
             resolve_hosts(&["cursor".into(), "cursor-agent".into()]).unwrap(),
             vec![Host::Cursor]
         );
+        assert_eq!(
+            resolve_hosts(&["agy".into(), "antigravity".into(), "antigravity-cli".into()]).unwrap(),
+            vec![Host::Antigravity]
+        );
     }
 
     #[test]
@@ -469,6 +487,10 @@ mod tests {
             add_args(Host::Codex, "recall").unwrap(),
             ["mcp", "add", "recall", "--", "recall", "mcp"]
         );
+        assert_eq!(
+            add_args(Host::Antigravity, "recall").unwrap(),
+            ["mcp", "add", "recall", "--", "recall", "mcp"]
+        );
         assert!(add_args(Host::Cursor, "recall").is_none());
         assert_eq!(
             add_args(Host::Claude, "/tmp/recall").unwrap(),
@@ -480,6 +502,7 @@ mod tests {
     fn remove_args_match_host_clis() {
         assert_eq!(remove_args(Host::Claude).unwrap(), ["mcp", "remove", "recall", "-s", "user"]);
         assert_eq!(remove_args(Host::Codex).unwrap(), ["mcp", "remove", "recall"]);
+        assert_eq!(remove_args(Host::Antigravity).unwrap(), ["mcp", "remove", "recall"]);
         assert!(remove_args(Host::Cursor).is_none());
     }
 
