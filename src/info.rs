@@ -149,7 +149,7 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
     }
 
     println!();
-    println!("Tip: open the TUI and press Ctrl+S to edit settings.");
+    println!("Tip: open the TUI and press Ctrl+S to sync, Ctrl+P to edit settings.");
 
     Ok(())
 }

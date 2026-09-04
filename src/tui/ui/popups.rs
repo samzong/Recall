@@ -612,7 +612,14 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(THEME.text_muted),
     );
 
-    let line = if let Some(ref msg) = app.status_message {
+    let line = if app.sync_requested || app.sync_in_flight {
+        let mut spans = vec![Span::styled(" Syncing...", Style::default().fg(THEME.info))];
+        if let Some(span) = semantic_span.clone() {
+            spans.push(span);
+        }
+        spans.push(stats_span);
+        Line::from(spans)
+    } else if let Some(ref msg) = app.status_message {
         let mut spans = vec![Span::styled(format!(" {msg}"), Style::default().fg(THEME.success))];
         if let Some(span) = semantic_span.clone() {
             spans.push(span);
@@ -631,11 +638,13 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" detail  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Ctrl+F", Style::default().fg(THEME.accent)),
                     Span::styled(" filter  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Ctrl+S", Style::default().fg(THEME.accent)),
+                    Span::styled(" sync  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Ctrl+R", Style::default().fg(THEME.accent)),
                     Span::styled(" resume  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Ctrl+O", Style::default().fg(THEME.accent)),
                     Span::styled(" app  ", Style::default().fg(THEME.text_muted)),
-                    Span::styled("Ctrl+S", Style::default().fg(THEME.accent)),
+                    Span::styled("Ctrl+P", Style::default().fg(THEME.accent)),
                     Span::styled(" settings  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Esc", Style::default().fg(THEME.accent)),
                     Span::styled(" clear  ", Style::default().fg(THEME.text_muted)),

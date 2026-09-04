@@ -9,6 +9,7 @@ ratatui application. Module roles:
 - `search_state.rs`, `share_state.rs`, `usage_state.rs`, `viewing_state.rs` —
   per-concern state, kept out of `app.rs` when self-contained.
 - `search_worker.rs` — background search thread connected by mpsc channels.
+- `sync_worker.rs` — background incremental sync thread connected by mpsc channels.
 - `layout.rs`, `text_layout.rs` — geometry and text wrapping.
 - `ui/` — rendering only. Draw functions read state; they must not mutate it.
 

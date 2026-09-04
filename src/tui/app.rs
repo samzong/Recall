@@ -24,6 +24,7 @@ use crate::tui::search_worker::{SearchPhase, SearchRequest, SearchResponse, Sear
 use crate::tui::share_state::{
     AppMode, PendingCommandAction, PendingResume, ResumeOrigin, SharePopup,
 };
+use crate::tui::sync_worker::SyncRequest;
 use crate::tui::text_layout::wrap_visual_rows;
 use crate::tui::usage_state::UsageTab;
 use crate::tui::usage_worker::{UsageRequest, UsageResponse};
@@ -166,6 +167,8 @@ pub(crate) struct App {
     pub(crate) active_search_id: u64,
     pub(crate) search_in_flight: bool,
     pub(crate) search_feedback: Option<String>,
+    pub(crate) sync_requested: bool,
+    pub(crate) sync_in_flight: bool,
     pub(crate) embedding_unavailable: bool,
     pub(crate) status_message: Option<String>,
     pub(crate) sort_order: SortOrder,
@@ -264,6 +267,8 @@ impl App {
             active_search_id: 0,
             search_in_flight: false,
             search_feedback: None,
+            sync_requested: false,
+            sync_in_flight: false,
             embedding_unavailable: false,
             status_message: None,
             sort_order: SortOrder::Relevance,
@@ -1108,6 +1113,11 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.sync_requested = true;
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
             self.mode = AppMode::Settings;
             self.settings_selected = 0;
             return;
@@ -1210,7 +1220,9 @@ impl App {
                 self.cycle_usage_time(false);
                 self.request_usage_refresh();
             }
-            KeyCode::Char('s') | KeyCode::Char('S') => {
+            KeyCode::Char('s') | KeyCode::Char('S')
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.cycle_usage_source(false);
                 self.request_usage_refresh();
             }
@@ -1239,6 +1251,10 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
             self.start_app_open_confirmation(ResumeOrigin::Viewing);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.sync_requested = true;
             return;
         }
         match key.code {
@@ -2002,6 +2018,64 @@ impl App {
             time_range: self.usage_time_filter,
             sync,
         })
+    }
+
+    pub(crate) fn take_sync_request(&mut self) -> Option<SyncRequest> {
+        if !self.sync_requested || self.sync_in_flight {
+            return None;
+        }
+
+        self.sync_requested = false;
+        self.sync_in_flight = true;
+        Some(SyncRequest { sources: self.source_filter_ids(), scope: self.scope.clone() })
+    }
+
+    pub(crate) fn fail_sync(&mut self, error: impl std::fmt::Display) {
+        self.sync_requested = false;
+        self.sync_in_flight = false;
+        self.status_message = Some(format!("Sync failed: {error}"));
+    }
+
+    pub(crate) fn apply_sync_response(&mut self, store: &Store, result: Result<(), String>) {
+        if !self.sync_in_flight {
+            return;
+        }
+
+        self.sync_in_flight = false;
+        match result {
+            Ok(()) => {
+                self.reload_after_sync(store);
+                if !self.sync_requested {
+                    self.status_message = Some("Synced".to_string());
+                }
+            }
+            Err(error) => {
+                if !self.sync_requested {
+                    self.status_message = Some(format!("Sync failed: {error}"));
+                }
+            }
+        }
+    }
+
+    fn reload_after_sync(&mut self, store: &Store) {
+        self.project_directories = store.list_project_directories().unwrap_or_default();
+        self.update_scope_metrics(store);
+        if matches!(self.mode, AppMode::Viewing) && self.viewing_search_input.is_none() {
+            let selected = self.viewing_selected_msg;
+            if let Some(session) = self.viewing_session.clone() {
+                let session =
+                    store.get_session_by_id(&session.id).ok().flatten().unwrap_or(session);
+                if self.load_into_viewing(session, store) && !self.viewing_messages.is_empty() {
+                    self.viewing_selected_msg = selected.min(self.viewing_messages.len() - 1);
+                    self.anchor_viewing_scroll();
+                }
+            }
+        }
+        if self.query.trim().is_empty() {
+            self.load_recent(store);
+        } else {
+            self.queue_search_now();
+        }
     }
 
     pub(crate) fn request_usage_refresh(&mut self) {
@@ -2847,6 +2921,8 @@ mod tests {
             active_search_id: 0,
             search_in_flight: false,
             search_feedback: None,
+            sync_requested: false,
+            sync_in_flight: false,
             embedding_unavailable: false,
             status_message: None,
             sort_order: SortOrder::Relevance,
@@ -3510,6 +3586,121 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "codex://threads/019e6d8d-588b-7fd2-a326-c525469ed120")
         );
+    }
+
+    #[test]
+    fn ctrl_p_from_search_opens_settings() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &store);
+
+        assert!(matches!(app.mode, AppMode::Settings));
+    }
+
+    #[test]
+    fn ctrl_s_from_search_requests_sync_instead_of_settings() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &store);
+
+        assert!(matches!(app.mode, AppMode::Search));
+        let request = app.take_sync_request().expect("sync request");
+        assert_eq!(request.scope, ProjectScope::Global);
+        assert!(request.sources.is_none());
+        assert!(app.sync_in_flight);
+        assert!(app.take_sync_request().is_none());
+    }
+
+    #[test]
+    fn ctrl_s_from_viewing_syncs_instead_of_sharing() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.mode = AppMode::Viewing;
+        app.viewing_session = Some(codex_search_result().session);
+
+        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &store);
+
+        assert!(matches!(app.mode, AppMode::Viewing));
+        assert!(app.share_popup.is_none());
+        assert!(app.sync_requested);
+    }
+
+    #[test]
+    fn in_flight_sync_coalesces_another_ctrl_s() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &store);
+        assert!(app.take_sync_request().is_some());
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &store);
+        assert!(app.take_sync_request().is_none());
+
+        app.apply_sync_response(&store, Ok(()));
+        assert!(app.take_sync_request().is_some());
+    }
+
+    #[test]
+    fn sync_response_reloads_recent_results() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        store.insert_session(&codex_search_result().session).unwrap();
+        app.sync_in_flight = true;
+
+        app.apply_sync_response(&store, Ok(()));
+
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.results[0].session.id, "session1");
+        assert!(!app.sync_in_flight);
+    }
+
+    #[test]
+    fn sync_response_keeps_selected_viewing_message_visible() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        let mut result = codex_search_result();
+        result.session.message_count = 5;
+        let messages = (0..5).map(|n| message(Role::User, None, n)).collect::<Vec<_>>();
+        store.insert_session(&result.session).unwrap();
+        store.insert_messages(&messages).unwrap();
+        app.set_terminal_size(80, 10);
+        app.mode = AppMode::Viewing;
+        app.viewing_session = Some(result.session);
+        app.viewing_messages = messages;
+        app.viewing_sanitized_lines = build_viewing_caches(&app.viewing_messages);
+        app.viewing_selected_msg = 4;
+        app.viewing_scroll_offset = 9;
+        app.sync_in_flight = true;
+
+        app.apply_sync_response(&store, Ok(()));
+
+        assert_eq!(app.viewing_selected_msg, 4);
+        let layout = viewing_layout(app.terminal_area);
+        let pane = app.viewing_pane(layout.messages.width as usize);
+        let selected_start = pane.start_of(app.viewing_selected_msg);
+        assert!(selected_start >= app.viewing_scroll_offset);
+        assert!(selected_start < app.viewing_scroll_offset + layout.messages.height as usize);
+    }
+
+    #[test]
+    fn sync_with_query_queues_search() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.query = "handoff".to_string();
+        app.sync_in_flight = true;
+
+        app.apply_sync_response(&store, Ok(()));
+
+        assert!(app.search_pending);
+        assert!(app.results.is_empty());
     }
 
     #[test]
