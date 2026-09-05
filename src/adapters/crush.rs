@@ -11,10 +11,13 @@ use crate::adapters::opencode;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
-use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
+use crate::types::{
+    FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation, RawSessionEvent,
+    RawUsageEvent, Role, ThreadRole,
+};
 
 const USAGE_PARSER_VERSION: u32 = 1;
-const EVENT_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 2;
 const METADATA_PARSER_VERSION: u32 = 1;
 const MS_THRESHOLD: i64 = 1_000_000_000_000;
 
@@ -287,9 +290,6 @@ fn scan_session(
         {
             provider = Some(value.to_string());
         }
-        let Some(role) = parse_role(&row.role) else {
-            continue;
-        };
         let parts = match serde_json::from_str::<Vec<Value>>(&row.parts) {
             Ok(parts) => parts,
             Err(err) => {
@@ -297,14 +297,22 @@ fn scan_session(
                 continue;
             }
         };
-        if let Some(content) = extract_text(&parts) {
+        if let Some(role) = parse_role(&row.role)
+            && let Some(content) = extract_text(&parts)
+        {
             messages.push(RawMessage { role, content, timestamp: Some(timestamp) });
         }
         if include_events {
-            for part in &parts {
-                if let Some(event) =
-                    parse_tool_event(&row.id, part, Some(timestamp), events.len() as u32)
-                {
+            for (part_index, part) in parts.iter().enumerate() {
+                let context = events::EventContext {
+                    event_seq: events.len() as u32,
+                    timestamp: Some(timestamp),
+                    source_path: db_path.to_str().map(str::to_string),
+                    source_event_id: Some(format!("messages:{}:parts:{part_index}", row.id)),
+                    message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                    parser_version: EVENT_PARSER_VERSION,
+                };
+                if let Some(event) = parse_tool_event(part, context, directory) {
                     events.push(event);
                 }
             }
@@ -390,30 +398,96 @@ fn part_text(part: &Value) -> Option<&str> {
 }
 
 fn parse_tool_event(
-    message_id: &str,
     part: &Value,
-    timestamp: Option<i64>,
-    event_seq: u32,
+    context: events::EventContext,
+    directory: &str,
 ) -> Option<RawSessionEvent> {
-    if part.get("type").and_then(Value::as_str) != Some("tool_call") {
-        return None;
-    }
     let data = part.get("data").unwrap_or(part);
-    let name = data.get("name").and_then(Value::as_str).filter(|name| !name.is_empty())?;
-    let input = data.get("input").and_then(Value::as_str);
-    let tool_id = data.get("id").and_then(Value::as_str).unwrap_or(message_id);
-    Some(events::tool_call_event_from_text(
-        events::EventContext {
-            event_seq,
-            timestamp,
-            source_path: None,
-            source_event_id: Some(tool_id.to_string()),
-            message_seq: None,
-            parser_version: EVENT_PARSER_VERSION,
-        },
-        name.to_string(),
-        input,
-    ))
+    let name = data.get("name").and_then(Value::as_str).filter(|name| !name.is_empty());
+    let mut event = match part.get("type").and_then(Value::as_str)? {
+        "tool_call" => {
+            let name = name?;
+            let input = data.get("input").and_then(Value::as_str);
+            let parsed = input.and_then(|input| serde_json::from_str::<Value>(input).ok());
+            let mut event = events::tool_call_event_from_text(context, name.to_string(), input);
+            event.tool_call_id = data.get("id").and_then(Value::as_str).map(str::to_string);
+            event.kind = match name {
+                "view" => "file_read",
+                "write" | "edit" | "multiedit" => "file_write",
+                "bash" => "command",
+                _ => "tool_call",
+            }
+            .to_string();
+            event.target = None;
+            if let Some(input) = parsed.as_ref() {
+                let operation = match name {
+                    "view" => Some(FileOperation::Read),
+                    "write" | "edit" | "multiedit" => Some(FileOperation::Write),
+                    _ => None,
+                };
+                if let Some(operation) = operation
+                    && let Some(path) = input.get("file_path").and_then(Value::as_str)
+                    && !path.trim().is_empty()
+                {
+                    event.target = Some(path.to_string());
+                    event.files.push(FileEvidence {
+                        path: path.to_string(),
+                        operation,
+                        kind: FileEvidenceKind::Call,
+                        cwd: Some(directory.to_string()),
+                        target: None,
+                    });
+                } else if name == "bash" {
+                    event.target = input.get("command").and_then(Value::as_str).map(str::to_string);
+                    if let Some(command) = event.target.as_deref() {
+                        let cwd = match input.get("working_dir") {
+                            Some(Value::String(cwd)) if cwd.is_empty() => Some(directory),
+                            Some(Value::String(cwd)) => Some(cwd.as_str()),
+                            Some(_) => None,
+                            None => Some(directory),
+                        }
+                        .filter(|cwd| Path::new(cwd).is_absolute());
+                        let (files, status) = events::shell_file_evidence(command, cwd);
+                        event.files = files;
+                        event.command_evidence_status = Some(status);
+                    }
+                }
+            }
+            event
+        }
+        "tool_result" => {
+            let mut event = events::tool_result_event(
+                context,
+                name.map(str::to_string),
+                data.get("content").and_then(Value::as_str).map(str::to_string),
+            );
+            event.tool_call_id =
+                data.get("tool_call_id").and_then(Value::as_str).map(str::to_string);
+            event.status = data
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .map(|is_error| if is_error { "error" } else { "success" }.to_string());
+            if name == Some("view")
+                && let Some(metadata) = data.get("metadata").and_then(Value::as_str)
+                && let Ok(metadata) = serde_json::from_str::<Value>(metadata)
+                && let Some(path) = metadata.get("file_path").and_then(Value::as_str)
+                && !path.trim().is_empty()
+            {
+                event.target = Some(path.to_string());
+                event.files.push(FileEvidence {
+                    path: path.to_string(),
+                    operation: FileOperation::Read,
+                    kind: FileEvidenceKind::Observation,
+                    cwd: Some(directory.to_string()),
+                    target: None,
+                });
+            }
+            event
+        }
+        _ => return None,
+    };
+    event.attrs_json = Some(part.to_string());
+    Some(event)
 }
 
 fn session_usage(
@@ -656,7 +730,7 @@ mod tests {
                 id: "m2",
                 session_id: "ses-1",
                 role: "assistant",
-                parts: r#"[{"type":"tool_call","data":{"id":"call-1","name":"write","input":"{\"file_path\":\"/repo/hello-crush.txt\"}"}},{"type":"finish","data":{"reason":"end_turn"}}]"#,
+                parts: r#"[{"type":"tool_call","data":{"id":"call-1","name":"write","finished":true,"input":"{\"file_path\":\"/repo/hello-crush.txt\"}"}},{"type":"finish","data":{"reason":"end_turn"}}]"#,
                 created_at: 1788279356,
                 updated_at: None,
                 model: Some("auto"),
@@ -668,8 +742,8 @@ mod tests {
             &MessageSpec {
                 id: "m3",
                 session_id: "ses-1",
-                role: "assistant",
-                parts: "[]",
+                role: "tool",
+                parts: r#"[{"type":"tool_result","data":{"tool_call_id":"call-1","name":"write","content":"written","is_error":false}}]"#,
                 created_at: 1788279401,
                 updated_at: None,
                 model: Some("auto"),
@@ -697,10 +771,114 @@ mod tests {
         assert_eq!(raw.usage_events[0].input_tokens, 19923);
         assert_eq!(raw.usage_events[0].output_tokens, 161);
         assert_eq!(raw.usage_events[0].provider, "aihubmix");
-        assert_eq!(raw.events.len(), 1);
+        assert_eq!(raw.events.len(), 2);
         assert_eq!(raw.events[0].name.as_deref(), Some("write"));
         assert_eq!(raw.events[0].target.as_deref(), Some("/repo/hello-crush.txt"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(raw.events[1].tool_call_id, raw.events[0].tool_call_id);
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("messages:m2:parts:0"));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("messages:m3:parts:0"));
+        assert_eq!(raw.events[0].source_path, raw.source_file_path);
+        assert_eq!(raw.events[0].files[0].cwd.as_deref(), project.to_str());
+        assert_eq!(raw.events[0].status, None);
+        assert_eq!(raw.events[1].status.as_deref(), Some("success"));
+        assert!(raw.events[1].files.is_empty());
         assert!(raw.thread_role.is_none());
+    }
+
+    #[test]
+    fn native_tool_results_and_partial_calls_preserve_evidence() {
+        let parse = |part: &Value| {
+            parse_tool_event(
+                part,
+                events::EventContext {
+                    event_seq: 0,
+                    timestamp: Some(1000),
+                    source_path: Some("crush.db".into()),
+                    source_event_id: Some("messages:m2:parts:0".into()),
+                    message_seq: None,
+                    parser_version: EVENT_PARSER_VERSION,
+                },
+                "/repo",
+            )
+            .unwrap()
+        };
+        for (name, operation) in [
+            ("view", FileOperation::Read),
+            ("edit", FileOperation::Write),
+            ("multiedit", FileOperation::Write),
+            ("write", FileOperation::Write),
+        ] {
+            let part = serde_json::json!({"type":"tool_call","data":{"id":"call-1","name":name,"input":"{\"file_path\":\"a.rs\"}","finished":true}});
+            let event = parse(&part);
+            assert_eq!(event.status, None);
+            assert_eq!(event.tool_call_id.as_deref(), Some("call-1"));
+            assert_eq!(event.files[0].operation, operation);
+            assert_eq!(event.files[0].kind, FileEvidenceKind::Call);
+            assert_eq!(event.files[0].path, "a.rs");
+            assert_eq!(
+                serde_json::from_str::<Value>(event.attrs_json.as_deref().unwrap()).unwrap(),
+                part
+            );
+        }
+        for (working_dir, expected_cwd) in [
+            (Some("/other"), Some("/other")),
+            (None, Some("/repo")),
+            (Some(""), Some("/repo")),
+            (Some("   "), None),
+            (Some("relative"), None),
+        ] {
+            let mut input = serde_json::json!({"command":"git restore -- src/lib.rs"});
+            if let Some(cwd) = working_dir {
+                input["working_dir"] = Value::String(cwd.to_string());
+            }
+            let part = serde_json::json!({"type":"tool_call","data":{"id":"shell-1","name":"bash","input":input.to_string(),"finished":true}});
+            let event = parse(&part);
+            assert_eq!(event.kind, "command");
+            assert_eq!(event.status, None);
+            assert_eq!(event.files[0].path, "src/lib.rs");
+            assert_eq!(event.files[0].cwd.as_deref(), expected_cwd);
+            assert_eq!(event.files[0].kind, FileEvidenceKind::Command);
+            assert_eq!(
+                event.command_evidence_status,
+                Some(if expected_cwd.is_some() {
+                    crate::types::CommandEvidenceStatus::Complete
+                } else {
+                    crate::types::CommandEvidenceStatus::Unsupported
+                })
+            );
+        }
+        let part = serde_json::json!({"type":"tool_call","data":{"id":"partial-1","name":"write","input":"{\"file_path\":","finished":false}});
+        let event = parse(&part);
+        assert!(event.files.is_empty());
+        assert_eq!(event.status, None);
+        assert_eq!(
+            serde_json::from_str::<Value>(event.attrs_json.as_deref().unwrap()).unwrap(),
+            part
+        );
+        for (error, status) in
+            [(Some(true), Some("error")), (Some(false), Some("success")), (None, None)]
+        {
+            let mut data =
+                serde_json::json!({"tool_call_id":"call-1","name":"write","content":"output"});
+            if let Some(error) = error {
+                data["is_error"] = Value::Bool(error);
+            }
+            let part = serde_json::json!({"type":"tool_result","data":data});
+            let event = parse(&part);
+            assert_eq!(event.status.as_deref(), status);
+            assert_eq!(event.tool_call_id.as_deref(), Some("call-1"));
+            assert!(event.files.is_empty());
+            assert_eq!(
+                serde_json::from_str::<Value>(event.attrs_json.as_deref().unwrap()).unwrap(),
+                part
+            );
+        }
+        let part = serde_json::json!({"type":"tool_result","data":{"tool_call_id":"read-1","name":"view","content":"file contents","is_error":false,"metadata":"{\"file_path\":\"/repo/a.rs\",\"content\":\"file contents\"}"}});
+        let event = parse(&part);
+        assert_eq!(event.files[0].kind, FileEvidenceKind::Observation);
+        assert_eq!(event.files[0].operation, FileOperation::Read);
+        assert_eq!(event.files[0].path, "/repo/a.rs");
     }
 
     #[test]
@@ -838,6 +1016,27 @@ mod tests {
         .unwrap();
         assert!(result.sessions.is_empty());
         assert_eq!(result.stats.skipped_sessions, 1);
+        store
+            .persist_session_events_for_existing_session(
+                "crush",
+                "ses-1",
+                &[],
+                EVENT_PARSER_VERSION - 1,
+                Some(200_000),
+            )
+            .unwrap();
+        let stale = scan_projects(
+            &[ProjectRef {
+                path: project.to_string_lossy().into_owned(),
+                data_dir: data_dir.to_string_lossy().into_owned(),
+            }],
+            Some(&AdapterSyncContext::from_store_for_test(&store, "crush").unwrap()),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(stale.sessions.len(), 1);
+        assert_eq!(stale.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
     }
 
     #[test]
