@@ -20,23 +20,22 @@ use crate::provider::Provider;
 
 const PAGE_SIZE: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CredentialSource {
-    Stored,
-    Environment,
-}
-
 #[derive(Debug, Clone)]
 struct ProviderState {
     provider: Provider,
-    credential: Option<CredentialSource>,
+    configured: bool,
+    stored_key: bool,
     environment_active: bool,
     default: bool,
 }
 
 impl ProviderState {
-    fn configured(&self) -> bool {
-        self.credential.is_some()
+    fn selectable(&self, action: Action) -> bool {
+        match action {
+            Action::Login => true,
+            Action::Logout => self.stored_key || self.configured,
+            Action::Use => self.configured,
+        }
     }
 }
 
@@ -111,7 +110,7 @@ impl App {
             .providers
             .iter()
             .enumerate()
-            .filter(|(_, provider)| self.action == Action::Login || provider.configured());
+            .filter(|(_, provider)| provider.selectable(self.action));
         if self.query.is_empty() {
             return candidates.map(|(index, _)| index).collect();
         }
@@ -336,7 +335,7 @@ fn update_models(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Res
         ids.push(id.to_string());
     } else {
         for state in provider_states(paths, env)? {
-            if state.configured() {
+            if state.configured {
                 ids.push(state.provider.id.clone());
             }
         }
@@ -368,7 +367,7 @@ fn update_models(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Res
 
 fn list(paths: &Paths, env: &EnvLookup) -> Result<()> {
     let states = provider_states(paths, env)?;
-    let configured = states.iter().filter(|provider| provider.configured()).collect::<Vec<_>>();
+    let configured = states.iter().filter(|provider| provider.configured).collect::<Vec<_>>();
     if configured.is_empty() {
         println!("No providers configured. Run: rx providers login");
         return Ok(());
@@ -379,7 +378,7 @@ fn list(paths: &Paths, env: &EnvLookup) -> Result<()> {
 
 fn login(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Result<()> {
     let states = provider_states(paths, env)?;
-    let selected = requested.map(|id| provider_index(&states, id, false)).transpose()?;
+    let selected = requested.map(|id| provider_index(&states, id, Action::Login)).transpose()?;
     let outcome = run_ui(Action::Login, states, env, selected)?;
     let Some(Outcome::Login { id, key }) = outcome else {
         return Ok(());
@@ -394,10 +393,10 @@ fn login(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Result<()> 
 fn logout(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Result<()> {
     let states = provider_states(paths, env)?;
     if let Some(id) = requested {
-        let index = provider_index(&states, id, true)?;
+        let index = provider_index(&states, id, Action::Logout)?;
         return logout_provider(paths, &states[index]);
     }
-    if !states.iter().any(ProviderState::configured) {
+    if !states.iter().any(|state| state.selectable(Action::Logout)) {
         println!("No providers configured.");
         return Ok(());
     }
@@ -434,10 +433,10 @@ fn use_provider(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Resu
     }
     let states = provider_states(paths, env)?;
     if let Some(id) = requested {
-        let index = provider_index(&states, id, true)?;
+        let index = provider_index(&states, id, Action::Use)?;
         return set_default_provider(paths, &states[index]);
     }
-    if !states.iter().any(ProviderState::configured) {
+    if !states.iter().any(|state| state.configured) {
         println!("No providers configured. Run: rx providers login");
         return Ok(());
     }
@@ -465,7 +464,7 @@ pub(crate) fn completion_ids(
         .filter(|state| match filter {
             crate::args::ProviderIdFilter::All => true,
             crate::args::ProviderIdFilter::Configured | crate::args::ProviderIdFilter::Targets => {
-                state.configured()
+                state.configured
             }
         })
         .map(|state| state.provider.id)
@@ -476,12 +475,12 @@ pub(crate) fn completion_ids(
     Ok(ids)
 }
 
-fn provider_index(states: &[ProviderState], id: &str, configured: bool) -> Result<usize> {
+fn provider_index(states: &[ProviderState], id: &str, action: Action) -> Result<usize> {
     let index = states
         .iter()
         .position(|state| state.provider.id == id)
         .ok_or_else(|| anyhow::anyhow!("unknown provider: {id}"))?;
-    if configured && !states[index].configured() {
+    if !states[index].selectable(action) {
         bail!("provider '{id}' is not configured; run: rx providers login {id}");
     }
     Ok(index)
@@ -494,19 +493,26 @@ fn provider_states(paths: &Paths, env: &EnvLookup) -> Result<Vec<ProviderState>>
         .into_iter()
         .map(|provider| {
             let entry = config.provider.get(&provider.id);
-            let environment_active = env.get(&provider.env).is_some()
-                && (crate::provider::find(&provider.id).is_some()
-                    || entry.is_some_and(|entry| entry.auth == AuthMode::Env));
-            let credential = if stored.contains(&provider.id) {
-                Some(CredentialSource::Stored)
-            } else if environment_active {
-                Some(CredentialSource::Environment)
-            } else {
-                None
-            };
+            let auth = entry.map(|entry| entry.auth).unwrap_or(AuthMode::ApiKey);
+            let environment = env.get(&provider.env).is_some();
+            let environment_active =
+                crate::provider::credential_source(&provider, auth, false, environment).is_some();
+            let configured = crate::provider::credential_source(
+                &provider,
+                auth,
+                stored.contains(&provider.id),
+                environment,
+            )
+            .is_some();
             let default =
                 config.default_provider.as_deref().unwrap_or("openrouter") == provider.id.as_str();
-            ProviderState { provider, credential, environment_active, default }
+            ProviderState {
+                stored_key: stored.contains(&provider.id),
+                provider,
+                configured,
+                environment_active,
+                default,
+            }
         })
         .collect::<Vec<_>>();
     sort_provider_states(&mut states);
@@ -517,7 +523,7 @@ fn sort_provider_states(states: &mut [ProviderState]) {
     states.sort_by(|left, right| {
         pin_rank(&left.provider.id)
             .cmp(&pin_rank(&right.provider.id))
-            .then_with(|| right.configured().cmp(&left.configured()))
+            .then_with(|| right.configured.cmp(&left.configured))
             .then_with(|| {
                 left.provider
                     .name
@@ -704,7 +710,7 @@ fn provider_line(
     };
     let (marker, marker_style) = if state.default {
         ("* ", Style::default().fg(palette.default))
-    } else if state.configured() {
+    } else if state.configured {
         ("• ", Style::default().fg(palette.configured))
     } else {
         ("  ", Style::default().fg(palette.muted))
@@ -771,12 +777,12 @@ fn render_api_key(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
 
 fn render_logout_confirmation(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
     let state = &app.providers[app.selected.expect("selected provider")];
-    let detail = match state.credential {
-        Some(CredentialSource::Stored) => "Removes the locally stored API key.",
-        Some(CredentialSource::Environment) => {
-            "The key comes from your environment; rx will show the unset command."
-        }
-        None => "No local credential is configured.",
+    let detail = if state.stored_key {
+        "Removes the locally stored API key."
+    } else if state.environment_active {
+        "The key comes from your environment; rx will show the unset command."
+    } else {
+        "No local credential is configured."
     };
     let lines = vec![
         Line::from(vec![
@@ -837,9 +843,84 @@ mod tests {
                 default_model: None,
                 claude_default_model: None,
             },
-            credential: configured.then_some(CredentialSource::Stored),
+            configured,
+            stored_key: configured,
             environment_active: false,
             default,
+        }
+    }
+
+    #[test]
+    fn provider_selection_matches_launch_credentials_and_overrides() {
+        for id in ["tokener", "custom"] {
+            for auth in [AuthMode::ApiKey, AuthMode::Env] {
+                for stored in [false, true] {
+                    for environment in [false, true] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let paths = Paths::in_dir(dir.path().to_path_buf());
+                        let config = crate::config::RxConfig {
+                            provider: std::collections::BTreeMap::from([(
+                                id.to_string(),
+                                crate::config::ProviderConfig {
+                                    base_url: Some("http://127.0.0.1:1/v1".to_string()),
+                                    env: Some("CUSTOM_TOKEN".to_string()),
+                                    auth,
+                                    ..Default::default()
+                                },
+                            )]),
+                            ..Default::default()
+                        };
+                        std::fs::write(&paths.config, toml::to_string(&config).unwrap()).unwrap();
+                        if stored {
+                            std::fs::write(&paths.keys, format!("{id} = \"stored-key\"")).unwrap();
+                        }
+                        let mut values = std::collections::HashMap::new();
+                        if environment {
+                            values.insert("CUSTOM_TOKEN".to_string(), "env-key".to_string());
+                        }
+                        let env = EnvLookup::isolated(values);
+                        let states = provider_states(&paths, &env).unwrap();
+                        let state = states.iter().find(|state| state.provider.id == id).unwrap();
+                        let expected = match auth {
+                            AuthMode::ApiKey if stored => Some("stored-key"),
+                            AuthMode::Env if environment => Some("env-key"),
+                            AuthMode::ApiKey if environment && id == "tokener" => Some("env-key"),
+                            _ => None,
+                        };
+                        assert_eq!(state.configured, expected.is_some());
+                        assert_eq!(
+                            state.environment_active,
+                            environment && (auth == AuthMode::Env || id == "tokener")
+                        );
+                        assert_eq!(state.provider.endpoint, "http://127.0.0.1:1/v1");
+                        assert_eq!(state.provider.env, "CUSTOM_TOKEN");
+                        let selection = use_provider(&paths, &env, Some(id));
+                        let launched = launch::configured_provider(Some(id), &paths, &env);
+                        if let Some(key) = expected {
+                            selection.unwrap();
+                            let launch::ProviderResolution::Target(target) = launched.unwrap()
+                            else {
+                                panic!("configured provider must launch");
+                            };
+                            assert_eq!(target.provider, state.provider);
+                            assert_eq!(target.key, key);
+                        } else {
+                            assert!(selection.is_err());
+                            assert!(launched.is_err());
+                        }
+                        if stored || expected.is_some() {
+                            let app = App::new(Action::Logout, states);
+                            assert!(
+                                app.filtered_providers()
+                                    .iter()
+                                    .any(|index| app.providers[*index].provider.id == id)
+                            );
+                            logout(&paths, &env, Some(id)).unwrap();
+                            assert!(crate::config::stored_key(&paths, id).unwrap().is_none());
+                        }
+                    }
+                }
+            }
         }
     }
 

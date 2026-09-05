@@ -1618,6 +1618,64 @@ auth = "env"
 }
 
 #[test]
+fn overlapping_provider_mutations_preserve_distinct_updates() {
+    let (_dir, paths) = temp_paths();
+    let ids = (0..24).map(|index| format!("custom-{index}")).collect::<Vec<_>>();
+    fs::write(
+        &paths.config,
+        ids.iter()
+            .map(|id| {
+                format!(
+                    "[provider.{id}]\nbase_url = \"https://provider.test/v1\"\nauth = \"env\"\n"
+                )
+            })
+            .collect::<String>(),
+    )
+    .unwrap();
+    fs::write(
+        &paths.keys,
+        ids[12..].iter().map(|id| format!("{id} = \"old-key\"\n")).collect::<String>(),
+    )
+    .unwrap();
+    let barrier = std::sync::Barrier::new(ids.len() + 2);
+    thread::scope(|scope| {
+        for (index, id) in ids.iter().enumerate() {
+            let paths = &paths;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                if index < 12 {
+                    config::login(paths, id, format!("key-{id}")).unwrap();
+                } else {
+                    assert!(config::logout(paths, id).unwrap());
+                }
+            });
+        }
+        scope.spawn(|| {
+            barrier.wait();
+            config::set_default(&paths, &ids[0]).unwrap();
+        });
+        scope.spawn(|| {
+            barrier.wait();
+            config::set_none(&paths).unwrap();
+        });
+    });
+    let loaded = config::load_or_default(&paths).unwrap();
+    assert_eq!(loaded.provider.len(), ids.len());
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(
+            config::stored_key(&paths, id).unwrap(),
+            (index < 12).then(|| format!("key-{id}"))
+        );
+        assert_eq!(
+            loaded.provider[id].auth,
+            if index < 12 { config::AuthMode::ApiKey } else { config::AuthMode::Env }
+        );
+        assert_eq!(loaded.provider[id].base_url.as_deref(), Some("https://provider.test/v1"));
+    }
+}
+
+#[test]
 fn provider_default_selection_preserves_env_auth() {
     let (_dir, paths) = temp_paths();
     fs::write(

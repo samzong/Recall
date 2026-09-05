@@ -276,30 +276,33 @@ fn resolve_key(
     paths: &Paths,
     env: &EnvLookup,
 ) -> Result<String> {
-    match auth {
-        AuthMode::Env => env.get(&provider.env).ok_or_else(|| {
-            anyhow::anyhow!(
-                "provider '{}' is set to auth = env, but ${} is not set",
-                provider.id,
-                provider.env
-            )
-        }),
-        AuthMode::ApiKey => {
-            if let Some(key) = crate::config::stored_key(paths, &provider.id)? {
-                return Ok(key);
-            }
-            if crate::provider::find(&provider.id).is_some()
-                && let Some(key) = env.get(&provider.env)
-            {
-                return Ok(key);
-            }
-            bail!(
-                "no API key for provider '{}'; run: rx providers login {} (or set ${})",
-                provider.id,
-                provider.id,
-                provider.env
-            )
+    let stored = if auth == AuthMode::ApiKey {
+        crate::config::stored_key(paths, &provider.id)?
+    } else {
+        None
+    };
+    let environment = env.get(&provider.env);
+    match crate::provider::credential_source(
+        provider,
+        auth,
+        stored.is_some(),
+        environment.is_some(),
+    ) {
+        Some(crate::provider::CredentialSource::Stored) => Ok(stored.expect("stored credential")),
+        Some(crate::provider::CredentialSource::Environment) => {
+            Ok(environment.expect("environment credential"))
         }
+        None if auth == AuthMode::Env => bail!(
+            "provider '{}' is set to auth = env, but ${} is not set",
+            provider.id,
+            provider.env
+        ),
+        None => bail!(
+            "no API key for provider '{}'; run: rx providers login {} (or set ${})",
+            provider.id,
+            provider.id,
+            provider.env
+        ),
     }
 }
 
