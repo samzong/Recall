@@ -680,6 +680,15 @@ This work does not add a TUI flow, a filesystem monitor, a required launcher,
 server-side summaries, or permanent archival. It cannot reconstruct operations
 that native sources never recorded and preserves existing retention semantics.
 
+File evidence preserves the native `path` and optional operation `cwd`.
+Its `target` is derived during sync from that directory and the locally
+available repository, independently of the session's project. Missing files
+can resolve through an existing parent directory. Unresolved repositories keep
+null identity fields; a derived target does not prove historical Git state.
+Ambiguous home-relative paths and broken symlinks retain their native path
+with no derived target; sync does not guess a home directory or bypass a link.
+Import preserves recorded targets without resolving imported paths on disk.
+
 ## Open Questions
 
 - Should `session list --sync` support `--force`, or should forced sync stay only

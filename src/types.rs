@@ -232,6 +232,16 @@ pub(crate) struct FileEvidence {
     pub(crate) kind: FileEvidenceKind,
     #[serde(default)]
     pub(crate) cwd: Option<String>,
+    #[serde(default)]
+    pub(crate) target: Option<FileTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileTarget {
+    pub(crate) absolute_path: String,
+    pub(crate) repo_root: Option<String>,
+    pub(crate) repo_relative_path: Option<String>,
+    pub(crate) repo_remote: Option<String>,
 }
 
 #[derive(Debug, Clone)]

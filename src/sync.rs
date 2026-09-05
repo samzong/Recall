@@ -659,7 +659,7 @@ impl SyncJob {
     fn process_raw_session(
         &mut self,
         source_id: &str,
-        raw: adapters::RawSession,
+        mut raw: adapters::RawSession,
         existing: &mut ExistingState,
         purged_excluded_ids: &mut HashSet<String>,
     ) -> Result<()> {
@@ -715,6 +715,14 @@ impl SyncJob {
             if ts < cutoff {
                 self.stats.filtered_out += 1;
                 return Ok(());
+            }
+        }
+
+        for event in &mut raw.events {
+            for file in &mut event.files {
+                file.target = self
+                    .repo_cache
+                    .resolve_file(&file.path, file.cwd.as_deref().or(raw.directory.as_deref()));
             }
         }
 

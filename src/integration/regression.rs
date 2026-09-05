@@ -292,6 +292,84 @@ fn persist_session_writes_session_events_and_state() {
 }
 
 #[test]
+fn sync_resolves_cross_repository_files_and_keeps_native_paths() {
+    use crate::adapters::{RawMessage, RawSession};
+    use crate::types::{FileEvidence, FileEvidenceKind, FileOperation};
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    let other = temp.path().join("other");
+    for (root, name) in [(&target, "target"), (&other, "other")] {
+        std::fs::create_dir_all(root).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init"])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    &format!("https://github.com/fixture/{name}.git")
+                ])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let raw_path = target.join("src/deleted.rs").to_str().unwrap().to_string();
+    let mut event = make_session_event("file_write", Some("Edit"), Some(&raw_path));
+    event.files =
+        [(raw_path.clone(), None), ("src/deleted.rs".into(), target.to_str().map(str::to_string))]
+            .into_iter()
+            .map(|(path, cwd)| FileEvidence {
+                path,
+                operation: FileOperation::Write,
+                kind: FileEvidenceKind::Call,
+                cwd,
+                target: None,
+            })
+            .collect();
+    let raw = RawSession::search_only(
+        "cross",
+        other.to_str().map(str::to_string),
+        1000,
+        None,
+        None,
+        vec![RawMessage {
+            role: Role::User,
+            content: "Update the target file".into(),
+            timestamp: Some(1000),
+        }],
+    )
+    .with_events(vec![event], 1);
+    let store = crate::sync::persist_raw_session_for_conformance(setup(), "codex", raw).unwrap();
+    let session = store.get_session_by_source_id("codex", "cross").unwrap().unwrap();
+    assert_eq!(session.directory.as_deref(), other.to_str());
+    assert_eq!(session.repo_remote.as_deref(), Some("github.com/fixture/other"));
+    let events = store.list_session_events_for_session(&session.id).unwrap();
+    assert_eq!(events[0].files[0].path, raw_path);
+    assert_eq!(events[0].files[0].target, events[0].files[1].target);
+    let file = events[0].files[0].target.as_ref().unwrap();
+    assert_eq!(file.repo_remote.as_deref(), Some("github.com/fixture/target"));
+    assert_eq!(file.repo_relative_path.as_deref(), Some("src/deleted.rs"));
+    let alternate = temp.path().join("TARGET");
+    if alternate.is_dir() {
+        let resolved = crate::repo_identity::RepoIdentityCache::default()
+            .resolve_file("src/deleted.rs", alternate.to_str())
+            .unwrap();
+        assert_eq!(&resolved, file);
+    }
+}
+
+#[test]
 fn export_jsonl_emits_session_messages_and_usage_events() {
     let store = setup();
     let mut session = make_session("s1", "codex", "raw1", "Export session");
