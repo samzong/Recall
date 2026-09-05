@@ -9,6 +9,7 @@ use tracing::warn;
 use walkdir::WalkDir;
 
 use crate::adapters::AdapterSyncContext;
+use crate::adapters::events::{EventContext, tool_call_event, tool_result_event};
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed};
 use crate::adapters::paths;
@@ -16,15 +17,19 @@ use crate::adapters::usage::usage_count;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
 };
-use crate::types::{RawUsageEvent, Role};
+use crate::types::{
+    FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, RawUsageEvent, Role,
+};
 
 pub(crate) struct KimiCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 1;
 
-fn kimi_scan_options() -> file_scan::FileScanOptions {
+fn kimi_scan_options(include_events: bool) -> file_scan::FileScanOptions {
     file_scan::FileScanOptions {
         usage_parser_version: Some(USAGE_PARSER_VERSION),
+        event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
         ..Default::default()
     }
 }
@@ -56,9 +61,9 @@ impl SourceAdapter for KimiCodeAdapter {
         &self,
         context: &AdapterSyncContext,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        Ok(Some(scan_kimi_dirs_for_sync(&resolve_kimi_dirs()?, context, since_ts)?))
+        Ok(Some(scan_kimi_dirs_for_sync(&resolve_kimi_dirs()?, context, since_ts, include_events)?))
     }
 }
 
@@ -68,7 +73,7 @@ fn scan_kimi_dirs(sessions_dirs: &[PathBuf]) -> anyhow::Result<Vec<RawSession>> 
     for sessions_dir in sessions_dirs {
         sessions.extend(scan_kimi_session_entries_with_parser(
             claim_session_entries(collect_session_entries(sessions_dir), &mut claimed),
-            parse_kimi_session_file,
+            |entry, mtime_ms| parse_kimi_session_file(entry, mtime_ms, true),
         )?);
     }
     Ok(sessions)
@@ -78,6 +83,7 @@ fn scan_kimi_dirs_for_sync(
     sessions_dirs: &[PathBuf],
     context: &AdapterSyncContext,
     since_ts: Option<i64>,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let mut combined = SyncScanResult::default();
     let mut claimed = HashSet::new();
@@ -85,10 +91,10 @@ fn scan_kimi_dirs_for_sync(
         combined.absorb(file_scan::run_file_scan_with_options_and_snapshot(
             context,
             since_ts,
-            kimi_scan_options(),
+            kimi_scan_options(include_events),
             claim_session_entries(collect_session_entries(sessions_dir), &mut claimed),
             kimi_session_snapshot,
-            parse_kimi_session_file,
+            |entry, mtime_ms| parse_kimi_session_file(entry, mtime_ms, include_events),
         )?);
     }
     Ok(combined)
@@ -217,8 +223,9 @@ fn collect_session_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
 fn parse_kimi_session_file(
     entry: FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    match parse_kimi_session_file_impl(&entry, mtime_ms) {
+    match parse_kimi_session_file_impl(&entry, mtime_ms, include_events) {
         Ok(raw) => Ok(raw),
         Err(e) => {
             warn!("failed to parse {}: {e}", entry.stat_target.display());
@@ -230,6 +237,7 @@ fn parse_kimi_session_file(
 fn parse_kimi_session_file_impl(
     entry: &FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let wire_path = &entry.stat_target;
     let Some(session_dir) = session_dir_for_wire(wire_path) else {
@@ -241,7 +249,7 @@ fn parse_kimi_session_file_impl(
     let file = fs::File::open(wire_path)?;
     let reader = BufReader::new(file);
     let source_path = wire_path.to_str().map(str::to_string);
-    parse_kimi_wire(meta, session_id, reader.lines(), mtime_ms, None, source_path)
+    parse_kimi_wire(meta, session_id, reader.lines(), mtime_ms, None, source_path, include_events)
 }
 
 #[cfg(test)]
@@ -252,7 +260,7 @@ pub(crate) fn parse_conformance_fixture(sessions_dir: &Path) -> anyhow::Result<O
     let Some(snapshot) = kimi_session_snapshot(&entry) else {
         return Ok(None);
     };
-    parse_kimi_session_file_impl(&entry, snapshot.effective_mtime_ms())
+    parse_kimi_session_file_impl(&entry, snapshot.effective_mtime_ms(), true)
 }
 
 fn session_dir_for_wire(wire_path: &Path) -> Option<&Path> {
@@ -282,9 +290,11 @@ fn parse_kimi_wire(
     mtime_ms: i64,
     directory: Option<String>,
     source_path: Option<String>,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let directory = meta.cwd.clone().or(directory);
     let mut messages = Vec::new();
+    let mut events: Vec<RawSessionEvent> = Vec::new();
     let mut usage_events: Vec<RawUsageEvent> = Vec::new();
     let mut last_provider: Option<String> = None;
 
@@ -317,6 +327,31 @@ fn parse_kimi_wire(
             "context.append_loop_event" => {
                 let event = v.get("event");
                 let event_type = event.and_then(|e| e.get("type")).and_then(|t| t.as_str());
+                if include_events
+                    && let Some(event) = event
+                    && let Some(raw) = extract_tool_event(
+                        &v,
+                        event,
+                        EventContext {
+                            event_seq: events.len() as u32,
+                            timestamp: time,
+                            source_path: source_path.clone(),
+                            source_event_id: Some(
+                                event
+                                    .get("uuid")
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty())
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| format!("wire:{line_index}")),
+                            ),
+                            message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                            parser_version: EVENT_PARSER_VERSION,
+                        },
+                        directory.as_deref(),
+                    )
+                {
+                    events.push(raw);
+                }
                 let part = event.and_then(|e| e.get("part"));
                 let part_type = part.and_then(|p| p.get("type")).and_then(|t| t.as_str());
                 if event_type != Some("content.part") || part_type != Some("text") {
@@ -351,14 +386,15 @@ fn parse_kimi_wire(
         }
     }
 
-    if messages.is_empty() && usage_events.is_empty() {
+    if messages.is_empty() && usage_events.is_empty() && events.is_empty() {
         return Ok(None);
     }
 
-    let started_at = first_timestamp(meta.created_at, &messages, &usage_events, &[]).unwrap_or(0);
+    let started_at =
+        first_timestamp(meta.created_at, &messages, &usage_events, &events).unwrap_or(0);
     let duration_minutes = match (
-        first_timestamp(None, &messages, &usage_events, &[]),
-        crate::adapters::last_timestamp(None, &messages, &usage_events, &[]),
+        first_timestamp(None, &messages, &usage_events, &events),
+        crate::adapters::last_timestamp(None, &messages, &usage_events, &events),
     ) {
         (Some(first), Some(last)) if last >= first => Some(((last - first) / 60_000) as u32),
         _ => None,
@@ -373,7 +409,96 @@ fn parse_kimi_wire(
     session.summary = summary;
     session.duration_minutes = duration_minutes;
     session = session.with_usage(usage_events, USAGE_PARSER_VERSION);
+    if include_events {
+        session = session.with_events(events, EVENT_PARSER_VERSION);
+    }
     Ok(Some(session))
+}
+
+fn extract_tool_event(
+    record: &Value,
+    event: &Value,
+    context: EventContext,
+    cwd: Option<&str>,
+) -> Option<RawSessionEvent> {
+    let mut raw = match event.get("type")?.as_str()? {
+        "tool.call" => {
+            let name = event.get("name")?.as_str()?;
+            let args = event.get("args");
+            let path = args
+                .and_then(|args| args.get("path"))
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty());
+            let operation = match name {
+                "Read" => Some(FileOperation::Read),
+                "Write" | "Edit" => Some(FileOperation::Write),
+                _ => None,
+            };
+            let mut call = tool_call_event(context, name.to_string(), args);
+            call.kind = "tool_call".to_string();
+            call.target = None;
+            if let Some(operation) = operation
+                && let Some(path) = path
+            {
+                call.kind = match operation {
+                    FileOperation::Read => "file_read",
+                    _ => "file_write",
+                }
+                .to_string();
+                call.target = Some(path.to_string());
+                call.files.push(FileEvidence {
+                    path: path.to_string(),
+                    operation,
+                    kind: FileEvidenceKind::Call,
+                    cwd: cwd.map(str::to_string),
+                    target: None,
+                });
+            } else if name == "Bash" {
+                call.kind = "command".to_string();
+                call.target = args
+                    .and_then(|args| args.get("command"))
+                    .and_then(Value::as_str)
+                    .filter(|command| !command.trim().is_empty())
+                    .map(str::to_string);
+                if let Some(command) = call.target.as_deref() {
+                    let shell_cwd = match args.and_then(|args| args.get("cwd")) {
+                        Some(value) => value.as_str(),
+                        None => cwd,
+                    }
+                    .filter(|cwd| Path::new(cwd).is_absolute());
+                    let (files, status) =
+                        crate::adapters::events::shell_file_evidence(command, shell_cwd);
+                    call.files = files;
+                    call.command_evidence_status = Some(status);
+                }
+            }
+            call
+        }
+        "tool.result" => {
+            let result = event.get("result");
+            let mut result_event = tool_result_event(
+                context,
+                None,
+                result.and_then(|result| result.get("output")).map(|output| match output {
+                    Value::String(text) => text.to_string(),
+                    value => value.to_string(),
+                }),
+            );
+            result_event.status = result
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool)
+                .map(|is_error| if is_error { "error" } else { "success" }.to_string());
+            result_event
+        }
+        _ => return None,
+    };
+    raw.tool_call_id = event
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    raw.attrs_json = Some(record.to_string());
+    Some(raw)
 }
 
 fn extract_text_parts(content: Option<&Value>) -> String {
@@ -438,7 +563,7 @@ pub(crate) fn parse_kimi_session(
 ) -> Option<RawSession> {
     let meta = parse_state_json(state_json).ok()?;
     let lines = wire_jsonl.lines().map(|line| Ok(line.to_string()));
-    parse_kimi_wire(meta, session_id.to_string(), lines, 0, None, None).unwrap()
+    parse_kimi_wire(meta, session_id.to_string(), lines, 0, None, None, true).unwrap()
 }
 
 #[cfg(test)]
@@ -470,6 +595,10 @@ mod tests {
             r#"{"type":"context.append_loop_event","time":1700000004000,"event":{"type":"content.part","uuid":"u1","part":{"type":"think","think":"pondering"}}}"#,
             "\n",
             r#"{"type":"context.append_loop_event","time":1700000005000,"event":{"type":"content.part","uuid":"u2","part":{"type":"text","text":"Here is the fix."}}}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","time":1700000005500,"event":{"type":"tool.call","uuid":"call-uuid","turnId":"1","step":1,"stepUuid":"step-uuid","toolCallId":"Edit:1","name":"Edit","args":{"path":"README.zh-CN.md","old_string":"old","new_string":"new"}}}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","time":1700000005600,"event":{"type":"tool.result","parentUuid":"call-uuid","toolCallId":"Edit:1","result":{"output":"Replaced 1 occurrence in README.zh-CN.md"}}}"#,
             "\n",
             r#"{"type":"usage.record","time":1700000006000,"model":"kimi-k3","usageScope":"turn","usage":{"inputOther":1200,"output":80,"inputCacheRead":300,"inputCacheCreation":40}}"#,
         )
@@ -508,7 +637,7 @@ mod tests {
         file_scan::run_file_scan_with_options_and_snapshot(
             context,
             None,
-            kimi_scan_options(),
+            kimi_scan_options(true),
             collect_session_entries(root),
             kimi_session_snapshot,
             |entry, mtime_ms| {
@@ -519,15 +648,15 @@ mod tests {
                             &state_path,
                             r#"{"id":"session_abc","cwd":"/repo","createdAt":1700000000000,"title":"changed while parsing","isCustomTitle":true}"#,
                         )?;
-                        parse_kimi_session_file(entry, mtime_ms)
+                        parse_kimi_session_file(entry, mtime_ms, true)
                     }
                     Some(SnapshotMutation::AppendWire) => {
-                        let raw = parse_kimi_session_file(entry.clone(), mtime_ms)?;
+                        let raw = parse_kimi_session_file(entry.clone(), mtime_ms, true)?;
                         append_wire_change(&entry.stat_target)?;
                         Ok(raw)
                     }
                     Some(SnapshotMutation::ReplaceState) => {
-                        let raw = parse_kimi_session_file(entry, mtime_ms)?;
+                        let raw = parse_kimi_session_file(entry, mtime_ms, true)?;
                         let replacement = state_path.with_extension("replacement");
                         fs::write(
                             &replacement,
@@ -537,7 +666,7 @@ mod tests {
                         fs::rename(replacement, state_path)?;
                         Ok(raw)
                     }
-                    None => parse_kimi_session_file(entry, mtime_ms),
+                    None => parse_kimi_session_file(entry, mtime_ms, true),
                 }
             },
         )
@@ -570,6 +699,32 @@ mod tests {
         assert_eq!(event.cache_write_tokens, 40);
         assert_eq!(event.token_source, crate::types::TokenSource::Observed);
         assert_eq!(session.usage_parser_version, Some(USAGE_PARSER_VERSION));
+        assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
+        assert_eq!(session.events.len(), 2);
+        let call = &session.events[0];
+        assert_eq!(call.source_event_id.as_deref(), Some("call-uuid"));
+        assert_eq!(call.tool_call_id.as_deref(), Some("Edit:1"));
+        assert_eq!(call.timestamp, Some(1700000005500));
+        assert_eq!(call.message_seq, Some(1));
+        assert_eq!(call.files.len(), 1);
+        assert_eq!(call.files[0].path, "README.zh-CN.md");
+        assert_eq!(call.files[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(call.files[0].operation, FileOperation::Write);
+        assert_eq!(call.files[0].kind, FileEvidenceKind::Call);
+        let attrs: Value = serde_json::from_str(call.attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs.pointer("/event/args/old_string"), Some(&Value::from("old")));
+        assert_eq!(attrs.pointer("/event/args/new_string"), Some(&Value::from("new")));
+        let result = &session.events[1];
+        assert_eq!(result.tool_call_id, call.tool_call_id);
+        assert_eq!(result.message_seq, Some(1));
+        assert_eq!(result.status, None);
+        assert!(result.files.is_empty());
+        let attrs: Value = serde_json::from_str(result.attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs.pointer("/event/parentUuid"), Some(&Value::from("call-uuid")));
+        assert_eq!(
+            attrs.pointer("/event/result/output"),
+            Some(&Value::from("Replaced 1 occurrence in README.zh-CN.md"))
+        );
     }
 
     #[test]
@@ -584,6 +739,62 @@ mod tests {
     fn parse_kimi_session_empty_wire_returns_none() {
         let wire = r#"{"type":"metadata","protocol_version":"1.5","created_at":1700000000100}"#;
         assert!(parse_kimi_session(fixture_state(), wire, "session_abc").is_none());
+        for (name, operation) in [
+            ("Read", Some(FileOperation::Read)),
+            ("Write", Some(FileOperation::Write)),
+            ("DeleteFile", None),
+            ("CustomEdit", None),
+        ] {
+            let record = serde_json::json!({
+                "type": "context.append_loop_event", "time": 1700000001000_i64,
+                "event": {"type": "tool.call", "uuid": "uuid", "toolCallId": "call",
+                    "name": name, "args": {"path": " spaced file.rs ", "content": "code"}}
+            })
+            .to_string();
+            let session = parse_kimi_session(fixture_state(), &record, "session_abc").unwrap();
+            assert!(session.messages.is_empty());
+            assert!(session.usage_events.is_empty());
+            let event = &session.events[0];
+            if let Some(operation) = operation {
+                assert_eq!(event.files[0].path, " spaced file.rs ");
+                assert_eq!(event.files[0].operation, operation);
+            } else {
+                assert!(event.files.is_empty());
+                assert_eq!(event.kind, "tool_call");
+                assert_eq!(event.target, None);
+            }
+        }
+        let record = serde_json::json!({
+            "type": "context.append_loop_event", "event": {
+                "type": "tool.call", "name": "Bash", "args": {
+                    "command": "git restore -- src/lib.rs", "cwd": "/other/repo"
+                }
+            }
+        });
+        let session =
+            parse_kimi_session(fixture_state(), &record.to_string(), "session_abc").unwrap();
+        assert_eq!(session.events[0].files[0].cwd.as_deref(), Some("/other/repo"));
+        for (flag, status) in [
+            (Value::Bool(true), Some("error")),
+            (Value::Bool(false), Some("success")),
+            (Value::Null, None),
+        ] {
+            let output = "result".repeat(1000);
+            let record = serde_json::json!({
+                "type": "context.append_loop_event", "event": {
+                    "type": "tool.result", "parentUuid": "missing-call", "toolCallId": "orphan",
+                    "result": {"output": output, "isError": flag}
+                }
+            })
+            .to_string();
+            let session = parse_kimi_session(fixture_state(), &record, "session_abc").unwrap();
+            let event = &session.events[0];
+            assert_eq!(event.status.as_deref(), status);
+            assert!(event.files.is_empty());
+            assert!(event.summary.as_ref().unwrap().len() < output.len());
+            let attrs: Value = serde_json::from_str(event.attrs_json.as_deref().unwrap()).unwrap();
+            assert_eq!(attrs.pointer("/event/result/output"), Some(&Value::from(output)));
+        }
     }
 
     #[test]
@@ -687,14 +898,16 @@ mod tests {
         let backfill = file_scan::run_file_scan_with_options_and_snapshot(
             &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
             None,
-            kimi_scan_options(),
+            kimi_scan_options(false),
             collect_session_entries(root.path()),
             kimi_session_snapshot,
-            parse_kimi_session_file,
+            |entry, mtime_ms| parse_kimi_session_file(entry, mtime_ms, false),
         )
         .unwrap();
         assert_eq!(backfill.sessions.len(), 1);
         assert_eq!(backfill.stats.skipped_sessions, 0);
+        assert!(backfill.sessions[0].events.is_empty());
+        assert_eq!(backfill.sessions[0].event_parser_version, None);
 
         store
             .persist_usage_events_for_existing_session(
@@ -705,10 +918,49 @@ mod tests {
                 Some(mtime_ms),
             )
             .unwrap();
+        let usage_only = scan_kimi_dirs_for_sync(
+            &[root.path().to_path_buf()],
+            &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(usage_only.stats.skipped_sessions, 1);
+        for previous_version in [None, Some(EVENT_PARSER_VERSION - 1)] {
+            if let Some(version) = previous_version {
+                store
+                    .persist_session_events_for_existing_session(
+                        "kimi-code",
+                        "session_abc",
+                        &[],
+                        version,
+                        Some(mtime_ms),
+                    )
+                    .unwrap();
+            }
+            let events = scan_kimi_dirs_for_sync(
+                &[root.path().to_path_buf()],
+                &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(events.sessions.len(), 1);
+            assert_eq!(events.sessions[0].events.len(), 2);
+        }
+        store
+            .persist_session_events_for_existing_session(
+                "kimi-code",
+                "session_abc",
+                &[],
+                EVENT_PARSER_VERSION,
+                Some(mtime_ms),
+            )
+            .unwrap();
         let skipped = file_scan::run_file_scan_with_options_and_snapshot(
             &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
             None,
-            kimi_scan_options(),
+            kimi_scan_options(true),
             collect_session_entries(root.path()),
             kimi_session_snapshot,
             |_, _| panic!("stable current session must skip parsing"),
@@ -726,7 +978,7 @@ mod tests {
         let sessions = scan_kimi_session_entries_with_parser(
             collect_session_entries(root.path()),
             |entry, mtime_ms| {
-                let raw = parse_kimi_session_file(entry.clone(), mtime_ms)?;
+                let raw = parse_kimi_session_file(entry.clone(), mtime_ms, true)?;
                 append_wire_change(&entry.stat_target)?;
                 Ok(raw)
             },
@@ -737,7 +989,7 @@ mod tests {
         assert_eq!(
             scan_kimi_session_entries_with_parser(
                 collect_session_entries(root.path()),
-                parse_kimi_session_file,
+                |entry, mtime_ms| parse_kimi_session_file(entry, mtime_ms, true),
             )
             .unwrap()
             .len(),
@@ -764,6 +1016,7 @@ mod tests {
             &roots,
             &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
             None,
+            true,
         )
         .unwrap();
         assert_eq!(result.sessions.len(), 1);
@@ -830,10 +1083,10 @@ mod tests {
         let result = file_scan::run_file_scan_with_options_and_snapshot(
             &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
             None,
-            kimi_scan_options(),
+            kimi_scan_options(true),
             collect_session_entries(root.path()),
             kimi_session_snapshot,
-            parse_kimi_session_file,
+            |entry, mtime_ms| parse_kimi_session_file(entry, mtime_ms, true),
         )
         .unwrap();
 
@@ -844,7 +1097,7 @@ mod tests {
 
         let sessions = scan_kimi_session_entries_with_parser(
             collect_session_entries(root.path()),
-            parse_kimi_session_file,
+            |entry, mtime_ms| parse_kimi_session_file(entry, mtime_ms, true),
         )
         .unwrap();
         assert_eq!(sessions[0].updated_at, Some(state_mtime));
