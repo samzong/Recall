@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::adapters;
 use crate::config::AppConfig;
+use crate::db::message_store::{MessageRead, MessageWindow};
 use crate::db::search::{SearchEngine, SearchFilters, ThreadRoleFilter, TimeRange};
 use crate::db::store::{SessionListSort, Store};
 use crate::export::{ExportIncludes, ExportOptions};
@@ -11,7 +12,7 @@ use crate::project_scope::ProjectScope;
 use crate::query::{parse_time_range, query_embedding, resolve_source_filter};
 use crate::semantic;
 use crate::session_action::{self, SessionAction};
-use crate::types::{MatchSource, Message, Role, Session, SessionTopology};
+use crate::types::{MatchSource, Session, SessionTopology};
 use crate::{sync::SyncRunOptions, sync::run_sync_job_inner, transcript};
 use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
@@ -61,6 +62,16 @@ pub(crate) enum SessionCommands {
         from_seq: Option<u32>,
         #[arg(long, help = "Last message sequence to include")]
         to_seq: Option<u32>,
+        #[arg(long, conflicts_with_all = ["from_seq", "to_seq", "cursor"], help = "Show a message and its neighbors (default 3 before and 3 after)")]
+        around_seq: Option<u32>,
+        #[arg(long, requires = "around_seq", help = "Number of messages before the anchor")]
+        before: Option<u32>,
+        #[arg(long, requires = "around_seq", help = "Number of messages after the anchor")]
+        after: Option<u32>,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=32000), help = "Page message content within this Unicode character budget")]
+        max_chars: Option<u32>,
+        #[arg(long, conflicts_with_all = ["from_seq", "to_seq", "around_seq", "before", "after", "role"], help = "Continue a previous message page")]
+        cursor: Option<String>,
         #[arg(long, value_enum, default_value_t = SessionRoleFilter::All)]
         role: SessionRoleFilter,
         #[arg(long, value_enum, default_value_t = SessionDetailFormat::Text)]
@@ -230,6 +241,11 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
             include,
             from_seq,
             to_seq,
+            around_seq,
+            before,
+            after,
+            max_chars,
+            cursor,
             role,
             format,
         } => cmd_session_show(
@@ -238,8 +254,9 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
             source_id.as_deref(),
             messages,
             include.as_deref(),
-            from_seq,
-            to_seq,
+            MessageWindow { from_seq, to_seq, around_seq, before, after },
+            max_chars,
+            cursor.as_deref(),
             role,
             format,
         ),
@@ -430,8 +447,9 @@ fn cmd_session_show(
     source_id: Option<&str>,
     messages_flag: bool,
     include: Option<&str>,
-    from_seq: Option<u32>,
-    to_seq: Option<u32>,
+    window: MessageWindow,
+    max_chars: Option<u32>,
+    cursor: Option<&str>,
     role: SessionRoleFilter,
     format: SessionDetailFormat,
 ) -> Result<()> {
@@ -439,10 +457,33 @@ fn cmd_session_show(
     let sources = adapters::source_labels();
     let session = resolve_session_ref(&store, &sources, id, source_filter, source_id)?;
     let includes = parse_session_includes(include, messages_flag, format)?;
-    let messages = if includes.messages {
-        filter_session_messages(store.get_messages(&session.id)?, from_seq, to_seq, role)
+    window.validate()?;
+    let paging = window.around_seq.is_some() || max_chars.is_some() || cursor.is_some();
+    anyhow::ensure!(
+        !(window.is_selected() || paging) || includes.messages,
+        "message selection requires --messages or --include messages"
+    );
+    let role = match role {
+        SessionRoleFilter::All => None,
+        SessionRoleFilter::User => Some("user"),
+        SessionRoleFilter::Assistant => Some("assistant"),
+    };
+    let (messages, next_cursor, first_message_byte_offset) = if paging {
+        let page = store.read_message_page(
+            &session.id,
+            &MessageRead {
+                window: &window,
+                role,
+                max_messages: 1000,
+                max_chars: max_chars.unwrap_or(6000) as usize,
+                cursor,
+            },
+        )?;
+        (page.messages, page.next_cursor, Some(page.first_message_byte_offset))
+    } else if includes.messages {
+        (store.get_messages_in_window(&session.id, &window, role, usize::MAX, false)?, None, None)
     } else {
-        Vec::new()
+        (Vec::new(), None, None)
     };
     let usage_events =
         if includes.usage { store.list_usage_events_for_session(&session.id)? } else { Vec::new() };
@@ -461,28 +502,30 @@ fn cmd_session_show(
             if !events.is_empty() {
                 println!("Session events: {}", events.len());
             }
+            if let Some(cursor) = next_cursor {
+                eprintln!("Continue with --cursor '{}'.", cursor.replace('\'', "'\\''"));
+            }
         }
-        SessionDetailFormat::Json => {
+        SessionDetailFormat::Json | SessionDetailFormat::Jsonl => {
             let topology = store.session_topology(&session.id)?;
-            let value = crate::export::session_record_value(
+            let mut value = crate::export::session_record_value(
                 session,
                 topology,
                 messages,
                 usage_events,
                 events,
             )?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-        }
-        SessionDetailFormat::Jsonl => {
-            let topology = store.session_topology(&session.id)?;
-            let value = crate::export::session_record_value(
-                session,
-                topology,
-                messages,
-                usage_events,
-                events,
-            )?;
-            println!("{}", serde_json::to_string(&value)?);
+            if paging {
+                value["next_cursor"] = serde_json::json!(next_cursor);
+                value["truncated"] = serde_json::json!(next_cursor.is_some());
+                value["first_message_byte_offset"] = serde_json::json!(first_message_byte_offset);
+            }
+            let output = if matches!(format, SessionDetailFormat::Json) {
+                serde_json::to_string_pretty(&value)?
+            } else {
+                serde_json::to_string(&value)?
+            };
+            println!("{output}");
         }
     }
     Ok(())
@@ -774,24 +817,6 @@ fn parse_session_includes(
         return Ok(includes);
     };
     crate::export::apply_include_filter(includes, include)
-}
-
-fn filter_session_messages(
-    messages: Vec<Message>,
-    from_seq: Option<u32>,
-    to_seq: Option<u32>,
-    role: SessionRoleFilter,
-) -> Vec<Message> {
-    messages
-        .into_iter()
-        .filter(|message| from_seq.is_none_or(|seq| message.seq >= seq))
-        .filter(|message| to_seq.is_none_or(|seq| message.seq <= seq))
-        .filter(|message| match role {
-            SessionRoleFilter::All => true,
-            SessionRoleFilter::User => matches!(message.role, Role::User),
-            SessionRoleFilter::Assistant => matches!(message.role, Role::Assistant),
-        })
-        .collect()
 }
 
 fn print_session_list_table(rows: &[SessionListRow], sources: &[(String, String)]) {

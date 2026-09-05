@@ -70,6 +70,25 @@ keystrokes, parse terminal UI output, and hope the focused row did not change.
 
 ## Command Design
 
+### `recall search --messages`
+
+Search individual message text with FTS, including assistant responses. The
+existing `recall search` mode continues to return sessions.
+
+```bash
+recall search "sync lock" --messages --project owner/repo --limit 10 --format json
+recall search "sync lock" --messages --session-id <session-id> --format json
+```
+
+`--limit` defaults to 10 and accepts 1–50 message matches. `--session-id`
+limits the search to an exact indexed session; it does not infer a project
+from the working directory. Explicit source, time, project, and repository
+filters still apply. JSON contains `protocol_version` and `matches`; each match
+has `session_id`, `source_session_id`, `source`, `title`, `seq`, `role`,
+`timestamp` (Unix milliseconds or null), and a match-centered `excerpt`.
+Matches are ranked and bounded, not an exhaustive list. This mode uses keyword
+matching only; existing session search retains hybrid retrieval.
+
 ### `recall session list`
 
 List indexed sessions. This command reads the local Recall SQLite index; it does
@@ -198,6 +217,42 @@ JSON output:
   "events": []
 }
 ```
+
+Read around a search hit:
+
+```bash
+recall session show --id <session-id> --messages --around-seq 83 --before 3 --after 3 --format json
+recall session show --id <session-id> --messages --from-seq 80 --to-seq 86 --max-chars 6000 --format json
+recall session show --id <session-id> --messages --cursor '<next_cursor>' --format json
+```
+
+`--around-seq` selects the exact anchor plus actual neighboring messages,
+including across gaps in sequence numbers. `--before` and `--after` default to
+3, allow zero, and require `--around-seq`. Around and explicit range selectors
+are mutually exclusive. Missing or ambiguous anchors are errors. The role
+filter is applied after selecting the neighboring window.
+
+Around reads default to 6,000 Unicode content characters per page. Set
+`--max-chars` to 1–32,000 to change the budget or enable range paging. Pages
+contain at most 1,000 message fragments and may end inside a message. Selected
+messages are returned in conversation order, so a long preceding message can
+fill a page before the anchor; use zero neighbors to read only the anchor.
+Paged JSON/JSONL adds `truncated`, `next_cursor`, and
+`first_message_byte_offset` (UTF-8 offset in the first returned message).
+Text mode prints the continuation argument on stderr. Continue with the same
+session reference and `--cursor`, without selection or role flags. Reindexing
+the session invalidates the cursor even if its content is unchanged. Sequence
+anchors refer to the current index, not permanent source identities.
+
+Without around, cursor, or a character budget, CLI show retains its existing
+full-content output. Bounds and role filtering are applied in SQLite.
+
+MCP exposes the same message search as `search_messages`. Pass `around_seq`,
+`before`, and `after` to `get_session`, or use `from_seq` / `to_seq`. Selected
+MCP reads default to at most 50 messages and 6,000 content characters;
+`max_chars` may lower this budget. `next_cursor` continues the selected window.
+Selectors and cursor cannot be combined with `tail`. Legacy `get_session`
+head/tail calls retain their existing text format and limits.
 
 ### `recall session export`
 

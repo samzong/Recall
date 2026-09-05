@@ -31,6 +31,12 @@ enum Commands {
         repo: Option<String>,
         #[arg(long, value_enum, default_value_t = crate::query::SearchFormat::Text)]
         format: crate::query::SearchFormat,
+        #[arg(long, help = "Return keyword matches with message sequence anchors")]
+        messages: bool,
+        #[arg(long, requires = "messages", help = "Search within one Recall session")]
+        session_id: Option<String>,
+        #[arg(long, requires = "messages", value_parser = clap::value_parser!(u32).range(1..=50), help = "Maximum message matches (default 10, maximum 50)")]
+        limit: Option<u32>,
     },
     #[command(about = "Operate on indexed sessions")]
     Session {
@@ -275,15 +281,38 @@ pub(crate) fn run() -> Result<()> {
             crate::bench::run_eval(dataset.as_deref(), verbose)?
         }
         Some(Commands::BenchDumpSessions) => crate::bench::dump_sessions()?,
-        Some(Commands::Search { query, source, time, project, repo, format }) => {
-            crate::query::run_search(
-                &query,
-                source.as_deref(),
-                time.as_deref(),
-                project.as_deref(),
-                repo.as_deref(),
-                format,
-            )?
+        Some(Commands::Search {
+            query,
+            source,
+            time,
+            project,
+            repo,
+            format,
+            messages,
+            session_id,
+            limit,
+        }) => {
+            if messages {
+                crate::query::run_message_search(
+                    &query,
+                    source.as_deref(),
+                    time.as_deref(),
+                    project.as_deref(),
+                    repo.as_deref(),
+                    session_id.as_deref(),
+                    limit.unwrap_or(10) as usize,
+                    format,
+                )?;
+            } else {
+                crate::query::run_search(
+                    &query,
+                    source.as_deref(),
+                    time.as_deref(),
+                    project.as_deref(),
+                    repo.as_deref(),
+                    format,
+                )?
+            }
         }
         Some(Commands::Usage { json, source, time }) => {
             crate::usage::run_cli(json, source.as_deref(), time.as_deref())?

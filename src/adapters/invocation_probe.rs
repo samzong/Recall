@@ -210,7 +210,10 @@ where
 }
 
 pub(crate) fn is_discovery_tool(name: &str) -> bool {
-    matches!(name.rsplit("__").next(), Some("search_sessions" | "list_recent_sessions"))
+    matches!(
+        name.rsplit("__").next(),
+        Some("search_sessions" | "search_messages" | "list_recent_sessions")
+    )
 }
 
 pub(crate) fn nonce_matches_input(input: &serde_json::Value, nonce: &str) -> bool {

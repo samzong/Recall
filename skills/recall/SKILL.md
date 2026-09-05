@@ -20,21 +20,32 @@ If neither MCP nor the installed CLI is available, stop and offer `brew install 
 
 ## Find Sessions
 
-Use MCP `list_recent_sessions` without a query, `search_sessions` with a query, and `get_session` only when transcript evidence is needed.
+For a specific historical question, use MCP `search_messages` with keywords and the current project. Each match includes `session_id`, `seq`, `role`, and an excerpt around the match. Add `session_id` to search within a known session. This is full-text matching, not semantic search; use `search_sessions` for broader session discovery and `list_recent_sessions` when there is no query.
+
+When a message excerpt needs context, call `get_session` with the returned `session_id` and `around_seq: <seq>`. It reads the anchor and up to three actual messages on each side. Adjust `before` and `after` independently; zero reads only the requested side or anchor. Use `from_seq` / `to_seq` instead when the exact inclusive range is known. Do not combine around and range selectors, or use either with `tail`.
+
+Selected MCP reads return up to 50 messages and 6,000 Unicode content characters. Pages follow conversation order; if preceding content fills the budget before the anchor, use `before: 0, after: 0` to read the anchor itself. For a truncated page, copy `next_cursor` into the next `get_session` call with the same `session_id`, without selectors or `tail`. `first_message_byte_offset` locates a partial first message in its UTF-8 content. A stale cursor requires a fresh search or selection. Sequence numbers locate the current index and are not permanent source-message identities.
 
 Use `session_id` as Recall's index identity and `source_session_id` as the native tool's identity. `get_session` reports the returned message range with `first_message_seq` and `last_message_seq`.
 
 Set `include_events: true` only when structured evidence is needed. Events cover the returned message range plus unanchored events; both count and text are bounded. Check returned counts and truncation flags before treating messages or events as complete. Consult the active tool schema for limits; raw arguments, results, and source paths are not returned.
 
-Pass a fresh high-entropy `invocation_nonce` literal on each MCP search or recent-list call. Only `current_session.resolution: resolved` proves self-exclusion before ranking and limit. If resolution is `unknown`, report that self-exclusion is unverified; never infer identity from time, project, source, or result order.
+Pass a fresh high-entropy `invocation_nonce` literal on each MCP search or recent-list call. For `search_sessions` and `list_recent_sessions`, only `current_session.resolution: resolved` proves self-exclusion before ranking and limit. If resolution is `unknown`, report that self-exclusion is unverified; never infer identity from time, project, source, or result order.
+
+For `search_messages`, `current_session_excluded` states whether self-exclusion was applied; an explicit `session_id` includes that session even when it is current.
 
 Use the equivalent CLI workflow when needed:
 
 ```bash
 recall session list --project /absolute/project/path --source <source> --limit 20 --sort updated --format json
 recall session list --project owner/repo --query "<keywords>" --time 7d --limit 20 --sort updated --format json
-recall session show --id <session-id> --format json --include metadata,messages
+recall search "<keywords>" --messages --project owner/repo --limit 10 --format json
+recall search "<keywords>" --messages --session-id <session-id> --format json
+recall session show --id <session-id> --messages --around-seq <seq> --before 3 --after 3 --format json
+recall session show --id <session-id> --messages --cursor '<next_cursor>' --format json
 ```
+
+CLI around reads default to a 6,000-character page. Use `--max-chars` (1–32,000) to change the budget or enable paging for a range. Without paging, existing CLI range reads return the full selected messages. CLI `--session-id` searches do not infer a project from the working directory; explicit project, source, and time filters still apply.
 
 Add `--sync` only when current data matters and index mutation is permitted. Check the selected session's project before using it. Discover current sources and protocol details with `recall info --format json` or `recall mcp capabilities --format json` instead of maintaining a catalog in this skill.
 
@@ -119,13 +130,13 @@ If a broad review lacks a topic or depth, ask one scoping question. Otherwise se
 
 ```bash
 recall info --format json
-recall search "<query>" --project /absolute/project/path --format json
+recall search "<query>" --messages --project /absolute/project/path --format json
 recall export --project /absolute/project/path --limit 0
 ```
 
 Treat search snippets as leads. Parse exports as JSONL instead of text, and verify historical conclusions against current code. Token usage is not monetary cost without an explicit price source.
 
-Synthesize relevant facts, recurring risks, rejected approaches, user constraints, and next checks. Distinguish history from current-code assumptions. Cite source, title or session id, and approximate time; quote only short supporting excerpts.
+Synthesize relevant facts, recurring risks, rejected approaches, user constraints, and next checks. Distinguish history from current-code assumptions. Cite source, title or session id, message sequence when available, and approximate time; quote only short supporting excerpts.
 
 Route requests about workflow friction, handoffs, repeated corrections, or calibration to the installed `reflect` skill.
 
