@@ -74,7 +74,7 @@ pub(crate) fn run(passthrough: Vec<OsString>, env: &EnvLookup) -> Result<()> {
             None => return Ok(()),
         },
     };
-    validate_route_args(harness, &passthrough)?;
+    validate_route_args(harness, &passthrough, &request.gateway.provider_id)?;
     let key = env
         .get(&request.gateway.credential_env)
         .filter(|value| !value.is_empty())
@@ -214,17 +214,21 @@ fn target(profile: &GatewayProfile, key: String) -> ProviderTarget {
     ProviderTarget { provider, key, model: None }
 }
 
-fn validate_route_args(harness: Harness, passthrough: &[OsString]) -> Result<()> {
+fn validate_route_args(
+    harness: Harness,
+    passthrough: &[OsString],
+    provider_id: &str,
+) -> Result<()> {
     let args = args::before_double_dash(passthrough);
     match harness {
         Harness::Claude => reject_flags(args, &["--settings", "--setting-sources"]),
         Harness::Codex => validate_codex(args),
-        Harness::OpenCode => validate_scoped_values(args, &["-m", "--model"], "tokener"),
+        Harness::OpenCode => validate_scoped_values(args, &["-m", "--model"], provider_id),
         Harness::Pi => {
             reject_flags(args, &["--api-key"])?;
-            validate_exact_values(args, &["--provider"], "tokener")?;
-            validate_scoped_values(args, &["-m", "--model"], "tokener")?;
-            validate_list_values(args, &["--models"], "tokener")
+            validate_exact_values(args, &["--provider"], provider_id)?;
+            validate_scoped_values(args, &["-m", "--model"], provider_id)?;
+            validate_list_values(args, &["--models"], provider_id)
         }
         Harness::Dsh => reject_flags(args, &["--profile", "--patch"]),
         Harness::Kimi => Ok(()),
@@ -237,9 +241,10 @@ fn validate_codex(args: &[OsString]) -> Result<()> {
         let key = value.split_once('=').map_or(value, |(key, _)| key).trim();
         if key == "model_provider"
             || key == "openai_base_url"
+            || key == "model_providers"
             || key.starts_with("model_providers.")
         {
-            bail!("{} cannot override the hosted Gateway route", value);
+            bail!("{key} cannot override the hosted Gateway route");
         }
     }
     Ok(())
@@ -295,10 +300,12 @@ fn flag_values<'a>(args: &'a [OsString], flags: &[&str]) -> Vec<&'a str> {
             index += 2;
             continue;
         }
-        if let Some(value) = arg
-            .to_str()
-            .and_then(|arg| flags.iter().find_map(|flag| arg.strip_prefix(&format!("{flag}="))))
-        {
+        if let Some(value) = arg.to_str().and_then(|arg| {
+            flags.iter().find_map(|flag| {
+                arg.strip_prefix(&format!("{flag}="))
+                    .or_else(|| (flag.len() == 2).then(|| arg.strip_prefix(flag)).flatten())
+            })
+        }) {
             values.push(value);
         }
         index += 1;
@@ -368,30 +375,114 @@ mod tests {
 
     #[test]
     fn route_guards_are_harness_specific() {
-        validate_route_args(Harness::Claude, &os(&["--resume", "session", "--tools", "Read"]))
-            .unwrap();
-        assert!(validate_route_args(Harness::Claude, &os(&["--settings", "route.json"])).is_err());
         validate_route_args(
-            Harness::Codex,
-            &os(&["resume", "--last", "-c", "sandbox_mode=read-only"]),
+            Harness::Claude,
+            &os(&["--resume", "session", "--tools", "Read"]),
+            "tokener",
         )
         .unwrap();
         assert!(
-            validate_route_args(Harness::Codex, &os(&["-c", "model_provider=ollama"])).is_err()
+            validate_route_args(Harness::Claude, &os(&["--settings", "route.json"]), "tokener")
+                .is_err()
         );
-        validate_route_args(Harness::OpenCode, &os(&["--model", "tokener/model-a", "--fork"]))
-            .unwrap();
+        validate_route_args(
+            Harness::Codex,
+            &os(&["resume", "--last", "-c", "sandbox_mode=read-only"]),
+            "tokener",
+        )
+        .unwrap();
         assert!(
-            validate_route_args(Harness::OpenCode, &os(&["--model", "openai/model-a"])).is_err()
+            validate_route_args(Harness::Codex, &os(&["-c", "model_provider=ollama"]), "tokener")
+                .is_err()
+        );
+        validate_route_args(
+            Harness::OpenCode,
+            &os(&["--model", "tokener/model-a", "--fork"]),
+            "tokener",
+        )
+        .unwrap();
+        assert!(
+            validate_route_args(Harness::OpenCode, &os(&["--model", "openai/model-a"]), "tokener")
+                .is_err()
         );
         validate_route_args(
             Harness::Pi,
             &os(&["--provider", "tokener", "--model", "model-a", "--resume"]),
+            "tokener",
         )
         .unwrap();
-        assert!(validate_route_args(Harness::Pi, &os(&["--api-key", "secret"])).is_err());
-        assert!(validate_route_args(Harness::Dsh, &os(&["--patch", "other.yml"])).is_err());
-        validate_route_args(Harness::Kimi, &os(&["--session", "session-id", "--plan"])).unwrap();
+        assert!(
+            validate_route_args(Harness::Pi, &os(&["--api-key", "secret"]), "tokener").is_err()
+        );
+        assert!(
+            validate_route_args(Harness::Dsh, &os(&["--patch", "other.yml"]), "tokener").is_err()
+        );
+        validate_route_args(Harness::Kimi, &os(&["--session", "session-id", "--plan"]), "tokener")
+            .unwrap();
+    }
+
+    #[test]
+    fn codex_route_overrides_are_rejected_in_native_config_forms() {
+        for value in [
+            "model_provider=other",
+            "openai_base_url='http://127.0.0.1:1'",
+            "model_providers.acme.base_url='http://127.0.0.1:1'",
+            "model_providers={acme={name='Other',wire_api='responses'}}",
+            "model_providers={acme={experimental_bearer_token='synthetic-gateway-secret'}}",
+        ] {
+            for override_args in [
+                os(&["-c", value]),
+                os(&["--config", value]),
+                os(&[&format!("-c={value}")]),
+                os(&[&format!("--config={value}")]),
+                os(&[&format!("-c{value}")]),
+            ] {
+                let error =
+                    validate_route_args(Harness::Codex, &override_args, "acme").unwrap_err();
+                assert!(!error.to_string().contains("synthetic-gateway-secret"));
+                let mut literal = os(&["--"]);
+                literal.extend(override_args);
+                validate_route_args(Harness::Codex, &literal, "acme").unwrap();
+            }
+        }
+        validate_route_args(Harness::Codex, &os(&["-csandbox_mode='read-only'"]), "acme").unwrap();
+    }
+
+    #[test]
+    fn model_scopes_follow_the_requested_gateway() {
+        for provider in ["acme", "tokener"] {
+            for harness in [Harness::OpenCode, Harness::Pi] {
+                for flag in ["-m", "--model"] {
+                    validate_route_args(
+                        harness,
+                        &os(&[flag, &format!("{provider}/model-a")]),
+                        provider,
+                    )
+                    .unwrap();
+                    assert!(
+                        validate_route_args(harness, &os(&[flag, "other/model-a"]), provider)
+                            .is_err()
+                    );
+                }
+            }
+            validate_route_args(
+                Harness::Pi,
+                &os(&["--provider", provider, "--models", &format!("{provider}/*")]),
+                provider,
+            )
+            .unwrap();
+            assert!(
+                validate_route_args(Harness::Pi, &os(&["--provider", "other"]), provider).is_err()
+            );
+            assert!(
+                validate_route_args(
+                    Harness::Pi,
+                    &os(&["--models", &format!("{provider}/*,other/*")]),
+                    provider,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -399,6 +490,7 @@ mod tests {
         validate_route_args(
             Harness::Claude,
             &os(&["--resume", "session", "--", "--settings", "literal"]),
+            "tokener",
         )
         .unwrap();
     }
