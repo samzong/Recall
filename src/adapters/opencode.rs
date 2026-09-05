@@ -417,6 +417,7 @@ fn parse_part_events(
             let attrs_json = Some(patch_attrs_without_files(&part));
             if files.is_empty() {
                 return vec![RawSessionEvent {
+                    command_evidence_status: None,
                     files: Vec::new(),
                     event_seq,
                     timestamp,
@@ -440,6 +441,7 @@ fn parse_part_events(
                 .into_iter()
                 .enumerate()
                 .map(|(offset, file)| RawSessionEvent {
+                    command_evidence_status: None,
                     files: Vec::new(),
                     event_seq: event_seq + offset as u32,
                     timestamp,

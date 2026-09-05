@@ -5,7 +5,9 @@ use chrono::Utc;
 use rusqlite::OptionalExtension;
 
 use super::store::{EventSessionStateMeta, Store};
-use crate::types::{EvidenceVisibility, RawSessionEvent, SessionEventRecord};
+use crate::types::{
+    CommandEvidenceStatus, EvidenceVisibility, RawSessionEvent, SessionEventRecord,
+};
 
 impl Store {
     pub(crate) fn event_state_meta_map(
@@ -81,17 +83,29 @@ impl Store {
         } else {
             "'[]'"
         };
+        let has_command_status: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_events')
+                           WHERE name = 'command_evidence_status')",
+            [],
+            |row| row.get(0),
+        )?;
+        let command_status_sql =
+            if has_command_status { "command_evidence_status" } else { "NULL" };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT event_seq, timestamp, kind, actor, name, status, target,
                     message_seq, summary, source_path, source_event_id, tool_call_id,
                     is_meta, visibility, attrs_json, parser_version,
-                    {files_sql}
+                    {files_sql}, {command_status_sql}
              FROM session_events
              WHERE session_id = ?1
              ORDER BY event_seq ASC",
         ))?;
         let rows = stmt.query_map(rusqlite::params![session_id], |row| {
             Ok(SessionEventRecord {
+                command_evidence_status: row
+                    .get::<_, Option<String>>(17)?
+                    .as_deref()
+                    .and_then(CommandEvidenceStatus::parse),
                 files: serde_json::from_str(&row.get::<_, String>(16)?).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
                         16,
@@ -141,11 +155,11 @@ pub(crate) fn replace_session_events(
             session_id, source, source_id, event_seq, timestamp,
             kind, actor, name, status, target, message_seq, summary,
             source_path, source_event_id, tool_call_id, is_meta, visibility,
-            attrs_json, parser_version, created_at
+            attrs_json, parser_version, created_at, command_evidence_status
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
          )",
     )?;
     let mut file_stmt = tx.prepare(
@@ -173,6 +187,7 @@ pub(crate) fn replace_session_events(
             event.attrs_json,
             event.parser_version,
             created_at,
+            event.command_evidence_status.map(CommandEvidenceStatus::as_str),
         ])?;
         let event_id = tx.last_insert_rowid();
         for (position, file) in event.files.iter().enumerate() {

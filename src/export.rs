@@ -157,6 +157,7 @@ struct ExportUsageEvent {
 
 #[derive(Serialize)]
 struct ExportEvent {
+    command_evidence_status: Option<crate::types::CommandEvidenceStatus>,
     files: Vec<crate::types::FileEvidence>,
     event_seq: u32,
     timestamp: Option<i64>,
@@ -356,6 +357,7 @@ impl From<SessionUsageEventRecord> for ExportUsageEvent {
 impl From<SessionEventRecord> for ExportEvent {
     fn from(event: SessionEventRecord) -> Self {
         Self {
+            command_evidence_status: event.command_evidence_status,
             files: event.files,
             event_seq: event.event_seq,
             timestamp: event.timestamp,

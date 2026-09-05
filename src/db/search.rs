@@ -759,6 +759,7 @@ mod tests {
 
     fn event(seq: u32, kind: &str, target: &str, timestamp: i64) -> RawSessionEvent {
         RawSessionEvent {
+            command_evidence_status: None,
             files: Vec::new(),
             event_seq: seq,
             timestamp: Some(timestamp),

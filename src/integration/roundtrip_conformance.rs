@@ -112,6 +112,7 @@ fn expected_contract(source: &str, raw: &RawSession) -> Value {
                 "visibility": event.visibility,
                 "attrs_json": event.attrs_json,
                 "files": files,
+                "command_evidence_status": event.command_evidence_status,
                 "parser_version": event.parser_version,
             })
         })

@@ -72,6 +72,7 @@ fn make_usage_event(key: &str, timestamp: i64, model: &str) -> RawUsageEvent {
 
 fn make_session_event(kind: &str, name: Option<&str>, target: Option<&str>) -> RawSessionEvent {
     RawSessionEvent {
+        command_evidence_status: None,
         files: Vec::new(),
         event_seq: 0,
         timestamp: Some(1_800_000_001_000),

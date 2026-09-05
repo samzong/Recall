@@ -207,6 +207,33 @@ impl EvidenceVisibility {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CommandEvidenceStatus {
+    Complete,
+    Unsupported,
+    LimitExceeded,
+}
+
+impl CommandEvidenceStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Unsupported => "unsupported",
+            Self::LimitExceeded => "limit_exceeded",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "complete" => Some(Self::Complete),
+            "unsupported" => Some(Self::Unsupported),
+            "limit_exceeded" => Some(Self::LimitExceeded),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FileEvidenceKind {
@@ -246,6 +273,7 @@ pub(crate) struct FileTarget {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RawSessionEvent {
+    pub(crate) command_evidence_status: Option<CommandEvidenceStatus>,
     pub(crate) files: Vec<FileEvidence>,
     pub(crate) event_seq: u32,
     pub(crate) timestamp: Option<i64>,
@@ -285,6 +313,7 @@ pub(crate) struct UsageEventRecord {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionEventRecord {
+    pub(crate) command_evidence_status: Option<CommandEvidenceStatus>,
     pub(crate) files: Vec<FileEvidence>,
     pub(crate) event_seq: u32,
     pub(crate) timestamp: Option<i64>,

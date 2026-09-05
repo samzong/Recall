@@ -531,6 +531,7 @@ mod tests {
             is_import: false,
         };
         let event = RawSessionEvent {
+            command_evidence_status: None,
             files: Vec::new(),
             event_seq: 0,
             timestamp: Some(now),
@@ -608,6 +609,7 @@ mod tests {
             is_import: false,
         };
         let event = RawSessionEvent {
+            command_evidence_status: None,
             files: Vec::new(),
             event_seq: 0,
             timestamp: None,

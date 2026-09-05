@@ -834,6 +834,7 @@ fn collect_claude_meta_event(
         return;
     }
     events_out.push(RawSessionEvent {
+        command_evidence_status: None,
         files: Vec::new(),
         event_seq: events_out.len() as u32,
         timestamp,

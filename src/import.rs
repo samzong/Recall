@@ -130,6 +130,8 @@ struct ImportUsageEvent {
 #[derive(Deserialize)]
 struct ImportEvent {
     #[serde(default)]
+    command_evidence_status: Option<crate::types::CommandEvidenceStatus>,
+    #[serde(default)]
     files: Vec<crate::types::FileEvidence>,
     event_seq: u32,
     #[serde(default)]
@@ -280,6 +282,7 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
         .events
         .into_iter()
         .map(|e| RawSessionEvent {
+            command_evidence_status: e.command_evidence_status,
             files: e.files,
             event_seq: e.event_seq,
             timestamp: e.timestamp,
@@ -406,6 +409,7 @@ mod tests {
 
     fn full_event() -> RawSessionEvent {
         RawSessionEvent {
+            command_evidence_status: Some(crate::types::CommandEvidenceStatus::Unsupported),
             files: vec![
                 crate::types::FileEvidence {
                     path: "src/alpha.rs".into(),
@@ -513,9 +517,17 @@ mod tests {
         let reexported = export_all(&b);
         let mut orig: serde_json::Value = serde_json::from_str(exported.trim()).unwrap();
         let mut copy: serde_json::Value = serde_json::from_str(reexported.trim()).unwrap();
+        assert_eq!(orig["events"][0]["command_evidence_status"], "unsupported");
         orig["session"]["id"] = serde_json::Value::Null;
         copy["session"]["id"] = serde_json::Value::Null;
         assert_eq!(orig, copy, "export -> import -> export must be lossless");
+        let mut legacy: serde_json::Value = serde_json::from_str(exported.trim()).unwrap();
+        legacy["events"][0].as_object_mut().unwrap().remove("command_evidence_status");
+        let legacy_store = setup();
+        import_jsonl(&legacy_store, false, legacy.to_string().as_bytes()).unwrap();
+        let restored: serde_json::Value =
+            serde_json::from_str(export_all(&legacy_store).trim()).unwrap();
+        assert_eq!(restored["events"][0]["command_evidence_status"], serde_json::Value::Null);
     }
 
     #[test]
@@ -525,12 +537,15 @@ mod tests {
         let before = export_all(&store);
         let first_id: i64 =
             store.conn.query_row("SELECT id FROM session_events", [], |row| row.get(0)).unwrap();
+        let mut invalid_replacement = full_event();
+        invalid_replacement.command_evidence_status =
+            Some(crate::types::CommandEvidenceStatus::Complete);
         assert!(
             store
                 .persist_session_events_for_existing_session(
                     "codex",
                     "src-1",
-                    &[full_event(), full_event()],
+                    &[invalid_replacement.clone(), invalid_replacement],
                     6,
                     None,
                 )
@@ -540,6 +555,8 @@ mod tests {
         assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 2);
         let mut replacement = full_event();
         replacement.files.remove(0);
+        replacement.command_evidence_status =
+            Some(crate::types::CommandEvidenceStatus::LimitExceeded);
         store
             .persist_session_events_for_existing_session(
                 "codex",
@@ -558,6 +575,10 @@ mod tests {
         assert_eq!(
             store.list_session_events_for_session(&session_id).unwrap()[0].files,
             replacement.files
+        );
+        assert_eq!(
+            store.list_session_events_for_session(&session_id).unwrap()[0].command_evidence_status,
+            replacement.command_evidence_status
         );
         store.conn.execute("DELETE FROM sessions", []).unwrap();
         assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 0);
@@ -725,6 +746,7 @@ mod tests {
 
         let session = store.get_session_by_source_id("claude-code", "v5-1").unwrap().unwrap();
         let events = store.list_session_events_for_session(&session.id).unwrap();
+        assert_eq!(events[0].command_evidence_status, None);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source_event_id.as_deref(), Some("2:0"));
         assert_eq!(events[0].tool_call_id, None);

@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 const V12_SCHEMA_VERSION: i64 = 12;
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -57,6 +57,24 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 14 {
         migrate_v14(conn)?;
     }
+    if version < 15 {
+        migrate_v15(conn)?;
+    }
+    Ok(())
+}
+
+fn migrate_v15(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    add_column_if_missing(
+        &tx,
+        "ALTER TABLE session_events ADD COLUMN command_evidence_status TEXT
+         CHECK (command_evidence_status IN ('complete', 'unsupported', 'limit_exceeded')
+                OR command_evidence_status IS NULL)",
+    )?;
+    if read_schema_version(&tx)? >= 14 {
+        tx.execute_batch("PRAGMA user_version = 15;")?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -597,7 +615,8 @@ mod tests {
         register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         store.conn.execute_batch(
-            r#"DROP TABLE event_files;
+            r#"ALTER TABLE session_events DROP COLUMN command_evidence_status;
+             DROP TABLE event_files;
              PRAGMA user_version = 13;
              INSERT INTO sessions(id, source, source_id, title, started_at) VALUES ('history', 'codex', 'native', 'History', 1);
              INSERT INTO session_events(session_id, source, source_id, event_seq, kind, actor, attrs_json, created_at)
@@ -606,6 +625,12 @@ mod tests {
         let legacy = store.list_session_events_for_session("history").unwrap();
         assert_eq!(legacy.len(), 1);
         assert!(legacy[0].files.is_empty());
+        assert_eq!(legacy[0].command_evidence_status, None);
+        migrate_v14(&store.conn).unwrap();
+        assert_eq!(
+            store.list_session_events_for_session("history").unwrap()[0].command_evidence_status,
+            None
+        );
         init(&store.conn).unwrap();
         init(&store.conn).unwrap();
         let payload: String = store
@@ -617,6 +642,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload, r#"{"input":"preserved"}"#);
+        assert_eq!(
+            store.list_session_events_for_session("history").unwrap()[0].command_evidence_status,
+            None
+        );
         assert!(store.list_session_events_for_session("history").unwrap()[0].files.is_empty());
     }
 

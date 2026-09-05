@@ -26,6 +26,7 @@ pub(crate) fn tool_call_event(
         other => format!("[{name}] {other}"),
     });
     RawSessionEvent {
+        command_evidence_status: None,
         files: Vec::new(),
         event_seq: context.event_seq,
         timestamp: context.timestamp,
@@ -59,6 +60,7 @@ pub(crate) fn tool_call_event_from_text(
         if text.trim().is_empty() { format!("[{name}]") } else { format!("[{name}] {text}") }
     });
     RawSessionEvent {
+        command_evidence_status: None,
         files: Vec::new(),
         event_seq: context.event_seq,
         timestamp: context.timestamp,
@@ -85,6 +87,7 @@ pub(crate) fn tool_result_event(
     summary: Option<String>,
 ) -> RawSessionEvent {
     RawSessionEvent {
+        command_evidence_status: None,
         files: Vec::new(),
         event_seq: context.event_seq,
         timestamp: context.timestamp,
@@ -112,6 +115,7 @@ pub(crate) fn file_write_event(
 ) -> RawSessionEvent {
     let summary = format!("[{name}] {target}");
     RawSessionEvent {
+        command_evidence_status: None,
         files: Vec::new(),
         event_seq: context.event_seq,
         timestamp: context.timestamp,

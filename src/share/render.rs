@@ -1175,6 +1175,7 @@ mod tests {
         tool_call_id: Option<&str>,
     ) -> SessionEventRecord {
         SessionEventRecord {
+            command_evidence_status: None,
             files: Vec::new(),
             event_seq,
             timestamp: None,
