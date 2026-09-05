@@ -18,10 +18,12 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
 };
-use crate::types::{RawSessionEvent, Role};
+use crate::types::{
+    EvidenceVisibility, FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, Role,
+};
 
 const SOURCE: &str = "openhands";
-const EVENT_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 2;
 
 #[derive(Deserialize)]
 struct EventIndexEntry {
@@ -219,7 +221,9 @@ fn parse_conversation_dir(
     }
     let conversation_json = dir.join("conversation.json");
     if conversation_json.is_file() {
-        return parse_docs_layout(&conversation_json, source_id, mtime_ms);
+        return Ok(parse_docs_layout(&conversation_json, source_id, mtime_ms)?.map(|raw| {
+            if include_events { raw.with_events(Vec::new(), EVENT_PARSER_VERSION) } else { raw }
+        }));
     }
     Ok(None)
 }
@@ -240,36 +244,39 @@ fn parse_sdk_layout(
         .into_iter()
         .filter_map(|path| read_event_index(&path).map(|event| (path, event)))
         .collect::<Vec<_>>();
-    for index in active_event_indices(&base, &stored_events)? {
+    let active_indices = active_event_indices(&base, &stored_events)?;
+    let mut active_anchors = HashMap::new();
+    for index in active_indices {
         let path = &stored_events[index].0;
-        let Some(value) = read_json(path) else {
-            continue;
-        };
-        let kind = event_kind(&value);
-        let timestamp = event_timestamp(&value);
-        match kind {
-            "SystemPromptEvent" => {}
-            "MessageEvent" => {
-                if let Some(role) = message_role(&value)
-                    && let Some(content) = message_text(&value)
-                {
-                    messages.push(RawMessage { role, content, timestamp });
+        if let Some(value) = read_json(path)
+            && event_kind(&value) == "MessageEvent"
+            && let Some(role) = message_role(&value)
+            && let Some(content) = message_text(&value)
+        {
+            messages.push(RawMessage { role, content, timestamp: event_timestamp(&value) });
+        }
+        active_anchors.insert(index, messages.len().checked_sub(1).map(|seq| seq as u32));
+    }
+    if include_events {
+        for (index, (path, _)) in stored_events.iter().enumerate() {
+            let Some(value) = read_json(path) else { continue };
+            let context = event_context(&value, event_timestamp(&value), events.len() as u32, path);
+            let event = match event_kind(&value) {
+                "ActionEvent" => action_event(&value, context, directory.as_deref()),
+                "ObservationEvent" | "UserRejectObservation" | "AgentErrorEvent" => {
+                    Some(observation_event(&value, context, directory.as_deref()))
                 }
+                _ => None,
+            };
+            if let Some(mut event) = event {
+                event.visibility = Some(if active_anchors.contains_key(&index) {
+                    EvidenceVisibility::Visible
+                } else {
+                    EvidenceVisibility::Inactive
+                });
+                event.message_seq = active_anchors.get(&index).copied().flatten();
+                events.push(event);
             }
-            "ActionEvent" if include_events => {
-                if let Some(event) = action_event(&value, timestamp, events.len() as u32, path) {
-                    events.push(event);
-                }
-            }
-            "ObservationEvent" if include_events => {
-                events.push(events::tool_result_event(
-                    event_context(&value, timestamp, events.len() as u32, path),
-                    json_string(&value, &["tool_name", "name"]),
-                    extract_text(value.get("content"))
-                        .or_else(|| extract_text(value.pointer("/observation/content"))),
-                ));
-            }
-            _ => {}
         }
     }
     if messages.is_empty() && events.is_empty() {
@@ -530,17 +537,93 @@ fn block_text(block: &Value) -> Option<&str> {
 
 fn action_event(
     value: &Value,
-    timestamp: Option<i64>,
-    event_seq: u32,
-    path: &Path,
+    context: events::EventContext,
+    directory: Option<&str>,
 ) -> Option<RawSessionEvent> {
-    let name = json_string(value, &["tool_name", "name"])
-        .or_else(|| {
-            json_string(value.pointer("/action").unwrap_or(&Value::Null), &["kind", "name"])
-        })
-        .filter(|name| !name.is_empty())?;
-    let args = value.get("action").or_else(|| value.get("tool_call")).or_else(|| value.get("args"));
-    Some(events::tool_call_event(event_context(value, timestamp, event_seq, path), name, args))
+    let name = json_string(value, &["tool_name", "name"]).or_else(|| {
+        json_string(value.pointer("/action").unwrap_or(&Value::Null), &["kind", "name"])
+    })?;
+    let action = value.get("action").filter(|action| action.is_object());
+    let mut event = events::tool_call_event(context, name.clone(), action);
+    event.kind = "tool_call".to_string();
+    event.target = None;
+    if let Some(action) = action {
+        if matches!(name.as_str(), "file_editor" | "planning_file_editor") {
+            event.files = file_editor_evidence(action, FileEvidenceKind::Call, directory);
+            if let Some(file) = event.files.first() {
+                event.kind =
+                    if file.operation == FileOperation::Read { "file_read" } else { "file_write" }
+                        .to_string();
+                event.target = Some(file.path.clone());
+            }
+        } else if name == "terminal"
+            && action.get("is_input").and_then(Value::as_bool) != Some(true)
+        {
+            event.kind = "command".to_string();
+            event.target = action.get("command").and_then(Value::as_str).map(str::to_string);
+            if let Some(command) = event.target.as_deref() {
+                let (files, status) = events::shell_file_evidence(command, None);
+                event.files = files;
+                event.command_evidence_status = Some(status);
+            }
+        }
+    }
+    event.tool_call_id = json_string(value, &["tool_call_id"]);
+    event.attrs_json = Some(value.to_string());
+    Some(event)
+}
+
+fn observation_event(
+    value: &Value,
+    context: events::EventContext,
+    directory: Option<&str>,
+) -> RawSessionEvent {
+    let name = json_string(value, &["tool_name", "name"]);
+    let summary = extract_text(value.get("content"))
+        .or_else(|| extract_text(value.pointer("/observation/content")))
+        .or_else(|| json_string(value, &["error", "rejection_reason"]));
+    let mut event = events::tool_result_event(context, name.clone(), summary);
+    event.status = match event_kind(value) {
+        "UserRejectObservation" => Some("rejected".to_string()),
+        "AgentErrorEvent" => Some("error".to_string()),
+        _ => value
+            .pointer("/observation/is_error")
+            .and_then(Value::as_bool)
+            .map(|error| if error { "error" } else { "success" }.to_string()),
+    };
+    if matches!(name.as_deref(), Some("file_editor" | "planning_file_editor"))
+        && let Some(observation) = value.get("observation")
+    {
+        event.files = file_editor_evidence(observation, FileEvidenceKind::Observation, directory);
+        event.target = event.files.first().map(|file| file.path.clone());
+    }
+    event.tool_call_id = json_string(value, &["tool_call_id"]);
+    event.attrs_json = Some(value.to_string());
+    event
+}
+
+fn file_editor_evidence(
+    value: &Value,
+    kind: FileEvidenceKind,
+    directory: Option<&str>,
+) -> Vec<FileEvidence> {
+    let operation = match value.get("command").and_then(Value::as_str) {
+        Some("view") => FileOperation::Read,
+        Some("create" | "str_replace" | "insert" | "undo_edit") => FileOperation::Write,
+        _ => return Vec::new(),
+    };
+    let Some(path) =
+        value.get("path").and_then(Value::as_str).filter(|path| !path.trim().is_empty())
+    else {
+        return Vec::new();
+    };
+    vec![FileEvidence {
+        path: path.to_string(),
+        operation,
+        kind,
+        cwd: directory.map(str::to_string),
+        target: None,
+    }]
 }
 
 fn event_context(
@@ -761,7 +844,7 @@ mod tests {
         assert_eq!(session.messages[1].content, "ordinal 99999 assistant");
         assert_eq!(session.events.len(), 2);
         assert_eq!(session.events[0].name.as_deref(), Some("terminal"));
-        assert_eq!(session.events[0].kind, "tool_call");
+        assert_eq!(session.events[0].kind, "command");
         assert_eq!(session.events[1].kind, "tool_result");
     }
 
@@ -774,7 +857,7 @@ mod tests {
         fs::write(
             conversation.join("base_state.json"),
             serde_json::to_vec(&serde_json::json!({
-                "leaf_event_id": "active"
+                "leaf_event_id": "active-result"
             }))
             .unwrap(),
         )
@@ -794,6 +877,8 @@ mod tests {
                 "source": "agent",
                 "llm_message": { "content": "abandoned branch" }
             }),
+            serde_json::json!({"kind":"ActionEvent","id":"abandoned-action","parent_id":"abandoned","tool_name":"file_editor","tool_call_id":"old-call","action":{"command":"create","path":"/repo/old.rs","file_text":"old"}}),
+            serde_json::json!({"kind":"ObservationEvent","id":"abandoned-result","parent_id":"abandoned-action","tool_name":"file_editor","tool_call_id":"old-call","action_id":"abandoned-action","observation":{"command":"create","path":"/repo/old.rs","is_error":false,"new_content":"old"}}),
             serde_json::json!({
                 "kind": "MessageEvent",
                 "id": "active",
@@ -801,6 +886,8 @@ mod tests {
                 "source": "agent",
                 "llm_message": { "content": "active branch" }
             }),
+            serde_json::json!({"kind":"ActionEvent","id":"active-action","parent_id":"active","tool_name":"file_editor","tool_call_id":"new-call","action":{"command":"str_replace","path":"/repo/new.rs","old_str":"old","new_str":"new"}}),
+            serde_json::json!({"kind":"ObservationEvent","id":"active-result","parent_id":"active-action","tool_name":"file_editor","tool_call_id":"new-call","action_id":"active-action","observation":{"command":"str_replace","path":"/repo/new.rs","is_error":false,"old_content":"old","new_content":"new"}}),
         ]
         .into_iter()
         .enumerate()
@@ -812,10 +899,66 @@ mod tests {
             .unwrap();
         }
         let session =
-            parse_conversation_dir(&conversation, "branching", Some(1), false).unwrap().unwrap();
+            parse_conversation_dir(&conversation, "branching", Some(1), true).unwrap().unwrap();
         let messages =
-            session.messages.into_iter().map(|message| message.content).collect::<Vec<_>>();
+            session.messages.iter().map(|message| message.content.clone()).collect::<Vec<_>>();
         assert_eq!(messages, vec!["root message", "active branch"]);
+        assert_eq!(session.events.len(), 4);
+        assert_eq!(session.events[0].visibility, Some(EvidenceVisibility::Inactive));
+        assert_eq!(session.events[1].visibility, Some(EvidenceVisibility::Inactive));
+        assert_eq!(session.events[0].message_seq, None);
+        assert_eq!(session.events[2].visibility, Some(EvidenceVisibility::Visible));
+        assert_eq!(session.events[2].message_seq, Some(1));
+        assert_eq!(session.events[2].tool_call_id, session.events[3].tool_call_id);
+        assert_eq!(session.events[2].files[0].kind, FileEvidenceKind::Call);
+        assert_eq!(session.events[3].files[0].kind, FileEvidenceKind::Observation);
+        assert_eq!(session.events[3].status.as_deref(), Some("success"));
+        let native: Value =
+            serde_json::from_str(session.events[3].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(native["parent_id"], "active-action");
+        assert_eq!(native["action_id"], "active-action");
+    }
+
+    #[test]
+    fn native_non_executable_actions_and_results_preserve_status() {
+        let action = serde_json::json!({"kind":"ActionEvent","id":"invalid-action","tool_name":"file_editor","tool_call_id":"call-1","action":null,"tool_call":{"name":"file_editor","arguments":"{invalid"}});
+        let context = event_context(&action, None, 0, Path::new("event-1.json"));
+        let event = action_event(&action, context, Some("/repo")).unwrap();
+        assert_eq!(event.tool_call_id.as_deref(), Some("call-1"));
+        assert!(event.files.is_empty());
+        assert_eq!(event.status, None);
+        assert_eq!(
+            serde_json::from_str::<Value>(event.attrs_json.as_deref().unwrap()).unwrap(),
+            action
+        );
+        for (value, status) in [
+            (
+                serde_json::json!({"kind":"AgentErrorEvent","id":"error-1","tool_call_id":"call-1","tool_name":"file_editor","error":"invalid arguments"}),
+                Some("error"),
+            ),
+            (
+                serde_json::json!({"kind":"UserRejectObservation","id":"reject-1","tool_call_id":"call-1","tool_name":"file_editor","action_id":"invalid-action","rejection_reason":"declined"}),
+                Some("rejected"),
+            ),
+            (
+                serde_json::json!({"kind":"ObservationEvent","id":"result-1","tool_call_id":"call-1","tool_name":"file_editor","observation":{"command":"str_replace","path":"/repo/a.rs","is_error":true,"content":[]}}),
+                Some("error"),
+            ),
+            (
+                serde_json::json!({"kind":"ObservationEvent","id":"result-2","tool_call_id":"call-1","tool_name":"file_editor","observation":{"command":"view","path":"/repo/a.rs","content":[]}}),
+                None,
+            ),
+        ] {
+            let context = event_context(&value, None, 1, Path::new("event-2.json"));
+            let event = observation_event(&value, context, Some("/repo"));
+            assert_eq!(event.status.as_deref(), status);
+            assert_eq!(event.tool_call_id.as_deref(), Some("call-1"));
+            assert!(event.files.iter().all(|file| file.kind == FileEvidenceKind::Observation));
+            assert_eq!(
+                serde_json::from_str::<Value>(event.attrs_json.as_deref().unwrap()).unwrap(),
+                value
+            );
+        }
     }
 
     #[test]
@@ -832,8 +975,15 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        let session =
+            parse_conversation_dir(&conversation, "empty-head", Some(1), true).unwrap().unwrap();
+        assert!(session.messages.is_empty());
+        assert_eq!(session.events.len(), 2);
         assert!(
-            parse_conversation_dir(&conversation, "empty-head", Some(1), true).unwrap().is_none()
+            session
+                .events
+                .iter()
+                .all(|event| event.visibility == Some(EvidenceVisibility::Inactive))
         );
     }
 
@@ -865,7 +1015,7 @@ mod tests {
             &fixtures_dir().join("docs-layout"),
             "abc123def456",
             Some(9),
-            false,
+            true,
         )
         .unwrap()
         .unwrap();
@@ -874,6 +1024,7 @@ mod tests {
         assert_eq!(session.messages[0].content, "Fix the login bug in auth.py");
         assert_eq!(session.messages[1].content, "Looking at auth.py now");
         assert!(session.events.is_empty());
+        assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
     }
 
     #[test]
