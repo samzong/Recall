@@ -69,10 +69,6 @@ pub(crate) fn prepare(
         }
         return Ok(());
     }
-    let recall_dir = paths.dir.join("pi");
-    fs::create_dir_all(&recall_dir)
-        .with_context(|| format!("failed to create {}", recall_dir.display()))?;
-    write_json_atomic(&recall_dir.join(format!("{provider_id}-provider.json")), &document)?;
     let agent_dir = global_agent_dir(env)?;
     fs::create_dir_all(&agent_dir)
         .with_context(|| format!("failed to create {}", agent_dir.display()))?;
@@ -82,7 +78,9 @@ pub(crate) fn prepare(
 pub(crate) fn env_set(env_key: &str, key: &str) -> Vec<(String, String)> {
     let mut env_set = vec![(env_key.to_string(), key.to_string())];
     for name in PI_ENV_CLEAR {
-        env_set.push(((*name).to_string(), String::new()));
+        if *name != env_key {
+            env_set.push(((*name).to_string(), String::new()));
+        }
     }
     env_set
 }
@@ -162,11 +160,14 @@ pub(crate) fn merge_provider(models_path: &Path, provider_id: &str, provider: Va
             models_path.display()
         );
     };
-    if let Some(providers) = root.get_mut("providers").and_then(Value::as_object_mut) {
-        providers.insert(provider_id.to_string(), provider);
-    } else {
-        root.insert("providers".to_string(), json!({ provider_id: provider }));
-    }
+    let Some(providers) = root.entry("providers").or_insert_with(|| json!({})).as_object_mut()
+    else {
+        bail!(
+            "{} providers is not a JSON object; fix or remove the file and retry",
+            models_path.display()
+        );
+    };
+    providers.insert(provider_id.to_string(), provider);
     write_json_atomic(models_path, &document)
 }
 
