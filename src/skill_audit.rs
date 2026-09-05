@@ -235,9 +235,16 @@ fn skill_from_attrs(attrs_json: Option<&str>) -> Option<String> {
     let args = match value.get("type").and_then(Value::as_str) {
         Some("tool_use") => value.get("input")?,
         Some("tool-call") => value.get("args")?,
-        Some("tool_result" | "tool-result") => return None,
+        Some("function_call" | "custom_tool_call") => {
+            value.get("arguments").or_else(|| value.get("input"))?
+        }
+        Some(
+            "tool_result" | "tool-result" | "function_call_output" | "custom_tool_call_output",
+        ) => return None,
         _ => &value,
     };
+    let decoded = args.as_str().and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let args = decoded.as_ref().unwrap_or(args);
     for key in ["skill", "name"] {
         if let Some(skill) = args.get(key).and_then(|skill| skill.as_str()) {
             return Some(skill.to_string());
@@ -380,6 +387,8 @@ mod tests {
         for attrs in [
             r#"{"type":"tool_use","name":"Skill","input":{"skill":"commit"}}"#,
             r#"{"type":"tool-call","toolName":"Skill","args":{"skill":"commit"}}"#,
+            r#"{"type":"function_call","name":"Skill","arguments":"{\"skill\":\"commit\"}"}"#,
+            r#"{"type":"custom_tool_call","name":"Skill","input":{"skill":"commit"}}"#,
         ] {
             event.attrs_json = Some(attrs.into());
             assert_eq!(

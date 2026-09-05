@@ -85,10 +85,16 @@ fn expected_contract(source: &str, raw: &RawSession) -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let mut identities = crate::repo_identity::RepoIdentityCache::default();
     let events = raw
         .events
         .iter()
         .map(|event| {
+            let mut files = event.files.clone();
+            for file in &mut files {
+                file.target = identities
+                    .resolve_file(&file.path, file.cwd.as_deref().or(raw.directory.as_deref()));
+            }
             json!({
                 "event_seq": event.event_seq,
                 "timestamp": event.timestamp,
@@ -105,7 +111,7 @@ fn expected_contract(source: &str, raw: &RawSession) -> Value {
                 "is_meta": event.is_meta,
                 "visibility": event.visibility,
                 "attrs_json": event.attrs_json,
-                "files": event.files,
+                "files": files,
                 "parser_version": event.parser_version,
             })
         })

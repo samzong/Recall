@@ -182,25 +182,6 @@ pub(crate) fn patch_file_evidence(text: &str) -> Vec<FileEvidence> {
     files
 }
 
-const PATCH_FILE_PREFIXES: [&str; 4] =
-    ["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "];
-
-pub(crate) fn patch_file_targets(text: &str) -> Vec<String> {
-    let mut targets = Vec::new();
-    for line in text.lines() {
-        let path = PATCH_FILE_PREFIXES
-            .iter()
-            .find_map(|prefix| line.trim_start().strip_prefix(prefix))
-            .and_then(non_empty);
-        if let Some(path) = path
-            && !targets.contains(&path)
-        {
-            targets.push(path);
-        }
-    }
-    targets
-}
-
 pub(crate) fn target_from_value(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => non_empty(text),
