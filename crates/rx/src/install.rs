@@ -19,8 +19,8 @@ pub(crate) struct InstallSpec {
     pub shell: &'static str,
 }
 
-pub(crate) fn spec(harness: Harness) -> InstallSpec {
-    match harness {
+pub(crate) fn spec(harness: Harness) -> Option<InstallSpec> {
+    Some(match harness {
         Harness::Claude => InstallSpec {
             program: "claude",
             display: "Claude Code",
@@ -45,19 +45,14 @@ pub(crate) fn spec(harness: Harness) -> InstallSpec {
             url: "https://pi.dev/install.sh",
             shell: "sh",
         },
-        Harness::Dsh => InstallSpec {
-            program: "dsh",
-            display: "DeepSeek Harness",
-            url: "https://www.npmjs.com/package/@deepseek-ai/dsh",
-            shell: "sh",
-        },
+        Harness::Dsh => return None,
         Harness::Kimi => InstallSpec {
             program: "kimi",
             display: "Kimi Code",
             url: "https://code.kimi.com/kimi-code/install.sh",
             shell: "bash",
         },
-    }
+    })
 }
 
 pub(crate) fn command_line(spec: &InstallSpec) -> String {
@@ -65,13 +60,12 @@ pub(crate) fn command_line(spec: &InstallSpec) -> String {
 }
 
 pub(crate) fn ensure(harness: Harness, env: &EnvLookup) -> Result<PathBuf> {
-    if matches!(harness, Harness::Dsh) {
+    let Some(spec) = spec(harness) else {
         return ensure_dsh(env);
-    }
+    };
     if !env.is_real() {
         return Ok(PathBuf::from(harness.as_str()));
     }
-    let spec = spec(harness);
     if let Some(path) = lookup(spec.program) {
         return Ok(path);
     }
