@@ -66,16 +66,40 @@ preview() {
   }'
 }
 
-looks_like_sse() {
-  awk '
-    NF {
-      line = $0
-      sub(/^[ \t\r]+/, "", line)
-      if (line ~ /^(data:|event:|:)/) found = 1
-      exit
-    }
-    END { if (!found) exit 1 }
-  ' "$1"
+stream_succeeded() {
+  jq -Rse --arg protocol "$2" '
+    def text: type == "string" and length > 0;
+    gsub("\r\n"; "\n") | split("\n\n")
+    | if last | test("[^\n]") then error("unterminated SSE frame") else .[:-1] end
+    | map(split("\n")
+        | {event: (map(select(startswith("event:")) | ltrimstr("event:") | ltrimstr(" ")) | last),
+           data: (map(select(startswith("data:")) | ltrimstr("data:") | ltrimstr(" ")) | join("\n"))}
+        | if .event == "error" then error("SSE error") else . end
+        | select(.data != "")
+        | if .data == "[DONE]" then {type: "done"}
+          else . as $frame | .data | fromjson
+          | if type != "object" then error("invalid SSE data")
+            elif $frame.event != null and $frame.event != "message" and $frame.event != .type
+            then error("SSE event type mismatch") else . end end)
+    | if any(.error != null or .response.error != null or .type == "error" or .type == "response.failed"
+        or .type == "response.incomplete") then false
+      elif $protocol == "chat_completions" then
+        last.type == "done"
+        and any(.object == "chat.completion.chunk"
+          and any(.choices[]?; .index == 0 and (.delta.content | text)))
+        and any(.object == "chat.completion.chunk"
+          and any(.choices[]?; .index == 0 and (.finish_reason == "stop" or .finish_reason == "length")))
+      elif $protocol == "responses" then
+        last.type == "response.completed" and last.response.status == "completed"
+        and any(.type == "response.output_text.delta" and (.delta | text))
+      elif $protocol == "messages" then
+        last.type == "message_stop"
+        and any(.type == "message_start" and .message.role == "assistant")
+        and any(.type == "content_block_delta" and .delta.type == "text_delta" and (.delta.text | text))
+        and any(.type == "message_delta" and
+          (.delta.stop_reason == "end_turn" or .delta.stop_reason == "max_tokens" or .delta.stop_reason == "stop_sequence"))
+      else false end
+  ' "$1" >/dev/null 2>&1
 }
 
 looks_like_json() {
@@ -192,6 +216,7 @@ curl_stream() {
   : >"$body"
   : >"$hdr"
   : >"$err"
+  stream_exit=0
   curl -sS -N --max-time 8 -D "$hdr" -o "$body" \
     -H "Authorization: Bearer ${api_key}" \
     -H "User-Agent: ${USER_AGENT}" \
@@ -199,21 +224,7 @@ curl_stream() {
     -H "Accept: text/event-stream" \
     "$@" \
     -d "$payload" \
-    "$url" >/dev/null 2>"$err" &
-  pid=$!
-  n=0
-  while [ "$n" -lt 8 ]; do
-    if [ -s "$body" ]; then
-      break
-    fi
-    if ! kill -0 "$pid" 2>/dev/null; then
-      break
-    fi
-    n=$((n + 1))
-    sleep 1
-  done
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" || true
+    "$url" >/dev/null 2>"$err" || stream_exit=$?
   status=$(http_status "$hdr")
   if [ "$status" = "401" ]; then
     fail_auth
@@ -239,15 +250,31 @@ check_stream() {
     record "$name" 0 "HTTP ${status}: $(preview "$body")"
     return 0
   fi
-  if looks_like_sse "$body"; then
-    record "$name" 1 "SSE ${label}"
+  if [ "$stream_exit" -ne 0 ]; then
+    record "$name" 0 "stream request failed: $(preview "$err")"
+    return 0
+  fi
+  if ! awk '
+    toupper($1) ~ /^HTTP\// { media_type = "" }
+    tolower($0) ~ /^content-type:/ {
+      media_type = tolower($0)
+      sub(/^content-type:[ \t]*/, "", media_type)
+      sub(/[; \t\r].*$/, "", media_type)
+    }
+    END { exit (media_type != "text/event-stream") }
+  ' "$hdr"; then
+    record "$name" 0 "expected Content-Type text/event-stream"
+    return 0
+  fi
+  if stream_succeeded "$body" "$name"; then
+    record "$name" 1 "completed SSE text ${label}"
     return 0
   fi
   if looks_like_json "$body"; then
     record "$name" 0 "non-streaming JSON; Codex/Claude require SSE"
     return 0
   fi
-  record "$name" 0 "no SSE frame: $(preview "$body")"
+  record "$name" 0 "no successful ${name} SSE completion"
 }
 
 base_url=${RX_PROVIDER_URL:-${RX_PROVIDER_BASE_URL:-}}

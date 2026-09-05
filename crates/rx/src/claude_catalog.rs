@@ -56,7 +56,6 @@ pub(crate) struct UserModel {
     pub name: Option<String>,
     pub context_length: Option<i64>,
     pub canonical_slug: Option<String>,
-    pub supported_efforts: Vec<String>,
     pub pricing: Option<Pricing>,
 }
 
@@ -79,7 +78,6 @@ pub(crate) struct ModelOption {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelAccess {
     pub api_name: String,
-    pub max_effort_level: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -163,7 +161,6 @@ fn from_listed_models(provider_id: &str, models: &[ListedModel]) -> Vec<UserMode
                 model.context_length.unwrap_or(catalog::fallback_context(provider_id)),
             ),
             canonical_slug: None,
-            supported_efforts: Vec::new(),
             pricing: None,
         })
         .collect()
@@ -171,10 +168,6 @@ fn from_listed_models(provider_id: &str, models: &[ListedModel]) -> Vec<UserMode
 
 fn parse_user_catalog(body: &str) -> Result<Vec<UserModel>> {
     let value: Value = serde_json::from_str(body).context("catalog response is not JSON")?;
-    parse_user_catalog_value(&value)
-}
-
-fn parse_user_catalog_value(value: &Value) -> Result<Vec<UserModel>> {
     let Some(data) = value.get("data").and_then(Value::as_array) else {
         bail!("catalog JSON has no data array");
     };
@@ -193,14 +186,6 @@ fn parse_user_model(entry: &Value) -> Option<UserModel> {
         .or_else(|| entry.get("max_input_tokens"))
         .and_then(Value::as_i64);
     let canonical_slug = entry.get("canonical_slug").and_then(Value::as_str).map(str::to_string);
-    let supported_efforts = entry
-        .get("reasoning")
-        .and_then(|value| value.get("supported_efforts"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let pricing = entry.get("pricing").map(|pricing| Pricing {
         prompt: pricing.get("prompt").and_then(Value::as_str).map(str::to_string),
         completion: pricing.get("completion").and_then(Value::as_str).map(str::to_string),
@@ -214,7 +199,7 @@ fn parse_user_model(entry: &Value) -> Option<UserModel> {
             .map(str::to_string),
         web_search: pricing.get("web_search").and_then(Value::as_str).map(str::to_string),
     });
-    Some(UserModel { id, name, context_length, canonical_slug, supported_efforts, pricing })
+    Some(UserModel { id, name, context_length, canonical_slug, pricing })
 }
 
 pub(crate) fn build_seed(models: &[UserModel]) -> SeedCaches {
@@ -242,13 +227,9 @@ pub(crate) fn build_seed(models: &[UserModel]) -> SeedCaches {
             description: context_label(capped),
         });
         let compact_window = auto_compact_window(&stripped, capped);
-        let max_effort = max_effort_level(&model.supported_efforts);
         for api_name in &api_names {
             auto_compact_windows.insert(api_name.clone(), compact_window);
-            model_access.push(ModelAccess {
-                api_name: api_name.clone(),
-                max_effort_level: max_effort.clone(),
-            });
+            model_access.push(ModelAccess { api_name: api_name.clone() });
         }
         if let Some(costs) = model_costs(model) {
             for key in cost_keys(&stripped, &picker_value, model.canonical_slug.as_deref()) {
@@ -429,13 +410,7 @@ fn model_access_values(caches: &SeedCaches) -> Vec<Value> {
     caches
         .model_access
         .iter()
-        .map(|access| {
-            let mut entry = json!({ "apiName": access.api_name, "entitled": true });
-            if let Some(level) = &access.max_effort_level {
-                entry["maxEffortLevel"] = json!(level);
-            }
-            entry
-        })
+        .map(|access| json!({ "apiName": access.api_name, "entitled": true }))
         .collect()
 }
 
@@ -648,12 +623,6 @@ fn context_label(context: i64) -> String {
 fn auto_compact_window(id: &str, context: i64) -> i64 {
     let window = if id.starts_with("openai/") { OPENAI_COMPACT_WINDOW } else { context };
     context.min(window)
-}
-
-fn max_effort_level(supported: &[String]) -> Option<String> {
-    const LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-    let supported: HashSet<&str> = supported.iter().map(String::as_str).collect();
-    LEVELS.iter().rev().find(|level| supported.contains(*level)).map(|level| (*level).to_string())
 }
 
 fn cost_keys(stripped: &str, picker: &str, canonical: Option<&str>) -> Vec<String> {

@@ -2199,7 +2199,7 @@ fn claude_seed_uses_openai_models_and_merges_from_cache() {
     let (_dir, paths) = temp_paths();
     let config_dir = tempfile::tempdir().unwrap();
     let (base_url, server) = serve_openai_models(
-        r#"{"data":[{"id":"claude-sonnet-5","display_name":"Sonnet 5","max_input_tokens":200000}]}"#,
+        r#"{"data":[{"id":"claude-sonnet-5","display_name":"Sonnet 5","max_input_tokens":200000,"reasoning":{"supported_efforts":["max"]}}]}"#,
     );
     let env = EnvLookup::isolated(HashMap::from([(
         "CLAUDE_CONFIG_DIR".to_string(),
@@ -2219,18 +2219,48 @@ fn claude_seed_uses_openai_models_and_merges_from_cache() {
     )
     .unwrap();
     assert_eq!(cached.provider_id, "openrouter");
-    let second = crate::claude_catalog::try_seed_user_catalog(
-        &paths,
-        "openrouter",
-        &base_url,
-        "sk-test",
-        &env,
-    );
-    assert_eq!(second, crate::claude_catalog::SeedOutcome::Seeded);
-    let document: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(config_dir.path().join(".claude.json")).unwrap())
-            .unwrap();
-    assert_eq!(document["additionalModelOptionsCache"][0]["value"], "claude-sonnet-5");
+    let config_path = config_dir.path().join(".claude.json");
+    let mut document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(document["modelAccessCache"][0]["entitled"], true);
+    assert!(document["modelAccessCache"][0].get("maxEffortLevel").is_none());
+    document["modelAccessCache"][0]["maxEffortLevel"] = serde_json::json!("max");
+    document["rxSeededCatalog"]["modelAccessCache"]["claude-sonnet-5"]["payload"] =
+        document["modelAccessCache"][0].clone();
+    document["modelAccessCache"].as_array_mut().unwrap().push(serde_json::json!({
+        "apiName": "user-model", "entitled": true, "maxEffortLevel": "high"
+    }));
+    fs::write(&config_path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let cache_path = paths.dir.join("catalogs/openrouter.claude.json");
+    let mut cached = serde_json::to_value(cached).unwrap();
+    cached["model_access"][0]["max_effort_level"] = serde_json::json!("max");
+    fs::write(&cache_path, serde_json::to_vec(&cached).unwrap()).unwrap();
+    for stale in [false, true] {
+        if stale {
+            let meta_path = paths.dir.join("catalogs/openrouter.meta.json");
+            let mut meta: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+            meta["fetched_at"] = serde_json::json!(0);
+            fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        }
+        let outcome = crate::claude_catalog::try_seed_user_catalog(
+            &paths,
+            "openrouter",
+            &base_url,
+            "sk-test",
+            &env,
+        );
+        assert_eq!(outcome, crate::claude_catalog::SeedOutcome::Seeded);
+        let document: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(document["additionalModelOptionsCache"][0]["value"], "claude-sonnet-5");
+        let access = document["modelAccessCache"].as_array().unwrap();
+        let owned = access.iter().find(|entry| entry["apiName"] == "claude-sonnet-5").unwrap();
+        assert_eq!(owned["entitled"], true);
+        assert!(owned.get("maxEffortLevel").is_none());
+        let unowned = access.iter().find(|entry| entry["apiName"] == "user-model").unwrap();
+        assert_eq!(unowned["maxEffortLevel"], "high");
+    }
 }
 
 #[test]
@@ -2349,7 +2379,6 @@ fn openrouter_seed_builds_picker_and_denylist() {
             name: Some("Sonnet 5".to_string()),
             context_length: Some(200_000),
             canonical_slug: Some("anthropic/claude-sonnet-5".to_string()),
-            supported_efforts: vec!["high".to_string()],
             pricing: None,
         },
         crate::claude_catalog::UserModel {
@@ -2357,7 +2386,6 @@ fn openrouter_seed_builds_picker_and_denylist() {
             name: Some("GPT 5.6 Sol".to_string()),
             context_length: Some(400_000),
             canonical_slug: None,
-            supported_efforts: vec![],
             pricing: None,
         },
     ];
@@ -2383,7 +2411,6 @@ fn openrouter_seed_writes_claude_json() {
         name: Some("Gemini".to_string()),
         context_length: Some(200_000),
         canonical_slug: None,
-        supported_efforts: vec![],
         pricing: None,
     }]);
     crate::claude_catalog::write_seed(&config_path, &caches).unwrap();
@@ -2521,7 +2548,6 @@ fn claude_seed_refreshes_and_removes_unmodified_owned_payloads() {
             name: Some("Current Old".to_string()),
             context_length: Some(200_000),
             canonical_slug: None,
-            supported_efforts: vec!["high".to_string()],
             pricing: Some(crate::claude_catalog::Pricing {
                 prompt: Some("0.000001".to_string()),
                 completion: Some("0.000003".to_string()),
@@ -2535,7 +2561,6 @@ fn claude_seed_refreshes_and_removes_unmodified_owned_payloads() {
             name: Some("Removed".to_string()),
             context_length: Some(200_000),
             canonical_slug: None,
-            supported_efforts: vec![],
             pricing: Some(crate::claude_catalog::Pricing {
                 prompt: Some("0.000001".to_string()),
                 completion: Some("0.000003".to_string()),
@@ -2552,7 +2577,6 @@ fn claude_seed_refreshes_and_removes_unmodified_owned_payloads() {
         name: Some("Current New".to_string()),
         context_length: Some(300_000),
         canonical_slug: None,
-        supported_efforts: vec!["max".to_string()],
         pricing: Some(crate::claude_catalog::Pricing {
             prompt: Some("0.000002".to_string()),
             completion: Some("0.000004".to_string()),
@@ -2575,9 +2599,9 @@ fn claude_seed_refreshes_and_removes_unmodified_owned_payloads() {
 
     let access = document["modelAccessCache"].as_array().unwrap();
     assert!(
-        access.iter().any(|entry| {
-            entry["apiName"] == "claude-current" && entry["maxEffortLevel"] == "max"
-        })
+        access
+            .iter()
+            .any(|entry| { entry["apiName"] == "claude-current" && entry["entitled"] == true })
     );
     assert!(!access.iter().any(|entry| entry["apiName"] == "claude-removed"));
     assert_eq!(document["additionalModelCostsCache"]["claude-current"]["inputTokens"], 2.0);
@@ -2600,7 +2624,6 @@ fn claude_seed_reclaims_modified_owned_payloads_and_preserves_unowned() {
         name: Some("RX".to_string()),
         context_length: Some(200_000),
         canonical_slug: None,
-        supported_efforts: vec!["high".to_string()],
         pricing: Some(crate::claude_catalog::Pricing {
             prompt: Some("0.000001".to_string()),
             completion: Some("0.000003".to_string()),
@@ -2662,7 +2685,6 @@ fn claude_seed_recreates_deleted_owned_payloads() {
         name: Some("Deleted".to_string()),
         context_length: Some(200_000),
         canonical_slug: None,
-        supported_efforts: vec!["high".to_string()],
         pricing: Some(crate::claude_catalog::Pricing {
             prompt: Some("0.000001".to_string()),
             completion: Some("0.000003".to_string()),
@@ -2735,7 +2757,6 @@ fn claude_seed_does_not_claim_unmarked_matching_identity() {
         name: Some("RX".to_string()),
         context_length: Some(200_000),
         canonical_slug: None,
-        supported_efforts: vec![],
         pricing: None,
     }]);
     crate::claude_catalog::write_seed(&config_path, &seed).unwrap();
@@ -2773,7 +2794,6 @@ fn concurrent_claude_seed_writes_leave_one_complete_catalog() {
             name: Some(id.to_string()),
             context_length: Some(200_000),
             canonical_slug: None,
-            supported_efforts: vec![],
             pricing: None,
         }]);
         writers.push(thread::spawn(move || {
@@ -2819,7 +2839,6 @@ fn claude_seed_remerges_external_config_changes() {
         name: Some("Race RX".to_string()),
         context_length: Some(200_000),
         canonical_slug: None,
-        supported_efforts: vec![],
         pricing: None,
     }]);
     let external_path = config_path.clone();
