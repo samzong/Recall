@@ -26,6 +26,7 @@ pub(super) fn resume_command(source_id: &str) -> Option<ResumeCommand> {
 pub(super) fn scan_uncovered(
     covered: &HashSet<String>,
     usage_parser_version: u32,
+    include_events: bool,
 ) -> anyhow::Result<Vec<RawSession>> {
     let Some(chats_dir) = resolve_chats_dir()? else {
         return Ok(vec![]);
@@ -35,7 +36,7 @@ pub(super) fn scan_uncovered(
         let Some(mtime_ms) = scan_timestamp_ms(&entry.stat_target) else {
             continue;
         };
-        match parse_store_entry(&entry, mtime_ms, usage_parser_version) {
+        match parse_store_entry(&entry, mtime_ms, usage_parser_version, include_events) {
             Ok(Some(raw)) => sessions.push(raw),
             Ok(None) => {}
             Err(err) => {
@@ -51,6 +52,7 @@ pub(super) fn scan_for_sync(
     since_ts: Option<i64>,
     covered: &HashSet<String>,
     usage_parser_version: u32,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let Some(chats_dir) = resolve_chats_dir()? else {
         return Ok(SyncScanResult {
@@ -60,28 +62,38 @@ pub(super) fn scan_for_sync(
         });
     };
     let entries = collect_store_entries(&chats_dir, covered);
-    file_scan::run_file_scan_with_options_and_mtime(
+    file_scan::run_file_scan_with_options_and_snapshot(
         context,
         since_ts,
         FileScanOptions {
             usage_parser_version: Some(usage_parser_version),
+            event_parser_version: include_events.then_some(super::EVENT_PARSER_VERSION),
             metadata_parser_version: Some(METADATA_PARSER_VERSION),
-            ..Default::default()
         },
         entries,
-        |entry| scan_timestamp_ms(&entry.stat_target),
-        |entry, mtime_ms| parse_store_entry(&entry, mtime_ms, usage_parser_version),
+        |entry| scan_snapshot(&entry.stat_target),
+        |entry, mtime_ms| parse_store_entry(&entry, mtime_ms, usage_parser_version, include_events),
     )
 }
 
 fn scan_timestamp_ms(store_db: &Path) -> Option<i64> {
-    let mtime = file_scan::stat_mtime_ms(store_db);
-    let sidecar_updated =
-        read_sidecar_meta(store_db).and_then(|value| json_i64(value.get("updatedAtMs")));
-    match (mtime, sidecar_updated) {
-        (Some(mtime), Some(sidecar)) => Some(mtime.max(sidecar)),
-        (mtime, sidecar) => mtime.or(sidecar),
-    }
+    scan_snapshot(store_db).map(|snapshot| snapshot.effective_mtime_ms())
+}
+
+fn scan_snapshot(
+    store_db: &Path,
+) -> Option<file_scan::FileScanSnapshot<[Option<file_scan::FileMetadataSnapshot>; 3]>> {
+    let mut wal = store_db.as_os_str().to_os_string();
+    wal.push("-wal");
+    let files = [
+        file_scan::file_metadata_snapshot(store_db),
+        file_scan::file_metadata_snapshot(Path::new(&wal)),
+        file_scan::file_metadata_snapshot(&store_db.parent()?.join("meta.json")),
+    ];
+    files[0].as_ref()?;
+    let mtime = files.iter().flatten().filter_map(|file| file.mtime_ms()).max()?;
+    let updated = read_sidecar_meta(store_db).and_then(|value| json_i64(value.get("updatedAtMs")));
+    Some(file_scan::FileScanSnapshot::new(updated.map_or(mtime, |value| value.max(mtime)), files))
 }
 
 fn resolve_chats_dir() -> anyhow::Result<Option<PathBuf>> {
@@ -137,7 +149,7 @@ fn collect_store_entries(chats_dir: &Path, covered: &HashSet<String>) -> Vec<Fil
     entries
 }
 
-fn find_store_db(source_id: &str) -> Option<PathBuf> {
+pub(super) fn find_store_db(source_id: &str) -> Option<PathBuf> {
     if uuid::Uuid::try_parse(source_id).is_err() {
         return None;
     }
@@ -156,8 +168,15 @@ fn parse_store_entry(
     entry: &FileScanEntry,
     mtime_ms: i64,
     usage_parser_version: u32,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    parse_store_db(&entry.stat_target, &entry.session_id, mtime_ms, usage_parser_version)
+    parse_store_db(
+        &entry.stat_target,
+        &entry.session_id,
+        mtime_ms,
+        usage_parser_version,
+        include_events,
+    )
 }
 
 fn parse_store_db(
@@ -165,6 +184,7 @@ fn parse_store_db(
     session_id: &str,
     mtime_ms: i64,
     usage_parser_version: u32,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let conn = match Connection::open_with_flags(
         path,
@@ -177,6 +197,7 @@ fn parse_store_db(
         }
     };
 
+    let conn = conn.unchecked_transaction()?;
     let Some(store_meta) = read_store_meta(&conn) else {
         return Ok(None);
     };
@@ -192,15 +213,32 @@ fn parse_store_db(
 
     let root_fields = decode_protobuf_fields(&root);
     let mut messages = Vec::new();
+    let mut events = Vec::new();
+    let mut prior_message_seq = None;
+    let source_path = path.display().to_string();
     for blob_id in message_blob_ids(&root_fields) {
         let Some(blob) = read_blob(&conn, &blob_id) else {
             continue;
         };
-        if let Some(message) = parse_message_blob(&blob) {
+        let Ok(value) = serde_json::from_slice::<Value>(&blob) else { continue };
+        let message = parse_message_blob(&value);
+        let current_message_seq = message.as_ref().map(|_| messages.len() as u32);
+        if include_events && let Some(items) = value.get("content").and_then(Value::as_array) {
+            super::collect_transcript_content_events(
+                items,
+                &source_path,
+                &blob_id,
+                prior_message_seq,
+                current_message_seq,
+                &mut events,
+            );
+        }
+        if let Some(message) = message {
             messages.push(message);
+            prior_message_seq = current_message_seq;
         }
     }
-    if messages.is_empty() {
+    if messages.is_empty() && events.is_empty() {
         return Ok(None);
     }
 
@@ -221,6 +259,9 @@ fn parse_store_db(
         messages,
     )
     .with_usage(Vec::new(), usage_parser_version);
+    if include_events {
+        session = session.with_events(events, super::EVENT_PARSER_VERSION);
+    }
     session.source_file_path = path.to_str().map(str::to_string);
     session.custom_title = sidecar
         .as_ref()
@@ -286,11 +327,7 @@ fn read_blob(conn: &Connection, id: &str) -> Option<Vec<u8>> {
     conn.query_row("SELECT data FROM blobs WHERE id = ?1", [id], |row| row.get(0)).ok()
 }
 
-fn parse_message_blob(data: &[u8]) -> Option<RawMessage> {
-    if data.first().is_none_or(|byte| *byte != b'{' && *byte != b'[') {
-        return None;
-    }
-    let value: Value = serde_json::from_slice(data).ok()?;
+fn parse_message_blob(value: &Value) -> Option<RawMessage> {
     let role = match value.get("role").and_then(Value::as_str) {
         Some("user") => Role::User,
         Some("assistant") => Role::Assistant,
@@ -634,7 +671,7 @@ mod tests {
             r#"{"role":"assistant","content":[{"type":"redacted-reasoning","data":"x"},{"type":"text","text":"hi"},{"type":"tool-call","toolCallId":"t1"}]}"#,
             "/tmp/cursor-cli-project",
         );
-        let raw = parse_store_db(&store_db, &session_id, 9, 2).unwrap().unwrap();
+        let raw = parse_store_db(&store_db, &session_id, 9, 2, true).unwrap().unwrap();
         assert_eq!(raw.source_id, session_id);
         assert_eq!(raw.messages.len(), 2);
         assert_eq!(raw.messages[0].content, "hello store");
@@ -666,7 +703,7 @@ mod tests {
             "/tmp/cursor-cli-sub",
             Some(&parent_id),
         );
-        let raw = parse_store_db(&store_db, &session_id, 9, 2).unwrap().unwrap();
+        let raw = parse_store_db(&store_db, &session_id, 9, 2, true).unwrap().unwrap();
         assert_eq!(raw.messages[0].content, "real task");
         assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));
         assert_eq!(raw.parent_links.len(), 1);
@@ -674,6 +711,37 @@ mod tests {
         assert_eq!(raw.parent_links[0].source, "cursor");
         assert!(raw.custom_title.is_none());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_store_preserves_only_root_referenced_calls_and_results() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let path = root.path().join("store.db");
+        let result = format!("Error: {}", "native output ".repeat(500));
+        write_store(
+            &path,
+            &session_id,
+            r#"{"role":"assistant","content":[{"type":"tool-call","toolCallId":"edit","toolName":"StrReplace","args":{"path":"src/file.rs","old_string":"old","new_string":"new"}}]}"#,
+            &serde_json::json!({"role":"tool","content":[{"type":"tool-result","toolCallId":"edit","toolName":"StrReplace","result":result}]}).to_string(),
+            "/repo",
+        );
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("INSERT INTO blobs (id, data) VALUES (?1, ?2)", rusqlite::params!["orphan", br#"{"role":"assistant","content":[{"type":"tool-call","toolCallId":"unreferenced","toolName":"Delete","args":{"path":"src/file.rs"}}]}"#.as_slice()]).unwrap();
+        let session = parse_store_db(&path, &session_id, 9, 2, true).unwrap().unwrap();
+        assert!(session.messages.is_empty());
+        assert_eq!(session.events.len(), 2);
+        assert_eq!(session.events[0].files[0].path, "src/file.rs");
+        assert!(session.events.iter().all(|event| event.tool_call_id.as_deref() == Some("edit")));
+        assert!(
+            session.events[1].source_event_id.as_deref().unwrap().starts_with(&to_hex(&[0x22; 32]))
+        );
+        assert_eq!(session.events[1].status, None);
+        assert!(session.events[1].summary.as_ref().unwrap().len() < result.len());
+        let native: Value =
+            serde_json::from_str(session.events[1].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(native["result"], result);
+        assert!(parse_store_db(&path, &session_id, 9, 2, false).unwrap().is_none());
     }
 
     #[test]
@@ -689,7 +757,7 @@ mod tests {
             "/tmp/ts",
         );
         let mtime = file_scan::stat_mtime_ms(&store_db).unwrap();
-        assert_eq!(scan_timestamp_ms(&store_db), Some(mtime.max(1_700_000_100_000)));
+        assert!(scan_timestamp_ms(&store_db).unwrap() >= mtime.max(1_700_000_100_000));
         let future = mtime + 86_400_000;
         fs::write(
             store_db.parent().unwrap().join("meta.json"),
@@ -697,6 +765,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scan_timestamp_ms(&store_db), Some(future));
+        fs::write(store_db.parent().unwrap().join("meta.json"), "{}").unwrap();
+        let conn = Connection::open(&store_db).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+        for path in [&store_db, &store_db.parent().unwrap().join("meta.json")] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH)
+                .unwrap();
+        }
+        let before = scan_snapshot(&store_db).unwrap();
+        let main_before = file_scan::file_metadata_snapshot(&store_db);
+        conn.execute("INSERT INTO blobs (id, data) VALUES ('wal-only', X'01')", []).unwrap();
+        let after = scan_snapshot(&store_db).unwrap();
+        assert_eq!(file_scan::file_metadata_snapshot(&store_db), main_before);
+        assert_ne!(before, after);
+        assert!(after.effective_mtime_ms() > before.effective_mtime_ms());
+        drop(conn);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -723,7 +810,7 @@ mod tests {
             [to_hex(meta.to_string().as_bytes())],
         )
         .unwrap();
-        assert!(parse_store_db(&store_db, &session_id, 1, 2).unwrap().is_none());
+        assert!(parse_store_db(&store_db, &session_id, 1, 2, true).unwrap().is_none());
         let _ = fs::remove_dir_all(root);
     }
 

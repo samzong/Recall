@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::types::RawSessionEvent;
+use crate::types::{FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent};
 
 const TOOL_RESULT_SUMMARY_MAX_BYTES: usize = 4096;
 
@@ -130,6 +130,56 @@ pub(crate) fn file_write_event(
         attrs_json: None,
         parser_version: context.parser_version,
     }
+}
+
+pub(crate) fn patch_file_evidence(text: &str) -> Vec<FileEvidence> {
+    let text = text.trim();
+    if text.lines().next() != Some("*** Begin Patch")
+        || text.lines().last() != Some("*** End Patch")
+    {
+        return Vec::new();
+    }
+    let mut files: Vec<FileEvidence> = Vec::new();
+    let mut update = None;
+    for line in text.lines() {
+        let parsed = if let Some(path) = line.strip_prefix("*** Update File: ") {
+            update = Some(files.len());
+            Some((path, FileOperation::Write))
+        } else if let Some(path) = line.strip_prefix("*** Add File: ") {
+            update = None;
+            Some((path, FileOperation::Write))
+        } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            update = None;
+            Some((path, FileOperation::Delete))
+        } else if let Some(path) =
+            line.strip_prefix("*** Move to: ").filter(|path| !path.trim().is_empty())
+        {
+            if let Some(index) = update.take() {
+                if let Some(file) = files.get_mut(index) {
+                    file.operation = FileOperation::MoveFrom;
+                    Some((path, FileOperation::MoveTo))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((path, operation)) = parsed
+            && !path.trim().is_empty()
+        {
+            files.push(FileEvidence {
+                path: path.into(),
+                operation,
+                kind: FileEvidenceKind::Call,
+                cwd: None,
+                target: None,
+            });
+        }
+    }
+    files
 }
 
 const PATCH_FILE_PREFIXES: [&str; 4] =
@@ -262,6 +312,16 @@ mod tests {
             message_seq: None,
             parser_version: 1,
         }
+    }
+
+    #[test]
+    fn patch_headers_preserve_context_and_incomplete_moves() {
+        let files = super::patch_file_evidence(
+            "*** Begin Patch\r\n*** Update File: src/main.rs\r\n*** Move to:   \r\n@@\r\n *** Update File: example.rs\r\n*** End Patch",
+        );
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/main.rs");
+        assert_eq!(files[0].operation, crate::types::FileOperation::Write);
     }
 
     #[test]

@@ -20,14 +20,16 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
 };
-use crate::types::{RawSessionEvent, RawUsageEvent, Role};
+use crate::types::{
+    FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, RawUsageEvent, Role,
+};
 
 pub(crate) struct CursorAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 2;
-const EVENT_PARSER_VERSION: u32 = 3;
+const EVENT_PARSER_VERSION: u32 = 4;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct ComposerMeta {
     name: Option<String>,
     unified_mode: Option<String>,
@@ -85,8 +87,16 @@ impl SourceAdapter for CursorAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let transcript_paths = collect_agent_transcript_paths();
+        let mut transcript_meta = transcript_metadata();
         let mut result = if let Some(conn) = open_global_db()? {
-            scan_for_sync_conn(&conn, context, since_ts, include_events, &transcript_paths)?
+            scan_for_sync_conn(
+                &conn,
+                context,
+                since_ts,
+                include_events,
+                &transcript_paths,
+                &mut transcript_meta,
+            )?
         } else {
             SyncScanResult {
                 sessions: vec![],
@@ -94,10 +104,35 @@ impl SourceAdapter for CursorAdapter {
                 observations: Vec::new(),
             }
         };
-        let covered = ids_covered_by_ide(context, &result.sessions);
-        let store_result =
-            cli_store::scan_for_sync(context, since_ts, &covered, USAGE_PARSER_VERSION)?;
-        merge_scan_results(&mut result, store_result);
+        let mut covered = result
+            .sessions
+            .iter()
+            .map(|session| session.source_id.clone())
+            .chain(result.observations.iter().map(|item| item.source_id.clone()))
+            .collect::<HashSet<_>>();
+        let store_result = cli_store::scan_for_sync(
+            context,
+            since_ts,
+            &covered,
+            USAGE_PARSER_VERSION,
+            include_events,
+        )?;
+        covered.extend(store_result.sessions.iter().map(|session| session.source_id.clone()));
+        covered.extend(store_result.observations.iter().map(|item| item.source_id.clone()));
+        covered.extend(context.session_paths().filter_map(|item| {
+            let path = Path::new(item.source_file_path.as_deref()?);
+            (path.file_name()?.to_str()? == "store.db" && path.is_file())
+                .then(|| item.source_id.clone())
+        }));
+        result.absorb(store_result);
+        result.absorb(scan_transcripts_for_sync(
+            context,
+            since_ts,
+            include_events,
+            &transcript_paths,
+            &covered,
+            &transcript_meta,
+        )?);
         Ok(Some(result))
     }
 }
@@ -108,6 +143,7 @@ fn scan_for_sync_conn(
     since_ts: Option<i64>,
     include_events: bool,
     transcript_paths: &HashMap<String, AgentTranscriptPath>,
+    transcript_meta: &mut HashMap<String, ComposerMeta>,
 ) -> anyhow::Result<SyncScanResult> {
     debug_assert_eq!(context.source(), "cursor");
     let existing = context.session_meta();
@@ -122,9 +158,11 @@ fn scan_for_sync_conn(
     let composer_ids = discover_composer_ids(conn)?;
     let mut sessions = Vec::new();
     let mut stats = SyncScanStats::default();
+    let mut observations = Vec::new();
 
     for composer_id in composer_ids {
         let meta = load_composer_meta(conn, &composer_id, &lookup);
+        transcript_meta.insert(composer_id.clone(), meta.clone());
         let source_path_changed = existing.contains_key(&composer_id)
             && transcript_paths
                 .get(&composer_id)
@@ -144,6 +182,11 @@ fn scan_for_sync_conn(
 
         let source_updated_at = updated_at.or(global_mtime);
         if let Some(old) = existing.get(&composer_id)
+            && cli_store::find_store_db(&composer_id).is_none()
+            && !existing_paths
+                .get(&composer_id)
+                .and_then(|path| path.as_deref())
+                .is_some_and(|path| path.ends_with("store.db"))
             && old.updated_at == source_updated_at
             && crate::adapters::sync_state::session_state_is_current(
                 USAGE_PARSER_VERSION,
@@ -156,6 +199,10 @@ fn scan_for_sync_conn(
             && !source_path_changed
         {
             stats.skipped_sessions += 1;
+            observations.push(crate::adapters::SourceObservation {
+                source_id: composer_id,
+                source_file_path: None,
+            });
             continue;
         }
 
@@ -166,68 +213,123 @@ fn scan_for_sync_conn(
         }
     }
 
-    Ok(SyncScanResult { sessions, stats, observations: Vec::new() })
+    Ok(SyncScanResult { sessions, stats, observations })
+}
+
+fn transcript_metadata() -> HashMap<String, ComposerMeta> {
+    build_agent_cwd_map(resolve_global_state_db_path().as_deref())
+        .into_iter()
+        .map(|(id, directory)| {
+            (id, ComposerMeta { directory: Some(directory), ..Default::default() })
+        })
+        .collect()
+}
+
+fn scan_transcripts_for_sync(
+    context: &AdapterSyncContext,
+    since_ts: Option<i64>,
+    include_events: bool,
+    transcripts: &HashMap<String, AgentTranscriptPath>,
+    covered: &HashSet<String>,
+    transcript_meta: &HashMap<String, ComposerMeta>,
+) -> anyhow::Result<SyncScanResult> {
+    let entries =
+        transcripts.values().filter(|entry| !covered.contains(&entry.session_id)).map(|entry| {
+            crate::adapters::file_scan::FileScanEntry {
+                session_id: entry.session_id.clone(),
+                stat_target: entry.path.clone(),
+                directory: entry.directory.clone(),
+            }
+        });
+    crate::adapters::file_scan::run_file_scan_with_options_and_snapshot(
+        context,
+        since_ts,
+        crate::adapters::file_scan::FileScanOptions {
+            usage_parser_version: Some(USAGE_PARSER_VERSION),
+            event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+            ..Default::default()
+        },
+        entries,
+        |entry| {
+            let snapshot = crate::adapters::file_scan::file_metadata_snapshot(&entry.stat_target)?;
+            Some(crate::adapters::file_scan::FileScanSnapshot::new(snapshot.mtime_ms()?, snapshot))
+        },
+        |entry, mtime_ms| {
+            load_transcript(
+                &entry.stat_target,
+                &entry.session_id,
+                entry.directory,
+                transcript_meta.get(&entry.session_id),
+                mtime_ms,
+                include_events,
+            )
+        },
+    )
+}
+
+fn load_transcript(
+    path: &Path,
+    session_id: &str,
+    directory: Option<String>,
+    meta: Option<&ComposerMeta>,
+    mtime_ms: i64,
+    include_events: bool,
+) -> anyhow::Result<Option<RawSession>> {
+    let Some(mut raw) = parse_agent_transcript(path, include_events)? else { return Ok(None) };
+    raw.source_id = session_id.into();
+    raw.directory = meta.and_then(|meta| meta.directory.clone()).or(raw.directory).or(directory);
+    raw.entrypoint = meta.and_then(|meta| meta.unified_mode.clone()).or(raw.entrypoint);
+    raw.started_at = stat_birth_ms(path).unwrap_or(mtime_ms);
+    raw.updated_at = Some(mtime_ms);
+    Ok(Some(raw))
 }
 
 fn scan_cursor_sessions(
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<Vec<RawSession>> {
-    let Some(conn) = open_global_db()? else {
-        return scan_transcript_only_sessions(since_ts, include_events);
-    };
-
     let transcript_paths = collect_agent_transcript_paths();
-    let lookup = ComposerLookup::load(&conn);
+    let mut transcript_meta = transcript_metadata();
     let mut sessions = Vec::new();
-    for composer_id in discover_composer_ids(&conn)? {
-        let meta = load_composer_meta(&conn, &composer_id, &lookup);
-        if let Some(cutoff) = since_ts {
-            let updated_at = meta.last_updated_at.or(meta.created_at).unwrap_or(0);
-            if updated_at < cutoff {
+    let mut covered = HashSet::new();
+    if let Some(conn) = open_global_db()? {
+        let lookup = ComposerLookup::load(&conn);
+        for composer_id in discover_composer_ids(&conn)? {
+            let meta = load_composer_meta(&conn, &composer_id, &lookup);
+            transcript_meta.insert(composer_id.clone(), meta.clone());
+            if since_ts.is_some_and(|cutoff| {
+                meta.last_updated_at.or(meta.created_at).is_some_and(|ts| ts < cutoff)
+            }) {
                 continue;
             }
+            if let Some(raw) =
+                build_raw_session(&conn, &composer_id, &meta, &transcript_paths, include_events)?
+            {
+                covered.insert(composer_id);
+                sessions.push(raw);
+            }
         }
-        if let Some(raw) =
-            build_raw_session(&conn, &composer_id, &meta, &transcript_paths, include_events)?
-        {
+    }
+    sessions.extend(cli_store::scan_uncovered(&covered, USAGE_PARSER_VERSION, include_events)?);
+    covered.extend(sessions.iter().map(|session| session.source_id.clone()));
+    for transcript in transcript_paths.values().filter(|entry| !covered.contains(&entry.session_id))
+    {
+        let Some(mtime_ms) = stat_mtime_ms(&transcript.path) else { continue };
+        if since_ts.is_some_and(|cutoff| mtime_ms < cutoff) {
+            continue;
+        }
+        if let Some(raw) = load_transcript(
+            &transcript.path,
+            &transcript.session_id,
+            transcript.directory.clone(),
+            transcript_meta.get(&transcript.session_id),
+            mtime_ms,
+            include_events,
+        )? {
             sessions.push(raw);
         }
     }
-    append_cli_store_sessions(sessions)
-}
-
-fn scan_transcript_only_sessions(
-    since_ts: Option<i64>,
-    include_events: bool,
-) -> anyhow::Result<Vec<RawSession>> {
-    let Some(projects_dir) = resolve_projects_dir()? else {
-        return append_cli_store_sessions(Vec::new());
-    };
-    let cwd_map = build_agent_cwd_map(resolve_global_state_db_path().as_deref());
-    let mut sessions = Vec::new();
-    for transcript in collect_agent_transcript_paths_from_dir(&projects_dir) {
-        let path = &transcript.path;
-        let Some(mtime_ms) = stat_mtime_ms(path) else {
-            continue;
-        };
-        if let Some(cutoff) = since_ts
-            && mtime_ms < cutoff
-        {
-            continue;
-        }
-        let mut raw = match parse_agent_transcript(path, include_events)? {
-            Some(raw) => raw,
-            None => continue,
-        };
-        raw.source_id = transcript.session_id;
-        raw.directory =
-            cwd_map.get(&raw.source_id).cloned().or(raw.directory).or(transcript.directory);
-        raw.started_at = stat_birth_ms(path).unwrap_or(mtime_ms);
-        raw.updated_at = Some(mtime_ms);
-        sessions.push(raw);
-    }
-    append_cli_store_sessions(sessions)
+    Ok(sessions)
 }
 
 fn build_raw_session(
@@ -237,33 +339,8 @@ fn build_raw_session(
     transcript_paths: &HashMap<String, AgentTranscriptPath>,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    let parsed = match parse_composer_session(conn, composer_id, meta, include_events)? {
-        Some(parsed)
-            if !parsed.messages.is_empty()
-                || !parsed.usage_events.is_empty()
-                || !parsed.events.is_empty() =>
-        {
-            parsed
-        }
-        _ => {
-            let Some(transcript) = transcript_paths.get(composer_id) else {
-                return Ok(None);
-            };
-            let path = &transcript.path;
-            let mtime_ms = stat_mtime_ms(path).unwrap_or(0);
-            let raw = parse_agent_transcript(path, include_events)?
-                .filter(|raw| !raw.messages.is_empty() || !raw.events.is_empty());
-            let Some(mut raw) = raw else {
-                return Ok(None);
-            };
-            raw.source_id = composer_id.to_string();
-            raw.directory =
-                meta.directory.clone().or(raw.directory).or_else(|| transcript.directory.clone());
-            raw.started_at = stat_birth_ms(path).unwrap_or(mtime_ms);
-            raw.updated_at = Some(mtime_ms);
-            raw.entrypoint = meta.unified_mode.clone().or(raw.entrypoint);
-            return Ok(Some(raw));
-        }
+    let Some(parsed) = parse_composer_session(conn, composer_id, meta, include_events)? else {
+        return Ok(None);
     };
 
     let mut session = RawSession::search_only(
@@ -616,6 +693,75 @@ fn render_bubble_content(bubble: &Value, role: &Role) -> String {
     parts.join("\n")
 }
 
+fn cursor_tool_call(
+    context: events::EventContext,
+    name: String,
+    args: Option<&Value>,
+) -> RawSessionEvent {
+    let decoded =
+        args.and_then(Value::as_str).and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let args = decoded.as_ref().or(args);
+    let mut event = if let Some(text) = args.and_then(Value::as_str) {
+        let mut event = events::tool_call_event_from_text(context, name.clone(), Some(text));
+        event.attrs_json = args.map(Value::to_string);
+        event
+    } else {
+        events::tool_call_event(context, name.clone(), args)
+    };
+    if name == "ApplyPatch" {
+        event.files =
+            args.and_then(Value::as_str).map(events::patch_file_evidence).unwrap_or_default();
+        event.target = event.files.first().map(|file| file.path.clone());
+        if !event.files.is_empty() {
+            event.kind = "file_write".into();
+        }
+        event.summary = event.summary.map(events::bounded_summary);
+        return event;
+    }
+    let operation = match name.as_str() {
+        "StrReplace" | "Write" | "edit_file" | "edit_file_v2" | "write_file" => {
+            FileOperation::Write
+        }
+        "Read" | "ReadFile" | "read_file" | "read_file_v2" => FileOperation::Read,
+        "Delete" | "delete_file" => FileOperation::Delete,
+        _ => return event,
+    };
+    let Some(args) = args else { return event };
+    let path = ["path", "file_path", "relativeWorkspacePath", "targetFile"]
+        .iter()
+        .find_map(|key| args.get(key).and_then(Value::as_str))
+        .filter(|path| !path.trim().is_empty());
+    if let Some(path) = path {
+        event.kind =
+            if operation == FileOperation::Read { "file_read" } else { "file_write" }.into();
+        event.target = Some(path.into());
+        event.files.push(FileEvidence {
+            path: path.into(),
+            operation,
+            kind: FileEvidenceKind::Call,
+            cwd: ["cwd", "workingDirectory", "working_directory", "workdir"]
+                .iter()
+                .find_map(|key| args.get(key).and_then(Value::as_str))
+                .map(str::to_string),
+            target: None,
+        });
+    }
+    event
+}
+
+fn cursor_tool_result(
+    context: events::EventContext,
+    name: Option<String>,
+    result: Option<&Value>,
+) -> RawSessionEvent {
+    let decoded =
+        result.and_then(Value::as_str).and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let result = decoded.as_ref().or(result);
+    let mut event = events::tool_result_event(context, name, result.and_then(render_json_fragment));
+    event.attrs_json = result.map(Value::to_string);
+    event
+}
+
 fn collect_bubble_tool_events(
     bubble: &Value,
     bubble_id: Option<&str>,
@@ -624,95 +770,31 @@ fn collect_bubble_tool_events(
     message_seq: u32,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
-    let Some(tool_data) = bubble.get("toolFormerData") else {
-        return;
+    let Some(tool_data) = bubble.get("toolFormerData") else { return };
+    let name = tool_data.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
+    let source_id = cursor_native_id(bubble_id);
+    let native_id = cursor_native_id(tool_data.get("toolCallId").and_then(Value::as_str))
+        .or_else(|| source_id.clone());
+    let context = |event_seq| events::EventContext {
+        event_seq,
+        timestamp,
+        source_path: Some(source_path.into()),
+        source_event_id: source_id.clone(),
+        message_seq: Some(message_seq),
+        parser_version: EVENT_PARSER_VERSION,
     };
-    let name = tool_data.get("name").and_then(|value| value.as_str()).unwrap_or("tool").to_string();
-    let source_event_id = cursor_native_id(bubble_id);
-    let tool_call_id = source_event_id.clone();
-
-    if let Some(params) = tool_data.get("params") {
-        let mut event = events::tool_call_event(
-            events::EventContext {
-                event_seq: events_out.len() as u32,
-                timestamp,
-                source_path: Some(source_path.to_string()),
-                source_event_id: source_event_id.clone(),
-                message_seq: Some(message_seq),
-                parser_version: EVENT_PARSER_VERSION,
-            },
-            name.clone(),
-            Some(params),
-        );
-        event.tool_call_id = tool_call_id.clone();
-        events_out.push(event);
-    } else if let Some(raw_args) = tool_data.get("rawArgs") {
-        match raw_args {
-            Value::String(text) => {
-                let mut event = events::tool_call_event_from_text(
-                    events::EventContext {
-                        event_seq: events_out.len() as u32,
-                        timestamp,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: source_event_id.clone(),
-                        message_seq: Some(message_seq),
-                        parser_version: EVENT_PARSER_VERSION,
-                    },
-                    name.clone(),
-                    Some(text.as_str()),
-                );
-                event.tool_call_id = tool_call_id.clone();
-                events_out.push(event);
-            }
-            other => {
-                let mut event = events::tool_call_event(
-                    events::EventContext {
-                        event_seq: events_out.len() as u32,
-                        timestamp,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: source_event_id.clone(),
-                        message_seq: Some(message_seq),
-                        parser_version: EVENT_PARSER_VERSION,
-                    },
-                    name.clone(),
-                    Some(other),
-                );
-                event.tool_call_id = tool_call_id.clone();
-                events_out.push(event);
-            }
-        }
-    } else {
-        let mut event = events::tool_call_event(
-            events::EventContext {
-                event_seq: events_out.len() as u32,
-                timestamp,
-                source_path: Some(source_path.to_string()),
-                source_event_id: source_event_id.clone(),
-                message_seq: Some(message_seq),
-                parser_version: EVENT_PARSER_VERSION,
-            },
-            name.clone(),
-            None,
-        );
-        event.tool_call_id = tool_call_id.clone();
-        events_out.push(event);
-    }
-
+    let mut call = cursor_tool_call(
+        context(events_out.len() as u32),
+        name.clone(),
+        tool_data.get("params").or_else(|| tool_data.get("rawArgs")),
+    );
+    call.tool_call_id = native_id.clone();
+    events_out.push(call);
     if let Some(result) = tool_data.get("result") {
-        let summary = render_json_fragment(result).filter(|text| !text.is_empty());
-        let mut event = events::tool_result_event(
-            events::EventContext {
-                event_seq: events_out.len() as u32,
-                timestamp,
-                source_path: Some(source_path.to_string()),
-                source_event_id,
-                message_seq: Some(message_seq),
-                parser_version: EVENT_PARSER_VERSION,
-            },
-            Some(name),
-            summary,
-        );
-        event.tool_call_id = tool_call_id;
+        let mut event =
+            cursor_tool_result(context(events_out.len() as u32), Some(name), Some(result));
+        event.tool_call_id = native_id;
+        event.status = tool_data.get("status").and_then(Value::as_str).map(str::to_string);
         events_out.push(event);
     }
 }
@@ -909,11 +991,11 @@ fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<O
         let content = render_transcript_content_items(items, is_user);
         let current_message_seq =
             if content.is_empty() { None } else { Some(messages.len() as u32) };
-        if include_events && matches!(role, Role::Assistant) {
+        if include_events {
             collect_transcript_content_events(
                 items,
                 &source_path,
-                line_index,
+                &line_index.to_string(),
                 last_visible_message_seq,
                 current_message_seq,
                 &mut session_events,
@@ -963,14 +1045,22 @@ pub(crate) fn parse_conformance_fixture(
 fn collect_transcript_content_events(
     items: &[Value],
     source_path: &str,
-    line_index: usize,
+    record_id: &str,
     prior_message_seq: Option<u32>,
     current_message_seq: Option<u32>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
     let mut message_seq = prior_message_seq;
     for (item_index, item) in items.iter().enumerate() {
-        match item.get("type").and_then(|t| t.as_str()) {
+        let context = events::EventContext {
+            event_seq: events_out.len() as u32,
+            timestamp: None,
+            source_path: Some(source_path.into()),
+            source_event_id: Some(format!("{record_id}:{item_index}")),
+            message_seq,
+            parser_version: EVENT_PARSER_VERSION,
+        };
+        let mut event = match item.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if item
                     .get("text")
@@ -979,26 +1069,45 @@ fn collect_transcript_content_events(
                 {
                     message_seq = current_message_seq;
                 }
+                continue;
             }
-            Some("tool_use") => {
-                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
-                let mut event = events::tool_call_event(
-                    events::EventContext {
-                        event_seq: events_out.len() as u32,
-                        timestamp: None,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: Some(format!("{line_index}:{item_index}")),
-                        message_seq,
-                        parser_version: EVENT_PARSER_VERSION,
-                    },
-                    name,
-                    item.get("input"),
+            Some("tool_use" | "tool-call") => {
+                let name = item
+                    .get("name")
+                    .or_else(|| item.get("toolName"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let mut event = cursor_tool_call(
+                    context,
+                    name.into(),
+                    item.get("input").or_else(|| item.get("args")),
                 );
-                event.tool_call_id = cursor_native_id(item.get("id").and_then(Value::as_str));
-                events_out.push(event);
+                event.tool_call_id = cursor_native_id(
+                    item.get("id").or_else(|| item.get("toolCallId")).and_then(Value::as_str),
+                );
+                event
             }
-            _ => {}
-        }
+            Some("tool_result" | "tool-result") => {
+                let mut event = cursor_tool_result(
+                    context,
+                    item.get("toolName").and_then(Value::as_str).map(str::to_string),
+                    item.get("content").or_else(|| item.get("result")),
+                );
+                event.tool_call_id = cursor_native_id(
+                    item.get("tool_use_id")
+                        .or_else(|| item.get("toolCallId"))
+                        .and_then(Value::as_str),
+                );
+                event.status = item
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .map(|failed| if failed { "error" } else { "success" }.into());
+                event
+            }
+            _ => continue,
+        };
+        event.attrs_json = Some(item.to_string());
+        events_out.push(event);
     }
 }
 
@@ -1139,34 +1248,6 @@ fn collect_cursor_project_key_matches(
             collect_cursor_project_key_matches(&next, parts, end, matches);
         }
     }
-}
-
-fn append_cli_store_sessions(mut sessions: Vec<RawSession>) -> anyhow::Result<Vec<RawSession>> {
-    let covered = sessions.iter().map(|session| session.source_id.clone()).collect();
-    sessions.extend(cli_store::scan_uncovered(&covered, USAGE_PARSER_VERSION)?);
-    Ok(sessions)
-}
-
-fn ids_covered_by_ide(context: &AdapterSyncContext, emitted: &[RawSession]) -> HashSet<String> {
-    let mut ids = emitted.iter().map(|session| session.source_id.clone()).collect::<HashSet<_>>();
-    for path in context.session_paths() {
-        let store_owned =
-            path.source_file_path.as_deref().is_some_and(|value| value.ends_with("store.db"));
-        if !store_owned {
-            ids.insert(path.source_id.clone());
-        }
-    }
-    ids
-}
-
-fn merge_scan_results(into: &mut SyncScanResult, extra: SyncScanResult) {
-    into.sessions.extend(extra.sessions);
-    into.observations.extend(extra.observations);
-    into.stats.skipped_sessions += extra.stats.skipped_sessions;
-    into.stats.filtered_sessions += extra.stats.filtered_sessions;
-    into.stats.candidates += extra.stats.candidates;
-    into.stats.rejected_before_parse += extra.stats.rejected_before_parse;
-    into.stats.parsed += extra.stats.parsed;
 }
 
 fn resolve_projects_dir() -> anyhow::Result<Option<PathBuf>> {
@@ -1461,6 +1542,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(raw.source_file_path.as_deref(), transcript_path.to_str());
+        schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let context = AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap();
+        conn.execute(
+            "DELETE FROM cursorDiskKV WHERE key = ?1",
+            [format!("composerData:{composer_id}")],
+        )
+        .unwrap();
+        write_jsonl(
+            &transcript_path,
+            &[
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Retained transcript"}]}}"#,
+            ],
+        );
+        let mut metadata = HashMap::new();
+        let scanned =
+            scan_for_sync_conn(&conn, &context, None, false, &transcript_paths, &mut metadata)
+                .unwrap();
+        assert!(scanned.sessions.is_empty());
+        let fallback = scan_transcripts_for_sync(
+            &context,
+            None,
+            false,
+            &transcript_paths,
+            &HashSet::new(),
+            &metadata,
+        )
+        .unwrap();
+        assert_eq!(fallback.sessions.len(), 1);
+        assert_eq!(fallback.sessions[0].directory.as_deref(), Some("/Users/x/project"));
+        assert_eq!(fallback.sessions[0].entrypoint.as_deref(), Some("chat"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1519,6 +1631,7 @@ mod tests {
             Some(source_updated_at + 1),
             false,
             &transcript_paths,
+            &mut HashMap::new(),
         )
         .unwrap();
 
@@ -1583,6 +1696,7 @@ mod tests {
             None,
             true,
             &HashMap::new(),
+            &mut HashMap::new(),
         )
         .unwrap();
 
@@ -1706,6 +1820,126 @@ mod tests {
             assert_eq!(events.len(), 2);
             assert!(events.iter().all(|event| event.source_event_id.is_none()));
             assert!(events.iter().all(|event| event.tool_call_id.is_none()));
+        }
+    }
+
+    #[test]
+    fn composer_file_evidence_decodes_native_arguments_and_keeps_content_ids() {
+        for (name, key, operation) in [
+            ("edit_file_v2", "relativeWorkspacePath", FileOperation::Write),
+            ("read_file_v2", "targetFile", FileOperation::Read),
+        ] {
+            let args = serde_json::json!({key: "src/file.rs"});
+            for params in [args.clone(), Value::String(args.to_string())] {
+                let bubble = serde_json::json!({"toolFormerData": {
+                    "name": name,
+                    "toolCallId": "native-call",
+                    "status": "completed",
+                    "params": params,
+                    "result": "{\"beforeContentId\":\"composer.content.before\",\"afterContentId\":\"composer.content.after\"}"
+                }});
+                let mut events = Vec::new();
+                collect_bubble_tool_events(
+                    &bubble,
+                    Some("record-id"),
+                    "composer:test",
+                    None,
+                    0,
+                    &mut events,
+                );
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0].files[0].path, "src/file.rs");
+                assert_eq!(events[0].files[0].operation, operation);
+                assert_eq!(events[0].source_event_id.as_deref(), Some("record-id"));
+                assert!(
+                    events.iter().all(|event| event.tool_call_id.as_deref() == Some("native-call"))
+                );
+                let result: Value =
+                    serde_json::from_str(events[1].attrs_json.as_deref().unwrap()).unwrap();
+                assert_eq!(result["afterContentId"], "composer.content.after");
+                assert_eq!(events[1].status.as_deref(), Some("completed"));
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_scan_includes_uncovered_transcripts_without_a_composer_database() {
+        schema::register_sqlite_vec();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let context = AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap();
+        let mut transcripts = HashMap::new();
+        for id in ["covered", "orphan"] {
+            let path = root.path().join(format!("{id}.jsonl"));
+            write_jsonl(
+                &path,
+                &[
+                    r#"{"role":"assistant","message":{"content":[{"type":"tool_use","id":"edit","name":"StrReplace","input":{"path":"src/file.rs","old_string":"old","new_string":"new"}}]}}"#,
+                    r#"{"role":"assistant","message":{"content":[{"type":"tool_use","id":"patch","name":"ApplyPatch","input":"*** Begin Patch\n*** Delete File: src/file.rs\n*** Add File: src/file.rs\n+replacement\n*** Update File: old.rs\n*** Move to: new.rs\n@@\n-old\n+new\n*** End Patch"}]}}"#,
+                    r#"{"role":"user","message":{"content":[{"type":"tool_result","tool_use_id":"patch","is_error":true,"content":"failed"}]}}"#,
+                ],
+            );
+            transcripts.insert(
+                id.into(),
+                AgentTranscriptPath {
+                    session_id: id.into(),
+                    path,
+                    directory: Some("/repo".into()),
+                },
+            );
+        }
+        let transcript_meta = HashMap::from([(
+            "orphan".into(),
+            ComposerMeta {
+                directory: Some("/metadata/repo".into()),
+                unified_mode: Some("chat".into()),
+                ..Default::default()
+            },
+        )]);
+        for covered in [HashSet::new(), HashSet::from(["covered".into()])] {
+            let result = scan_transcripts_for_sync(
+                &context,
+                None,
+                true,
+                &transcripts,
+                &covered,
+                &transcript_meta,
+            )
+            .unwrap();
+            assert_eq!(result.sessions.len(), 2 - covered.len());
+            assert!(result.sessions.iter().all(|session| !covered.contains(&session.source_id)));
+            for session in result.sessions {
+                let orphan = session.source_id == "orphan";
+                assert_eq!(
+                    session.directory.as_deref(),
+                    Some(if orphan { "/metadata/repo" } else { "/repo" })
+                );
+                assert_eq!(
+                    session.entrypoint.as_deref(),
+                    Some(if orphan { "chat" } else { "agent" })
+                );
+                assert_eq!(session.events[0].files[0].operation, FileOperation::Write);
+                assert_eq!(session.events.len(), 3);
+                assert_eq!(session.events[0].status, None);
+                assert_eq!(
+                    session.events[1]
+                        .files
+                        .iter()
+                        .map(|file| (file.path.as_str(), file.operation.clone()))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("src/file.rs", FileOperation::Delete),
+                        ("src/file.rs", FileOperation::Write),
+                        ("old.rs", FileOperation::MoveFrom),
+                        ("new.rs", FileOperation::MoveTo)
+                    ]
+                );
+                assert_eq!(session.events[1].tool_call_id.as_deref(), Some("patch"));
+                assert_eq!(session.events[1].status, None);
+                assert_eq!(session.events[2].tool_call_id.as_deref(), Some("patch"));
+                assert_eq!(session.events[2].status.as_deref(), Some("error"));
+                assert!(session.events[2].files.is_empty());
+            }
         }
     }
 

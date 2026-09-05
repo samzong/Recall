@@ -232,8 +232,14 @@ fn is_skill_tool_name(name: &str) -> bool {
 fn skill_from_attrs(attrs_json: Option<&str>) -> Option<String> {
     let attrs = attrs_json?;
     let value: Value = serde_json::from_str(attrs).ok()?;
+    let args = match value.get("type").and_then(Value::as_str) {
+        Some("tool_use") => value.get("input")?,
+        Some("tool-call") => value.get("args")?,
+        Some("tool_result" | "tool-result") => return None,
+        _ => &value,
+    };
     for key in ["skill", "name"] {
-        if let Some(skill) = value.get(key).and_then(|skill| skill.as_str()) {
+        if let Some(skill) = args.get(key).and_then(|skill| skill.as_str()) {
             return Some(skill.to_string());
         }
     }
@@ -360,7 +366,7 @@ mod tests {
 
     #[test]
     fn extract_skill_from_skill_tool_attrs() {
-        let event = SkillAuditEventRow {
+        let mut event = SkillAuditEventRow {
             session_id: "s1".to_string(),
             source: "codex".to_string(),
             timestamp: Some(1),
@@ -371,6 +377,19 @@ mod tests {
         let (id, signal) = extract_skill_from_event(&event, &installed(&["commit"])).unwrap();
         assert_eq!(id, "commit");
         assert_eq!(signal, SkillSignal::SkillTool);
+        for attrs in [
+            r#"{"type":"tool_use","name":"Skill","input":{"skill":"commit"}}"#,
+            r#"{"type":"tool-call","toolName":"Skill","args":{"skill":"commit"}}"#,
+        ] {
+            event.attrs_json = Some(attrs.into());
+            assert_eq!(
+                extract_skill_from_event(&event, &installed(&["commit"])).unwrap().0,
+                "commit"
+            );
+        }
+        event.attrs_json =
+            Some(r#"{"type":"tool-result","toolName":"Skill","result":{"name":"result"}}"#.into());
+        assert!(extract_skill_from_event(&event, &installed(&["commit"])).is_none());
     }
 
     #[test]
@@ -523,8 +542,24 @@ mod tests {
             attrs_json: None,
             parser_version: 1,
         };
+        let result = RawSessionEvent {
+            event_seq: 1,
+            kind: "tool_result".into(),
+            actor: "tool".into(),
+            name: Some("Skill".into()),
+            target: None,
+            attrs_json: Some(r#"{"skill":"commit"}"#.into()),
+            ..event.clone()
+        };
         store
-            .persist_session_with_usage_and_events(&session, &[], &[], None, &[event], Some(1))
+            .persist_session_with_usage_and_events(
+                &session,
+                &[],
+                &[],
+                None,
+                &[event, result],
+                Some(1),
+            )
             .unwrap();
 
         let events = store.list_skill_audit_events(None, TimeRange::All).unwrap();
