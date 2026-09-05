@@ -1092,10 +1092,120 @@ fn codex_openrouter_overrides_model_and_uses_command_auth() {
     assert!(arg_str(&plan.args[3]).contains("base_url=\"https://openrouter.ai/api/v1\""));
     assert!(arg_str(&plan.args[3]).contains("wire_api=\"responses\""));
     assert!(arg_str(&plan.args[3]).contains("supports_websockets=false"));
-    assert!(arg_str(&plan.args[3]).contains("auth={command=\"sh\""));
     assert!(!arg_str(&plan.args[3]).contains("env_key="));
     assert_eq!(plan.args[5], "model=\"~openai/gpt-latest\"");
     assert_eq!(plan.env_set, vec![("OPENROUTER_API_KEY".to_string(), "sk-or-test".to_string())]);
+}
+
+#[test]
+fn codex_injected_values_round_trip_through_toml() {
+    let (_dir, paths) = temp_paths();
+    let mut provider = crate::provider::find("tokener").unwrap().clone();
+    provider.name = "Gateway \"Beta\"\nC:\\gateway".to_string();
+    provider.endpoint = "http://127.0.0.1:1/\"quoted\\path".to_string();
+    provider.env = "KEY\"'$(exit 9)\\VALUE".to_string();
+    let model = "vendor/\"model\\name\nnext";
+    let target = launch::ProviderTarget {
+        provider: provider.clone(),
+        key: "synthetic-value".to_string(),
+        model: Some(model.to_string()),
+    };
+    let plan = launch::plan_target(
+        &LaunchRequest { harness: Harness::Codex, provider: None, passthrough: Vec::new() },
+        &paths,
+        &EnvLookup::isolated(HashMap::from([("RX_NO_YOLO".to_string(), "1".to_string())])),
+        &target,
+    )
+    .unwrap();
+    let config: toml::Value = arg_str(&plan.args[3]).parse().unwrap();
+    let injected = &config["model_providers"]["tokener"];
+    assert_eq!(injected["name"].as_str(), Some(provider.name.as_str()));
+    assert_eq!(
+        injected["base_url"].as_str(),
+        Some(crate::catalog::openai_base(&provider.endpoint).as_str())
+    );
+    let selection: toml::Value = arg_str(&plan.args[5]).parse().unwrap();
+    assert_eq!(selection["model"].as_str(), Some(model));
+    #[cfg(unix)]
+    {
+        let auth = &injected["auth"];
+        let output = std::process::Command::new(auth["command"].as_str().unwrap())
+            .args(auth["args"].as_array().unwrap().iter().map(|arg| arg.as_str().unwrap()))
+            .env_clear()
+            .env(&provider.env, &target.key)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim_end(), target.key);
+    }
+}
+
+#[test]
+fn codex_catalog_override_preserves_the_generated_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = if cfg!(unix) { "quoted\"\\state" } else { "catalog state" };
+    let paths = Paths::in_dir(dir.path().join(state_dir));
+    let (endpoint, server) = serve_openai_models(r#"{"data":[{"id":"test-model"}]}"#);
+    let mut provider = crate::provider::find("tokener").unwrap().clone();
+    provider.endpoint = endpoint;
+    let plan = launch::plan_target(
+        &LaunchRequest { harness: Harness::Codex, provider: None, passthrough: Vec::new() },
+        &paths,
+        &EnvLookup::real_with(HashMap::from([("RX_NO_YOLO".to_string(), "1".to_string())])),
+        &launch::ProviderTarget { provider, key: "synthetic-key".to_string(), model: None },
+    )
+    .unwrap();
+    server.join().unwrap();
+    let override_arg =
+        plan.args.iter().find(|arg| arg_str(arg).starts_with("model_catalog_json=")).unwrap();
+    let config: toml::Value = arg_str(override_arg).parse().unwrap();
+    let catalog = PathBuf::from(config["model_catalog_json"].as_str().unwrap());
+    assert_eq!(catalog, paths.dir.join("catalogs/tokener.json"));
+    assert!(catalog.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_scopes_inherited_controls_and_explicit_credentials() {
+    const CONTROLS: [&str; 4] = ["RX_HOST_REQUEST", "RX_NO_INSTALL", "RX_NO_UPDATE", "RX_NO_YOLO"];
+    if let Ok(credential) = std::env::var("RX_TEST_EXEC_CREDENTIAL") {
+        let plan = launch::LaunchPlan {
+            program: PathBuf::from("/usr/bin/env"),
+            args: Vec::new(),
+            env_set: if credential.is_empty() {
+                Vec::new()
+            } else {
+                vec![(credential, "selected-credential".to_string())]
+            },
+            stderr_note: None,
+        };
+        launch::exec(&plan).unwrap();
+        unreachable!();
+    }
+    for credential in std::iter::once("").chain(CONTROLS) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "tests::exec_scopes_inherited_controls_and_explicit_credentials",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("RX_TEST_EXEC_CREDENTIAL", credential)
+            .env("NATIVE_SENTINEL", "preserved");
+        for control in CONTROLS {
+            child.env(control, "parent-control");
+        }
+        let output = child.output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.lines().any(|line| line == "NATIVE_SENTINEL=preserved"));
+        for control in CONTROLS {
+            let entry = stdout.lines().find(|line| line.starts_with(&format!("{control}=")));
+            let expected = format!("{control}=selected-credential");
+            assert_eq!(entry, (control == credential).then_some(expected.as_str()));
+        }
+    }
 }
 
 #[test]

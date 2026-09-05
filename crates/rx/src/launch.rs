@@ -481,7 +481,7 @@ fn inject(
             let openai_base = openai_base(base_url);
             let mut args = vec![
                 OsString::from("-c"),
-                OsString::from(format!("model_provider=\"{provider_id}\"")),
+                OsString::from(format!("model_provider={}", toml_edit::Value::from(provider_id))),
                 OsString::from("-c"),
                 OsString::from(codex_provider_override(provider_id, provider, &openai_base)),
             ];
@@ -490,8 +490,10 @@ fn inject(
                     Ok(Some(path)) => {
                         args.push(OsString::from("-c"));
                         args.push(OsString::from(format!(
-                            "model_catalog_json=\"{}\"",
-                            path.display()
+                            "model_catalog_json={}",
+                            toml_edit::Value::from(path.to_str().ok_or_else(|| {
+                                anyhow::anyhow!("Codex model catalog path must be UTF-8")
+                            })?)
                         )));
                     }
                     Ok(None) => {}
@@ -502,7 +504,7 @@ fn inject(
             }
             if let Some(model) = model.filter(|_| !user_sets_model(&request.passthrough)) {
                 args.push(OsString::from("-c"));
-                args.push(OsString::from(format!("model=\"{model}\"")));
+                args.push(OsString::from(format!("model={}", toml_edit::Value::from(model))));
             }
             args.extend(request.passthrough.iter().cloned());
             Ok(LaunchPlan {
@@ -575,26 +577,28 @@ fn inject(
 }
 
 fn codex_provider_override(provider_id: &str, provider: &Provider, openai_base: &str) -> String {
-    format!(
-        "model_providers.{}={{name=\"{}\", base_url=\"{}\", wire_api=\"responses\", supports_websockets=false, {}}}",
-        provider_id,
-        provider.name,
-        openai_base,
-        auth_override(&provider.env)
-    )
-}
-
-fn auth_override(env_key: &str) -> String {
     #[cfg(unix)]
-    {
-        format!("auth={{command=\"sh\", args=[\"-c\", \"printf %s \\\"${env_key}\\\"\"]}}")
-    }
+    let auth = format!(
+        "auth={{command=\"printenv\", args=[\"--\", {}]}}",
+        toml_edit::Value::from(provider.env.as_str())
+    );
     #[cfg(not(unix))]
-    {
+    let auth = {
+        let script = format!(
+            "[Environment]::GetEnvironmentVariable('{}')",
+            provider.env.replace('\'', "''")
+        );
         format!(
-            "auth={{command=\"powershell\", args=[\"-NoProfile\", \"-Command\", \"Write-Output $env:{env_key}\"]}}"
+            "auth={{command=\"powershell\", args=[\"-NoProfile\", \"-Command\", {}]}}",
+            toml_edit::Value::from(script)
         )
-    }
+    };
+    format!(
+        "model_providers.{}={{name={}, base_url={}, wire_api=\"responses\", supports_websockets=false, {auth}}}",
+        provider_id,
+        toml_edit::Value::from(provider.name.as_str()),
+        toml_edit::Value::from(openai_base),
+    )
 }
 
 fn user_sets_opencode_model(passthrough: &[OsString]) -> bool {
@@ -643,6 +647,9 @@ fn user_sets_model(passthrough: &[OsString]) -> bool {
 pub(crate) fn exec(plan: &LaunchPlan) -> Result<()> {
     let mut cmd = Command::new(&plan.program);
     cmd.args(&plan.args);
+    for key in ["RX_HOST_REQUEST", "RX_NO_INSTALL", "RX_NO_UPDATE", "RX_NO_YOLO"] {
+        cmd.env_remove(key);
+    }
     for (key, value) in &plan.env_set {
         cmd.env(key, value);
     }
