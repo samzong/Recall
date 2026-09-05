@@ -8,11 +8,15 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::adapters::AdapterSyncContext;
+use crate::adapters::events::{self, EventContext};
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util;
 use crate::adapters::paths;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
-use crate::types::Role;
+use crate::types::{FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, Role};
+
+pub(super) const EVENT_PARSER_VERSION: u32 = 1;
+pub(super) const METADATA_PARSER_VERSION: u32 = 1;
 
 const CLINE_EXTENSION_ID: &str = "saoudrizwan.claude-dev";
 
@@ -38,11 +42,15 @@ impl SourceAdapter for ClineAdapter {
         &self,
         context: &AdapterSyncContext,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let mut result = scan_task_dirs_for_sync(&resolve_tasks_dirs(), context, since_ts)?;
+        let mut result =
+            scan_task_dirs_for_sync(&resolve_tasks_dirs(), context, since_ts, include_events)?;
         let covered = ids_covered_by_plugin(context, &result.sessions);
-        merge_scan_results(&mut result, cli_store::scan_for_sync(context, since_ts, &covered)?);
+        merge_scan_results(
+            &mut result,
+            cli_store::scan_for_sync(context, since_ts, &covered, include_events)?,
+        );
         Ok(Some(result))
     }
 }
@@ -50,10 +58,15 @@ impl SourceAdapter for ClineAdapter {
 pub(crate) fn scan_task_dirs(tasks_dirs: &[PathBuf]) -> anyhow::Result<Vec<RawSession>> {
     let mut sessions = Vec::new();
     for entry in collect_all_entries(tasks_dirs) {
-        let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+        let Some(snapshot) = task_snapshot(&entry) else {
             continue;
         };
-        if let Some(raw) = parse_cline_task(entry, mtime_ms)? {
+        let observed = entry.clone();
+        let raw = parse_cline_task(entry, snapshot.effective_mtime_ms())?;
+        if task_snapshot(&observed).as_ref() != Some(&snapshot) {
+            continue;
+        }
+        if let Some(raw) = raw {
             sessions.push(raw);
         }
     }
@@ -64,11 +77,21 @@ pub(crate) fn scan_task_dirs_for_sync(
     tasks_dirs: &[PathBuf],
     context: &AdapterSyncContext,
     since_ts: Option<i64>,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let entries = collect_all_entries(tasks_dirs);
-    file_scan::run_file_scan(context, since_ts, entries, |entry, mtime_ms| {
-        parse_cline_task(entry, mtime_ms)
-    })
+    file_scan::run_file_scan_with_options_and_snapshot(
+        context,
+        since_ts,
+        file_scan::FileScanOptions {
+            event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+            metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
+            ..Default::default()
+        },
+        entries,
+        task_snapshot,
+        parse_cline_task,
+    )
 }
 
 fn resolve_tasks_dirs() -> Vec<PathBuf> {
@@ -103,10 +126,15 @@ fn collect_cline_entries(tasks_dir: &Path) -> Vec<FileScanEntry> {
             Some(n) => n.to_string(),
             None => continue,
         };
-        let messages_path = path.join("ui_messages.json");
-        if !messages_path.exists() {
+        let ui_path = path.join("ui_messages.json");
+        let api_path = path.join("api_conversation_history.json");
+        let messages_path = if ui_path.is_file() {
+            ui_path
+        } else if api_path.is_file() {
+            api_path
+        } else {
             continue;
-        }
+        };
         entries.push(FileScanEntry {
             session_id: dir_name,
             stat_target: messages_path,
@@ -117,8 +145,34 @@ fn collect_cline_entries(tasks_dir: &Path) -> Vec<FileScanEntry> {
     entries
 }
 
+fn task_snapshot(
+    entry: &FileScanEntry,
+) -> Option<file_scan::FileScanSnapshot<Vec<Option<file_scan::FileMetadataSnapshot>>>> {
+    let dir = entry.stat_target.parent()?;
+    let files = [
+        "ui_messages.json",
+        "api_conversation_history.json",
+        "history_item.json",
+        "history.json",
+        "task_metadata.json",
+    ]
+    .into_iter()
+    .map(|name| file_scan::file_metadata_snapshot(&dir.join(name)))
+    .collect::<Vec<_>>();
+    let mtime =
+        files.iter().flatten().filter_map(file_scan::FileMetadataSnapshot::mtime_ms).max()?;
+    Some(file_scan::FileScanSnapshot::new(mtime, files))
+}
+
 fn parse_cline_task(entry: FileScanEntry, mtime_ms: i64) -> anyhow::Result<Option<RawSession>> {
-    let messages = match load_ui_messages(&entry.stat_target) {
+    let Some(task_dir) = entry.stat_target.parent() else {
+        return Ok(None);
+    };
+    let ui_path = task_dir.join("ui_messages.json");
+    let api_path = task_dir.join("api_conversation_history.json");
+    let ui_records =
+        if ui_path.is_file() { load_ui_records(&ui_path) } else { Ok((Vec::new(), Vec::new())) };
+    let (messages, mut events) = match ui_records {
         Ok(m) => m,
         Err(e) => {
             debug!("failed to parse Cline ui_messages {}: {e}", entry.stat_target.display());
@@ -126,7 +180,37 @@ fn parse_cline_task(entry: FileScanEntry, mtime_ms: i64) -> anyhow::Result<Optio
         }
     };
 
-    if messages.is_empty() {
+    if api_path.is_file() {
+        let parsed = fs::read_to_string(&api_path).map_err(anyhow::Error::from).and_then(|text| {
+            serde_json::from_str::<Vec<Value>>(&text).map_err(anyhow::Error::from)
+        });
+        let records = match parsed {
+            Ok(records) => records,
+            Err(error) => {
+                debug!("failed to parse Cline API history {}: {error}", api_path.display());
+                return Ok(None);
+            }
+        };
+        let cwd = read_history_workspace(&task_dir.join("history_item.json"))
+            .or_else(|| read_history_workspace(&task_dir.join("history.json")));
+        for (index, record) in records.iter().enumerate() {
+            let start = events.len();
+            cli_store::append_tool_events(record, index, &api_path, None, &mut events);
+            if events.len() == start
+                && matches!(record.get("role").and_then(Value::as_str), Some("assistant" | "user"))
+            {
+                append_legacy_api_events(record, index, &api_path, &mut events);
+            }
+            for event in &mut events[start..] {
+                for file in &mut event.files {
+                    if file.kind != FileEvidenceKind::Command {
+                        file.cwd = cwd.clone();
+                    }
+                }
+            }
+        }
+    }
+    if messages.is_empty() && events.is_empty() {
         return Ok(None);
     }
 
@@ -142,25 +226,403 @@ fn parse_cline_task(entry: FileScanEntry, mtime_ms: i64) -> anyhow::Result<Optio
         None,
         messages,
     );
+    raw = raw.with_events(events, EVENT_PARSER_VERSION);
+    raw.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    raw.refresh_session_on_metadata_backfill = true;
     raw.source_file_path = source_file_path;
     Ok(Some(raw))
 }
 
+fn append_legacy_api_events(
+    record: &Value,
+    index: usize,
+    path: &Path,
+    events: &mut Vec<RawSessionEvent>,
+) {
+    const TOOLS: &[&str] = &[
+        "ask_followup_question",
+        "attempt_completion",
+        "execute_command",
+        "replace_in_file",
+        "read_file",
+        "write_to_file",
+        "search_files",
+        "list_files",
+        "list_code_definition_names",
+        "browser_action",
+        "use_mcp_tool",
+        "access_mcp_resource",
+        "load_mcp_documentation",
+        "new_task",
+        "plan_mode_respond",
+        "act_mode_respond",
+        "focus_chain",
+        "web_fetch",
+        "web_search",
+        "condense",
+        "summarize_task",
+        "report_bug",
+        "new_rule",
+        "apply_patch",
+        "generate_explanation",
+        "use_skill",
+        "use_subagents",
+        "apply_diff",
+        "insert_content",
+        "switch_mode",
+        "fetch_instructions",
+        "codebase_search",
+        "update_todo_list",
+        "run_slash_command",
+        "generate_image",
+    ];
+    const PARAMS: &[&str] = &[
+        "command",
+        "requires_approval",
+        "path",
+        "absolutePath",
+        "content",
+        "diff",
+        "regex",
+        "file_pattern",
+        "recursive",
+        "action",
+        "url",
+        "coordinate",
+        "text",
+        "query",
+        "allowed_domains",
+        "blocked_domains",
+        "prompt",
+        "server_name",
+        "tool_name",
+        "arguments",
+        "uri",
+        "question",
+        "options",
+        "response",
+        "result",
+        "context",
+        "title",
+        "what_happened",
+        "steps_to_reproduce",
+        "api_request_output",
+        "additional_context",
+        "needs_more_exploration",
+        "task_progress",
+        "timeout",
+        "input",
+        "from_ref",
+        "to_ref",
+        "skill_name",
+        "prompt_1",
+        "prompt_2",
+        "prompt_3",
+        "prompt_4",
+        "prompt_5",
+        "line_count",
+        "mode_slug",
+        "reason",
+        "line",
+        "mode",
+        "message",
+        "cwd",
+        "follow_up",
+        "task",
+        "size",
+        "args",
+        "start_line",
+        "end_line",
+        "todos",
+        "image",
+        "files",
+    ];
+    let content = record.get("content").unwrap_or(&Value::Null);
+    let parts =
+        content.as_array().map(Vec::as_slice).unwrap_or_else(|| std::slice::from_ref(content));
+    for (part_index, part) in parts.iter().enumerate() {
+        let text = part.as_str().or_else(|| {
+            (part.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| part.get("text").and_then(Value::as_str))
+                .flatten()
+        });
+        let Some(text) = text else {
+            continue;
+        };
+        if record.get("role").and_then(Value::as_str) == Some("user") {
+            if let Some((header, _)) =
+                text.strip_prefix('[').and_then(|text| text.split_once("] Result:"))
+                && let Some(name) =
+                    header.split_whitespace().next().filter(|name| TOOLS.contains(name))
+            {
+                let mut event = events::tool_result_event(
+                    EventContext {
+                        event_seq: events.len() as u32,
+                        timestamp: json_util::json_i64(record.get("ts")),
+                        source_path: path.to_str().map(str::to_string),
+                        source_event_id: Some(format!(
+                            "{}:{index}:text:{part_index}",
+                            record.get("id").and_then(Value::as_str).unwrap_or("message")
+                        )),
+                        message_seq: None,
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    Some(name.to_string()),
+                    Some(text.to_string()),
+                );
+                event.attrs_json = Some(record.to_string());
+                events.push(event);
+            }
+            continue;
+        }
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let Some((start, name)) = TOOLS
+                .iter()
+                .filter_map(|name| {
+                    text[cursor..].find(&format!("<{name}>")).map(|offset| (cursor + offset, *name))
+                })
+                .min_by_key(|(start, _)| *start)
+            else {
+                break;
+            };
+            cursor = start + name.len() + 2;
+            let close = format!("</{name}>");
+            let mut input = serde_json::Map::new();
+            while cursor < text.len() {
+                if text[cursor..].starts_with(&close) {
+                    cursor += close.len();
+                    break;
+                }
+                if let Some(param) =
+                    PARAMS.iter().find(|param| text[cursor..].starts_with(&format!("<{param}>")))
+                {
+                    cursor += param.len() + 2;
+                    let close_param = format!("</{param}>");
+                    let Some(end) = text[cursor..].find(&close_param) else {
+                        cursor = text.len();
+                        break;
+                    };
+                    input.insert(
+                        (*param).to_string(),
+                        Value::String(text[cursor..cursor + end].trim().to_string()),
+                    );
+                    cursor += end + close_param.len();
+                } else {
+                    cursor += text[cursor..].chars().next().unwrap().len_utf8();
+                }
+            }
+            if matches!(name, "read_file" | "apply_diff")
+                && let Some(args) = input.get("args").and_then(Value::as_str)
+            {
+                let mut files = Vec::new();
+                let mut remaining = args;
+                while let Some((_, after_open)) = remaining.split_once("<file>") {
+                    let Some((file, after_close)) = after_open.split_once("</file>") else {
+                        break;
+                    };
+                    if let Some((_, after_path)) = file.split_once("<path>")
+                        && let Some((path, _)) = after_path.split_once("</path>")
+                    {
+                        let mut decoded = String::new();
+                        let mut rest = path.trim();
+                        while let Some((prefix, entity)) = rest.split_once('&') {
+                            decoded.push_str(prefix);
+                            let Some((entity, after)) = entity.split_once(';') else {
+                                decoded.push('&');
+                                decoded.push_str(entity);
+                                rest = "";
+                                break;
+                            };
+                            let character = match entity {
+                                "amp" => Some('&'),
+                                "lt" => Some('<'),
+                                "gt" => Some('>'),
+                                "quot" => Some('"'),
+                                "apos" => Some('\''),
+                                entity if entity.starts_with("#x") => {
+                                    u32::from_str_radix(&entity[2..], 16)
+                                        .ok()
+                                        .and_then(char::from_u32)
+                                }
+                                entity if entity.starts_with('#') => {
+                                    entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+                                }
+                                _ => None,
+                            };
+                            if let Some(character) = character {
+                                decoded.push(character);
+                            } else {
+                                decoded.push('&');
+                                decoded.push_str(entity);
+                                decoded.push(';');
+                            }
+                            rest = after;
+                        }
+                        decoded.push_str(rest);
+                        files.push(serde_json::json!({ "path":decoded }));
+                    }
+                    remaining = after_close;
+                }
+                input.insert("files".to_string(), Value::Array(files));
+            }
+            let message = serde_json::json!({
+                "id":record.get("id"), "ts":record.get("ts"), "role":"assistant",
+                "content":[{"type":"tool_use","name":name,"input":input}]
+            });
+            let before = events.len();
+            cli_store::append_tool_events(&message, index, path, None, events);
+            for event in &mut events[before..] {
+                event.source_event_id = Some(format!(
+                    "{}:{index}:text:{part_index}:byte:{start}",
+                    record.get("id").and_then(Value::as_str).unwrap_or("message")
+                ));
+                event.attrs_json = Some(record.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
+    load_ui_records(path).map(|(messages, _)| messages)
+}
+
+fn load_ui_records(path: &Path) -> anyhow::Result<(Vec<RawMessage>, Vec<RawSessionEvent>)> {
     let content = fs::read_to_string(path)?;
     let messages: Vec<Value> = serde_json::from_str(&content)?;
 
     let mut result = Vec::new();
     let mut user_input_seen = false;
+    let mut events = Vec::new();
+    let cwd = path.parent().and_then(|parent| {
+        read_history_workspace(&parent.join("history_item.json"))
+            .or_else(|| read_history_workspace(&parent.join("history.json")))
+    });
 
-    for msg in messages {
+    for (index, msg) in messages.into_iter().enumerate() {
+        let event_start = events.len();
+        let record_type = msg.get("type").and_then(Value::as_str).unwrap_or("");
+        let category = msg.get(record_type).and_then(Value::as_str).unwrap_or("");
+        let discussion = match record_type {
+            "say" => matches!(
+                category,
+                "task"
+                    | "text"
+                    | "user_feedback"
+                    | "reasoning"
+                    | "completion_result"
+                    | "plan_completion_result"
+                    | "task_progress"
+            ),
+            "ask" => matches!(
+                category,
+                "" | "followup" | "plan_mode_respond" | "act_mode_respond" | "completion_result"
+            ),
+            "question" => true,
+            _ => false,
+        };
+        if matches!(msg.get("type").and_then(Value::as_str), Some("ask" | "say"))
+            && (msg.get("ask").and_then(Value::as_str) == Some("tool")
+                || msg.get("say").and_then(Value::as_str) == Some("tool"))
+            && let Some(tool) = msg
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            && let Some(name) = tool.get("tool").and_then(Value::as_str)
+        {
+            let mut event = events::tool_call_event(
+                EventContext {
+                    event_seq: events.len() as u32,
+                    timestamp: json_util::json_i64(msg.get("ts")),
+                    source_path: path.to_str().map(str::to_string),
+                    source_event_id: Some(format!(
+                        "ui_messages:{index}:{}",
+                        msg.get("ts").unwrap_or(&Value::Null)
+                    )),
+                    message_seq: result.len().checked_sub(1).map(|seq| seq as u32),
+                    parser_version: EVENT_PARSER_VERSION,
+                },
+                name.to_string(),
+                Some(&tool),
+            );
+            event.kind = "approval".to_string();
+            event.target = None;
+            let operation = match name {
+                "readFile" => Some(FileOperation::Read),
+                "editedExistingFile" | "newFileCreated" | "appliedDiff" => {
+                    Some(FileOperation::Write)
+                }
+                "fileDeleted" => Some(FileOperation::Delete),
+                _ => None,
+            };
+            if let Some(operation) = operation
+                && msg.get("partial").and_then(Value::as_bool) != Some(true)
+            {
+                let files = tool
+                    .get("batchFiles")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .filter(|_| name == "readFile")
+                    .unwrap_or_else(|| std::slice::from_ref(&tool));
+                for file in files {
+                    if let Some(path) = file
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .filter(|path| !path.trim().is_empty())
+                    {
+                        event.files.push(FileEvidence {
+                            path: path.to_string(),
+                            operation: operation.clone(),
+                            kind: FileEvidenceKind::Call,
+                            cwd: cwd.clone(),
+                            target: None,
+                        });
+                    }
+                }
+                event.target = event.files.first().map(|file| file.path.clone());
+            }
+            event.attrs_json = Some(msg.to_string());
+            events.push(event);
+        }
+        if !discussion {
+            if events.len() == event_start {
+                let mut event = events::tool_call_event(
+                    EventContext {
+                        event_seq: events.len() as u32,
+                        timestamp: json_util::json_i64(msg.get("ts")),
+                        source_path: path.to_str().map(str::to_string),
+                        source_event_id: Some(format!(
+                            "ui_messages:{index}:{}",
+                            msg.get("ts").unwrap_or(&Value::Null)
+                        )),
+                        message_seq: result.len().checked_sub(1).map(|seq| seq as u32),
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    category.to_string(),
+                    msg.get("text"),
+                );
+                event.kind =
+                    if record_type == "ask" { "approval" } else { "observation" }.to_string();
+                event.target = None;
+                if category == "command"
+                    && let Some(command) = msg.get("text").and_then(Value::as_str)
+                {
+                    let (files, status) = events::shell_file_evidence(command, None);
+                    event.files = files;
+                    event.command_evidence_status = Some(status);
+                }
+                event.attrs_json = Some(msg.to_string());
+                events.push(event);
+            }
+            continue;
+        }
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match msg_type {
             "say" => {
                 let say_type = msg.get("say").and_then(|v| v.as_str()).unwrap_or("");
                 match say_type {
                     "task" => {
-                        // "task" is the user's initial task message
                         if let Some(text) = extract_text(&msg) {
                             let timestamp = msg.get("ts").and_then(|v| v.as_i64());
                             result.push(RawMessage { role: Role::User, content: text, timestamp });
@@ -169,11 +631,9 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
                     }
                     "text" => {
                         if let Some(text) = extract_text(&msg) {
-                            // Skip empty text messages
                             if text.trim().is_empty() {
                                 continue;
                             }
-                            // First non-empty text message is User input (if not already seen from "task")
                             let role = if !user_input_seen {
                                 user_input_seen = true;
                                 Role::User
@@ -190,22 +650,12 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
                             result.push(RawMessage { role: Role::User, content: text, timestamp });
                         }
                     }
-                    // api_req_started contains the full request (user input + system context),
-                    // which is not a meaningful AI reply. Skip it.
                     "api_req_started" => {}
-                    "tool" => {
-                        if let Some(content) = format_tool_message(&msg) {
-                            // Skip empty content messages
-                            if content.trim().is_empty() {
-                                continue;
-                            }
-                            let timestamp = msg.get("ts").and_then(|v| v.as_i64());
-                            result.push(RawMessage { role: Role::Assistant, content, timestamp });
-                        }
-                    }
-                    "reasoning" | "command" | "completion_result" | "task_progress" => {
+                    "reasoning"
+                    | "completion_result"
+                    | "plan_completion_result"
+                    | "task_progress" => {
                         if let Some(text) = extract_text(&msg) {
-                            // Skip empty text messages
                             if text.trim().is_empty() {
                                 continue;
                             }
@@ -221,14 +671,12 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
                 }
             }
             "ask" => {
-                // "ask" is AI's response to user (e.g., plan_mode_respond, completion_result)
                 if let Some(text) = extract_text(&msg) {
                     let timestamp = msg.get("ts").and_then(|v| v.as_i64());
                     result.push(RawMessage { role: Role::Assistant, content: text, timestamp });
                 }
             }
             "question" => {
-                // AI asking user a question, e.g., {"type": "question", "question": "请问你xxxx"}
                 if let Some(text) =
                     msg.get("question").and_then(|v| v.as_str()).map(|s| s.to_string())
                 {
@@ -240,43 +688,11 @@ fn load_ui_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
         }
     }
 
-    Ok(result)
+    Ok((result, events))
 }
 
 fn extract_text(msg: &Value) -> Option<String> {
     msg.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
-}
-
-fn format_tool_message(msg: &Value) -> Option<String> {
-    // Try to parse the text as JSON
-    let text = extract_text(msg)?;
-    let tool_json: Value = serde_json::from_str(&text).ok()?;
-
-    let tool_name = tool_json.get("tool").and_then(|v| v.as_str()).unwrap_or("Unknown");
-    let path = tool_json.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let regex = tool_json.get("regex").and_then(|v| v.as_str()).unwrap_or("");
-    let file_pattern = tool_json.get("filePattern").and_then(|v| v.as_str()).unwrap_or("");
-
-    // Format based on tool name
-    let formatted = match tool_name {
-        "readFile" => format!("[ReadFile] {path}"),
-        "editedExistingFile" => format!("[EditedFile] {path}"),
-        "listFilesTopLevel" => format!("[ListFiles] {path}"),
-        "listFilesRecursive" => format!("[ListFilesRecursive] {path}"),
-        "searchFiles" => {
-            let mut parts = vec![format!("[SearchFiles] {path}")];
-            if !regex.is_empty() {
-                parts.push(format!("regex: {regex}"));
-            }
-            if !file_pattern.is_empty() {
-                parts.push(format!("pattern: {file_pattern}"));
-            }
-            parts.join(" - ")
-        }
-        _ => format!("[{tool_name}] {path}"),
-    };
-
-    Some(formatted)
 }
 
 fn task_started_at(entry: &FileScanEntry, messages: &[RawMessage]) -> i64 {
@@ -425,16 +841,20 @@ mod tests {
         ]"#;
         let path = write_task(&root, "1000", messages_json);
 
-        let msgs = load_ui_messages(&path).unwrap();
-        assert_eq!(msgs.len(), 4);
+        let (msgs, events) = load_ui_records(&path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "approval");
+        assert_eq!(events[0].files[0].path, "foo.txt");
+        assert_eq!(events[0].message_seq, Some(2));
+        assert_eq!(events[0].status, None);
+        assert!(events[0].attrs_json.as_ref().unwrap().contains("readFile"));
+        assert_eq!(msgs.len(), 3);
         assert!(matches!(msgs[0].role, Role::User));
         assert_eq!(msgs[0].content, "hello world");
         assert!(matches!(msgs[1].role, Role::Assistant));
         assert_eq!(msgs[1].content, "hi there");
         assert!(matches!(msgs[2].role, Role::User));
         assert_eq!(msgs[2].content, "fix it");
-        assert!(matches!(msgs[3].role, Role::Assistant));
-        assert_eq!(msgs[3].content, "[ReadFile] foo.txt");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -469,23 +889,40 @@ mod tests {
     }
 
     #[test]
-    fn format_tool_message_various_tools() {
+    fn tool_approvals_preserve_evidence_outside_discussion() {
         let root = temp_root("tools");
         let messages_json = r#"[
             {"ts": 1000, "type": "say", "say": "task", "text": "test tools"},
             {"ts": 2000, "type": "say", "say": "tool", "text": "{\"tool\":\"readFile\",\"path\":\"src/main.rs\"}"},
             {"ts": 3000, "type": "say", "say": "tool", "text": "{\"tool\":\"editedExistingFile\",\"path\":\"src/main.rs\"}"},
             {"ts": 4000, "type": "say", "say": "tool", "text": "{\"tool\":\"listFilesTopLevel\",\"path\":\"src\"}"},
-            {"ts": 5000, "type": "say", "say": "tool", "text": "{\"tool\":\"searchFiles\",\"path\":\"vllm\",\"regex\":\"gelu\",\"filePattern\":\"*.py\"}"}
+            {"ts": 5000, "type": "say", "say": "tool", "text": "{\"tool\":\"searchFiles\",\"path\":\"vllm\",\"regex\":\"gelu\",\"filePattern\":\"*.py\"}"},
+            {"ts": 6000, "type": "ask", "ask": "command", "text": "rm -rf build", "partial": true},
+            {"ts": 7000, "type": "say", "say": "command_output", "text": "permission denied"},
+            {"ts": 8000, "type": "ask", "ask": "tool", "text": "{incomplete", "partial": true},
+            {"ts": 9000, "type": "say", "say": "text", "text": "Approval is needed because this changes your project."}
         ]"#;
         let path = write_task(&root, "1000", messages_json);
 
         let msgs = load_ui_messages(&path).unwrap();
-        assert_eq!(msgs.len(), 5);
-        assert_eq!(msgs[1].content, "[ReadFile] src/main.rs");
-        assert_eq!(msgs[2].content, "[EditedFile] src/main.rs");
-        assert_eq!(msgs[3].content, "[ListFiles] src");
-        assert_eq!(msgs[4].content, "[SearchFiles] vllm - regex: gelu - pattern: *.py");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "test tools");
+        assert_eq!(msgs[1].content, "Approval is needed because this changes your project.");
+        let (_, events) = load_ui_records(&path).unwrap();
+        assert_eq!(events.len(), 7);
+        assert_eq!(events[4].kind, "approval");
+        assert_eq!(events[5].kind, "observation");
+        assert_eq!(events[6].kind, "approval");
+        assert!(events.iter().all(|event| event.message_seq == Some(0) && event.status.is_none()));
+        assert_eq!(
+            serde_json::from_str::<Value>(events[6].attrs_json.as_deref().unwrap()).unwrap()["text"],
+            "{incomplete"
+        );
+        assert_eq!(events[1].kind, "approval");
+        assert_eq!(events[1].files[0].operation, FileOperation::Write);
+        assert_eq!(events[1].status, None);
+        assert!(events[2].files.is_empty());
+        assert!(events[3].files.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -544,9 +981,13 @@ mod tests {
         let empty = root.join("019e6d8d-588b-7fd2-a326-c525469ed120");
         fs::create_dir_all(&empty).unwrap();
 
+        fs::write(empty.join("api_conversation_history.json"), r#"[{"role":"assistant","content":[{"type":"tool_use","id":"only","name":"write_to_file","input":{"path":"only.rs"}}]}]"#).unwrap();
         let entries = collect_cline_entries(&root);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].session_id, "1765706891317");
+        assert_eq!(entries.len(), 2);
+        let sessions = scan_task_dirs(std::slice::from_ref(&root)).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].messages.is_empty());
+        assert_eq!(sessions[0].events[0].files[0].path, "only.rs");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -573,6 +1014,16 @@ mod tests {
             {"ts": 1000, "type": "say", "say": "text", "text": "hello"}
         ]"#;
         let path = write_task(&root, "1765706891317", messages_json);
+        let api_path = path.parent().unwrap().join("api_conversation_history.json");
+        fs::write(&api_path, serde_json::json!([
+            {"role":"assistant","id":"native-message","condenseParent":"summary-1","content":[
+                {"type":"tool_use","id":"call-1","name":"write_to_file","input":{"path":"a.rs","content":"next"}},
+                {"type":"tool_use","id":"call-2","name":"read_file","input":{"files":[{"path":"a.rs"},{"path":"b.rs"}]}}
+            ]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","is_error":true,"content":"denied"}]},
+            {"role":"assistant","content":"<write_to_file><path>legacy.rs</path><content><read_file><path>not-a-call</path></read_file></content></write_to_file><read_file><args><file><path>a&amp;b.rs</path></file><file><path>c.rs</path></file></args></read_file>"},
+            {"role":"user","content":[{"type":"text","text":"[write_to_file for 'legacy.rs'] Result:"},{"type":"text","text":"operation denied"}]}
+        ]).to_string()).unwrap();
         let mtime = file_scan::stat_mtime_ms(&path).unwrap();
 
         let entry = FileScanEntry {
@@ -588,6 +1039,23 @@ mod tests {
         assert_eq!(raw.source_file_path.as_deref(), path.to_str());
         assert_eq!(raw.messages.len(), 1);
 
+        assert_eq!(raw.events.len(), 6);
+        assert!(raw.events.iter().all(|event| event.message_seq.is_none()));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(raw.events[0].source_path.as_deref(), api_path.to_str());
+        assert!(raw.events[0].attrs_json.as_ref().unwrap().contains("condenseParent"));
+        assert_eq!(raw.events[1].files.len(), 2);
+        assert_eq!(raw.events[2].status.as_deref(), Some("error"));
+        assert!(raw.events[2].files.is_empty());
+        assert_eq!(raw.events[3].files[0].path, "legacy.rs");
+        assert_eq!(
+            raw.events[4].files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            ["a&b.rs", "c.rs"]
+        );
+        assert!(raw.events[3].tool_call_id.is_none());
+        assert_eq!(raw.events[5].kind, "tool_result");
+        assert_eq!(raw.events[5].status, None);
+        assert!(raw.events[5].attrs_json.as_ref().unwrap().contains("operation denied"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -667,11 +1135,92 @@ mod tests {
             std::slice::from_ref(&root),
             &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
-
+        let backfill = scan_task_dirs_for_sync(
+            std::slice::from_ref(&root),
+            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(backfill.sessions.len(), 1);
+        assert_eq!(backfill.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
+        store
+            .persist_session_events_for_existing_session(
+                "cline",
+                "1765706891317",
+                &[],
+                EVENT_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+        let refresh = scan_task_dirs_for_sync(
+            std::slice::from_ref(&root),
+            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(refresh.sessions.len(), 1);
+        assert!(refresh.sessions[0].refresh_session_on_metadata_backfill);
+        store
+            .persist_topology_for_existing_session(
+                "cline",
+                "1765706891317",
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION),
+                },
+            )
+            .unwrap();
+        let current = scan_task_dirs_for_sync(
+            std::slice::from_ref(&root),
+            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(current.stats.skipped_sessions, 1);
+        let api = path.parent().unwrap().join("api_conversation_history.json");
+        fs::write(&api, r#"[{"role":"assistant","content":[{"type":"tool_use","id":"new-call","name":"write_to_file","input":{"path":"new.rs"}}]}]"#).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&api)
+            .unwrap()
+            .set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis((mtime + 1000) as u64),
+            )
+            .unwrap();
+        let changed = scan_task_dirs_for_sync(
+            std::slice::from_ref(&root),
+            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(changed.sessions[0].events[0].files[0].path, "new.rs");
+        assert_eq!(changed.sessions[0].updated_at, Some(mtime + 1000));
+        assert_eq!(file_scan::stat_mtime_ms(&path), Some(mtime));
+        let unstable = file_scan::run_file_scan_with_options_and_snapshot(
+            &AdapterSyncContext::empty_for_test("cline"),
+            None,
+            Default::default(),
+            collect_all_entries(std::slice::from_ref(&root)),
+            task_snapshot,
+            |entry, mtime| {
+                let raw = parse_cline_task(entry, mtime)?;
+                fs::write(&api, "[]")?;
+                Ok(raw)
+            },
+        )
+        .unwrap();
+        assert!(unstable.sessions.is_empty());
+        assert_eq!(unstable.stats.unstable_sessions, 1);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -693,6 +1242,7 @@ mod tests {
             std::slice::from_ref(&root),
             &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(result.sessions.len(), 1);
@@ -717,6 +1267,7 @@ mod tests {
             std::slice::from_ref(&root),
             &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(result.sessions.len(), 1);
@@ -804,6 +1355,7 @@ mod tests {
             std::slice::from_ref(&root),
             &AdapterSyncContext::from_store_for_test(&store, "roo").unwrap(),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(result.sessions.len(), 1);

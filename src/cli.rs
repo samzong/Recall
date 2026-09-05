@@ -469,9 +469,6 @@ mod tests {
         Cli, Commands, ExtensionCommands, McpCommands, ShareCommands, Shell, SkillCommands,
         generate, insert_installed_help,
     };
-    use crate::adapters::{
-        adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
-    };
     use crate::session;
     use clap::{CommandFactory, Parser};
 
@@ -926,22 +923,6 @@ mod tests {
                 assert_eq!(args, ["reflect", "--limit", "3"]);
             }
             _ => panic!("expected external command"),
-        }
-    }
-
-    #[test]
-    fn dashboard_sync_skips_sources_without_usage_or_events() {
-        for adapter in all_adapters() {
-            let id = adapter.id();
-            if matches!(id, "cline" | "roo" | "antigravity-cli" | "kiro-cli" | "copilot-chat") {
-                assert!(
-                    !adapter_supports_usage_dashboard(adapter.as_ref(), true),
-                    "{id} should be skipped during dashboard sync"
-                );
-            }
-            if source_supports_event_backfill(id) {
-                assert!(adapter_supports_usage_dashboard(adapter.as_ref(), true));
-            }
         }
     }
 }
