@@ -2051,30 +2051,19 @@ fn copilot_parser_indexes_tool_requests_and_results() {
 {"type":"tool.execution_complete","data":{"toolCallId":"tc1","success":true,"result":{"content":"short summary","detailedContent":"# My Project\nHello world."}},"id":"e4","timestamp":"2026-02-26T06:30:00.500Z","parentId":"e3"}"##;
 
     let session = parse_copilot_events(jsonl, "fallback").unwrap().unwrap();
-    assert_eq!(session.messages.len(), 2);
-    let assistant = &session.messages[0];
-    assert!(
-        assistant.content.contains("Let me read the file"),
-        "prose preserved: {}",
-        assistant.content
-    );
-    assert!(assistant.content.contains("[read_file]"), "tool name indexed: {}", assistant.content);
-    assert!(
-        assistant.content.contains("/tmp/README.md"),
-        "tool args indexed: {}",
-        assistant.content
-    );
-    let tool_result = &session.messages[1];
-    assert!(
-        tool_result.content.contains("[read_file]"),
-        "tool result tagged with name: {}",
-        tool_result.content
-    );
-    assert!(
-        tool_result.content.contains("Hello world"),
-        "detailedContent preferred over content: {}",
-        tool_result.content
-    );
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].content, "Let me read the file.");
+    assert_eq!(session.events.len(), 3);
+    assert_eq!(session.events[2].summary.as_deref(), Some("# My Project\nHello world."));
+    for (event, record) in session.events.iter().zip(jsonl.lines().skip(1)) {
+        assert_eq!(event.tool_call_id.as_deref(), Some("tc1"));
+        assert_eq!(event.message_seq, Some(0));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(event.attrs_json.as_deref().unwrap())
+                .unwrap(),
+            serde_json::from_str::<serde_json::Value>(record).unwrap()
+        );
+    }
 }
 
 #[test]
