@@ -3162,7 +3162,7 @@ fn live_openrouter_seed_populates_claude_json() {
 
 #[test]
 fn install_specs_use_official_urls() {
-    let claude = crate::install::spec(Harness::Claude);
+    let claude = crate::install::spec(Harness::Claude).unwrap();
     assert_eq!(claude.url, "https://claude.ai/install.sh");
     assert_eq!(claude.shell, "bash");
     assert_eq!(
@@ -3170,23 +3170,19 @@ fn install_specs_use_official_urls() {
         "curl -fsSL https://claude.ai/install.sh | bash"
     );
 
-    let codex = crate::install::spec(Harness::Codex);
+    let codex = crate::install::spec(Harness::Codex).unwrap();
     assert_eq!(codex.url, "https://chatgpt.com/codex/install.sh");
     assert_eq!(codex.shell, "sh");
 
-    let opencode = crate::install::spec(Harness::OpenCode);
+    let opencode = crate::install::spec(Harness::OpenCode).unwrap();
     assert_eq!(opencode.url, "https://opencode.ai/install");
     assert_eq!(opencode.shell, "bash");
 
-    let pi = crate::install::spec(Harness::Pi);
+    let pi = crate::install::spec(Harness::Pi).unwrap();
     assert_eq!(pi.url, "https://pi.dev/install.sh");
     assert_eq!(pi.shell, "sh");
 
-    let dsh = crate::install::spec(Harness::Dsh);
-    assert_eq!(dsh.program, "dsh");
-    assert_eq!(dsh.display, "DeepSeek Harness");
-
-    let kimi = crate::install::spec(Harness::Kimi);
+    let kimi = crate::install::spec(Harness::Kimi).unwrap();
     assert_eq!(kimi.program, "kimi");
     assert_eq!(kimi.display, "Kimi Code");
     assert_eq!(kimi.url, "https://code.kimi.com/kimi-code/install.sh");
