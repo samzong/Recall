@@ -793,7 +793,7 @@ impl SyncJob {
                         self.apply_backfill(
                             source_id,
                             &raw_source_id,
-                            &raw,
+                            &mut raw,
                             plan,
                             was_imported,
                             existing,
@@ -894,11 +894,39 @@ impl SyncJob {
         &mut self,
         source_id: &str,
         raw_source_id: &str,
-        raw: &adapters::RawSession,
+        raw: &mut adapters::RawSession,
         plan: BackfillPlan,
         was_imported: bool,
         existing: &mut ExistingState,
     ) -> Result<()> {
+        if (plan.usage && raw.usage_events.iter().any(|event| event.message_seq.is_some()))
+            || (plan.events && raw.events.iter().any(|event| event.message_seq.is_some()))
+        {
+            let stored = existing
+                .meta
+                .get(raw_source_id)
+                .map(|session| self.store.get_messages(&session.id))
+                .transpose()?;
+            let same_messages = stored.as_ref().is_some_and(|stored| {
+                stored.len() == raw.messages.len()
+                    && stored.iter().zip(&raw.messages).enumerate().all(
+                        |(index, (stored, parsed))| {
+                            stored.seq == index as u32
+                                && stored.role == parsed.role
+                                && stored.content == parsed.content
+                                && stored.timestamp == parsed.timestamp
+                        },
+                    )
+            });
+            if !same_messages {
+                for event in &mut raw.events {
+                    event.message_seq = None;
+                }
+                for event in &mut raw.usage_events {
+                    event.message_seq = None;
+                }
+            }
+        }
         let mut reprocessed = false;
         if plan.usage
             && let Some(parser_version) = raw.usage_parser_version
@@ -1524,6 +1552,134 @@ mod tests {
                 metadata: false
             })
         );
+        for (old_texts, expected_anchor) in [
+            (vec!["question", "tool payload", "answer"], None),
+            (vec!["question", "different answer"], None),
+            (vec!["question", "answer"], Some(1)),
+        ] {
+            for backfill_events in [false, true] {
+                let mut job = global_job(&[]);
+                job.options.usage_only = true;
+                job.options.backfill_events = backfill_events;
+                let mut old = session("anchor-test", "test", "raw1");
+                old.message_count = old_texts.len() as u32;
+                job.store.insert_session(&old).unwrap();
+                job.store
+                    .insert_messages(
+                        &old_texts
+                            .iter()
+                            .enumerate()
+                            .map(|(index, text)| Message {
+                                session_id: old.id.clone(),
+                                role: if index == 0 { Role::User } else { Role::Assistant },
+                                content: text.to_string(),
+                                timestamp: Some(1),
+                                seq: index as u32,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                let make_raw = || {
+                    let event = crate::adapters::events::tool_call_event(
+                        crate::adapters::events::EventContext {
+                            event_seq: 0,
+                            timestamp: Some(1),
+                            source_path: Some("native.jsonl".to_string()),
+                            source_event_id: Some("native-record".to_string()),
+                            message_seq: Some(1),
+                            parser_version: 2,
+                        },
+                        "Edit".to_string(),
+                        Some(&serde_json::json!({"file_path": "a.rs"})),
+                    );
+                    let usage = crate::types::RawUsageEvent {
+                        event_key: "usage-1".to_string(),
+                        event_seq: 0,
+                        message_seq: Some(1),
+                        timestamp: 1,
+                        model: "model".to_string(),
+                        provider: "provider".to_string(),
+                        input_tokens: 10,
+                        output_tokens: 2,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        reasoning_tokens: 0,
+                        token_source: crate::types::TokenSource::Observed,
+                        parser_version: 2,
+                        source_path: Some("native.jsonl".to_string()),
+                        raw_usage_json: None,
+                    };
+                    let mut raw = RawSession::search_only(
+                        "raw1",
+                        None,
+                        0,
+                        Some(1),
+                        None,
+                        vec![
+                            RawMessage {
+                                role: Role::User,
+                                content: "question".to_string(),
+                                timestamp: Some(1),
+                            },
+                            RawMessage {
+                                role: Role::Assistant,
+                                content: "answer".to_string(),
+                                timestamp: Some(1),
+                            },
+                        ],
+                    )
+                    .with_usage(vec![usage], 2)
+                    .with_events(vec![event], 2);
+                    raw.metadata_parser_version = Some(1);
+                    raw.refresh_session_on_metadata_backfill = true;
+                    raw
+                };
+                let context = job.load_adapter_sync_context("test").unwrap();
+                let mut existing = job.prepare_existing_state("test", context).unwrap();
+                job.process_raw_session("test", make_raw(), &mut existing, &mut HashSet::new())
+                    .unwrap();
+                assert_eq!(
+                    job.store
+                        .get_messages(&old.id)
+                        .unwrap()
+                        .iter()
+                        .map(|message| message.content.as_str())
+                        .collect::<Vec<_>>(),
+                    old_texts
+                );
+                assert_eq!(
+                    job.store.list_usage_events_for_session(&old.id).unwrap()[0].message_seq,
+                    expected_anchor
+                );
+                let events = job.store.list_session_events_for_session(&old.id).unwrap();
+                if backfill_events {
+                    assert_eq!(events[0].message_seq, expected_anchor);
+                    assert_eq!(events[0].source_event_id.as_deref(), Some("native-record"));
+                } else {
+                    assert!(events.is_empty());
+                }
+                job.options.usage_only = false;
+                job.process_raw_session("test", make_raw(), &mut existing, &mut HashSet::new())
+                    .unwrap();
+                assert_eq!(
+                    job.store
+                        .get_messages(&old.id)
+                        .unwrap()
+                        .iter()
+                        .map(|message| message.content.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["question", "answer"]
+                );
+                assert_eq!(
+                    job.store.list_session_events_for_session(&old.id).unwrap()[0].message_seq,
+                    Some(1)
+                );
+                assert_eq!(
+                    job.store.list_usage_events_for_session(&old.id).unwrap()[0].message_seq,
+                    Some(1)
+                );
+            }
+        }
     }
 
     #[test]
