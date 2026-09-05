@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, params_from_iter, types::ValueRef};
 use serde_json::Value;
@@ -13,11 +13,13 @@ use crate::adapters::events;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
-use crate::types::{RawSessionEvent, RawUsageEvent, Role};
+use crate::types::{
+    FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, RawUsageEvent, Role,
+};
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
 pub(crate) const USAGE_PARSER_VERSION: u32 = 2;
-pub(crate) const EVENT_PARSER_VERSION: u32 = 5;
+pub(crate) const EVENT_PARSER_VERSION: u32 = 6;
 pub(crate) const METADATA_PARSER_VERSION: u32 = 2;
 const PARSED_PART_FILTER_SQL: &str = "
     json_valid(m.data)
@@ -259,7 +261,15 @@ fn scan_session_messages(
     for session in sessions {
         let messages = session_messages.remove(&session.id).unwrap_or_default();
         let usage_events = session_usage_events.remove(&session.id).unwrap_or_default();
-        let events = session_events.remove(&session.id).unwrap_or_default();
+        let mut events = session_events.remove(&session.id).unwrap_or_default();
+        for file in events.iter_mut().flat_map(|event| &mut event.files) {
+            if file.kind != FileEvidenceKind::Command
+                && file.cwd.is_none()
+                && !session.directory.trim().is_empty()
+            {
+                file.cwd = Some(session.directory.clone());
+            }
+        }
         if messages.is_empty() && usage_events.is_empty() && events.is_empty() {
             continue;
         }
@@ -273,6 +283,7 @@ fn scan_session_messages(
             messages,
         )
         .with_usage(usage_events, USAGE_PARSER_VERSION);
+        raw.source_file_path = conn.path().filter(|path| !path.is_empty()).map(str::to_string);
         raw.custom_title =
             session.title.map(|title| title.trim().to_string()).filter(|title| !title.is_empty());
         raw.metadata_parser_version = Some(METADATA_PARSER_VERSION);
@@ -294,7 +305,7 @@ fn load_event_chunk(
 ) -> anyhow::Result<()> {
     let placeholders = std::iter::repeat_n("?", session_ids.len()).collect::<Vec<_>>().join(", ");
     let sql = format!(
-        "SELECT m.session_id, CAST(p.id AS TEXT), p.data, m.time_created
+        "SELECT m.session_id, CAST(p.id AS TEXT), p.data, m.time_created, CAST(m.id AS TEXT), m.data
          FROM message m
          JOIN part p ON p.message_id = m.id
          WHERE m.session_id IN ({placeholders})
@@ -312,15 +323,30 @@ fn load_event_chunk(
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             sqlite_millis(row, 3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
         ))
     })?;
     let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     rows.sort_by_key(|row| row.3);
 
     for row in rows {
-        let (session_id, part_id, part_data, timestamp) = row;
+        let (session_id, part_id, part_data, timestamp, message_id, message_data) = row;
+        let message: Value = serde_json::from_str(&message_data)?;
+        let cwd = message
+            .pointer("/path/cwd")
+            .and_then(Value::as_str)
+            .filter(|cwd| !cwd.trim().is_empty());
         let events = session_events.entry(session_id).or_default();
-        let part_events = parse_part_events(&part_id, &part_data, timestamp, events.len() as u32);
+        let part_events = parse_part_events(
+            &part_id,
+            &part_data,
+            timestamp,
+            events.len() as u32,
+            conn.path().filter(|path| !path.is_empty()),
+            &message_id,
+            cwd,
+        );
         events.extend(part_events);
     }
 
@@ -332,138 +358,170 @@ fn parse_part_events(
     part_data: &str,
     timestamp: Option<i64>,
     event_seq: u32,
+    source_path: Option<&str>,
+    message_id: &str,
+    cwd: Option<&str>,
 ) -> Vec<RawSessionEvent> {
     let Some(part) = serde_json::from_str::<Value>(part_data).ok() else {
         return Vec::new();
     };
-    match part.get("type").and_then(|t| t.as_str()) {
+    let context = |event_seq, source_event_id| events::EventContext {
+        event_seq,
+        timestamp,
+        source_path: source_path.map(str::to_string),
+        source_event_id: Some(source_event_id),
+        message_seq: None,
+        parser_version: EVENT_PARSER_VERSION,
+    };
+    let mut parsed = match part.get("type").and_then(Value::as_str) {
         Some("tool-invocation") => {
-            let name = part.get("toolName").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
+            let name = part.get("toolName").and_then(Value::as_str).unwrap_or("tool").to_string();
             vec![events::tool_call_event(
-                events::EventContext {
-                    event_seq,
-                    timestamp,
-                    source_path: None,
-                    source_event_id: Some(part_id.to_string()),
-                    message_seq: None,
-                    parser_version: EVENT_PARSER_VERSION,
-                },
+                context(event_seq, part_id.to_string()),
                 name,
                 part.get("input"),
             )]
         }
         Some("tool-result") => {
-            let name = part.get("toolName").and_then(|n| n.as_str()).map(String::from);
+            let name = part.get("toolName").and_then(Value::as_str).map(String::from);
             let summary = part.get("result").map(|result| result.to_string());
-            vec![events::tool_result_event(
-                events::EventContext {
-                    event_seq,
-                    timestamp,
-                    source_path: None,
-                    source_event_id: Some(part_id.to_string()),
-                    message_seq: None,
-                    parser_version: EVENT_PARSER_VERSION,
-                },
-                name,
-                summary,
-            )]
+            vec![events::tool_result_event(context(event_seq, part_id.to_string()), name, summary)]
         }
         Some("tool") => {
             let name = opencode_tool_name(&part);
             let Some(state) = part.get("state") else {
                 return Vec::new();
             };
-            let status = state.get("status").and_then(|status| status.as_str()).map(String::from);
+            let status = match state.get("status").and_then(Value::as_str) {
+                Some("completed") => Some("success"),
+                Some("error") => Some("error"),
+                _ => None,
+            };
             let mut part_events = Vec::new();
-
             if let Some(input) = state.get("input") {
-                let mut event = events::tool_call_event(
-                    events::EventContext {
-                        event_seq,
-                        timestamp,
-                        source_path: None,
-                        source_event_id: Some(format!("{part_id}:input")),
-                        message_seq: None,
-                        parser_version: EVENT_PARSER_VERSION,
-                    },
+                part_events.push(events::tool_call_event(
+                    context(event_seq, format!("{part_id}:input")),
                     name.clone(),
                     Some(input),
-                );
-                event.status = status.clone();
-                part_events.push(event);
+                ));
             }
-
-            if let Some(output) = state.get("output") {
+            let output = state.get("output").or_else(|| state.get("error"));
+            if output.is_some() || status.is_some() {
                 let mut event = events::tool_result_event(
-                    events::EventContext {
-                        event_seq: event_seq + part_events.len() as u32,
-                        timestamp,
-                        source_path: None,
-                        source_event_id: Some(format!("{part_id}:output")),
-                        message_seq: None,
-                        parser_version: EVENT_PARSER_VERSION,
-                    },
+                    context(event_seq + part_events.len() as u32, format!("{part_id}:output")),
                     Some(name),
-                    Some(display_json_value(output)),
+                    output.map(display_json_value),
                 );
-                event.status = status;
+                event.status = status.map(str::to_string);
                 part_events.push(event);
             }
-
             part_events
         }
         Some("patch") => {
-            let files = patch_files(&part);
-            let attrs_json = Some(patch_attrs_without_files(&part));
-            if files.is_empty() {
-                return vec![RawSessionEvent {
-                    command_evidence_status: None,
-                    files: Vec::new(),
-                    event_seq,
-                    timestamp,
-                    kind: "file_write".to_string(),
-                    actor: "assistant".to_string(),
-                    name: Some("patch".to_string()),
-                    status: None,
-                    target: None,
-                    message_seq: None,
-                    summary: None,
-                    source_path: None,
-                    source_event_id: Some(part_id.to_string()),
-                    tool_call_id: None,
-                    is_meta: None,
-                    visibility: None,
-                    attrs_json,
-                    parser_version: EVENT_PARSER_VERSION,
-                }];
-            }
-            files
+            let files = patch_files(&part)
                 .into_iter()
-                .enumerate()
-                .map(|(offset, file)| RawSessionEvent {
-                    command_evidence_status: None,
-                    files: Vec::new(),
-                    event_seq: event_seq + offset as u32,
-                    timestamp,
-                    kind: "file_write".to_string(),
-                    actor: "assistant".to_string(),
-                    name: Some("patch".to_string()),
-                    status: None,
-                    summary: Some(format!("[patch] {file}")),
-                    target: Some(file),
-                    message_seq: None,
-                    source_path: None,
-                    source_event_id: Some(part_id.to_string()),
-                    tool_call_id: None,
-                    is_meta: None,
-                    visibility: None,
-                    attrs_json: attrs_json.clone(),
-                    parser_version: EVENT_PARSER_VERSION,
+                .map(|path| FileEvidence {
+                    path,
+                    operation: FileOperation::Write,
+                    kind: FileEvidenceKind::Observation,
+                    cwd: cwd.map(str::to_string),
+                    target: None,
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            vec![RawSessionEvent {
+                command_evidence_status: None,
+                target: files.first().map(|file| file.path.clone()),
+                files,
+                event_seq,
+                timestamp,
+                kind: "file_write".to_string(),
+                actor: "assistant".to_string(),
+                name: Some("patch".to_string()),
+                status: None,
+                message_seq: None,
+                summary: None,
+                source_path: source_path.map(str::to_string),
+                source_event_id: Some(part_id.to_string()),
+                tool_call_id: None,
+                is_meta: None,
+                visibility: None,
+                attrs_json: None,
+                parser_version: EVENT_PARSER_VERSION,
+            }]
         }
         _ => Vec::new(),
+    };
+    let call_id = match part.get("type").and_then(Value::as_str) {
+        Some("tool") => part.get("callID"),
+        Some("tool-invocation" | "tool-result") => part.get("toolCallId"),
+        _ => None,
     }
+    .and_then(Value::as_str)
+    .filter(|id| !id.trim().is_empty());
+    let attrs = serde_json::json!({"part_id": part_id, "message_id": message_id, "part": part});
+    for event in &mut parsed {
+        event.attrs_json = Some(attrs.to_string());
+        event.tool_call_id = call_id.map(str::to_string);
+        if matches!(part.get("type").and_then(Value::as_str), Some("tool" | "tool-invocation"))
+            && event.actor == "assistant"
+        {
+            let input = part.get("input").or_else(|| part.pointer("/state/input"));
+            if event.name.as_deref() == Some("bash") {
+                event.kind = "command".to_string();
+                event.target = input
+                    .and_then(|input| input.get("command"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(command) = event.target.as_deref() {
+                    let base = cwd.filter(|cwd| Path::new(cwd).is_absolute());
+                    let shell_cwd = match input.and_then(|input| input.get("workdir")) {
+                        Some(Value::String(path)) if Path::new(path).is_absolute() => {
+                            Some(PathBuf::from(path))
+                        }
+                        Some(Value::String(path)) => base.map(|base| Path::new(base).join(path)),
+                        Some(_) => None,
+                        None => base.map(PathBuf::from),
+                    };
+                    let (files, status) = events::shell_file_evidence(
+                        command,
+                        shell_cwd.as_deref().and_then(Path::to_str),
+                    );
+                    event.files = files;
+                    event.command_evidence_status = Some(status);
+                }
+            }
+            let selection = match event.name.as_deref() {
+                Some("read") => Some((FileOperation::Read, "filePath")),
+                Some("write" | "edit") => Some((FileOperation::Write, "filePath")),
+                Some("readFile") => Some((FileOperation::Read, "path")),
+                _ => None,
+            };
+            if let Some((operation, key)) = selection
+                && let Some(path) = input
+                    .and_then(|input| input.get(key))
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.trim().is_empty())
+            {
+                event.files.push(FileEvidence {
+                    path: path.to_string(),
+                    operation,
+                    kind: FileEvidenceKind::Call,
+                    cwd: cwd.map(str::to_string),
+                    target: None,
+                });
+            }
+            if event.name.as_deref() == Some("apply_patch")
+                && let Some(patch) =
+                    input.and_then(|input| input.get("patchText")).and_then(Value::as_str)
+            {
+                event.files = events::patch_file_evidence(patch);
+                for file in &mut event.files {
+                    file.cwd = cwd.map(str::to_string);
+                }
+            }
+        }
+    }
+    parsed
 }
 
 fn load_message_chunk(
@@ -683,16 +741,8 @@ fn patch_files(part: &Value) -> Vec<String> {
         .flatten()
         .filter_map(|file| file.as_str())
         .filter(|file| !file.trim().is_empty())
-        .map(|file| file.trim().to_string())
+        .map(str::to_string)
         .collect()
-}
-
-fn patch_attrs_without_files(part: &Value) -> String {
-    let mut attrs = part.clone();
-    if let Some(object) = attrs.as_object_mut() {
-        object.remove("files");
-    }
-    attrs.to_string()
 }
 
 fn display_json_value(value: &Value) -> String {
@@ -1183,21 +1233,55 @@ mod tests {
         let (path, conn) = setup_opencode_db();
         insert_session_with_message(&conn, "s1", 200, 100, "hello");
 
-        let store = setup_store();
-        store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
-        mark_usage_current(&store, "s1", Some(200));
-        mark_event_current(&store, "s1", Some(200));
-        mark_metadata_current(&store, "s1");
+        for source in ["opencode", "kilo-code", "mimo-code", "zcode"] {
+            let raw = scan(&conn, true).unwrap().pop().unwrap();
+            let store =
+                crate::sync::persist_raw_session_for_conformance(setup_store(), source, raw)
+                    .unwrap();
+            let result = scan_for_sync_conn(
+                &conn,
+                &AdapterSyncContext::from_store_for_test(&store, source).unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(result.sessions.is_empty());
+            assert_eq!(result.stats.skipped_sessions, 1);
 
-        let result = scan_for_sync_conn(
-            &conn,
-            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
-            None,
-            true,
-        )
-        .unwrap();
-        assert!(result.sessions.is_empty());
-        assert_eq!(result.stats.skipped_sessions, 1);
+            store
+                .persist_session_events_for_existing_session(
+                    source,
+                    "s1",
+                    &[],
+                    EVENT_PARSER_VERSION - 1,
+                    Some(200),
+                )
+                .unwrap();
+            let mut result = scan_for_sync_conn(
+                &conn,
+                &AdapterSyncContext::from_store_for_test(&store, source).unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(result.sessions.len(), 1);
+            assert_eq!(result.stats.skipped_sessions, 0);
+            let store = crate::sync::persist_raw_session_for_conformance(
+                store,
+                source,
+                result.sessions.pop().unwrap(),
+            )
+            .unwrap();
+            let result = scan_for_sync_conn(
+                &conn,
+                &AdapterSyncContext::from_store_for_test(&store, source).unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(result.sessions.is_empty());
+            assert_eq!(result.stats.skipped_sessions, 1);
+        }
         drop(conn);
         let _ = std::fs::remove_file(path);
     }
@@ -1456,7 +1540,7 @@ mod tests {
              VALUES (NULL, ?1, ?2)",
             rusqlite::params![
                 message_id,
-                r#"{"type":"tool-invocation","toolName":"readFile","input":{"path":"src/main.rs"}}"#
+                r#"{"type":"tool-invocation","toolCallId":"legacy-call","toolName":"readFile","input":{"path":"src/main.rs"}}"#
             ],
         )
         .unwrap();
@@ -1465,7 +1549,7 @@ mod tests {
              VALUES (NULL, ?1, ?2)",
             rusqlite::params![
                 message_id,
-                r#"{"type":"tool-result","toolName":"readFile","result":"file body"}"#
+                r#"{"type":"tool-result","toolCallId":"legacy-call","toolName":"readFile","result":"file body"}"#
             ],
         )
         .unwrap();
@@ -1481,6 +1565,12 @@ mod tests {
         assert_eq!(raw[0].events[0].name.as_deref(), Some("readFile"));
         assert_eq!(raw[0].events[0].target.as_deref(), Some("src/main.rs"));
         assert_eq!(raw[0].events[1].kind, "tool_result");
+        assert_eq!(raw[0].events[0].files[0].operation, FileOperation::Read);
+        assert_eq!(raw[0].events[0].files[0].cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(raw[0].events[0].tool_call_id.as_deref(), Some("legacy-call"));
+        assert_eq!(raw[0].events[1].tool_call_id, raw[0].events[0].tool_call_id);
+        assert!(raw[0].events[1].files.is_empty());
+        assert_eq!(raw[0].events[1].status, None);
         drop(conn);
         let _ = std::fs::remove_file(path);
     }
@@ -1496,57 +1586,108 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO message (session_id, data, time_created)
-             VALUES ('s1', '{\"role\":\"assistant\"}', 110)",
-            [],
+             VALUES ('s1', ?1, 110)",
+            [r#"{"role":"assistant","path":{"cwd":"/tmp/target-worktree","root":"/tmp/project"}}"#],
         )
         .unwrap();
         let message_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO part (id, message_id, data)
-             VALUES (NULL, ?1, ?2)",
-            rusqlite::params![
-                message_id,
-                r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"file body"}}"#
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO part (id, message_id, data)
-             VALUES (NULL, ?1, ?2)",
-            rusqlite::params![
-                message_id,
-                r#"{"type":"patch","hash":"abc","files":["src/main.rs","README.md"]}"#
-            ],
-        )
-        .unwrap();
-
-        let (sessions, _) = load_session_rows(&conn, None).unwrap();
-        let raw = scan_session_messages(&conn, sessions, true, ScanOptions::default()).unwrap();
-
+        let long_output = "汉🦀".repeat(3000);
+        let parts = [
+            serde_json::json!({
+                "type": "tool", "callID": "read-1", "tool": "read",
+                "state": {"status": "completed", "input": {"filePath": "src/main.rs"}, "output": long_output}
+            }),
+            serde_json::json!({
+                "type": "tool", "callID": "edit-1", "tool": "edit",
+                "state": {"status": "error", "input": {"filePath": "src/main.rs", "oldString": "before", "newString": "after"}, "error": "oldString not found"}
+            }),
+            serde_json::json!({
+                "type": "tool", "callID": "write-1", "tool": "write",
+                "state": {"status": "running", "input": {"filePath": "src/new.rs", "content": "new content"}}
+            }),
+            serde_json::json!({
+                "type": "tool", "callID": "patch-1", "tool": "apply_patch",
+                "state": {"status": "completed", "input": {"patchText": "*** Begin Patch\n*** Delete File: old.txt\n*** Add File: new.txt\n+hello\n*** End Patch"}, "output": "applied"}
+            }),
+            serde_json::json!({"type": "patch", "hash": "abc", "files": ["src/main.rs", " README.md "]}),
+        ];
+        let mut part_ids = Vec::new();
+        for part in &parts {
+            conn.execute(
+                "INSERT INTO part (id, message_id, data) VALUES (NULL, ?1, ?2)",
+                rusqlite::params![message_id, part.to_string()],
+            )
+            .unwrap();
+            part_ids.push(conn.last_insert_rowid().to_string());
+        }
+        let raw = scan(&conn, true).unwrap();
         assert_eq!(raw.len(), 1);
-        assert!(raw[0].messages.is_empty());
-        assert_eq!(raw[0].custom_title.as_deref(), Some("Test"));
-        assert_eq!(raw[0].events.len(), 4);
-        assert_eq!(raw[0].events[0].kind, "file_read");
-        assert_eq!(raw[0].events[0].name.as_deref(), Some("read"));
-        assert_eq!(raw[0].events[0].status.as_deref(), Some("completed"));
-        assert_eq!(raw[0].events[0].target.as_deref(), Some("src/main.rs"));
-        assert_eq!(raw[0].events[1].kind, "tool_result");
-        assert_eq!(raw[0].events[1].name.as_deref(), Some("read"));
-        assert_eq!(raw[0].events[1].status.as_deref(), Some("completed"));
-        assert_eq!(raw[0].events[1].summary.as_deref(), Some("file body"));
-        assert_eq!(raw[0].events[2].kind, "file_write");
-        assert_eq!(raw[0].events[2].name.as_deref(), Some("patch"));
-        assert_eq!(raw[0].events[2].target.as_deref(), Some("src/main.rs"));
-        assert_eq!(raw[0].events[3].kind, "file_write");
-        assert_eq!(raw[0].events[3].name.as_deref(), Some("patch"));
-        assert_eq!(raw[0].events[3].target.as_deref(), Some("README.md"));
-        assert_eq!(raw[0].events[3].event_seq, raw[0].events[2].event_seq + 1);
+        let session = &raw[0];
+        assert!(session.messages.is_empty());
+        assert_eq!(session.directory.as_deref(), Some("/tmp/project"));
+        assert_eq!(session.source_file_path.as_deref(), conn.path());
+        assert_eq!(session.events.len(), 8);
+        let events = &session.events;
+        assert_eq!(events[0].files[0].operation, FileOperation::Read);
+        assert_eq!(events[0].status, None);
+        assert_eq!(events[1].status.as_deref(), Some("success"));
+        assert_eq!(events[2].files[0].operation, FileOperation::Write);
+        assert_eq!(events[3].status.as_deref(), Some("error"));
+        assert_eq!(events[3].summary.as_deref(), Some("oldString not found"));
+        assert_eq!(events[4].files[0].path, "src/new.rs");
+        assert_eq!(events[4].status, None);
         assert_eq!(
-            raw[0].events[2].attrs_json.as_deref(),
-            Some(r#"{"hash":"abc","type":"patch"}"#)
+            events[5].files.iter().map(|file| &file.operation).collect::<Vec<_>>(),
+            vec![&FileOperation::Delete, &FileOperation::Write]
         );
-        assert_eq!(raw[0].events[3].attrs_json, raw[0].events[2].attrs_json);
+        assert_eq!(
+            events[5].files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            vec!["old.txt", "new.txt"]
+        );
+        for (call_index, result_index, part_index) in [(0, 1, 0), (2, 3, 1), (5, 6, 3)] {
+            assert_eq!(events[call_index].tool_call_id, events[result_index].tool_call_id);
+            assert_eq!(
+                events[call_index].tool_call_id.as_deref(),
+                parts[part_index]["callID"].as_str()
+            );
+            assert!(events[result_index].files.is_empty());
+            assert_eq!(events[result_index].source_path.as_deref(), conn.path());
+            let attrs: Value =
+                serde_json::from_str(events[result_index].attrs_json.as_deref().unwrap()).unwrap();
+            assert_eq!(attrs["message_id"], message_id.to_string());
+            assert_eq!(attrs["part_id"], part_ids[part_index]);
+            assert_eq!(attrs["part"], parts[part_index]);
+        }
+        let observation = &events[7];
+        assert_eq!(observation.tool_call_id, None);
+        assert_eq!(observation.status, None);
+        assert_eq!(
+            observation.files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/main.rs", " README.md "]
+        );
+        assert!(observation.files.iter().all(|file| file.kind == FileEvidenceKind::Observation));
+        for event in events {
+            for file in &event.files {
+                assert_eq!(file.cwd.as_deref(), Some("/tmp/target-worktree"));
+            }
+        }
+        let shell = serde_json::json!({"type":"tool","tool":"bash","callID":"shell-1","state":{"status":"running","input":{"command":"git restore -- src/lib.rs","workdir":"nested"}}});
+        let parsed = parse_part_events(
+            "shell-part",
+            &shell.to_string(),
+            None,
+            0,
+            conn.path(),
+            "message",
+            Some("/tmp/target-worktree"),
+        );
+        assert_eq!(parsed[0].files[0].cwd.as_deref(), Some("/tmp/target-worktree/nested"));
+        assert_eq!(parsed[0].files[0].kind, FileEvidenceKind::Command);
+        assert_eq!(parsed[0].status, None);
+        let attrs: Value =
+            serde_json::from_str(observation.attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs["part"], parts[4]);
+        assert_eq!(observation.source_event_id.as_deref(), Some(part_ids[4].as_str()));
         drop(conn);
         let _ = std::fs::remove_file(path);
     }

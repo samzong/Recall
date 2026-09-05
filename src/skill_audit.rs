@@ -232,7 +232,10 @@ fn is_skill_tool_name(name: &str) -> bool {
 fn skill_from_attrs(attrs_json: Option<&str>) -> Option<String> {
     let attrs = attrs_json?;
     let value: Value = serde_json::from_str(attrs).ok()?;
+    let value = value.get("part").unwrap_or(&value);
     let args = match value.get("type").and_then(Value::as_str) {
+        Some("tool") => value.pointer("/state/input")?,
+        Some("tool-invocation") => value.get("input")?,
         Some("tool_use") => value.get("input")?,
         Some("tool-call") => value.get("args")?,
         Some("function_call" | "custom_tool_call") => {
@@ -241,7 +244,7 @@ fn skill_from_attrs(attrs_json: Option<&str>) -> Option<String> {
         Some(
             "tool_result" | "tool-result" | "function_call_output" | "custom_tool_call_output",
         ) => return None,
-        _ => &value,
+        _ => value,
     };
     let decoded = args.as_str().and_then(|text| serde_json::from_str::<Value>(text).ok());
     let args = decoded.as_ref().unwrap_or(args);
@@ -427,7 +430,9 @@ mod tests {
             timestamp: Some(1),
             name: Some("skill".to_string()),
             target: None,
-            attrs_json: Some(r#"{"name":"commit"}"#.to_string()),
+            attrs_json: Some(
+                r#"{"part_id":"part","message_id":"message","part":{"type":"tool","state":{"input":{"name":"commit"}}}}"#.to_string(),
+            ),
         };
         let (id, signal) = extract_skill_from_event(&event, &installed(&["commit"])).unwrap();
         assert_eq!(id, "commit");
