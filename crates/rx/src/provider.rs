@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
-use crate::config::{ProviderConfig, RxConfig};
+use crate::config::{AuthMode, ProviderConfig, RxConfig};
 
 pub(crate) const NONE: &str = "none";
 
@@ -189,13 +189,37 @@ pub(crate) fn claude_base(provider: &Provider) -> String {
 }
 
 pub(crate) fn available(config: &RxConfig) -> Result<Vec<Provider>> {
-    let mut providers = catalog().to_vec();
+    let mut providers = catalog()
+        .iter()
+        .map(|provider| resolve(&provider.id, config.provider.get(&provider.id)))
+        .collect::<Result<Vec<_>>>()?;
     for (id, entry) in &config.provider {
         if find(id).is_none() && entry.base_url.is_some() {
             providers.push(resolve(id, Some(entry))?);
         }
     }
     Ok(providers)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialSource {
+    Stored,
+    Environment,
+}
+
+pub(crate) fn credential_source(
+    provider: &Provider,
+    auth: AuthMode,
+    stored: bool,
+    environment: bool,
+) -> Option<CredentialSource> {
+    if auth == AuthMode::ApiKey && stored {
+        Some(CredentialSource::Stored)
+    } else if environment && (auth == AuthMode::Env || find(&provider.id).is_some()) {
+        Some(CredentialSource::Environment)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn is_none(id: &str) -> bool {

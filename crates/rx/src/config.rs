@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
@@ -90,6 +91,7 @@ pub(crate) fn stored_providers(paths: &Paths) -> Result<BTreeSet<String>> {
 }
 
 pub(crate) fn set_default(paths: &Paths, provider: &str) -> Result<()> {
+    let _lock = mutation_lock(paths)?;
     let mut config = load_or_default(paths)?;
     crate::provider::resolve(provider, config.provider.get(provider))?;
     config.default_provider = Some(provider.to_string());
@@ -97,12 +99,14 @@ pub(crate) fn set_default(paths: &Paths, provider: &str) -> Result<()> {
 }
 
 pub(crate) fn set_none(paths: &Paths) -> Result<()> {
+    let _lock = mutation_lock(paths)?;
     let mut config = load_or_default(paths)?;
     config.default_provider = Some(crate::provider::NONE.to_string());
     save_config(paths, &config)
 }
 
 pub(crate) fn login(paths: &Paths, provider: &str, key: String) -> Result<()> {
+    let _lock = mutation_lock(paths)?;
     let mut config = load_or_default(paths)?;
     crate::provider::resolve(provider, config.provider.get(provider))?;
     let mut keys = load_keys(paths)?;
@@ -115,6 +119,7 @@ pub(crate) fn login(paths: &Paths, provider: &str, key: String) -> Result<()> {
 }
 
 pub(crate) fn logout(paths: &Paths, provider: &str) -> Result<bool> {
+    let _lock = mutation_lock(paths)?;
     let mut config = load_or_default(paths)?;
     crate::provider::resolve(provider, config.provider.get(provider))?;
     let mut keys = load_keys(paths)?;
@@ -127,6 +132,21 @@ pub(crate) fn logout(paths: &Paths, provider: &str) -> Result<bool> {
         save_config(paths, &config)?;
     }
     Ok(removed)
+}
+
+fn mutation_lock(paths: &Paths) -> Result<fs::File> {
+    fs::create_dir_all(&paths.dir)
+        .with_context(|| format!("failed to create {}", paths.dir.display()))?;
+    let lock_path = paths.dir.join("rx.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    Ok(lock)
 }
 
 fn load_keys(paths: &Paths) -> Result<KeyFile> {
