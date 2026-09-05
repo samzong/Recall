@@ -1401,7 +1401,8 @@ agent-default-model:
     assert!(patch.contains("id: llm-deepseek"));
     assert!(patch.contains("disabled: true"));
     let overlay = paths.dir.join("dsh").join("settings.yaml");
-    assert!(patch.contains(&overlay.display().to_string()));
+    let patch: serde_yaml::Value = serde_yaml::from_str(&patch).unwrap();
+    assert_eq!(patch[0]["config"]["path"].as_str(), overlay.to_str());
     let settings: serde_yaml::Value =
         serde_yaml::from_str(&fs::read_to_string(&overlay).unwrap()).unwrap();
     assert_eq!(settings["dsh-tui"]["lang"], "zh");
