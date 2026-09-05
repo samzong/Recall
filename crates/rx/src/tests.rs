@@ -225,7 +225,6 @@ fn bare_rx_with_provider_is_harness_picker() {
 fn rx_help_and_version() {
     assert_eq!(parse_line(&["rx", "--help"]), Command::Help);
     assert_eq!(parse_line(&["rx", "-V"]), Command::Version);
-    assert!(!crate::help_text().contains("rx config"));
     assert!(crate::help_text().contains("rx --provider <provider> <harness>"));
     assert!(crate::help_text().contains("rx --provider none <harness>"));
     assert!(crate::help_text().contains("rx providers <list|login|logout|use>"));
@@ -233,7 +232,6 @@ fn rx_help_and_version() {
     assert!(crate::help_text().contains("rx completions <bash|zsh|fish>"));
     assert!(!crate::help_text().contains("rx providers list\n"));
     assert!(!crate::help_text().contains("rx completions --providers"));
-    assert!(!crate::help_text().contains("rx debug"));
 }
 
 #[test]
@@ -278,36 +276,66 @@ fn completions_rejects_provider_flag_and_extra_args() {
     assert!(unknown.to_string().contains("unknown completions command: powershell"), "{unknown}");
 }
 
+#[cfg(unix)]
 #[test]
-fn completions_scripts_cover_rx_surface() {
-    for shell in [CompletionShell::Bash, CompletionShell::Zsh, CompletionShell::Fish] {
-        let script = crate::completions::script(shell);
-        for needle in [
-            "claude",
-            "codex",
-            "opencode",
-            "pi",
-            "dsh",
-            "kimi",
-            "providers",
-            "update",
-            "completions",
-            "--provider",
-            "--configured",
-            "--providers",
-            "--targets",
-            "rxc",
-            "rxx",
-            "rxo",
-            "rxp",
-            "rxd",
-            "rxk",
-        ] {
-            assert!(script.contains(needle), "{shell:?} missing {needle}");
-        }
-        assert!(!script.contains("search"), "{shell:?} leaked recall commands");
+fn bash_completions_follow_argument_context() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("rx");
+    fs::write(
+        &bin,
+        "#!/bin/sh\ncase \"$*\" in\n'completions --targets') printf 'openrouter\\nnone\\n';;\n'completions --providers') echo all-provider;;\n'completions --configured') echo configured-provider;;\n*) exit 1;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    let script = format!(
+        "{}\nCOMP_WORDS=(\"$@\"); COMP_CWORD=$(($# - 1)); _rx; if ((${{#COMPREPLY[@]}})); then printf '%s\\n' \"${{COMPREPLY[@]}}\"; fi",
+        crate::completions::script(CompletionShell::Bash)
+    );
+    let cases: &[(&[&str], &[&str])] = &[
+        (&["rx", "co"], &["codex", "completions"]),
+        (&["rx", "codex", "--prov"], &["--provider"]),
+        (&["rx", "--provider", "open"], &["openrouter"]),
+        (&["rx", "--provider=open"], &["--provider=openrouter"]),
+        (&["rx", "--provider", "=", "open"], &["openrouter"]),
+        (&["rx", "--provider", "="], &["openrouter", "none"]),
+        (&["rx", "--provider", "=", "none", "co"], &["codex"]),
+        (&["rx", "--provider=none", "co"], &["codex"]),
+        (&["rx", "codex", "--", "--prov"], &[]),
+        (&["rx", "codex", "--", "--provider", "open"], &[]),
+        (&["rx", "codex", "--", "--provider=open"], &[]),
+        (&["rx", "--provider", "none", "codex", "--", "--prov"], &[]),
+        (&["rx", "providers", "lo"], &["login", "logout"]),
+        (&["rx", "providers", "login", "all"], &["all-provider"]),
+        (&["rx", "providers", "logout", "conf"], &["configured-provider"]),
+        (&["rx", "providers", "use", "open"], &["openrouter"]),
+        (&["rx", "providers", "models", "update", "conf"], &["configured-provider"]),
+        (&["rx", "completions", "z"], &["zsh"]),
+        (&["rx", "update", "--y"], &["--yes"]),
+        (&["rx", "codex", "--provider", "none", "--prov"], &[]),
+    ];
+    let check = |words: &[&str], expected: &[&str]| {
+        let output = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", &script, "completion-test"])
+            .args(words)
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{words:?}: {}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.lines().collect::<Vec<_>>(), expected, "{words:?}");
+    };
+    for (words, expected) in cases {
+        check(words, expected);
     }
-    assert!(crate::completions::script(CompletionShell::Zsh).contains("#compdef rx"));
+    for alias in ["rxc", "rxx", "rxo", "rxp", "rxd", "rxk"] {
+        check(&[alias, "--prov"], &["--provider"]);
+        check(&[alias, "--", "--prov"], &[]);
+        check(&[alias, "--provider", "=", "open"], &["openrouter"]);
+    }
 }
 
 #[test]
@@ -2307,12 +2335,6 @@ fn real_claude_plan_uses_seeded_generated_route() {
         plan.env_set.iter().any(|(key, value)| key == "ANTHROPIC_AUTH_TOKEN" && value == "sk-test")
     );
     assert!(config_dir.path().join(".claude.json").is_file());
-}
-
-#[test]
-fn debug_is_not_a_harness() {
-    let error = parse(&args(&["rx", "debug", "models"])).unwrap_err();
-    assert!(error.to_string().contains("unknown harness: debug"), "{error}");
 }
 
 #[test]

@@ -34,7 +34,6 @@ _rx_has_provider() {
   local i w
   for ((i = 1; i < COMP_CWORD; i++)); do
     w=${COMP_WORDS[i]}
-    [[ $w == -- ]] && return 1
     [[ $w == --provider || $w == --provider=* ]] && return 0
   done
   return 1
@@ -44,10 +43,9 @@ _rx_positionals() {
   local i=1 pending=0 w
   while ((i < COMP_CWORD)); do
     w=${COMP_WORDS[i]}
-    if [[ $w == -- ]]; then
-      break
-    elif [[ $w == --provider ]]; then
+    if [[ $w == --provider ]]; then
       pending=1
+      [[ ${COMP_WORDS[i + 1]} == = ]] && i=$((i + 1))
     elif [[ $w == --provider=* ]]; then
       :
     elif ((pending)); then
@@ -66,11 +64,21 @@ _rx() {
   prev=${COMP_WORDS[COMP_CWORD - 1]}
   COMPREPLY=()
 
+  local i
+  for ((i = 1; i < COMP_CWORD; i++)); do
+    [[ ${COMP_WORDS[i]} == -- ]] && return
+  done
+
   if [[ $cur == --provider=* ]]; then
     _rx_ids --targets
     return
   fi
   if [[ $prev == --provider ]]; then
+    [[ $cur == = ]] && cur=
+    _rx_ids --targets
+    return
+  fi
+  if [[ $prev == = && ${COMP_WORDS[COMP_CWORD - 2]} == --provider ]]; then
     _rx_ids --targets
     return
   fi
@@ -179,7 +187,6 @@ _rx_ids() {
 _rx_has_provider() {
   local w
   for w in $words[2,CURRENT-1]; do
-    [[ $w == -- ]] && return 1
     [[ $w == --provider || $w == --provider=* ]] && return 0
   done
   return 1
@@ -190,9 +197,7 @@ _rx_positionals() {
   local i=2 pending=0 w
   while (( i < CURRENT )); do
     w=$words[i]
-    if [[ $w == -- ]]; then
-      break
-    elif [[ $w == --provider ]]; then
+    if [[ $w == --provider ]]; then
       pending=1
     elif [[ $w == --provider=* ]]; then
       :
@@ -210,6 +215,11 @@ _rx() {
   local cur=$words[CURRENT]
   local prev=$words[CURRENT-1]
   local cmd=${words[1]:t}
+
+  local i
+  for ((i = 2; i < CURRENT; i++)); do
+    [[ $words[i] == -- ]] && return
+  done
 
   if [[ $cur == --provider=* ]]; then
     _rx_ids --targets
