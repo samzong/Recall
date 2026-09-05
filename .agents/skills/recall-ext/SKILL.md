@@ -1,111 +1,51 @@
 ---
 name: recall-ext
-description: Develop, release, and self-check Recall extensions. Use when working on Recall ext/extension host behavior, official extensions under extensions/recall-*, extension manifests, extension catalog and binary release flow, managed install/upgrade/remove design, or docs that explain Recall's extension model.
+description: Develop and verify Recall's extension host, official extensions, manifests, and release wiring. Use for extension implementation or maintenance in this repository.
 ---
 
 # Recall Ext
 
-## First Read
+Read `extensions/AGENTS.md` and `docs/extensions.md` for the extension boundary,
+CLI protocol, and managed-install contract. Compare implementation with the
+contract; resolve disagreements before changing behavior.
 
-Read `docs/extensions.md` before changing extension code, extension docs, or
-official extension release wiring. Treat it as the design source. Treat code as
-runtime truth if the doc and implementation disagree.
+## Develop
 
-## Boundaries
+- Use `extensions/recall-probe/` for the minimal package layout. Add the new
+  `recall-<name>` binary to workspace members and keep its version independent
+  of core.
+- Implement `--recall-extension-manifest` with `name`, package `version`,
+  `protocol`, and `min_recall`. Choose compatibility values from the CLI
+  features actually consumed; do not copy the probe's legacy values or
+  `commands` field into a new extension.
+- Pass an explicit `--project` on scoped Recall queries and syncs; use `all`
+  only for global work. Omitted scope follows the caller's working directory.
+- `recall session show --format json` returns metadata by default. Request
+  `--messages` or `--include metadata,messages` when reading transcripts.
+- For host changes, trace `src/extension.rs` against the managed-install
+  contract: official catalog, checksum and manifest validation, managed-only
+  dispatch and removal. Do not add PATH discovery or a third-party registry.
 
-- Keep Recall core as the data plane and stable CLI JSON/JSONL protocol.
-- Build extensions as external binaries named `recall-<name>`.
-- Use `recall extension ...` and `recall ext ...` for host commands.
-- Manage only official extensions from the official catalog unless the product
-  explicitly adds third-party distribution later.
-- Do not expose Rust internals, add a `recall-core` crate, or depend on SQLite
-  schema from an extension.
-- Do not add permissions/capabilities fields for native binaries; Recall cannot
-  enforce them.
-- Do not add an open registry unless real third-party distribution demand
-  exists. Official catalog first.
+## Verify
 
-## Develop An Official Extension
-
-Use `extensions/recall-probe/` as the minimal template.
-
-1. Create `extensions/recall-<name>/` as a workspace binary package.
-2. Name the Cargo package and binary `recall-<name>`.
-3. Keep the package version independent from Recall core.
-4. Add the package to the root workspace members, keeping `default-members = ["."]`.
-5. Implement `--recall-extension-manifest` with JSON stdout:
-
-```json
-{
-  "name": "<name>",
-  "version": "0.1.0",
-  "protocol": 1,
-  "min_recall": "0.2.10",
-  "commands": ["<name>"]
-}
-```
-
-6. Consume Recall through stable CLI commands such as `recall info --format json`,
-   `recall session list --format json`, `recall search --format json`,
-   `recall session show --format json`, and `recall export`.
-
-## Self-Check
-
-Run the smallest relevant set, then `make check` before ship:
+Run the relevant package checks and exercise its CLI protocol:
 
 ```bash
 cargo build -p recall-<name>
+cargo test -p recall-<name>
 cargo run -p recall-<name> -- --recall-extension-manifest
-cargo run -- ext list --available
-cargo test --lib extension::tests
-make check
 ```
 
-For release-only edits, also verify package output for each changed official
-extension:
+For host changes, run `cargo test --lib extension::tests`; for catalog changes,
+check `cargo run -- ext list --available`. Run root `make check` before ship.
 
-```bash
-cargo build -p recall-<name> --release --target <target>
-shasum -a 256 <archive>
-```
+## Release
 
-## Release An Official Extension
+Bump the package version only when a release is requested. Follow
+`.github/workflows/extension-release.yml` for version/tag validation, target
+packaging, publication, and catalog generation. Extension tags are
+`recall-<name>-v<version>`; a core tag does not release an extension.
 
-Changing an extension package version is release intent. Changing extension code
-without changing its package version is not a release.
-
-Use independent generated extension tags:
-
-```text
-recall-<name>-v<version>
-```
-
-Release flow:
-
-1. Bump `extensions/recall-<name>/Cargo.toml` only when releasing.
-2. Let PR checks verify version increase, absent tag, build, and manifest.
-3. After merge, let the workflow create `recall-<name>-v<version>`.
-4. Let the release job build archives and upload the GitHub Release.
-5. Let the catalog job generate and commit `website/public/extensions/catalog.json`.
-6. Publish the catalog through GitHub Pages at
-   `https://samzong.github.io/Recall/extensions/catalog.json`.
-7. Include `sha256`, `protocol`, `min_recall`, target URLs, and version entries.
-
-Recall core tags (`v*`) and extension tags are separate. Tag core only when core
-changes. Tag an extension only when that extension binary changes.
-
-## Managed Install Design
-
-When implementing `recall ext install`, `upgrade`, or `remove`, follow the
-managed model in `docs/extensions.md`:
-
-- install root: `<data_dir>/recall/extensions/`;
-- state file: `installed.json`;
-- packages: `packages/<name>/<version>/`;
-- command entries: `bin/recall-<name>`;
-- dispatch order: core command, managed extension, unknown.
-
-Install and upgrade must download from the official catalog, verify `sha256`,
-validate the manifest, move into `packages/`, update the `bin/` entry, then
-write `installed.json`. Remove must delete only managed files. Recall does not
-scan PATH for `recall-*` binaries in the managed official extension model.
+Verify the affected target archives, manifests, and SHA-256 checksums using
+that workflow. Never hand-edit `website/public/extensions/catalog.json` or
+couple extension and core releases unless protocol compatibility requires it.

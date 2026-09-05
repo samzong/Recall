@@ -22,11 +22,11 @@ If neither MCP nor the installed CLI is available, stop and offer `brew install 
 
 Use MCP `list_recent_sessions` without a query, `search_sessions` with a query, and `get_session` only when transcript evidence is needed.
 
-MCP search and recent hits expose `session_id` as Recall's index identity and `source_session_id` as the source tool's session identity. `get_session` returns both identities plus `first_message_seq` and `last_message_seq` for the messages represented in its text; both sequence fields are null when no messages are returned.
+Use `session_id` as Recall's index identity and `source_session_id` as the native tool's identity. `get_session` reports the returned message range with `first_message_seq` and `last_message_seq`.
 
-Set `include_events: true` on `get_session` only when tool relationships, file operations, meta records, or other structured evidence is needed. The opt-in payload returns at most 50 events anchored to the returned message range plus unanchored events. Each event string field is capped at 200 characters and all event string fields at 10,000 characters total; check `returned_events` and `events_truncated` before treating it as complete. Events expose only sequence, timestamp, kind, actor, name, status, target, message anchor, source event ID, tool call ID, meta, visibility, and short summary fields. They never include raw arguments, raw results, source paths, or parser internals.
+Set `include_events: true` only when structured evidence is needed. Events cover the returned message range plus unanchored events; both count and text are bounded. Check returned counts and truncation flags before treating messages or events as complete. Consult the active tool schema for limits; raw arguments, results, and source paths are not returned.
 
-For every MCP discovery call, generate a fresh high-entropy `invocation_nonce` literal and never reuse it. Recall prefers a verified host session ID and otherwise looks for that exact nonce in Codex or Claude Code discovery tool input. Treat `current_session.resolution: resolved` as proof that the named session was excluded before ranking and limit. When it is `unknown`, results are unchanged: do not guess the current session from time, project, recency, tool name, or result order.
+Pass a fresh high-entropy `invocation_nonce` literal on each MCP search or recent-list call. Only `current_session.resolution: resolved` proves self-exclusion before ranking and limit. If resolution is `unknown`, report that self-exclusion is unverified; never infer identity from time, project, source, or result order.
 
 Use the equivalent CLI workflow when needed:
 
@@ -42,7 +42,7 @@ Search results are relevance-ranked and bounded. In a queried CLI listing, `--so
 
 ## Find Recent Work
 
-When the user asks what other agents recently did, call `list_recent_sessions` for the current project with no source filter, a fresh `invocation_nonce`, and a limit of 10. Call `get_session` only for relevant candidates. If `current_session.resolution` is `unknown`, state that self-exclusion could not be verified.
+For recent work from other agents, list 10 sessions in the current project without a source filter, following the self-exclusion rule above. Load transcripts only for relevant candidates.
 
 If MCP is unavailable, use:
 
@@ -50,7 +50,7 @@ If MCP is unavailable, use:
 recall session list --project /absolute/project/path --limit 10 --sort updated --format json
 ```
 
-The result proves only that sessions were recently indexed. Do not describe them as live peers or attribute them to another agent without supporting metadata. The listing may fold spawned subagents beneath a visible parent, so it is not an exhaustive peer inventory. Report when the bounded result cannot isolate relevant work.
+These are recently active sessions in the index, not live peers. Attribute work only with supporting metadata. The bounded listing may fold subagents beneath their parent; report when it cannot isolate relevant work.
 
 ## Find File History
 
@@ -64,16 +64,16 @@ Return the matching event rows with session, source, title, kind, target, and ti
 
 When Recall is invoked without a clear task, list the five most recent sessions in the current project and inspect their latest 12 messages. Do not broaden to all projects.
 
-With MCP, call `list_recent_sessions` with a fresh `invocation_nonce`, then `get_session` with `max_messages: 12` and `tail: true`. Without MCP, use:
+With MCP, list recent sessions, then use `get_session` with `max_messages: 12` and `tail: true`. Without MCP, list candidates and parse each selected session's JSON locally. With `jq` available:
 
 ```bash
 recall session list --project /absolute/project/path --limit 5 --sort updated --format json
-recall session show --id <session-id> --format json --include metadata,messages --from-seq <calculated-sequence>
+recall session show --id <session-id> --format json --include metadata,messages | jq '.messages | sort_by(.seq) | .[-12:]'
 ```
 
-Set `<calculated-sequence>` to `max(message_count - 12, 0)` from the list result. Offer at most three numbered candidates. Include only sessions whose ending contains an unanswered request, explicit remaining work, a blocker, or interrupted execution. Exclude completed and ambiguous sessions. Trust self-exclusion only when `current_session.resolution` is `resolved`; otherwise state that it could not be verified. Treat the bounded list as candidates, not a complete inventory of unfinished work. A numeric reply selects the same candidate and continues it in the current agent.
+If `jq` is unavailable, use an available JSON parser for the same array selection. Message sequences may have gaps or start above zero; never derive them from `message_count`.
 
-Do not launch native resume or app-open behavior unless the user explicitly requests it.
+Offer at most three numbered candidates whose endings show an unanswered request, remaining work, a blocker, or interruption. Exclude completed or ambiguous sessions. This bounded list is not an exhaustive unfinished-work inventory. A numeric reply continues the same candidate in the current agent.
 
 ## Resume Or Open
 
@@ -94,13 +94,15 @@ Use an explicit session id when provided. Otherwise sync and list recent session
 recall session list --project /absolute/project/path --source <source> --limit 5 --sort updated --sync --format json
 ```
 
-Create a unique temporary file with `mktemp /tmp/recall-tldr.XXXXXX`, write a short Markdown TL;DR from the current conversation context, and do not reload the transcript just to summarize it. Then publish with that path:
+Base the TL;DR on the selected session. For the current conversation, use the existing context without reloading its transcript solely for a summary. For another session, use its retrieved transcript; omit the optional TL;DR if evidence is insufficient. Never substitute the current conversation for a different session.
+
+When including a TL;DR, create a unique file with `mktemp /tmp/recall-tldr.XXXXXX`, write the short Markdown summary, and publish with that path:
 
 ```bash
 recall session share --id <session-id> --tldr-file <temporary-tldr-path> --format json
 ```
 
-Remove the temporary file after publishing. Missing, unreadable, or blank TL;DR input does not block publishing. Read `share.url` from the JSON and verify it with `curl -I -L`. If the first check returns 404, publish once more and recheck, then stop. If sharing is not configured, tell the user to run `recall share init`. Return the live URL rather than raw JSON.
+Omit `--tldr-file` when no summary is supplied; remove any temporary file after publishing. Missing, unreadable, or blank TL;DR input does not block publishing. Read `share.url` from the JSON and verify it with `curl -I -L`. If the first check returns 404, publish once more and recheck, then stop. If sharing is not configured, tell the user to run `recall share init`. Return the live URL rather than raw JSON.
 
 List and unpublish shared pages with:
 
@@ -123,18 +125,7 @@ recall export --project /absolute/project/path --limit 0
 
 Treat search snippets as leads. Parse exports as JSONL instead of text, and verify historical conclusions against current code. Token usage is not monetary cost without an explicit price source.
 
-Return project memory, not a list of matching sessions. Cite source, title or session id, and approximate time for each fact. Summarize transcripts and quote only short excerpts that serve as evidence. For a broad review, use this shape:
-
-```text
-Recall review of <project>:
-
-1. Historical facts that matter now
-2. Repeated risks or unresolved problems
-3. Failed or rejected approaches to avoid
-4. User or project constraints extracted from history
-5. Current code assumptions to verify
-6. Recommended next checks
-```
+Synthesize relevant facts, recurring risks, rejected approaches, user constraints, and next checks. Distinguish history from current-code assumptions. Cite source, title or session id, and approximate time; quote only short supporting excerpts.
 
 Route requests about workflow friction, handoffs, repeated corrections, or calibration to the installed `reflect` skill.
 
@@ -142,8 +133,6 @@ Route requests about workflow friction, handoffs, repeated corrections, or calib
 
 - `recall` with no subcommand launches the TUI.
 - `recall usage` without `--json` launches an interactive dashboard.
-- `recall session share --dry-run` when the user asked to share or refresh a link, and returning a URL without a real publish.
-- `recall share unpublish` without an exact target selected by the user.
 - `recall sync --force` unless the user asks for a rebuild or incremental sync provably cannot repair the index.
 - Hidden `__bench-*` and `__background-worker` commands.
 - Raw source transcript paths unless the user explicitly asks for source-level forensics.

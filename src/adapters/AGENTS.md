@@ -1,57 +1,23 @@
-# src/adapters/
+# Adapters
 
-One adapter per AI coding tool. This is the most-extended surface in Recall —
-DEVELOPMENT.md walks through adding an adapter; this file states the rules that
-apply when working here.
+`SourceAdapter` in `mod.rs` is the implementation contract;
+`DEVELOPMENT.md` provides the walkthrough.
 
-## Contract
-
-- The `SourceAdapter` trait in `mod.rs` is the authoritative contract, not the
-  DEVELOPMENT.md example. `id()`, `label()`, `scan()`, and `resume_command()`
-  are required; `scan_for_sync()`, `scan_for_sync_output()`, `app_command()`,
-  `usage_parser_version()`, and `start_command()` are optional overrides.
-  `start_command()` is how an adapter becomes a handoff target: implement it
-  when the CLI can start a new session from an initial prompt. Registration
-  plus a present binary on PATH is what the TUI/CLI list; do not keep a
-  parallel target table.
-- Adapters never delete from `Store`. An adapter with a complete source
-  inventory may return a bounded `ReconcilePlan`; sync owns applying it after
-  the source run succeeds and only in global scope.
-- Register new adapters in `all_adapters()` in `mod.rs`. Registration alone
-  wires the adapter into sync, search, the TUI source filter, and the CLI
-  `--source` flag. No schema change is needed — `sessions.source` is a value,
-  not a column per tool.
-- `events.rs`, `file_scan.rs`, `sync_state.rs`, `json_util.rs`, and `paths.rs`
-  are shared helpers, not adapters. Prefer them over hand-rolling:
-  `file_scan::run_file_scan_with_options` for mtime tracking,
-  `json_util::jsonl_indexed` for per-line JSONL read loops,
-  `json_util::rfc3339_ms` and `json_util::json_i64` for timestamp/number
-  coercion, `paths::resolve_home_dir` for `~/…` directory resolution,
-  `paths::vscode_extension_task_dirs` for VS Code-family `globalStorage`
-  extension task roots, `cline/cli_store.rs` for Cline CLI sessions under
-  `CLINE_DATA_DIR` / `CLINE_DIR/data` / `~/.cline/data/sessions` (merged into
-  the `cline` adapter like Cursor's CLI store), and `first_timestamp` /
-  `last_timestamp` (`mod.rs`) for started_at/updated_at fallback chains.
-- Usage and session events are extensions on the same `RawSession`
-  (`with_usage`, `with_events`), each with its own parser version. Bump the
-  parser version when parsing changes — that is what triggers backfill for
-  sessions whose files did not change.
-- `source_supports_event_backfill()` in `mod.rs` is a hardcoded source list.
-  An adapter that starts emitting events must be added there, or usage
-  dashboards will not pick it up.
-
-## Rules
-
-- Tool not installed → return `Ok(vec![])`, never an error.
-- Open external tool databases read-only (`SQLITE_OPEN_READ_ONLY`).
-- Extract text content only; skip tool calls, images, and internal metadata.
-- Recoverable parse error → `tracing::warn!`, skip the session, continue.
-- Timestamps are Unix milliseconds.
-
-## Verify
-
-```bash
-make check
-cargo run -- sync -v          # should log the new source with a session count
-cargo run -- search "query" --source <id>
-```
+- Register each source in `all_adapters()`. This connects sync, search, and
+  CLI/TUI source selection; adding a source needs no schema change.
+- Implement `start_command()` when a native CLI supports an initial prompt.
+  Handoff targets come from registered adapters with an available binary;
+  do not create a separate target table.
+- Adapters never mutate the Recall store. A complete source inventory may
+  return a bounded `ReconcilePlan`; sync applies it only after successful
+  processing and only in global scope.
+- Missing source data returns an empty scan. Open external databases read-only.
+- Extract message text separately from structured usage and session events;
+  do not put tool payloads or images into message text.
+- Warn on recoverable session parse failures and skip the affected session;
+  use shared JSONL helpers to tolerate malformed individual records.
+- Timestamps are Unix milliseconds. Reuse shared file-scan, JSON, timestamp,
+  path, and event helpers.
+- Usage and events belong to the same `RawSession`, with separate parser
+  versions. Bump the relevant version when parsing changes to backfill
+  unchanged files. Add new event sources to `source_supports_event_backfill()`.
