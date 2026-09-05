@@ -27,7 +27,7 @@ use crate::types::{
 pub(crate) struct CodexAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 6;
-const EVENT_PARSER_VERSION: u32 = 5;
+const EVENT_PARSER_VERSION: u32 = 6;
 const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for CodexAdapter {
@@ -823,6 +823,7 @@ fn collect_codex_response_item_event(
     let Some(payload_type) = payload.get("type").and_then(Value::as_str) else {
         return;
     };
+    let mut command_evidence_status = None;
     let mut event = if payload_type.ends_with("_output") {
         events::tool_result_event(
             context,
@@ -839,7 +840,14 @@ fn collect_codex_response_item_event(
             .and_then(|args| args.get("workdir").or_else(|| args.get("cwd")))
             .and_then(Value::as_str)
             .or(cwd);
-        let files = if matches!(name.as_str(), "apply_patch" | "functions.apply_patch") {
+        let files = if matches!(
+            name.as_str(),
+            "exec" | "functions.exec" | "exec_command" | "functions.exec_command"
+        ) {
+            let (files, status) = events::command_file_evidence(&name, args, cwd);
+            command_evidence_status = Some(status);
+            files
+        } else if matches!(name.as_str(), "apply_patch" | "functions.apply_patch") {
             args.and_then(Value::as_str).map(events::patch_file_evidence).unwrap_or_default()
         } else {
             let operation = match name.as_str() {
@@ -875,14 +883,16 @@ fn collect_codex_response_item_event(
         };
         event.files = files;
         for file in &mut event.files {
-            file.cwd = effective_cwd.map(str::to_string);
+            if file.kind != FileEvidenceKind::Command {
+                file.cwd = effective_cwd.map(str::to_string);
+            }
         }
-        event.summary = event.summary.map(events::bounded_summary);
         event
     } else {
         return;
     };
     event.status = payload.get("status").and_then(Value::as_str).map(String::from);
+    event.command_evidence_status = command_evidence_status;
     event.tool_call_id = codex_tool_call_id(payload);
     event.attrs_json = Some(payload.to_string());
     events_out.push(event);
@@ -1560,7 +1570,17 @@ mod tests {
         assert_eq!(raw.events[5].source_event_id.as_deref(), Some("7:0"));
         assert_eq!(raw.events[6].tool_call_id.as_deref(), Some("legacy"));
         assert_eq!(raw.events[6].status.as_deref(), Some("failed"));
-        assert!(raw.events[7].files.is_empty());
+        assert_eq!(raw.events[7].files.len(), 2);
+        assert!(
+            raw.events[7]
+                .files
+                .iter()
+                .all(|file| file.kind == FileEvidenceKind::Command && file.cwd.is_none())
+        );
+        assert_eq!(
+            raw.events[7].command_evidence_status,
+            Some(crate::types::CommandEvidenceStatus::Unsupported)
+        );
         assert_eq!(raw.events[7].tool_call_id.as_deref(), Some("wrapper"));
         assert_eq!(raw.events[8].kind, "file_change");
         assert!(raw.events[8].tool_call_id.is_none());

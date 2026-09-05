@@ -2,7 +2,11 @@ use serde_json::Value;
 
 use crate::types::{FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent};
 
-const TOOL_RESULT_SUMMARY_MAX_BYTES: usize = 4096;
+mod command;
+
+pub(crate) use command::{command_file_evidence, shell_file_evidence};
+
+const EVENT_SUMMARY_MAX_BYTES: usize = 4096;
 
 pub(crate) struct EventContext {
     pub(crate) event_seq: u32,
@@ -36,7 +40,7 @@ pub(crate) fn tool_call_event(
         status: None,
         target,
         message_seq: context.message_seq,
-        summary,
+        summary: summary.map(bounded_summary),
         source_path: context.source_path,
         source_event_id: context.source_event_id,
         tool_call_id: None,
@@ -70,7 +74,7 @@ pub(crate) fn tool_call_event_from_text(
         status: None,
         target,
         message_seq: context.message_seq,
-        summary,
+        summary: summary.map(bounded_summary),
         source_path: context.source_path,
         source_event_id: context.source_event_id,
         tool_call_id: None,
@@ -125,7 +129,7 @@ pub(crate) fn file_write_event(
         status: None,
         target: Some(target),
         message_seq: context.message_seq,
-        summary: Some(summary),
+        summary: Some(bounded_summary(summary)),
         source_path: context.source_path,
         source_event_id: context.source_event_id,
         tool_call_id: None,
@@ -272,10 +276,10 @@ fn non_empty(text: &str) -> Option<String> {
 }
 
 pub(crate) fn bounded_summary(summary: String) -> String {
-    if summary.len() <= TOOL_RESULT_SUMMARY_MAX_BYTES {
+    if summary.len() <= EVENT_SUMMARY_MAX_BYTES {
         return summary;
     }
-    let mut end = TOOL_RESULT_SUMMARY_MAX_BYTES;
+    let mut end = EVENT_SUMMARY_MAX_BYTES;
     while !summary.is_char_boundary(end) {
         end -= 1;
     }
@@ -286,7 +290,7 @@ pub(crate) fn bounded_summary(summary: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventContext, TOOL_RESULT_SUMMARY_MAX_BYTES, tool_result_event};
+    use super::{EVENT_SUMMARY_MAX_BYTES, EventContext, tool_result_event};
 
     fn context() -> EventContext {
         EventContext {
@@ -311,15 +315,161 @@ mod tests {
 
     #[test]
     fn tool_result_summary_is_capped_on_a_char_boundary() {
-        let long = "汉".repeat(TOOL_RESULT_SUMMARY_MAX_BYTES);
+        let long = "汉".repeat(EVENT_SUMMARY_MAX_BYTES);
         let event = tool_result_event(context(), None, Some(long));
         let summary = event.summary.unwrap();
         assert!(summary.ends_with('…'));
-        assert!(summary.len() <= TOOL_RESULT_SUMMARY_MAX_BYTES + '…'.len_utf8());
+        assert!(summary.len() <= EVENT_SUMMARY_MAX_BYTES + '…'.len_utf8());
         assert!(summary.trim_end_matches('…').chars().all(|c| c == '汉'));
 
         let short = "ok".to_string();
         let event = tool_result_event(context(), None, Some(short.clone()));
         assert_eq!(event.summary, Some(short));
+    }
+
+    #[test]
+    fn command_candidates_decode_literals_without_inventing_execution() {
+        use crate::types::{CommandEvidenceStatus, FileEvidenceKind};
+        let patch = "*** Begin Patch\n*** Update File: /repo/README.zh-CN.md\n@@\n-old\n+new\n*** End Patch";
+        for script in [
+            format!("text(await tools.apply_patch({}));", serde_json::to_string(patch).unwrap()),
+            format!(
+                "const patch = {};\ntext(await tools.apply_patch(patch));",
+                serde_json::to_string(patch).unwrap()
+            ),
+            format!("if (false) {{ await tools.apply_patch(`{patch}`); }}"),
+            format!("text({});", serde_json::to_string(patch).unwrap()),
+            format!("const patch = {} + suffix;", serde_json::to_string(patch).unwrap()),
+        ] {
+            let (files, status) =
+                super::command_file_evidence("exec", Some(&serde_json::json!(script)), None);
+            assert_eq!(status, CommandEvidenceStatus::Unsupported);
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].path, "/repo/README.zh-CN.md");
+            assert_eq!(files[0].kind, FileEvidenceKind::Command);
+            assert!(files[0].cwd.is_none());
+        }
+        for script in [
+            format!(
+                "text({});",
+                serde_json::to_string(&format!("tools.apply_patch({patch:?})")).unwrap()
+            ),
+            format!("/* tools.apply_patch(`{patch}`) */"),
+        ] {
+            assert!(
+                super::command_file_evidence("exec", Some(&serde_json::json!(script)), None)
+                    .0
+                    .is_empty()
+            );
+        }
+        let (files, status) = super::command_file_evidence(
+            "exec",
+            Some(&serde_json::json!(
+                "await tools.apply_patch(`*** Begin Patch\n*** Update File: ${file}\n*** End Patch`);"
+            )),
+            None,
+        );
+        assert!(files.is_empty());
+        assert_eq!(status, CommandEvidenceStatus::Unsupported);
+    }
+
+    #[test]
+    fn command_candidates_keep_directory_and_heredoc_boundaries() {
+        use crate::types::{CommandEvidenceStatus, FileOperation};
+        let command = "git restore --staged -- index-only\ngit restore -- 'file one'\ncd /second && mv -- old new\ngit checkout -- ambiguous\napply_patch <<'PATCH'\n*** Begin Patch\n*** Delete File: /repo/deleted\n*** Add File: /repo/added\n+${literal}\n*** End Patch\nPATCH\ncat <<'QUOTE'\ngit restore -- not-executed\nQUOTE";
+        let script = format!(
+            "await tools.exec_command({{cmd:{},workdir:'/first',yield_time_ms:1000}});",
+            serde_json::to_string(command).unwrap()
+        );
+        let (files, status) =
+            super::command_file_evidence("functions.exec", Some(&serde_json::json!(script)), None);
+        assert_eq!(status, CommandEvidenceStatus::Unsupported);
+        assert_eq!(
+            files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            ["file one", "old", "new", "ambiguous", "/repo/deleted", "/repo/added"]
+        );
+        assert_eq!(files[0].cwd.as_deref(), Some("/first"));
+        assert_eq!(files[1].cwd.as_deref(), Some("/second"));
+        assert_eq!(files[1].operation, FileOperation::MoveFrom);
+        assert_eq!(files[2].operation, FileOperation::MoveTo);
+        assert!(files[3].cwd.is_none());
+        assert_eq!(files[4].operation, FileOperation::Delete);
+        let (files, status) = super::command_file_evidence(
+            "exec",
+            Some(&serde_json::json!(
+                "tools.exec_command({cmd:'git checkout -- relative', workdir: destination});"
+            )),
+            None,
+        );
+        assert_eq!(status, CommandEvidenceStatus::Unsupported);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].cwd.is_none());
+        let (files, status) = super::command_file_evidence(
+            "exec_command",
+            Some(
+                &serde_json::json!({"cmd":"printf 'git restore -- absent'\ngit -C /target restore -- file", "workdir":"/session"}),
+            ),
+            None,
+        );
+        assert_eq!(status, CommandEvidenceStatus::Complete);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].cwd.as_deref(), Some("/target"));
+    }
+
+    #[test]
+    fn heredoc_target_is_distinct_from_printed_command_text() {
+        let command = "cat > scripts/regenerate-changelog <<'HOOK'\n#!/bin/sh\ngit restore -- printed-only\nHOOK\ncat <<'TEXT'\ncat > not-written <<INNER\nTEXT";
+        let (files, _) = super::shell_file_evidence(command, Some("/repo"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "scripts/regenerate-changelog");
+        assert_eq!(files[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(files[0].kind, crate::types::FileEvidenceKind::Command);
+        let (files, _) = super::command_file_evidence(
+            "exec_command",
+            Some(&serde_json::json!({"cmd":"git restore -- tracked"})),
+            Some("/native-turn"),
+        );
+        assert_eq!(files[0].cwd.as_deref(), Some("/native-turn"));
+        let (files, status) = super::shell_file_evidence(
+            "python <<'PY'\nignored()\nPY\ngit restore -- uncertain",
+            Some("/repo"),
+        );
+        assert_eq!(status, crate::types::CommandEvidenceStatus::Unsupported);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].cwd.is_none());
+        for command in [
+            "apply_patch <<'PATCH' 2>/dev/null\n*** Begin Patch\n*** Update File: /repo/a.rs\n@@\n-old\n+new\n*** End Patch\nPATCH",
+            "git restore -- ' '",
+        ] {
+            let (files, status) = super::shell_file_evidence(command, Some("/repo"));
+            assert_eq!(status, crate::types::CommandEvidenceStatus::Unsupported);
+            assert!(files.iter().all(|file| !file.path.trim().is_empty()));
+        }
+    }
+
+    #[test]
+    fn command_scan_limits_are_explicit() {
+        use crate::types::CommandEvidenceStatus;
+        let script = " ".repeat(1_048_577);
+        let (files, status) =
+            super::command_file_evidence("exec", Some(&serde_json::json!(script)), None);
+        assert!(files.is_empty());
+        assert_eq!(status, CommandEvidenceStatus::LimitExceeded);
+        let (files, status) = super::command_file_evidence(
+            "exec",
+            Some(&serde_json::json!("a;".repeat(16_385))),
+            None,
+        );
+        assert!(files.is_empty());
+        assert_eq!(status, CommandEvidenceStatus::LimitExceeded);
+        let patch = format!(
+            "*** Begin Patch\n{}*** End Patch",
+            (0..257).map(|i| format!("*** Add File: /repo/{i}\n+x\n")).collect::<String>()
+        );
+        let script = format!("tools.apply_patch({});", serde_json::to_string(&patch).unwrap());
+        let (files, status) =
+            super::command_file_evidence("exec", Some(&serde_json::json!(script)), None);
+        assert_eq!(files.len(), 256);
+        assert_eq!(status, CommandEvidenceStatus::LimitExceeded);
     }
 }

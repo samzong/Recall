@@ -27,7 +27,7 @@ use crate::types::{
 pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 6;
-const EVENT_PARSER_VERSION: u32 = 5;
+const EVENT_PARSER_VERSION: u32 = 6;
 const METADATA_PARSER_VERSION: u32 = 3;
 
 impl SourceAdapter for ClaudeCodeAdapter {
@@ -434,7 +434,7 @@ fn parse_claude_session_file(
     let meta = indexes.live.get(&entry.session_id);
     let fallback_cwd = meta.and_then(|m| m.cwd.as_deref()).or(entry.directory.as_deref());
     for file in parsed.events.iter_mut().flat_map(|event| &mut event.files) {
-        if file.cwd.is_none() {
+        if file.cwd.is_none() && file.kind != FileEvidenceKind::Command {
             file.cwd = fallback_cwd.map(str::to_string);
         }
     }
@@ -767,6 +767,13 @@ fn collect_claude_content_events(
                         cwd: context.cwd.map(str::to_string),
                         target: None,
                     });
+                }
+                if event.name.as_deref() == Some("Bash")
+                    && let Some(command) = item.pointer("/input/command").and_then(Value::as_str)
+                {
+                    let (files, status) = events::shell_file_evidence(command, context.cwd);
+                    event.files = files;
+                    event.command_evidence_status = Some(status);
                 }
                 event.attrs_json = Some(item.to_string());
                 event.tool_call_id = claude_tool_call_id(item.get("id"));

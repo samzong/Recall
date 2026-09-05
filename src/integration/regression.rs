@@ -338,6 +338,19 @@ fn sync_resolves_cross_repository_files_and_keeps_native_paths() {
                 target: None,
             })
             .collect();
+    for (path, kind) in [
+        ("src/unknown.rs".to_string(), FileEvidenceKind::Command),
+        (raw_path.clone(), FileEvidenceKind::Command),
+        ("src/fallback.rs".to_string(), FileEvidenceKind::Call),
+    ] {
+        event.files.push(FileEvidence {
+            path,
+            operation: FileOperation::Write,
+            kind,
+            cwd: None,
+            target: None,
+        });
+    }
     let raw = RawSession::search_only(
         "cross",
         other.to_str().map(str::to_string),
@@ -356,6 +369,12 @@ fn sync_resolves_cross_repository_files_and_keeps_native_paths() {
     assert_eq!(session.directory.as_deref(), other.to_str());
     assert_eq!(session.repo_remote.as_deref(), Some("github.com/fixture/other"));
     let events = store.list_session_events_for_session(&session.id).unwrap();
+    assert!(events[0].files[2].target.is_none());
+    assert_eq!(events[0].files[3].target, events[0].files[0].target);
+    assert_eq!(
+        events[0].files[4].target.as_ref().unwrap().repo_remote.as_deref(),
+        Some("github.com/fixture/other")
+    );
     assert_eq!(events[0].files[0].path, raw_path);
     assert_eq!(events[0].files[0].target, events[0].files[1].target);
     let file = events[0].files[0].target.as_ref().unwrap();

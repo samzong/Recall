@@ -715,7 +715,6 @@ fn cursor_tool_call(
         if !event.files.is_empty() {
             event.kind = "file_write".into();
         }
-        event.summary = event.summary.map(events::bounded_summary);
         return event;
     }
     let operation = match name.as_str() {
