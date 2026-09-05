@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::adapters;
+use crate::db::message_store::{MessageRead, MessageWindow};
 use crate::db::search::{SearchEngine, SearchFilters, SessionEventQuery, TimeRange};
 use crate::db::store::Store;
 use crate::project_scope::ProjectScope;
@@ -65,7 +66,7 @@ struct SearchSessionsArgs {
     invocation_nonce: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct GetSessionArgs {
     /// Recall session id from search_sessions or list_recent_sessions.
     session_id: String,
@@ -84,6 +85,47 @@ struct GetSessionArgs {
         description = "Include up to 50 structured events anchored to the returned message range, plus unanchored events. Each event string field is capped at 200 characters and all event string fields at 10000 characters total. Defaults to false."
     )]
     include_events: bool,
+    #[serde(default)]
+    #[schemars(
+        description = "First message sequence to read; incompatible with around_seq and cursor."
+    )]
+    from_seq: Option<u32>,
+    #[serde(default)]
+    #[schemars(description = "Last message sequence to read, inclusive.")]
+    to_seq: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Read this message and its neighbors. Missing or ambiguous sequences are errors. Defaults to three messages before and after."
+    )]
+    around_seq: Option<u32>,
+    #[serde(default)]
+    #[schemars(description = "Actual messages before around_seq, excluding the anchor.")]
+    before: Option<u32>,
+    #[serde(default)]
+    #[schemars(description = "Actual messages after around_seq, excluding the anchor.")]
+    after: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Unicode character budget for paged message content, default 6000, maximum 6000. Also enables paging without a sequence selector.",
+        range(min = 1, max = 6000)
+    )]
+    max_chars: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Opaque next_cursor copied from the previous page. Use with session_id, without sequence selectors or tail. Reindexing invalidates cursors."
+    )]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchMessagesArgs {
+    #[serde(flatten)]
+    search: SearchSessionsArgs,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional Recall session_id to search exactly this session, including the invoking session."
+    )]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -310,6 +352,10 @@ struct SessionDetail {
     truncated: bool,
     messages: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_message_byte_offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     events: Option<Vec<SessionEventDetail>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     returned_events: Option<usize>,
@@ -454,7 +500,26 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Load one indexed session by Recall session_id. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 characters. Set include_events only when structured evidence is needed; it returns at most 50 events anchored to the returned message range plus unanchored events, caps each event string field at 200 characters and all event string fields at 10000 characters total, and never returns raw arguments, results, source paths, or parser internals. Returns metadata, including source-native source_session_id and the first_message_seq and last_message_seq represented by the response, plus messages as plain text in sequence order.",
+        description = "Search message text by keywords and return individual matches with session_id, source_session_id, source, title, seq, role, timestamp (Unix milliseconds), and an excerpt around the match. This uses full-text search, not embeddings. Prefer this for specific historical evidence; use get_session with around_seq set to a returned seq for context. Limit defaults to 10, maximum 50. Pass project for project-scoped discovery and a fresh invocation_nonce for self-exclusion. Explicit session_id searches include that session even when it is the invoking session. Sequence anchors refer to the current index, not permanent source identities.",
+        annotations(
+            title = "Search messages",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn search_messages(
+        &self,
+        Parameters(args): Parameters<SearchMessagesArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(json_result(
+            search_message_matches(&lock_index(&self.index), &args, &self.current_session)
+                .map_err(|message| serde_json::json!({"message": message, "matches": []})),
+        ))
+    }
+
+    #[tool(
+        description = "Load one indexed session by Recall session_id. After search_messages, pass around_seq to read the matched message and its neighbors (default three before and after). Alternatively use inclusive from_seq/to_seq. These selectors cannot be combined with tail. Selected reads return up to 50 messages and 6000 Unicode content characters, with first_message_byte_offset and next_cursor for lossless continuation. Resume using session_id and cursor without selectors; reindexing invalidates cursors. Without selectors, cursor, or max_chars, the legacy head/tail behavior follows. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 bytes. Set include_events only when structured evidence is needed; it returns at most 50 events anchored to the returned message range plus unanchored events, caps each event string field at 200 characters and all event string fields at 10000 characters total, and never returns raw arguments, results, source paths, or parser internals. Returns metadata, including source-native source_session_id and the first_message_seq and last_message_seq represented by the response, plus messages as plain text in sequence order.",
         annotations(
             title = "Get session",
             read_only_hint = true,
@@ -538,6 +603,7 @@ impl GetSessionBenchmark {
                 max_messages: Some(self.max_messages),
                 tail: self.tail,
                 include_events: false,
+                ..Default::default()
             }))
             .expect("benchmark get_session");
         serde_json::to_vec(&result).expect("serialize benchmark get_session")
@@ -697,6 +763,46 @@ fn search_ready(
     })
 }
 
+fn search_message_matches(
+    index: &IndexState,
+    args: &SearchMessagesArgs,
+    context: &CurrentSessionContext,
+) -> std::result::Result<Value, String> {
+    let store = match index {
+        IndexState::Ready(store) => store,
+        IndexState::Unavailable { message, .. } => return Err(message.clone()),
+    };
+    if let Some(id) = args.session_id.as_deref()
+        && store.get_session_by_id(id).map_err(|e| e.to_string())?.is_none()
+    {
+        return Err(format!("{SESSION_NOT_FOUND} {id}"));
+    }
+    let current = context.resolve(store, args.search.invocation_nonce.as_deref());
+    let (scope, sources) =
+        resolve_filters(store, args.search.project.as_deref(), args.search.source.as_deref())?;
+    let filters = SearchFilters {
+        sources,
+        scope,
+        time_range: TimeRange::All,
+        thread_role: None,
+        excluded_session_id: if args.session_id.is_none() {
+            current.session_id.clone()
+        } else {
+            None
+        },
+    };
+    let matches = SearchEngine::new(&store.conn)
+        .search_messages(
+            &args.search.query,
+            &filters,
+            args.session_id.as_deref(),
+            clamp_limit(args.search.limit, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"matches": matches, "current_session": current,
+        "current_session_excluded": filters.excluded_session_id.is_some()}))
+}
+
 #[cfg(test)]
 fn list_recent_sessions(
     index: &IndexState,
@@ -837,10 +943,72 @@ fn get_ready(store: &Store, args: &GetSessionArgs) -> std::result::Result<Sessio
         };
         return Err(message);
     };
-    let max_messages = clamp_limit(args.max_messages, GET_MAX_MESSAGES_DEFAULT, u32::MAX);
-    let messages = store.get_messages(&session.id).map_err(|error| error.to_string())?;
-    let (text, returned, truncated, first_message_seq, last_message_seq) =
-        render_messages(&messages, max_messages, args.tail);
+    let window = MessageWindow {
+        from_seq: args.from_seq,
+        to_seq: args.to_seq,
+        around_seq: args.around_seq,
+        before: args.before,
+        after: args.after,
+    };
+    window.validate().map_err(|e| e.to_string())?;
+    let paging = window.is_selected() || args.cursor.is_some() || args.max_chars.is_some();
+    let mut next_cursor = None;
+    let mut first_message_byte_offset = None;
+    let (text, returned, truncated, first_message_seq, last_message_seq) = if paging {
+        if args.tail {
+            return Err("tail cannot be combined with message selection or cursor".to_string());
+        }
+        let max_chars = args.max_chars.unwrap_or(6000);
+        if !(1..=6000).contains(&max_chars) {
+            return Err("max_chars must be between 1 and 6000".to_string());
+        }
+        let page = store
+            .read_message_page(
+                &session.id,
+                &MessageRead {
+                    window: &window,
+                    role: None,
+                    max_messages: clamp_limit(args.max_messages, GET_MAX_MESSAGES_DEFAULT, 50),
+                    max_chars: max_chars as usize,
+                    cursor: args.cursor.as_deref(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        first_message_byte_offset = Some(page.first_message_byte_offset);
+        let first = page.messages.first().map(|m| m.seq);
+        let last = page.messages.last().map(|m| m.seq);
+        let text = page
+            .messages
+            .iter()
+            .map(|m| format!("[{}][{}] {}", m.seq, role_label(&m.role), m.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let truncated = page.next_cursor.is_some();
+        next_cursor = page.next_cursor;
+        (text, page.messages.len(), truncated, first, last)
+    } else {
+        let max_messages = clamp_limit(args.max_messages, GET_MAX_MESSAGES_DEFAULT, u32::MAX);
+        let messages = store
+            .get_messages_in_window(
+                &session.id,
+                &window,
+                None,
+                max_messages.min(GET_RESPONSE_CHAR_CAP / 7 + 1),
+                args.tail,
+            )
+            .map_err(|e| e.to_string())?;
+        let total: usize = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let (text, returned, truncated, first, last) =
+            render_messages(&messages, max_messages, args.tail);
+        (text, returned, truncated || total > messages.len(), first, last)
+    };
     let (events, returned_events, events_truncated) = if args.include_events {
         let records = store
             .list_session_events_for_session(&session.id)
@@ -867,6 +1035,8 @@ fn get_ready(store: &Store, args: &GetSessionArgs) -> std::result::Result<Sessio
         last_message_seq,
         truncated,
         messages: text,
+        next_cursor,
+        first_message_byte_offset,
         events,
         returned_events,
         events_truncated,
@@ -889,6 +1059,8 @@ fn empty_detail(message: Option<String>) -> SessionDetail {
         last_message_seq: None,
         truncated: false,
         messages: String::new(),
+        next_cursor: None,
+        first_message_byte_offset: None,
         events: None,
         returned_events: None,
         events_truncated: None,
@@ -1572,6 +1744,7 @@ mod tests {
                 max_messages: None,
                 tail: false,
                 include_events: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1671,6 +1844,7 @@ mod tests {
                 max_messages: Some(1),
                 tail: false,
                 include_events: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1707,6 +1881,7 @@ mod tests {
                 max_messages: None,
                 tail: false,
                 include_events: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1748,6 +1923,7 @@ mod tests {
                 max_messages: None,
                 tail: false,
                 include_events: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1783,6 +1959,7 @@ mod tests {
                 max_messages: Some(2),
                 tail: true,
                 include_events: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1820,6 +1997,7 @@ mod tests {
                 max_messages: Some(20),
                 tail: true,
                 include_events: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1846,6 +2024,7 @@ mod tests {
             max_messages: None,
             tail: false,
             include_events: false,
+            ..Default::default()
         };
 
         let index = ready(store);
@@ -1900,6 +2079,7 @@ mod tests {
                 max_messages: Some(2),
                 tail: false,
                 include_events: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1917,6 +2097,7 @@ mod tests {
                 max_messages: Some(2),
                 tail: true,
                 include_events: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1964,6 +2145,7 @@ mod tests {
                     max_messages: None,
                     tail,
                     include_events: true,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -2000,6 +2182,7 @@ mod tests {
                 max_messages: None,
                 tail: false,
                 include_events: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2030,6 +2213,7 @@ mod tests {
                 max_messages: None,
                 tail: false,
                 include_events: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2049,6 +2233,7 @@ mod tests {
             max_messages: None,
             tail: false,
             include_events: false,
+            ..Default::default()
         };
         let error = get_session(&index, &args).expect_err("missing session");
         assert!(error.contains(SESSION_NOT_FOUND));
@@ -2161,6 +2346,7 @@ mod tests {
                 max_messages: None,
                 tail: false,
                 include_events: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2193,6 +2379,7 @@ mod tests {
     fn tools_advertise_read_only_closed_world() {
         for notes in [
             RecallMcp::search_sessions_tool_attr().annotations.unwrap(),
+            RecallMcp::search_messages_tool_attr().annotations.unwrap(),
             RecallMcp::get_session_tool_attr().annotations.unwrap(),
             RecallMcp::list_recent_sessions_tool_attr().annotations.unwrap(),
             RecallMcp::file_history_tool_attr().annotations.unwrap(),
@@ -2564,5 +2751,92 @@ mod tests {
         let summary = list.events[0].summary.as_deref().unwrap();
         assert_eq!(summary.chars().count(), EXCERPT_CHAR_CAP);
         assert!(summary.ends_with('…'));
+    }
+    #[test]
+    fn message_search_opens_sparse_context_and_preserves_explicit_current_session_reads() {
+        let store = setup();
+        store.insert_session(&session("s1", "codex", "Evidence", 2000)).unwrap();
+        store
+            .insert_messages(&[
+                message("s1", Role::User, "What fixed it?", 0),
+                message("s1", Role::Assistant, "evidencekeyword fixed it", 83),
+                message("s1", Role::User, "Confirmed", 100),
+            ])
+            .unwrap();
+        let index = ready(store);
+        let args: SearchMessagesArgs =
+            serde_json::from_value(serde_json::json!({"query": "evidencekeyword"})).unwrap();
+        let ctx = context("codex", "src-s1");
+        let hidden = search_message_matches(&index, &args, &ctx).unwrap();
+        assert!(hidden["matches"].as_array().unwrap().is_empty());
+        let args = SearchMessagesArgs { session_id: Some("s1".into()), ..args };
+        let hits = search_message_matches(&index, &args, &ctx).unwrap();
+        assert_eq!(hits["matches"][0]["seq"], 83);
+        assert_eq!(hits["current_session_excluded"], false);
+        let detail = get_session(
+            &index,
+            &GetSessionArgs { session_id: "s1".into(), around_seq: Some(83), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!((detail.first_message_seq, detail.last_message_seq), (Some(0), Some(100)));
+        assert_eq!(detail.returned_messages, 3);
+        assert!(detail.messages.contains("[83][assistant] evidencekeyword"));
+        assert!(!detail.truncated);
+        assert!(
+            get_session(
+                &index,
+                &GetSessionArgs {
+                    session_id: "s1".into(),
+                    around_seq: Some(82),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            get_session(
+                &index,
+                &GetSessionArgs {
+                    session_id: "s1".into(),
+                    around_seq: Some(83),
+                    tail: true,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn get_session_cursor_reads_the_rest_of_a_long_message() {
+        let store = setup();
+        store.insert_session(&session("s1", "codex", "Long", 2000)).unwrap();
+        let original = "\u{4f60}\u{597d}🦀end".repeat(500);
+        store.insert_messages(&[message("s1", Role::Assistant, &original, 83)]).unwrap();
+        let index = ready(store);
+        let mut args = GetSessionArgs {
+            session_id: "s1".into(),
+            around_seq: Some(83),
+            max_chars: Some(731),
+            ..Default::default()
+        };
+        let mut text = String::new();
+        loop {
+            let page = get_session(&index, &args).unwrap();
+            assert_eq!(page.first_message_byte_offset, Some(text.len()));
+            text.push_str(page.messages.strip_prefix("[83][assistant] ").unwrap());
+            let Some(cursor) = page.next_cursor else {
+                assert!(!page.truncated);
+                break;
+            };
+            assert!(page.truncated);
+            args = GetSessionArgs {
+                session_id: "s1".into(),
+                cursor: Some(cursor),
+                max_chars: Some(731),
+                ..Default::default()
+            };
+        }
+        assert_eq!(text, original);
     }
 }

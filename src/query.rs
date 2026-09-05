@@ -14,6 +14,57 @@ pub(crate) enum SearchFormat {
     Json,
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_message_search(
+    query: &str,
+    source: Option<&str>,
+    time: Option<&str>,
+    project: Option<&str>,
+    repo: Option<&str>,
+    session_id: Option<&str>,
+    limit: usize,
+    format: SearchFormat,
+) -> Result<()> {
+    let store = Store::open()?;
+    if let Some(id) = session_id {
+        anyhow::ensure!(store.get_session_by_id(id)?.is_some(), "session not found: {id}");
+    }
+    let scope = if session_id.is_some() && project.is_none() && repo.is_none() {
+        crate::project_scope::ProjectScope::Global
+    } else {
+        store.resolve_scope(project, repo)?.announce()
+    };
+    let filters = SearchFilters {
+        sources: resolve_source_filter(source, &adapters::source_labels())?,
+        time_range: parse_time_range(time)?,
+        scope,
+        thread_role: None,
+        excluded_session_id: None,
+    };
+    let matches =
+        SearchEngine::new(&store.conn).search_messages(query, &filters, session_id, limit)?;
+    match format {
+        SearchFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "protocol_version": crate::PROTOCOL_VERSION, "matches": matches,
+            }))?
+        ),
+        SearchFormat::Text => {
+            for hit in &matches {
+                println!(
+                    "{} #{} [{}] {}\n  {}",
+                    hit.session_id, hit.seq, hit.role, hit.title, hit.excerpt
+                );
+            }
+            if matches.is_empty() {
+                println!("No matching messages.");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn run_search(
     query: &str,
     source_filter: Option<&str>,

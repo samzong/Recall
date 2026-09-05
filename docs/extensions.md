@@ -114,12 +114,20 @@ Core support in v0.1:
 - `recall session list` supports `--format json|jsonl`;
 - `recall search --format json` is a thin wrapper over the same JSON shape as
   `recall session list --query ... --format json`;
+- `recall search --messages --format json` returns individual FTS matches in
+  `matches`, with session identity, message sequence, role, and a match-centered
+  excerpt; the default session-search shape is unchanged.
 - `recall session show` supports `--format json|jsonl`;
 - `recall export` emits JSONL, one session record per line, with export record
   schema version 6, and supports `--include metadata,messages,usage,events`
   for field projection. Export projections must include `messages`; `usage`
   and `events` are optional add-ons. `recall session list` and `recall export`
   also accept `--thread-role primary|subagent|unknown` to filter by topology;
+- Paged `session show` reads (`--around-seq`, `--max-chars`, or `--cursor`)
+  add `truncated`, `next_cursor`, and `first_message_byte_offset`. Message
+  content may be a fragment; consume all cursor pages before treating it as
+  a complete transcript. Do not import a partial page as a complete session.
+  Cursors expire when the session is reindexed.
 - `recall session show --format json` defaults to metadata only. Extensions
   that need transcript data must pass `--messages` or
   `--include metadata,messages,usage,events`.

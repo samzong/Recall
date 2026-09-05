@@ -119,9 +119,93 @@ struct Hit {
     snippet: Option<String>,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct MessageHit {
+    pub(crate) session_id: String,
+    pub(crate) source_session_id: String,
+    pub(crate) source: String,
+    pub(crate) title: String,
+    pub(crate) seq: u32,
+    pub(crate) role: String,
+    pub(crate) timestamp: Option<i64>,
+    pub(crate) excerpt: String,
+}
+
 impl<'a> SearchEngine<'a> {
     pub(crate) fn new(conn: &'a Connection) -> Self {
         Self { conn }
+    }
+
+    pub(crate) fn search_messages(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageHit>> {
+        anyhow::ensure!((1..=50).contains(&limit), "limit must be between 1 and 50");
+        let tokens = tokenize_query(query);
+        let trigram = crate::db::schema::has_trigram_fts(self.conn)?;
+        let queries = [
+            ("messages_fts", unicode61_fts5_query(&tokens, trigram)),
+            (
+                "messages_fts_trigram",
+                if trigram { trigram_fts5_query(&tokens) } else { String::new() },
+            ),
+        ];
+        let mut hits: HashMap<i64, (MessageHit, f64)> = HashMap::new();
+        for (table, query) in queries {
+            if query.is_empty() {
+                continue;
+            }
+            let mut sql = format!(
+                "SELECT m.id, m.session_id, s.source_id, s.source, s.title, m.seq, m.role,
+                        m.timestamp, snippet({table}, 0, char(1), char(2), '…', 48)
+                 FROM {table} JOIN messages m ON m.id = {table}.rowid
+                 JOIN sessions s ON s.id = m.session_id WHERE {table} MATCH ?1"
+            );
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(query)];
+            let mut param_idx = 2;
+            apply_filters(&mut sql, &mut params, &mut param_idx, filters);
+            if let Some(id) = session_id {
+                sql.push_str(&format!(" AND m.session_id = ?{param_idx}"));
+                params.push(Box::new(id.to_string()));
+            }
+            sql.push_str(&format!(
+                " ORDER BY {table}.rank, m.session_id, m.seq, m.id LIMIT {limit}"
+            ));
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    MessageHit {
+                        session_id: row.get(1)?,
+                        source_session_id: row.get(2)?,
+                        source: row.get(3)?,
+                        title: row.get::<_, String>(4)?.chars().take(200).collect(),
+                        seq: row.get(5)?,
+                        role: row.get(6)?,
+                        timestamp: row.get(7)?,
+                        excerpt: message_excerpt(&row.get::<_, String>(8)?),
+                    },
+                ))
+            })?;
+            for (rank, row) in rows.enumerate() {
+                let (id, hit) = row?;
+                hits.entry(id).or_insert((hit, 0.0)).1 += 1.0 / (60 + rank) as f64;
+            }
+        }
+        let mut hits: Vec<_> = hits.into_iter().collect();
+        hits.sort_by(|a, b| {
+            b.1.1
+                .total_cmp(&a.1.1)
+                .then_with(|| a.1.0.session_id.cmp(&b.1.0.session_id))
+                .then_with(|| a.1.0.seq.cmp(&b.1.0.seq))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(hits.into_iter().take(limit).map(|(_, (hit, _))| hit).collect())
     }
 
     pub(crate) fn hybrid_search(
@@ -488,6 +572,17 @@ fn rrf_merge(fts_hits: &[Hit], vec_hits: &[Hit], k: u32) -> Vec<(String, f64, Ma
 
 const FTS_TRIGRAM_MIN_CHARS: usize = 3;
 
+fn message_excerpt(marked: &str) -> String {
+    let hit = marked.find('\u{1}').map_or(0, |position| marked[..position].chars().count());
+    let start = hit.saturating_sub(160);
+    let mut excerpt: String =
+        marked.chars().filter(|c| !matches!(c, '\u{1}' | '\u{2}')).skip(start).take(400).collect();
+    if start > 0 {
+        excerpt.insert(0, '…');
+    }
+    excerpt
+}
+
 fn tokenize_query(query: &str) -> Vec<String> {
     query
         .split_whitespace()
@@ -797,5 +892,42 @@ mod tests {
         assert_eq!(hits[0].session.id, "s3");
         assert_eq!(hits[0].timestamp, None);
         assert_eq!(hits[1].timestamp, Some(8_000));
+    }
+    #[test]
+    fn message_search_returns_distinct_anchors_and_match_centered_excerpts() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        store.conn.execute_batch("INSERT INTO sessions (id, source, source_id, title, started_at) VALUES ('s', 'codex', 'native', 'Test', 1), ('other', 'claude-code', 'other', 'Other', 2);").unwrap();
+        let long = format!("{} evidencekeyword fixes the lock", "ordinary preamble ".repeat(100));
+        for (id, seq, content) in [
+            ("s", 83, long.as_str()),
+            ("s", 90, "evidencekeyword verified"),
+            ("other", 2, "evidencekeyword unrelated"),
+        ] {
+            store.conn.execute("INSERT INTO messages (session_id, seq, role, content) VALUES (?1, ?2, 'assistant', ?3)", rusqlite::params![id, seq, content]).unwrap();
+        }
+        let filters = SearchFilters {
+            sources: None,
+            time_range: TimeRange::All,
+            scope: ProjectScope::Global,
+            thread_role: None,
+            excluded_session_id: None,
+        };
+        let engine = SearchEngine::new(&store.conn);
+        let hits = engine.search_messages("evidencekeyword", &filters, Some("s"), 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.session_id == "s"
+            && h.role == "assistant"
+            && h.excerpt.contains("evidencekeyword")));
+        let mut seqs = hits.iter().map(|h| h.seq).collect::<Vec<_>>();
+        seqs.sort_unstable();
+        assert_eq!(seqs, vec![83, 90]);
+        let excluded = SearchFilters { excluded_session_id: Some("s".into()), ..filters.clone() };
+        assert_eq!(
+            engine.search_messages("evidencekeyword", &excluded, None, 10).unwrap()[0].session_id,
+            "other"
+        );
+        let filtered = SearchFilters { sources: Some(vec!["codex".into()]), ..filters };
+        assert_eq!(engine.search_messages("evidencekeyword", &filtered, None, 1).unwrap().len(), 1);
     }
 }
