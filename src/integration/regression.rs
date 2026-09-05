@@ -1761,17 +1761,13 @@ fn gemini_parser_indexes_tool_calls() {
         "prose preserved: {}",
         assistant.content
     );
-    assert!(assistant.content.contains("[read_file]"), "tool name indexed: {}", assistant.content);
-    assert!(
-        assistant.content.contains("/tmp/README.md"),
-        "tool args indexed: {}",
-        assistant.content
-    );
-    assert!(
-        assistant.content.contains("Hello world"),
-        "tool result indexed: {}",
-        assistant.content
-    );
+    assert_eq!(assistant.content, "Let me read the file.");
+    assert_eq!(session.events.len(), 2);
+    assert_eq!(session.events[0].tool_call_id.as_deref(), Some("t1"));
+    assert_eq!(session.events[1].tool_call_id, session.events[0].tool_call_id);
+    let attrs: serde_json::Value =
+        serde_json::from_str(session.events[1].attrs_json.as_deref().unwrap()).unwrap();
+    assert_eq!(attrs["toolCalls"][0]["result"][0]["text"], "# My Project\nHello world.");
 }
 
 #[test]
