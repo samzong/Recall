@@ -1403,6 +1403,37 @@ fn pi_openrouter_injects_provider_without_extension() {
 }
 
 #[test]
+fn pi_selected_credential_survives_route_cleanup() {
+    let (_dir, paths) = temp_paths();
+    for env_key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CUSTOM_API_KEY"] {
+        fs::write(
+            &paths.config,
+            format!("[provider.openrouter]\nenv = \"{env_key}\"\nauth = \"env\"\n"),
+        )
+        .unwrap();
+        let env =
+            EnvLookup::isolated(HashMap::from([(env_key.to_string(), "sk-selected".to_string())]));
+        let plan = launch::plan(
+            &LaunchRequest {
+                harness: Harness::Pi,
+                provider: Some("openrouter".to_string()),
+                passthrough: Vec::new(),
+            },
+            &paths,
+            &env,
+        )
+        .unwrap();
+        let child_env: HashMap<_, _> = plan.env_set.into_iter().collect();
+        assert_eq!(child_env.get(env_key).map(String::as_str), Some("sk-selected"));
+        for other in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"] {
+            if other != env_key {
+                assert_eq!(child_env.get(other).map(String::as_str), Some(""));
+            }
+        }
+    }
+}
+
+#[test]
 fn pi_tokener_merges_provider_into_models_json() {
     let dir = tempfile::tempdir().unwrap();
     let models_path = dir.path().join("models.json");
@@ -1425,16 +1456,24 @@ fn pi_tokener_merges_provider_into_models_json() {
 fn pi_merge_provider_refuses_to_reset_corrupt_models_json() {
     let dir = tempfile::tempdir().unwrap();
     let models_path = dir.path().join("models.json");
-    fs::write(&models_path, "{").unwrap();
-    let provider = serde_json::json!({ "baseUrl": "https://api.tokener.dev/v1" });
-    let error = crate::pi::merge_provider(&models_path, "tokener", provider).unwrap_err();
-    assert!(error.to_string().contains("failed to parse"));
-    // The corrupt file must be left untouched, not overwritten with an empty provider map.
-    assert_eq!(fs::read_to_string(&models_path).unwrap(), "{");
+    for body in [
+        "{",
+        "[]",
+        r#"{"providers":[{"name":"user-entry"}],"other":"keep"}"#,
+        r#"{"providers":null}"#,
+        r#"{"providers":"user-entry"}"#,
+        r#"{"providers":42}"#,
+        r#"{"providers":false}"#,
+    ] {
+        fs::write(&models_path, body).unwrap();
+        let provider = serde_json::json!({ "baseUrl": "https://api.tokener.dev/v1" });
+        assert!(crate::pi::merge_provider(&models_path, "tokener", provider).is_err());
+        assert_eq!(fs::read_to_string(&models_path).unwrap(), body);
+    }
 }
 
 #[test]
-fn pi_tokener_writes_recall_cache() {
+fn pi_tokener_prepares_native_models() {
     let (dir, paths) = temp_paths();
     let provider = crate::provider::find("tokener").unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1461,12 +1500,11 @@ fn pi_tokener_writes_recall_cache() {
     crate::pi::prepare("tokener", provider, &base_url, "sk-test", &paths, &env).unwrap();
     server.join().unwrap();
 
-    let cache = dir.path().join("pi/tokener-provider.json");
-    assert!(cache.is_file());
-    let body = fs::read_to_string(cache).unwrap();
-    assert!(body.contains(&format!("\"baseUrl\": \"{base_url}/v1\"")));
-    let models = fs::read_to_string(agent_dir.join("models.json")).unwrap();
-    assert!(models.contains("gpt-5.6-sol"));
+    let models: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(agent_dir.join("models.json")).unwrap()).unwrap();
+    assert_eq!(models["providers"]["tokener"]["baseUrl"], format!("{base_url}/v1"));
+    assert_eq!(models["providers"]["tokener"]["apiKey"], "$TOKENER_API_KEY");
+    assert_eq!(models["providers"]["tokener"]["models"][0]["id"], "gpt-5.6-sol");
 }
 
 #[test]
@@ -1781,7 +1819,6 @@ model = "gpt-prod"
     )
     .unwrap();
     assert_eq!(pi.args, ["--models", "tokener-dev/*", "--model", "tokener-dev/gpt-dev"]);
-    assert!(dir.path().join("pi/tokener-dev-provider.json").is_file());
     let pi_models: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(agent_dir.join("models.json")).unwrap()).unwrap();
     assert!(pi_models["providers"]["tokener-dev"].is_object());
