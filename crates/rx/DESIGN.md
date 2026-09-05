@@ -46,11 +46,30 @@ read `recall.db`.
 | OpenCode config | launch | Prefer `OPENCODE_CONFIG_CONTENT`; only warn about native auth conflicts. |
 | Pi `models.json` | shared | Own the selected provider entry; preserve the rest; reject malformed roots. |
 | DSH install and profile | user | Use the user's npm prefix and native `DSH_HOME` (`~/.dsh` by default); routing uses a launch overlay. Hosted mode does not override `DSH_HOME`. |
-| Kimi `config.toml` | shared | Use rx-prefixed marked entries; preserve collisions and user edits. Its required literal credential uses secret mode. |
+| Kimi `config.toml` | shared | Use rx-prefixed marked entries; preserve collisions and user edits. Launch leases protect active catalog identities. Its required literal credential uses secret mode. |
 | Hosted state | host caller | Runtime state for the selected harness only; never an installation root. |
 
 Injection preference is: flags or environment, immutable launch config, then a
 narrowly merged owned entry. Convenience never justifies persistent mutation.
+
+Kimi launches hold shared file leases across native execution: inherited `flock`
+locks on Unix and inherited read handles denying write sharing on Windows.
+Identical complete
+catalog snapshots share one immutable lease identity derived from the snapshot
+fingerprint. The catalog marker records active and current snapshots; historical
+lease files alone never establish config ownership. A later launch may reclaim
+an exited snapshot's entries only when its lease permits an exclusive probe and
+the entries still match their ownership records. Active identities retain their
+original aliases; conflicting changes fail closed. Missing or malformed lease
+records do not prove that a launch exited. Empty lease files are retained and
+reused, so file growth follows distinct snapshots rather than launch count.
+rx never truncates or deletes lease files and has no automatic cleanup command.
+
+Before migrating a version 1 Kimi catalog marker, the user must close every
+Kimi session started by an older rx and explicitly confirm migration in a
+terminal. rx never terminates those sessions. Non-interactive launches refuse
+migration, and older rx versions cannot write the migrated marker. Rolling
+back rx must preserve the new marker so older writers continue to fail closed.
 
 Hosted order is: select harness, discover or install in the user environment,
 build selected-harness state, validate route conflicts, execute with scoped

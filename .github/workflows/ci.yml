@@ -25,3 +25,27 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo install cargo-audit --locked --version 0.22.2
       - run: make check
+
+  kimi-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: kimi-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: cargo test -p rx
+      - name: Install pinned native Kimi Code
+        shell: pwsh
+        run: |
+          $env:KIMI_VERSION = '0.39.1'
+          $env:KIMI_NO_MODIFY_PATH = '1'
+          irm https://code.kimi.com/kimi-code/install.ps1 | iex
+          "$env:USERPROFILE\.kimi-code\bin" >> $env:GITHUB_PATH
+      - name: Verify native lease lifetime after launcher termination
+        run: cargo test -p rx native_kimi_lease_survives_launcher_exit -- --ignored --nocapture

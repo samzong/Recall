@@ -330,7 +330,7 @@ mod tests {
                 "endpoint": "https://api.tokener.dev/v1",
                 "credential_env": "TOKENER_API_KEY"
             },
-            "state_dir": "/tmp/tokener-agent",
+            "state_dir": std::env::temp_dir().join("tokener-agent"),
             "permission_policy": "standard",
             "install_policy": "prompt"
         })

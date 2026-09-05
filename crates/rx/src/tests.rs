@@ -1170,6 +1170,7 @@ fn exec_scopes_inherited_controls_and_explicit_credentials() {
     const CONTROLS: [&str; 4] = ["RX_HOST_REQUEST", "RX_NO_INSTALL", "RX_NO_UPDATE", "RX_NO_YOLO"];
     if let Ok(credential) = std::env::var("RX_TEST_EXEC_CREDENTIAL") {
         let plan = launch::LaunchPlan {
+            launch_lease: None,
             program: PathBuf::from("/usr/bin/env"),
             args: Vec::new(),
             env_set: if credential.is_empty() {
@@ -1400,7 +1401,8 @@ agent-default-model:
     assert!(patch.contains("id: llm-deepseek"));
     assert!(patch.contains("disabled: true"));
     let overlay = paths.dir.join("dsh").join("settings.yaml");
-    assert!(patch.contains(&overlay.display().to_string()));
+    let patch: serde_yaml::Value = serde_yaml::from_str(&patch).unwrap();
+    assert_eq!(patch[0]["config"]["path"].as_str(), overlay.to_str());
     let settings: serde_yaml::Value =
         serde_yaml::from_str(&fs::read_to_string(&overlay).unwrap()).unwrap();
     assert_eq!(settings["dsh-tui"]["lang"], "zh");
