@@ -13,7 +13,7 @@ use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SyncScanResult};
 use crate::types::{ParentLink, ParentRelation, Role, ThreadRole};
 
-const METADATA_PARSER_VERSION: u32 = 1;
+use super::METADATA_PARSER_VERSION;
 
 pub(super) fn resume_command(source_id: &str) -> Option<ResumeCommand> {
     find_store_db(source_id)?;
@@ -212,6 +212,7 @@ fn parse_store_db(
     }
 
     let root_fields = decode_protobuf_fields(&root);
+    let directory = first_len_field(&root_fields, 9).and_then(|uri| directory_from_file_uri(&uri));
     let mut messages = Vec::new();
     let mut events = Vec::new();
     let mut prior_message_seq = None;
@@ -247,7 +248,6 @@ fn parse_store_db(
         .or_else(|| sidecar.as_ref().and_then(|value| json_i64(value.get("createdAtMs"))))
         .or_else(|| first_varint_field(&root_fields, 26))
         .unwrap_or(mtime_ms);
-    let directory = first_len_field(&root_fields, 9).and_then(|uri| directory_from_file_uri(&uri));
     let entrypoint = first_len_field(&root_fields, 22).filter(|value| !value.is_empty());
 
     let mut session = RawSession::search_only(
@@ -272,6 +272,7 @@ fn parse_store_db(
         .map(str::to_string);
     apply_topology(&mut session, &store_meta, &sidecar, session_id);
     session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    session.refresh_session_on_metadata_backfill = true;
     Ok(Some(session))
 }
 
@@ -686,6 +687,7 @@ mod tests {
         assert_eq!(raw.thread_role, Some(ThreadRole::Primary));
         assert!(raw.parent_links.is_empty());
         assert_eq!(raw.metadata_parser_version, Some(METADATA_PARSER_VERSION));
+        assert!(raw.refresh_session_on_metadata_backfill);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -742,6 +744,23 @@ mod tests {
             serde_json::from_str(session.events[1].attrs_json.as_deref().unwrap()).unwrap();
         assert_eq!(native["result"], result);
         assert!(parse_store_db(&path, &session_id, 9, 2, false).unwrap().is_none());
+        let shell = serde_json::json!({"role":"assistant","content":[{"type":"tool-call","toolCallId":"shell","toolName":"Shell","args":{"command":"mv old.rs new.rs"}}]});
+        conn.execute(
+            "UPDATE blobs SET data=?1 WHERE id=?2",
+            rusqlite::params![shell.to_string().as_bytes(), to_hex(&[0x11; 32])],
+        )
+        .unwrap();
+        let native = parse_store_db(&path, &session_id, 9, 2, true).unwrap().unwrap();
+        assert_eq!(native.events[0].files.len(), 2);
+        assert!(
+            native.events[0]
+                .files
+                .iter()
+                .all(|file| file.cwd.is_none()
+                    && file.kind == crate::types::FileEvidenceKind::Command)
+        );
+        assert_eq!(native.events[0].message_seq, None);
+        assert_eq!(native.events[0].status, None);
     }
 
     #[test]

@@ -26,8 +26,9 @@ use crate::types::{
 
 pub(crate) struct CursorAdapter;
 
-const USAGE_PARSER_VERSION: u32 = 2;
-const EVENT_PARSER_VERSION: u32 = 4;
+const METADATA_PARSER_VERSION: u32 = 2;
+const USAGE_PARSER_VERSION: u32 = 3;
+const EVENT_PARSER_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Default)]
 struct ComposerMeta {
@@ -153,6 +154,7 @@ fn scan_for_sync_conn(
         .collect::<HashMap<_, _>>();
     let usage_state = context.usage_state();
     let event_state = context.event_state();
+    let metadata_state = context.metadata_state();
     let global_mtime = global_db_mtime();
     let lookup = ComposerLookup::load(conn);
     let composer_ids = discover_composer_ids(conn)?;
@@ -195,6 +197,11 @@ fn scan_for_sync_conn(
                 event_state.get(&composer_id).copied(),
                 source_updated_at,
                 include_events,
+            )
+            && crate::adapters::sync_state::metadata_state_is_current(
+                METADATA_PARSER_VERSION,
+                metadata_state.get(&composer_id).copied(),
+                source_updated_at,
             )
             && !source_path_changed
         {
@@ -247,7 +254,7 @@ fn scan_transcripts_for_sync(
         crate::adapters::file_scan::FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
-            ..Default::default()
+            metadata_parser_version: Some(METADATA_PARSER_VERSION),
         },
         entries,
         |entry| {
@@ -355,6 +362,8 @@ fn build_raw_session(
     if include_events {
         session = session.with_events(parsed.events, EVENT_PARSER_VERSION);
     }
+    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    session.refresh_session_on_metadata_backfill = true;
     session.source_file_path = transcript_paths
         .get(composer_id)
         .and_then(|transcript| transcript.path.to_str())
@@ -387,6 +396,7 @@ fn parse_composer_session(
     let conversation_map = data.get("conversationMap").and_then(|value| value.as_object());
 
     let mut messages = Vec::new();
+    let mut has_tool_records = false;
     let mut usage_events = Vec::new();
     let mut bubble_usage_events = Vec::new();
     let mut session_events = Vec::new();
@@ -400,33 +410,30 @@ fn parse_composer_session(
             continue;
         };
 
-        let bubble = bubble_id.and_then(|bubble_id| load_bubble(conn, composer_id, bubble_id));
-        let content = if let Some(bubble) = bubble.as_ref() {
-            render_bubble_content(bubble, &role)
-        } else if let (Some(bubble_id), Some(map)) = (bubble_id, conversation_map) {
-            map.get(bubble_id).map(|value| render_legacy_bubble(value, &role)).unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let stored_bubble =
+            bubble_id.and_then(|bubble_id| load_bubble(conn, composer_id, bubble_id));
+        let bubble = stored_bubble
+            .as_ref()
+            .or_else(|| conversation_map.and_then(|map| bubble_id.and_then(|id| map.get(id))));
+        has_tool_records |=
+            bubble.and_then(|bubble| bubble.get("toolFormerData")).is_some_and(Value::is_object);
+        let content = bubble.map(|bubble| render_bubble_content(bubble, &role)).unwrap_or_default();
 
-        if content.is_empty() {
-            continue;
+        let timestamp = bubble.and_then(|value| json_i64(value.get("createdAt"))).or_else(|| {
+            conversation_map
+                .and_then(|map| bubble_id.and_then(|id| map.get(id)))
+                .and_then(|value| json_i64(value.get("createdAt")))
+        });
+
+        if !content.is_empty() {
+            messages.push(RawMessage { role: role.clone(), content, timestamp });
         }
-
-        let timestamp =
-            bubble.as_ref().and_then(|value| json_i64(value.get("createdAt"))).or_else(|| {
-                conversation_map
-                    .and_then(|map| bubble_id.and_then(|id| map.get(id)))
-                    .and_then(|value| json_i64(value.get("createdAt")))
-            });
-
-        messages.push(RawMessage { role: role.clone(), content, timestamp });
+        let message_seq = messages.len().checked_sub(1).map(|seq| seq as u32);
 
         if include_events
             && matches!(role, Role::Assistant)
-            && let Some(bubble) = bubble.as_ref()
+            && let Some(bubble) = bubble
         {
-            let message_seq = (messages.len() - 1) as u32;
             collect_bubble_tool_events(
                 bubble,
                 bubble_id,
@@ -437,11 +444,12 @@ fn parse_composer_session(
             );
         }
 
-        if let Some(bubble) = bubble.as_ref()
+        if let Some(bubble) = bubble
             && let Some(event) = extract_bubble_usage_event(
                 composer_id,
                 bubble_id.unwrap_or("unknown"),
                 index as u32,
+                message_seq,
                 timestamp.unwrap_or(0),
                 bubble,
                 &data,
@@ -457,20 +465,28 @@ fn parse_composer_session(
         usage_events.push(event);
     }
 
-    if messages.is_empty() && usage_events.is_empty() && session_events.is_empty() {
+    if messages.is_empty()
+        && usage_events.is_empty()
+        && session_events.is_empty()
+        && !has_tool_records
+    {
         return Ok(None);
     }
 
-    let started_at =
-        first_timestamp(json_i64(data.get("createdAt")).or(meta.created_at), &messages, &[], &[])
-            .unwrap_or(0);
+    let started_at = first_timestamp(
+        json_i64(data.get("createdAt")).or(meta.created_at),
+        &messages,
+        &usage_events,
+        &session_events,
+    )
+    .unwrap_or(0);
     let updated_at = last_timestamp(
         json_i64(data.get("lastUpdatedAt"))
             .or(json_i64(data.get("conversationCheckpointLastUpdatedAt")))
             .or(meta.last_updated_at),
         &messages,
-        &[],
-        &[],
+        &usage_events,
+        &session_events,
     );
 
     Ok(Some(ParsedComposerSession {
@@ -663,25 +679,6 @@ fn render_bubble_content(bubble: &Value, role: &Role) -> String {
         }
     }
 
-    if let Some(tool_data) = bubble.get("toolFormerData") {
-        let name = tool_data.get("name").and_then(|value| value.as_str()).unwrap_or("tool");
-        let args = tool_data
-            .get("rawArgs")
-            .or_else(|| tool_data.get("params"))
-            .and_then(render_json_fragment)
-            .unwrap_or_default();
-        if !args.is_empty() {
-            parts.push(format!("[tool:{name}] {args}"));
-        } else {
-            parts.push(format!("[tool:{name}]"));
-        }
-        if let Some(result) =
-            tool_data.get("result").and_then(render_json_fragment).filter(|s| !s.is_empty())
-        {
-            parts.push(format!("[tool_result:{name}] {result}"));
-        }
-    }
-
     if let Some(blocks) = bubble.get("codeBlocks").and_then(|value| value.as_array()) {
         for block in blocks {
             if let Some(content) = block.get("content").and_then(|value| value.as_str()) {
@@ -708,6 +705,27 @@ fn cursor_tool_call(
     } else {
         events::tool_call_event(context, name.clone(), args)
     };
+    if matches!(name.as_str(), "Shell" | "run_terminal_command_v2") {
+        let cwd_key = if name == "Shell" { "working_directory" } else { "cwd" };
+        let native_cwd = args.and_then(|args| args.get(cwd_key));
+        let cwd = native_cwd
+            .and_then(Value::as_str)
+            .filter(|path| Path::new(path).is_absolute() && !path.contains(['$', '`']));
+        let (files, mut status) =
+            match args.and_then(|args| args.get("command")).and_then(Value::as_str) {
+                Some(command) => events::shell_file_evidence(command, cwd),
+                None => (Vec::new(), crate::types::CommandEvidenceStatus::Unsupported),
+            };
+        if native_cwd.is_some()
+            && cwd.is_none()
+            && status != crate::types::CommandEvidenceStatus::LimitExceeded
+        {
+            status = crate::types::CommandEvidenceStatus::Unsupported;
+        }
+        event.files = files;
+        event.command_evidence_status = Some(status);
+        return event;
+    }
     if name == "ApplyPatch" {
         event.files =
             args.and_then(Value::as_str).map(events::patch_file_evidence).unwrap_or_default();
@@ -766,7 +784,7 @@ fn collect_bubble_tool_events(
     bubble_id: Option<&str>,
     source_path: &str,
     timestamp: Option<i64>,
-    message_seq: u32,
+    message_seq: Option<u32>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
     let Some(tool_data) = bubble.get("toolFormerData") else { return };
@@ -779,7 +797,7 @@ fn collect_bubble_tool_events(
         timestamp,
         source_path: Some(source_path.into()),
         source_event_id: source_id.clone(),
-        message_seq: Some(message_seq),
+        message_seq,
         parser_version: EVENT_PARSER_VERSION,
     };
     let mut call = cursor_tool_call(
@@ -802,24 +820,11 @@ fn cursor_native_id(value: Option<&str>) -> Option<String> {
     value.map(str::trim).filter(|id| !id.is_empty() && *id != "unknown").map(String::from)
 }
 
-fn render_legacy_bubble(value: &Value, role: &Role) -> String {
-    if let Some(text) = non_empty_str(value.get("text")) {
-        let normalized = if matches!(role, Role::User) {
-            strip_user_query_envelope(text).trim().to_string()
-        } else {
-            text.trim().to_string()
-        };
-        if !normalized.is_empty() {
-            return normalized;
-        }
-    }
-    render_bubble_content(value, role)
-}
-
 fn extract_bubble_usage_event(
     composer_id: &str,
     bubble_id: &str,
     event_seq: u32,
+    message_seq: Option<u32>,
     timestamp: i64,
     bubble: &Value,
     composer_data: &Value,
@@ -833,7 +838,7 @@ fn extract_bubble_usage_event(
 
     let model = model_from_composer(composer_data);
     Some(RawUsageEvent {
-        message_seq: Some(event_seq),
+        message_seq,
         model: model.clone(),
         provider: infer_cursor_provider(&model),
         input_tokens,
@@ -962,6 +967,7 @@ fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<O
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
+    let mut has_tool_records = false;
     let mut session_events = Vec::new();
     let mut last_visible_message_seq: Option<u32> = None;
     let source_path = path.display().to_string();
@@ -986,6 +992,12 @@ fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<O
         let Some(items) = content_array else {
             continue;
         };
+        has_tool_records |= items.iter().any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("tool_use" | "tool-call" | "tool_result" | "tool-result")
+            )
+        });
         let is_user = matches!(role, Role::User);
         let content = render_transcript_content_items(items, is_user);
         let current_message_seq =
@@ -1009,20 +1021,16 @@ fn parse_agent_transcript(path: &Path, include_events: bool) -> anyhow::Result<O
         }
     }
 
-    if messages.is_empty() && session_events.is_empty() {
+    if messages.is_empty() && session_events.is_empty() && !has_tool_records {
         return Ok(None);
     }
 
-    // Agent transcripts carry no token accounting, but the sync state still has
-    // to record that this session was processed at the current usage parser
-    // version. Without the record, `usage_state_is_current` sees no state at
-    // all, never becomes true, and the session is re-parsed on every sync
-    // forever — which is what made Cursor re-materialise hundreds of sessions
-    // per run.
     let mut session =
         RawSession::search_only(String::new(), None, 0, None, Some("agent".to_string()), messages)
             .with_usage(Vec::new(), USAGE_PARSER_VERSION);
     session.source_file_path = Some(source_path);
+    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    session.refresh_session_on_metadata_backfill = true;
     if include_events {
         session = session.with_events(session_events, EVENT_PARSER_VERSION);
     }
@@ -1120,27 +1128,14 @@ fn transcript_content_has_visible_text(items: &[Value]) -> bool {
 fn render_transcript_content_items(items: &[Value], is_user: bool) -> String {
     let mut parts = Vec::new();
     for item in items {
-        match item.get("type").and_then(|t| t.as_str()) {
-            Some("text") => {
-                let Some(text) = item.get("text").and_then(|t| t.as_str()) else {
-                    continue;
-                };
-                let normalized = if is_user { strip_user_query_envelope(text) } else { text };
-                let trimmed = normalized.trim();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed.to_string());
-                }
-            }
-            Some("tool_use") => {
-                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                let rendered_input = match item.get("input") {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(v) => serde_json::to_string(v).unwrap_or_default(),
-                    None => String::new(),
-                };
-                parts.push(format!("[tool_use:{name}] {rendered_input}"));
-            }
-            _ => {}
+        if item.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(text) = item.get("text").and_then(Value::as_str) else { continue };
+        let normalized = if is_user { strip_user_query_envelope(text) } else { text };
+        let trimmed = normalized.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
         }
     }
     parts.join("\n")
@@ -1485,9 +1480,10 @@ mod tests {
     }
 
     #[test]
-    fn render_bubble_content_includes_tool_former_data() {
+    fn render_bubble_content_preserves_discussion_and_code() {
         let bubble = serde_json::json!({
-            "text": "",
+            "text": "Investigating usage",
+            "codeBlocks": [{"content":"let total = 1;"}],
             "toolFormerData": {
                 "name": "grep",
                 "rawArgs": "{\"pattern\":\"usage\"}",
@@ -1495,9 +1491,7 @@ mod tests {
             }
         });
         let rendered = render_bubble_content(&bubble, &Role::Assistant);
-        assert!(rendered.contains("[tool:grep]"));
-        assert!(rendered.contains("usage"));
-        assert!(rendered.contains("[tool_result:grep]"));
+        assert_eq!(rendered, "Investigating usage\n[code_block] let total = 1;");
     }
 
     #[test]
@@ -1705,6 +1699,45 @@ mod tests {
         assert_eq!(result.sessions[0].messages.len(), 1);
         assert_eq!(result.sessions[0].messages[0].content, "hello cursor");
 
+        let meta = load_composer_meta(&conn, &composer_id, &ComposerLookup::load(&conn));
+        let mut stale =
+            build_raw_session(&conn, &composer_id, &meta, &HashMap::new(), true).unwrap().unwrap();
+        stale.metadata_parser_version = Some(METADATA_PARSER_VERSION - 1);
+        stale.messages[0].content.push_str("\n[tool:Shell] stale payload");
+        let store =
+            crate::sync::persist_raw_session_for_conformance(store, "cursor", stale).unwrap();
+        let mut reparsed = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap(),
+            None,
+            true,
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(reparsed.sessions.len(), 1);
+        assert_eq!(reparsed.sessions[0].messages.len(), 1);
+        assert!(reparsed.sessions[0].refresh_session_on_metadata_backfill);
+        let store = crate::sync::persist_raw_session_for_conformance(
+            store,
+            "cursor",
+            reparsed.sessions.remove(0),
+        )
+        .unwrap();
+        let stored = store.get_session_by_source_id("cursor", &composer_id).unwrap().unwrap();
+        assert_eq!(store.get_messages(&stored.id).unwrap()[0].content, "hello cursor");
+        let current = scan_for_sync_conn(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap(),
+            None,
+            true,
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert!(current.sessions.is_empty());
+        assert_eq!(current.stats.skipped_sessions, 1);
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1758,49 +1791,88 @@ mod tests {
     fn parse_composer_session_extracts_tool_events() {
         let root = temp_root("tool-events");
         let composer_id = uuid::Uuid::new_v4().to_string();
-        let bubble_id = uuid::Uuid::new_v4().to_string();
-        let conn = seed_global_db(&root, &composer_id, &bubble_id);
-        let composer_data = serde_json::json!({
-            "composerId": composer_id,
+        let ids: Vec<_> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        let conn = seed_global_db(&root, &composer_id, &ids[0]);
+        let data = serde_json::json!({
             "createdAt": 1_700_000_000_000_i64,
             "lastUpdatedAt": 1_700_000_100_000_i64,
-            "unifiedMode": "chat",
-            "modelConfig": { "modelName": "claude-sonnet-4" },
             "fullConversationHeadersOnly": [
-                { "bubbleId": bubble_id, "type": 2 },
+                {"bubbleId":ids[0],"type":2},
+                {"bubbleId":ids[1],"type":1},
+                {"bubbleId":ids[2],"type":2},
+                {"bubbleId":ids[3],"type":2}
             ]
         });
         conn.execute(
-            "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
-            rusqlite::params![composer_data.to_string(), format!("composerData:{composer_id}"),],
+            "UPDATE cursorDiskKV SET value=?1 WHERE key=?2",
+            rusqlite::params![data.to_string(), format!("composerData:{composer_id}")],
         )
         .unwrap();
-        let bubble = serde_json::json!({
-            "type": 2,
-            "text": "",
-            "createdAt": 1_700_000_050_000_i64,
-            "toolFormerData": {
-                "name": "grep",
-                "rawArgs": "{\"pattern\":\"usage\"}",
-                "result": "{\"matches\":1}"
-            }
-        });
-        conn.execute(
-            "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
-            rusqlite::params![bubble.to_string(), format!("bubbleId:{composer_id}:{bubble_id}"),],
-        )
-        .unwrap();
-
+        for (index, id) in ids.iter().enumerate() {
+            let bubble = if index == 1 {
+                serde_json::json!({"text":"Move this file"})
+            } else {
+                serde_json::json!({
+                    "text":if index == 3 {"Applying the next change"} else {""},
+                    "createdAt":1_700_000_050_000_i64,
+                    "tokenCount":{"inputTokens":12,"outputTokens":34},
+                    "toolFormerData":{
+                        "name":"run_terminal_command_v2",
+                        "params":{"command":"mv old.rs new.rs","cwd":"/native/repo"},
+                        "result":{"exitCode":0},
+                        "status":"completed"
+                    }
+                })
+            };
+            conn.execute(
+                "INSERT OR REPLACE INTO cursorDiskKV (key,value) VALUES (?1,?2)",
+                rusqlite::params![format!("bubbleId:{composer_id}:{id}"), bubble.to_string()],
+            )
+            .unwrap();
+        }
         let meta = load_composer_meta(&conn, &composer_id, &ComposerLookup::load(&conn));
         let parsed = parse_composer_session(&conn, &composer_id, &meta, true).unwrap().unwrap();
-        assert_eq!(parsed.events.len(), 2);
-        assert_eq!(parsed.events[0].kind, "search");
-        assert_eq!(parsed.events[0].name.as_deref(), Some("grep"));
-        assert_eq!(parsed.events[0].source_event_id.as_deref(), Some(bubble_id.as_str()));
-        assert_eq!(parsed.events[0].tool_call_id.as_deref(), Some(bubble_id.as_str()));
-        assert_eq!(parsed.events[1].kind, "tool_result");
-        assert_eq!(parsed.events[1].source_event_id.as_deref(), Some(bubble_id.as_str()));
-        assert_eq!(parsed.events[1].tool_call_id.as_deref(), Some(bubble_id.as_str()));
+        assert_eq!(
+            parsed.messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
+            ["Move this file", "Applying the next change"]
+        );
+        assert_eq!(parsed.events.len(), 6);
+        assert_eq!(parsed.usage_events.len(), 3);
+        for (index, anchor) in [None, Some(0), Some(1)].into_iter().enumerate() {
+            let call = &parsed.events[index * 2];
+            let result = &parsed.events[index * 2 + 1];
+            assert_eq!(call.message_seq, anchor);
+            assert_eq!(result.message_seq, anchor);
+            assert_eq!(parsed.usage_events[index].message_seq, anchor);
+            assert_eq!(call.tool_call_id, result.tool_call_id);
+            assert_eq!(call.source_event_id, result.source_event_id);
+            assert_eq!(call.files.len(), 2);
+            assert!(call.files.iter().all(|file| file.kind == FileEvidenceKind::Command
+                && file.cwd.as_deref() == Some("/native/repo")));
+            assert_eq!(call.status, None);
+            assert_eq!(result.status.as_deref(), Some("completed"));
+        }
+        let no_events = parse_composer_session(&conn, &composer_id, &meta, false).unwrap().unwrap();
+        assert_eq!(no_events.messages.len(), 2);
+        assert_eq!(no_events.usage_events.len(), 3);
+        assert!(no_events.events.is_empty());
+        let mut tool_only = data.clone();
+        tool_only["fullConversationHeadersOnly"] =
+            serde_json::json!([{"bubbleId":ids[0],"type":2}]);
+        conn.execute(
+            "UPDATE cursorDiskKV SET value=?1 WHERE key=?2",
+            rusqlite::params![tool_only.to_string(), format!("composerData:{composer_id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE cursorDiskKV SET value=json_remove(value,'$.tokenCount') WHERE key=?1",
+            [format!("bubbleId:{composer_id}:{}", ids[0])],
+        )
+        .unwrap();
+        let empty = parse_composer_session(&conn, &composer_id, &meta, false).unwrap().unwrap();
+        assert!(
+            empty.messages.is_empty() && empty.events.is_empty() && empty.usage_events.is_empty()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1815,7 +1887,14 @@ mod tests {
         });
         for bubble_id in [None, Some(""), Some("unknown")] {
             let mut events = Vec::new();
-            collect_bubble_tool_events(&bubble, bubble_id, "composer:test", None, 0, &mut events);
+            collect_bubble_tool_events(
+                &bubble,
+                bubble_id,
+                "composer:test",
+                None,
+                Some(0),
+                &mut events,
+            );
             assert_eq!(events.len(), 2);
             assert!(events.iter().all(|event| event.source_event_id.is_none()));
             assert!(events.iter().all(|event| event.tool_call_id.is_none()));
@@ -1843,7 +1922,7 @@ mod tests {
                     Some("record-id"),
                     "composer:test",
                     None,
-                    0,
+                    Some(0),
                     &mut events,
                 );
                 assert_eq!(events.len(), 2);
@@ -1857,6 +1936,51 @@ mod tests {
                     serde_json::from_str(events[1].attrs_json.as_deref().unwrap()).unwrap();
                 assert_eq!(result["afterContentId"], "composer.content.after");
                 assert_eq!(events[1].status.as_deref(), Some("completed"));
+            }
+        }
+        for (name, args, expected_cwd) in [
+            (
+                "Shell",
+                serde_json::json!({"command":"mv old.rs new.rs","working_directory":"/explicit/repo"}),
+                Some("/explicit/repo"),
+            ),
+            ("Shell", serde_json::json!({"command":"mv old.rs new.rs"}), None),
+            (
+                "run_terminal_command_v2",
+                serde_json::json!({"command":"mv old.rs new.rs","cwd":"$WORKSPACE"}),
+                None,
+            ),
+            (
+                "run_terminal_command_v2",
+                serde_json::json!({"command":"mv old.rs new.rs","cwd":null}),
+                None,
+            ),
+        ] {
+            let bubble =
+                serde_json::json!({"toolFormerData":{"name":name,"params":args.to_string()}});
+            let mut events = Vec::new();
+            collect_bubble_tool_events(
+                &bubble,
+                Some("bubble"),
+                "composer:test",
+                None,
+                None,
+                &mut events,
+            );
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].files.len(), 2);
+            assert!(events[0].files.iter().all(|file| file.kind == FileEvidenceKind::Command
+                && file.cwd.as_deref() == expected_cwd));
+            assert_eq!(events[0].status, None);
+            assert_eq!(
+                serde_json::from_str::<Value>(events[0].attrs_json.as_deref().unwrap()).unwrap(),
+                args
+            );
+            if expected_cwd.is_none() {
+                assert_eq!(
+                    events[0].command_evidence_status,
+                    Some(crate::types::CommandEvidenceStatus::Unsupported)
+                );
             }
         }
     }
@@ -1943,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_composer_legacy_map_preserves_messages_without_guessing_events() {
+    fn parse_composer_legacy_map_preserves_messages_and_tool_evidence() {
         let root = temp_root("legacy-map");
         let composer_id = uuid::Uuid::new_v4().to_string();
         let bubble_id = uuid::Uuid::new_v4().to_string();
@@ -1979,7 +2103,22 @@ mod tests {
 
         assert_eq!(parsed.messages.len(), 1);
         assert_eq!(parsed.messages[0].content, "Legacy assistant message");
-        assert!(parsed.events.is_empty());
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].source_event_id.as_deref(), Some(bubble_id.as_str()));
+        assert_eq!(parsed.events[0].tool_call_id.as_deref(), Some(bubble_id.as_str()));
+        assert_eq!(parsed.events[0].message_seq, Some(0));
+        let mut tool_only = composer_data.clone();
+        tool_only["conversationMap"][&bubble_id]["text"] = serde_json::json!("");
+        conn.execute(
+            "UPDATE cursorDiskKV SET value=?1 WHERE key=?2",
+            rusqlite::params![tool_only.to_string(), format!("composerData:{composer_id}")],
+        )
+        .unwrap();
+        let parsed = parse_composer_session(&conn, &composer_id, &meta, true).unwrap().unwrap();
+        assert!(parsed.messages.is_empty());
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].source_event_id.as_deref(), Some(bubble_id.as_str()));
+        assert_eq!(parsed.events[0].message_seq, None);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2010,6 +2149,30 @@ mod tests {
         assert_eq!(raw.events[3].tool_call_id, None);
         assert_eq!(raw.events[4].tool_call_id, None);
         assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
+        assert_eq!(raw.messages[1].content, "searching");
+        write_jsonl(
+            &jsonl_path,
+            &[
+                r#"{"role":"assistant","message":{"content":[{"type":"tool_use","id":"shell","name":"Shell","input":{"command":"mv old.rs new.rs"}}]}}"#,
+            ],
+        );
+        let meta =
+            ComposerMeta { directory: Some("/native/transcript".into()), ..Default::default() };
+        let native =
+            load_transcript(&jsonl_path, &uuid, None, Some(&meta), 1, true).unwrap().unwrap();
+        assert!(native.messages.is_empty());
+        assert_eq!(native.events.len(), 1);
+        assert_eq!(native.events[0].message_seq, None);
+        assert!(native.events[0].files.iter().all(|file| file.cwd.is_none()));
+        let empty = parse_agent_transcript(&jsonl_path, false).unwrap().unwrap();
+        assert!(empty.messages.is_empty() && empty.events.is_empty());
+        assert!(empty.refresh_session_on_metadata_backfill);
+        let unknown = parse_agent_transcript(&jsonl_path, true).unwrap().unwrap();
+        assert!(unknown.events[0].files.iter().all(|file| file.cwd.is_none()));
+        assert_eq!(
+            unknown.events[0].command_evidence_status,
+            Some(crate::types::CommandEvidenceStatus::Unsupported)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2028,11 +2191,9 @@ mod tests {
         let raw = parse_agent_transcript(&jsonl_path, true).unwrap().unwrap();
         assert_eq!(raw.messages.len(), 2);
         assert_eq!(raw.messages[0].content, "hello");
-        assert!(raw.messages[1].content.contains("[tool_use:Glob]"));
-        // Agent transcripts carry no token accounting, but the version must
-        // still be declared: without it no usage state row is written, so the
-        // incremental scan never marks the session current and reparses it on
-        // every sync.
+        assert_eq!(raw.messages[1].content, "hi");
+        assert_eq!(raw.metadata_parser_version, Some(METADATA_PARSER_VERSION));
+        assert!(raw.refresh_session_on_metadata_backfill);
         assert_eq!(raw.usage_parser_version, Some(USAGE_PARSER_VERSION));
         assert!(raw.usage_events.is_empty());
         assert_eq!(raw.source_file_path.as_deref(), jsonl_path.to_str());
