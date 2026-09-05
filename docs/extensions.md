@@ -452,6 +452,19 @@ Do not add an open registry yet. The official catalog is enough for v0.1 binary
 management. Third-party distribution can be designed later if there is real
 demand.
 
+## File History Compatibility Requirements
+
+File-history implementation follows the acceptance contract in
+[session.md](session.md#file-history-implementation-contract). Existing
+`file_history.project` denotes session scope; target-file scope must be an
+explicit additive selection, not a silent change to that parameter. Existing
+head/tail reads and message continuation retain their published meanings.
+
+New evidence fields must survive full export/import. Old records lacking those
+fields represent unknown evidence, not a claim that no operation occurred.
+Partial pages must not replace complete sessions during import. Schema changes
+belong to core migrations; extensions continue to use the CLI protocol.
+
 ## Non-Goals
 
 - Rust dylib plugins;

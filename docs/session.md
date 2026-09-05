@@ -644,6 +644,42 @@ match `excluded_paths` still runs, restricted to the current scope.
   share dry-run behavior.
 - Documentation includes at least one end-to-end agent workflow.
 
+## File History Implementation Contract
+
+The file-history work must let an agent explain how a file changed across
+coding sessions, with references to the recorded operations and surrounding
+discussion. This section defines the acceptance contract; it does not advertise
+unimplemented parameters as available commands.
+
+- Keep tool requests, tool-reported outcomes, observed content changes, and
+  command candidates distinct. A successful wrapper or a filename appearing in
+  text does not prove a successful file modification.
+- Preserve one operation with multiple file associations. Do not infer the
+  number of independent changes from event rows, matching content, or commits.
+- Resolve the target file separately from the session's starting project.
+  A session started in another repository can modify this repository's files.
+  Preserve unresolved identities instead of guessing from worktree names.
+- Retain native event and call identities, discussion anchors, and available
+  evidence. Reuse message windows and continuation cursors for discussion;
+  event and source revisions must independently invalidate stale evidence.
+- Support bounded continuation of file history and large evidence payloads.
+  Querying must not trigger sync or accept arbitrary source-file reads.
+- Backfill unchanged native records after parser changes. Failed parsing must
+  preserve old evidence; repeated runs must not create duplicates. Maintenance
+  must respect source configuration and explicitly report its scope and gaps.
+- Verify every registered source and supported storage format against native
+  input. Available but unparsed evidence is unfinished work. Missing source
+  records or fields must be reported without invented attribution.
+
+Acceptance includes cross-repository writes, multi-file patches, rename and
+restore operations, failed edits, command wrappers, long evidence, inherited
+history, and imported sessions. Native records and Git content provide separate
+checks; parser output is not its own expected result.
+
+This work does not add a TUI flow, a filesystem monitor, a required launcher,
+server-side summaries, or permanent archival. It cannot reconstruct operations
+that native sources never recorded and preserves existing retention semantics.
+
 ## Open Questions
 
 - Should `session list --sync` support `--force`, or should forced sync stay only
