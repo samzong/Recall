@@ -461,7 +461,11 @@ fn should_check(state: &UpdateState) -> bool {
     let Some(last_check) = &state.last_check else {
         return true;
     };
-    let Ok(parsed) = parse_unix_seconds(last_check) else {
+    let Some(parsed) = last_check
+        .parse::<u64>()
+        .ok()
+        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+    else {
         return true;
     };
     SystemTime::now().duration_since(parsed).is_ok_and(|elapsed| elapsed >= CHECK_INTERVAL)
@@ -472,7 +476,22 @@ fn now_unix_seconds() -> String {
     format!("{seconds}")
 }
 
-fn parse_unix_seconds(value: &str) -> Result<SystemTime> {
-    let seconds: u64 = value.parse().context("parse last_check timestamp")?;
-    Ok(UNIX_EPOCH + Duration::from_secs(seconds))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_last_check_controls_update_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path().to_path_buf());
+        for (last_check, expected) in [
+            (now_unix_seconds(), false),
+            ("0".to_string(), true),
+            ("invalid".to_string(), true),
+            (u64::MAX.to_string(), true),
+        ] {
+            fs::write(state_path(&paths), format!("last_check = {last_check:?}\n")).unwrap();
+            assert_eq!(should_check(&load_state(&paths).unwrap()), expected, "{last_check}");
+        }
+    }
 }
