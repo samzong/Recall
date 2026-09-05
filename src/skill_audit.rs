@@ -503,6 +503,7 @@ mod tests {
             is_import: false,
         };
         let event = RawSessionEvent {
+            files: Vec::new(),
             event_seq: 0,
             timestamp: Some(now),
             kind: "command".to_string(),
@@ -563,6 +564,7 @@ mod tests {
             is_import: false,
         };
         let event = RawSessionEvent {
+            files: Vec::new(),
             event_seq: 0,
             timestamp: None,
             kind: "tool_call".to_string(),

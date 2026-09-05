@@ -129,6 +129,8 @@ struct ImportUsageEvent {
 
 #[derive(Deserialize)]
 struct ImportEvent {
+    #[serde(default)]
+    files: Vec<crate::types::FileEvidence>,
     event_seq: u32,
     #[serde(default)]
     timestamp: Option<i64>,
@@ -180,7 +182,7 @@ pub(crate) fn import_jsonl<R: BufRead>(
         if record.record_type != RECORD_TYPE {
             bail!("line {line_no}: unsupported record_type '{}'", record.record_type);
         }
-        if !matches!(record.schema_version, 2..=6) {
+        if !matches!(record.schema_version, 2..=7) {
             bail!("line {line_no}: unsupported schema_version {}", record.schema_version);
         }
 
@@ -278,6 +280,7 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
         .events
         .into_iter()
         .map(|e| RawSessionEvent {
+            files: e.files,
             event_seq: e.event_seq,
             timestamp: e.timestamp,
             kind: e.kind,
@@ -403,15 +406,29 @@ mod tests {
 
     fn full_event() -> RawSessionEvent {
         RawSessionEvent {
+            files: vec![
+                crate::types::FileEvidence {
+                    path: "src/alpha.rs".into(),
+                    operation: crate::types::FileOperation::Write,
+                    kind: crate::types::FileEvidenceKind::Call,
+                    cwd: Some("/workspace/project".into()),
+                },
+                crate::types::FileEvidence {
+                    path: "src/β.rs".into(),
+                    operation: crate::types::FileOperation::Delete,
+                    kind: crate::types::FileEvidenceKind::Call,
+                    cwd: None,
+                },
+            ],
             event_seq: 0,
             timestamp: Some(1_200),
-            kind: "tool".to_string(),
+            kind: "file_write".to_string(),
             actor: "assistant".to_string(),
-            name: Some("Shell".to_string()),
+            name: Some("apply_patch".to_string()),
             status: Some("ok".to_string()),
-            target: Some("ls".to_string()),
+            target: Some("src/alpha.rs".to_string()),
             message_seq: Some(0),
-            summary: Some("ran ls".to_string()),
+            summary: Some("updated alpha and removed beta".to_string()),
             source_path: Some("/home/origin/raw.jsonl".to_string()),
             source_event_id: Some("ev-1".to_string()),
             tool_call_id: Some("call-1".to_string()),
@@ -492,6 +509,51 @@ mod tests {
         orig["session"]["id"] = serde_json::Value::Null;
         copy["session"]["id"] = serde_json::Value::Null;
         assert_eq!(orig, copy, "export -> import -> export must be lossless");
+    }
+
+    #[test]
+    fn event_replacement_preserves_files_on_failure_and_removes_old_associations() {
+        let store = setup();
+        persist_full(&store, "codex", "src-1", "Files");
+        let before = export_all(&store);
+        let first_id: i64 =
+            store.conn.query_row("SELECT id FROM session_events", [], |row| row.get(0)).unwrap();
+        assert!(
+            store
+                .persist_session_events_for_existing_session(
+                    "codex",
+                    "src-1",
+                    &[full_event(), full_event()],
+                    6,
+                    None,
+                )
+                .is_err()
+        );
+        assert_eq!(export_all(&store), before);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 2);
+        let mut replacement = full_event();
+        replacement.files.remove(0);
+        store
+            .persist_session_events_for_existing_session(
+                "codex",
+                "src-1",
+                &[replacement.clone()],
+                6,
+                None,
+            )
+            .unwrap();
+        let next_id: i64 =
+            store.conn.query_row("SELECT id FROM session_events", [], |row| row.get(0)).unwrap();
+        assert!(next_id > first_id);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 1);
+        let session_id: String =
+            store.conn.query_row("SELECT id FROM sessions", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            store.list_session_events_for_session(&session_id).unwrap()[0].files,
+            replacement.files
+        );
+        store.conn.execute("DELETE FROM sessions", []).unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 0);
     }
 
     #[test]

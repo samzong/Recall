@@ -72,6 +72,7 @@ fn make_usage_event(key: &str, timestamp: i64, model: &str) -> RawUsageEvent {
 
 fn make_session_event(kind: &str, name: Option<&str>, target: Option<&str>) -> RawSessionEvent {
     RawSessionEvent {
+        files: Vec::new(),
         event_seq: 0,
         timestamp: Some(1_800_000_001_000),
         kind: kind.to_string(),
@@ -337,7 +338,7 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     let lines: Vec<_> = text.lines().collect();
     assert_eq!(lines.len(), 1);
     let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(value["schema_version"], 6);
+    assert_eq!(value["schema_version"], 7);
     assert_eq!(value["record_type"], "session");
     assert_eq!(value["session"]["source"], "codex");
     assert_eq!(value["session"]["source_id"], "raw1");

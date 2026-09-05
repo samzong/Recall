@@ -70,16 +70,35 @@ impl Store {
         &self,
         session_id: &str,
     ) -> Result<Vec<SessionEventRecord>> {
-        let mut stmt = self.conn.prepare(
+        let has_files: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'event_files')",
+            [], |row| row.get(0),
+        )?;
+        let files_sql = if has_files {
+            "(SELECT json_group_array(json(evidence_json)) FROM
+                (SELECT evidence_json FROM event_files
+                 WHERE event_id = session_events.id ORDER BY position))"
+        } else {
+            "'[]'"
+        };
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT event_seq, timestamp, kind, actor, name, status, target,
                     message_seq, summary, source_path, source_event_id, tool_call_id,
-                    is_meta, visibility, attrs_json, parser_version
+                    is_meta, visibility, attrs_json, parser_version,
+                    {files_sql}
              FROM session_events
              WHERE session_id = ?1
              ORDER BY event_seq ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map(rusqlite::params![session_id], |row| {
             Ok(SessionEventRecord {
+                files: serde_json::from_str(&row.get::<_, String>(16)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        16,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
                 event_seq: row.get(0)?,
                 timestamp: row.get(1)?,
                 kind: row.get(2)?,
@@ -129,6 +148,9 @@ pub(crate) fn replace_session_events(
             ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
          )",
     )?;
+    let mut file_stmt = tx.prepare(
+        "INSERT INTO event_files(event_id, position, path, evidence_json) VALUES (?1, ?2, ?3, ?4)",
+    )?;
     for event in session_events {
         stmt.execute(rusqlite::params![
             session_id,
@@ -152,6 +174,16 @@ pub(crate) fn replace_session_events(
             event.parser_version,
             created_at,
         ])?;
+        let event_id = tx.last_insert_rowid();
+        for (position, file) in event.files.iter().enumerate() {
+            anyhow::ensure!(!file.path.trim().is_empty(), "file evidence requires a path");
+            file_stmt.execute(rusqlite::params![
+                event_id,
+                position as i64,
+                file.path,
+                serde_json::to_string(file)?,
+            ])?;
+        }
     }
 
     if let Some(parser_version) = event_parser_version {

@@ -12,7 +12,7 @@ use crate::types::{
     Message, Role, Session, SessionEventRecord, SessionTopology, SessionUsageEventRecord,
 };
 
-pub(crate) const RECORD_SCHEMA_VERSION: u32 = 6;
+pub(crate) const RECORD_SCHEMA_VERSION: u32 = 7;
 const RECORD_TYPE: &str = "session";
 const EXPORT_IN_MEMORY_DB_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -157,6 +157,7 @@ struct ExportUsageEvent {
 
 #[derive(Serialize)]
 struct ExportEvent {
+    files: Vec<crate::types::FileEvidence>,
     event_seq: u32,
     timestamp: Option<i64>,
     kind: String,
@@ -355,6 +356,7 @@ impl From<SessionUsageEventRecord> for ExportUsageEvent {
 impl From<SessionEventRecord> for ExportEvent {
     fn from(event: SessionEventRecord) -> Self {
         Self {
+            files: event.files,
             event_seq: event.event_seq,
             timestamp: event.timestamp,
             kind: event.kind,

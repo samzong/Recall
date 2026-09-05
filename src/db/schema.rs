@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 const V12_SCHEMA_VERSION: i64 = 12;
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -51,9 +51,31 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
         migrate_v12(conn)?;
     }
     let version = read_schema_version(conn)?;
-    if version < SCHEMA_VERSION {
+    if version < 13 {
         migrate_v13(conn)?;
     }
+    if version < 14 {
+        migrate_v14(conn)?;
+    }
+    Ok(())
+}
+
+fn migrate_v14(conn: &Connection) -> anyhow::Result<()> {
+    let version = read_schema_version(conn)?;
+    let version_update = if version >= 13 { "PRAGMA user_version = 14;" } else { "" };
+    conn.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS event_files (
+             event_id INTEGER NOT NULL REFERENCES session_events(id) ON DELETE CASCADE,
+             position INTEGER NOT NULL,
+             path TEXT NOT NULL,
+             evidence_json TEXT NOT NULL,
+             PRIMARY KEY(event_id, position)
+         );
+         CREATE INDEX IF NOT EXISTS idx_event_files_path ON event_files(path);
+         {version_update}
+         COMMIT;",
+    ))?;
     Ok(())
 }
 
@@ -571,6 +593,34 @@ mod tests {
     use crate::types::{Message, Role};
 
     #[test]
+    fn v14_preserves_existing_events_and_is_idempotent() {
+        register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        store.conn.execute_batch(
+            r#"DROP TABLE event_files;
+             PRAGMA user_version = 13;
+             INSERT INTO sessions(id, source, source_id, title, started_at) VALUES ('history', 'codex', 'native', 'History', 1);
+             INSERT INTO session_events(session_id, source, source_id, event_seq, kind, actor, attrs_json, created_at)
+             VALUES ('history', 'codex', 'native', 0, 'tool_call', 'assistant', '{"input":"preserved"}', 1);"#,
+        ).unwrap();
+        let legacy = store.list_session_events_for_session("history").unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert!(legacy[0].files.is_empty());
+        init(&store.conn).unwrap();
+        init(&store.conn).unwrap();
+        let payload: String = store
+            .conn
+            .query_row(
+                "SELECT attrs_json FROM session_events WHERE session_id = 'history'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload, r#"{"input":"preserved"}"#);
+        assert!(store.list_session_events_for_session("history").unwrap()[0].files.is_empty());
+    }
+
+    #[test]
     fn migrate_v6_adds_metadata_columns_to_existing_v5_db() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -969,7 +1019,7 @@ mod tests {
         migrate_v12_with_lock(&store.conn, true, || Ok::<Option<()>, anyhow::Error>(Some(())))
             .unwrap();
         assert_eq!(schema_version(&store.conn).unwrap(), V12_SCHEMA_VERSION);
-        migrate_v13(&store.conn).unwrap();
+        init(&store.conn).unwrap();
         assert_eq!(schema_version(&store.conn).unwrap(), SCHEMA_VERSION);
         assert!(has_trigram_fts(&store.conn).unwrap());
         let hits: i64 = store

@@ -119,7 +119,7 @@ Core support in v0.1:
   excerpt; the default session-search shape is unchanged.
 - `recall session show` supports `--format json|jsonl`;
 - `recall export` emits JSONL, one session record per line, with export record
-  schema version 6, and supports `--include metadata,messages,usage,events`
+  schema version 7, and supports `--include metadata,messages,usage,events`
   for field projection. Export projections must include `messages`; `usage`
   and `events` are optional add-ons. `recall session list` and `recall export`
   also accept `--thread-role primary|subagent|unknown` to filter by topology;

@@ -207,8 +207,36 @@ impl EvidenceVisibility {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileEvidenceKind {
+    Call,
+    Observation,
+    Command,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileOperation {
+    Read,
+    Write,
+    Delete,
+    MoveFrom,
+    MoveTo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileEvidence {
+    pub(crate) path: String,
+    pub(crate) operation: FileOperation,
+    pub(crate) kind: FileEvidenceKind,
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RawSessionEvent {
+    pub(crate) files: Vec<FileEvidence>,
     pub(crate) event_seq: u32,
     pub(crate) timestamp: Option<i64>,
     pub(crate) kind: String,
@@ -247,6 +275,7 @@ pub(crate) struct UsageEventRecord {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionEventRecord {
+    pub(crate) files: Vec<FileEvidence>,
     pub(crate) event_seq: u32,
     pub(crate) timestamp: Option<i64>,
     pub(crate) kind: String,

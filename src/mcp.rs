@@ -2438,6 +2438,7 @@ mod tests {
         name: Option<&str>,
     ) -> RawSessionEvent {
         RawSessionEvent {
+            files: Vec::new(),
             event_seq: seq,
             timestamp,
             kind: kind.to_string(),

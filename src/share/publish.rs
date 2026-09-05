@@ -639,6 +639,7 @@ mod tests {
 
     fn session_event(event_seq: u32, kind: &str) -> SessionEventRecord {
         SessionEventRecord {
+            files: Vec::new(),
             event_seq,
             timestamp: None,
             kind: kind.to_string(),
