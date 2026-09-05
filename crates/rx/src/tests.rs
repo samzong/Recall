@@ -1170,6 +1170,7 @@ fn exec_scopes_inherited_controls_and_explicit_credentials() {
     const CONTROLS: [&str; 4] = ["RX_HOST_REQUEST", "RX_NO_INSTALL", "RX_NO_UPDATE", "RX_NO_YOLO"];
     if let Ok(credential) = std::env::var("RX_TEST_EXEC_CREDENTIAL") {
         let plan = launch::LaunchPlan {
+            launch_lease: None,
             program: PathBuf::from("/usr/bin/env"),
             args: Vec::new(),
             env_set: if credential.is_empty() {

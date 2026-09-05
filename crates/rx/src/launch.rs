@@ -43,8 +43,9 @@ impl EnvLookup {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct LaunchPlan {
+    pub(crate) launch_lease: Option<std::fs::File>,
     pub(crate) program: PathBuf,
     pub(crate) args: Vec<OsString>,
     pub(crate) env_set: Vec<(String, String)>,
@@ -260,6 +261,7 @@ fn push_note(plan: &mut LaunchPlan, note: &str) {
 
 fn passthrough(request: &LaunchRequest, note: String) -> LaunchPlan {
     LaunchPlan {
+        launch_lease: None,
         program: PathBuf::from(request.harness.as_str()),
         args: match request.harness {
             Harness::Dsh => crate::dsh::args(&request.passthrough, None),
@@ -334,6 +336,7 @@ pub(crate) fn inject_claude_openrouter(
         SeedOutcome::Seeded => None,
     };
     LaunchPlan {
+        launch_lease: None,
         program: PathBuf::from("claude"),
         args,
         env_set: claude_openrouter_env(base_url, key, model, seeded),
@@ -406,6 +409,7 @@ pub(crate) fn inject_claude_generated_seeded(
         args.insert(0, OsString::from("--settings"));
     }
     LaunchPlan {
+        launch_lease: None,
         program: PathBuf::from("claude"),
         args,
         env_set: claude_generated_seeded_env(env_key, base_url, key, model),
@@ -472,6 +476,7 @@ fn inject(
     let key = target.key.as_str();
     match request.harness {
         Harness::Claude => Ok(LaunchPlan {
+            launch_lease: None,
             program: PathBuf::from("claude"),
             args: request.passthrough.clone(),
             env_set: claude_env(&provider.env, &crate::provider::claude_base(provider), key, model),
@@ -508,6 +513,7 @@ fn inject(
             }
             args.extend(request.passthrough.iter().cloned());
             Ok(LaunchPlan {
+                launch_lease: None,
                 program: PathBuf::from("codex"),
                 args,
                 env_set: vec![(provider.env.clone(), key.to_string())],
@@ -540,6 +546,7 @@ fn inject(
                 );
             }
             Ok(LaunchPlan {
+                launch_lease: None,
                 program: PathBuf::from("opencode"),
                 args,
                 env_set,
@@ -549,6 +556,7 @@ fn inject(
         Harness::Pi => {
             crate::pi::prepare(provider_id, provider, base_url, key, paths, env)?;
             Ok(LaunchPlan {
+                launch_lease: None,
                 program: PathBuf::from("pi"),
                 args: crate::pi::args(provider_id, model, &request.passthrough),
                 env_set: crate::pi::env_set(&provider.env, key),
@@ -559,6 +567,7 @@ fn inject(
             let patch =
                 crate::dsh::prepare(provider_id, provider, base_url, key, model, paths, env)?;
             Ok(LaunchPlan {
+                launch_lease: None,
                 program: PathBuf::from("dsh"),
                 args: crate::dsh::args(&request.passthrough, Some(&patch)),
                 env_set: crate::dsh::env_set(provider_id, provider, key),
@@ -655,6 +664,7 @@ pub(crate) fn exec(plan: &LaunchPlan) -> Result<()> {
     }
     cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
+    let _lease = plan.launch_lease.as_ref().map(fs2::FileExt::duplicate).transpose()?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
