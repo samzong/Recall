@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 use crate::adapters::AdapterSyncContext;
+use crate::adapters::events::{EventContext, tool_call_event, tool_result_event};
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths;
@@ -16,13 +17,17 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp,
 };
-use crate::types::{ParentLink, ParentRelation, RawUsageEvent, Role, ThreadRole};
+use crate::types::{
+    EvidenceVisibility, FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation,
+    RawSessionEvent, RawUsageEvent, Role, ThreadRole,
+};
 
 pub(crate) struct OmpAdapter;
 
-const METADATA_PARSER_VERSION: u32 = 1;
+const METADATA_PARSER_VERSION: u32 = 2;
 
-const USAGE_PARSER_VERSION: u32 = 2;
+const USAGE_PARSER_VERSION: u32 = 3;
+const EVENT_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for OmpAdapter {
     fn id(&self) -> &str {
@@ -59,7 +64,7 @@ impl SourceAdapter for OmpAdapter {
             let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
                 continue;
             };
-            if let Some(raw) = parse_omp_session_file(entry, mtime_ms)? {
+            if let Some(raw) = parse_omp_session_file(entry, mtime_ms, true)? {
                 sessions.push(raw);
             }
         }
@@ -93,6 +98,7 @@ struct ParsedOmpSession {
     custom_title: Option<String>,
     messages: Vec<RawMessage>,
     usage_events: Vec<RawUsageEvent>,
+    events: Vec<RawSessionEvent>,
     parent_session: Option<String>,
 }
 
@@ -179,11 +185,11 @@ fn scan_for_sync_impl(
         since_ts,
         file_scan::FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
-            event_parser_version: None,
+            event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
             metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
         },
         entries,
-        parse_omp_session_file,
+        |entry, mtime_ms| parse_omp_session_file(entry, mtime_ms, include_events),
     )
 }
 
@@ -253,9 +259,10 @@ fn decode_session_dir_name(name: &str) -> Option<String> {
 fn parse_omp_session_file(
     entry: FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let source_file_path = entry.stat_target.to_str().map(str::to_string);
-    let parsed = match parse_omp_session(&entry.stat_target, mtime_ms) {
+    let parsed = match parse_omp_session(&entry.stat_target, mtime_ms, include_events) {
         Ok(parsed) => parsed,
         Err(err) => {
             warn!("failed to parse OMP session {}: {err}", entry.stat_target.display());
@@ -263,12 +270,12 @@ fn parse_omp_session_file(
         }
     };
 
-    if parsed.messages.is_empty() && parsed.usage_events.is_empty() {
+    if parsed.messages.is_empty() && parsed.usage_events.is_empty() && parsed.events.is_empty() {
         return Ok(None);
     }
 
     let started_at =
-        first_timestamp(parsed.started_at, &parsed.messages, &parsed.usage_events, &[])
+        first_timestamp(parsed.started_at, &parsed.messages, &parsed.usage_events, &parsed.events)
             .unwrap_or(0);
 
     let source_id = parsed.session_id.unwrap_or(entry.session_id);
@@ -295,8 +302,8 @@ fn parse_omp_session_file(
         messages: parsed.messages,
         usage_events: parsed.usage_events,
         usage_parser_version: Some(USAGE_PARSER_VERSION),
-        events: Vec::new(),
-        event_parser_version: None,
+        events: parsed.events,
+        event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
         source_file_path,
         custom_title: parsed.custom_title,
         summary: None,
@@ -304,11 +311,15 @@ fn parse_omp_session_file(
         thread_role: Some(ThreadRole::Primary),
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
-        refresh_session_on_metadata_backfill: false,
+        refresh_session_on_metadata_backfill: true,
     }))
 }
 
-fn parse_omp_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<ParsedOmpSession> {
+fn parse_omp_session(
+    path: &Path,
+    fallback_timestamp: i64,
+    include_events: bool,
+) -> anyhow::Result<ParsedOmpSession> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let source_path = path.to_string_lossy().to_string();
@@ -323,6 +334,7 @@ fn parse_omp_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Par
     let mut parent_session = None;
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
+    let mut events = Vec::new();
 
     for item in jsonl_indexed(reader.lines()) {
         let (line_index, entry) = item?;
@@ -378,6 +390,22 @@ fn parse_omp_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Par
             }
             "message" => {
                 if let Some(message) = entry.get("message") {
+                    let timestamp = json_i64(message.get("timestamp"))
+                        .or_else(|| parse_entry_timestamp(&entry))
+                        .unwrap_or(fallback_timestamp);
+                    if include_events
+                        && inherited_usage_cutoff.is_none_or(|cutoff| timestamp > cutoff)
+                    {
+                        extract_omp_events(
+                            &entry,
+                            message,
+                            line_index,
+                            timestamp,
+                            (&source_path, messages.len().checked_sub(1).map(|seq| seq as u32)),
+                            cwd.as_deref(),
+                            &mut events,
+                        );
+                    }
                     parse_omp_message(
                         &entry,
                         message,
@@ -426,6 +454,7 @@ fn parse_omp_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Par
         custom_title,
         messages,
         usage_events,
+        events,
         parent_session,
     })
 }
@@ -481,34 +510,149 @@ fn parse_omp_message(
                 });
             }
         }
-        "toolResult" => {
-            let content = extract_tool_result_content(message);
-            if !content.trim().is_empty() {
-                messages.push(RawMessage {
-                    role: Role::Assistant,
-                    content,
-                    timestamp: Some(timestamp),
-                });
-            }
-        }
-        "bashExecution" => {
-            if message.get("excludeFromContext").and_then(Value::as_bool) == Some(true) {
-                return;
-            }
-            let content = extract_bash_execution_content(message);
-            if !content.trim().is_empty() {
-                messages.push(RawMessage {
-                    role: Role::Assistant,
-                    content,
-                    timestamp: Some(timestamp),
-                });
-            }
-        }
         "custom" => {
             let content = extract_content(message.get("content"));
             if !content.trim().is_empty() {
                 messages.push(RawMessage { role: Role::User, content, timestamp: Some(timestamp) });
             }
+        }
+        _ => {}
+    }
+}
+
+fn extract_omp_events(
+    entry: &Value,
+    message: &Value,
+    line_index: usize,
+    timestamp: i64,
+    (source_path, message_seq): (&str, Option<u32>),
+    cwd: Option<&str>,
+    events: &mut Vec<RawSessionEvent>,
+) {
+    let context = |event_seq, part_index| EventContext {
+        event_seq,
+        timestamp: Some(timestamp),
+        source_path: Some(source_path.to_string()),
+        source_event_id: Some(format!(
+            "{}:line:{line_index}:part:{part_index}",
+            non_empty_str(entry.get("id")).unwrap_or("message")
+        )),
+        message_seq,
+        parser_version: EVENT_PARSER_VERSION,
+    };
+    match message.get("role").and_then(Value::as_str) {
+        Some("assistant") => {
+            let Some(parts) = message.get("content").and_then(Value::as_array) else {
+                return;
+            };
+            for (part_index, part) in parts.iter().enumerate() {
+                if !matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("toolCall" | "tool_call" | "function_call")
+                ) {
+                    continue;
+                }
+                let Some(name) = non_empty_str(part.get("name")) else {
+                    continue;
+                };
+                let raw_args = part.get("arguments").or_else(|| part.get("input"));
+                let decoded = raw_args
+                    .and_then(Value::as_str)
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok());
+                let args = decoded.as_ref().or(raw_args);
+                let mut event = tool_call_event(
+                    context(events.len() as u32, part_index),
+                    name.to_string(),
+                    args,
+                );
+                event.kind = "tool_call".to_string();
+                event.target = None;
+                let operation = match name {
+                    "read" => Some(FileOperation::Read),
+                    _ => None,
+                };
+                if let Some(operation) = operation
+                    && let Some(path) = args.and_then(|args| non_empty_str(args.get("path")))
+                {
+                    event.kind =
+                        if operation == FileOperation::Read { "file_read" } else { "file_write" }
+                            .to_string();
+                    event.target = Some(path.to_string());
+                    event.files.push(FileEvidence {
+                        path: path.to_string(),
+                        operation,
+                        kind: FileEvidenceKind::Call,
+                        cwd: cwd.map(str::to_string),
+                        target: None,
+                    });
+                } else if name == "bash" {
+                    event.kind = "command".to_string();
+                    event.target = args
+                        .and_then(|args| non_empty_str(args.get("command")))
+                        .map(str::to_string);
+                    if let Some(command) = event.target.as_deref() {
+                        let shell_cwd = args
+                            .and_then(|args| args.get("cwd"))
+                            .and_then(Value::as_str)
+                            .filter(|cwd| Path::new(cwd).is_absolute());
+                        let (files, status) =
+                            crate::adapters::events::shell_file_evidence(command, shell_cwd);
+                        event.files = files;
+                        event.command_evidence_status = Some(status);
+                    }
+                } else if name == "grep" {
+                    event.kind = "search".to_string();
+                    event.target = args
+                        .and_then(|args| non_empty_str(args.get("pattern")))
+                        .map(str::to_string);
+                }
+                event.tool_call_id = non_empty_str(part.get("id")).map(str::to_string);
+                event.attrs_json = Some(entry.to_string());
+                events.push(event);
+            }
+        }
+        Some("toolResult" | "bashExecution") => {
+            let bash = message.get("role").and_then(Value::as_str) == Some("bashExecution");
+            let mut event = tool_result_event(
+                context(events.len() as u32, 0),
+                if bash {
+                    Some("bash".to_string())
+                } else {
+                    non_empty_str(message.get("toolName")).map(str::to_string)
+                },
+                Some(if bash {
+                    extract_bash_execution_content(message)
+                } else {
+                    extract_content(message.get("content"))
+                }),
+            );
+            if bash {
+                event.target = non_empty_str(message.get("command")).map(str::to_string);
+                if let Some(command) = event.target.as_deref() {
+                    let (files, status) =
+                        crate::adapters::events::shell_file_evidence(command, None);
+                    event.files = files;
+                    event.command_evidence_status = Some(status);
+                }
+                event.status = if message.get("cancelled").and_then(Value::as_bool) == Some(true) {
+                    Some("cancelled".to_string())
+                } else {
+                    json_i64(message.get("exitCode"))
+                        .map(|code| if code == 0 { "success" } else { "error" }.to_string())
+                };
+                if message.get("excludeFromContext").and_then(Value::as_bool) == Some(true) {
+                    event.visibility = Some(EvidenceVisibility::Hidden);
+                    event.message_seq = None;
+                }
+            } else {
+                event.tool_call_id = non_empty_str(message.get("toolCallId")).map(str::to_string);
+                event.status = message
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .map(|is_error| if is_error { "error" } else { "success" }.to_string());
+            }
+            event.attrs_json = Some(entry.to_string());
+            events.push(event);
         }
         _ => {}
     }
@@ -593,58 +737,17 @@ fn non_empty_str(value: Option<&Value>) -> Option<&str> {
 fn extract_content(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(text)) => text.to_string(),
-        Some(Value::Array(items)) => {
-            let mut parts = Vec::new();
-            for item in items {
-                match item.get("type").and_then(|value| value.as_str()).unwrap_or("") {
-                    "text" | "output_text" => {
-                        if let Some(text) = item.get("text").and_then(|value| value.as_str())
-                            && !text.trim().is_empty()
-                        {
-                            parts.push(text.to_string());
-                        }
-                    }
-                    "toolCall" | "tool_call" | "function_call" => {
-                        let name = item
-                            .get("name")
-                            .and_then(|value| value.as_str())
-                            .filter(|value| !value.trim().is_empty())
-                            .unwrap_or("tool");
-                        let arguments = item
-                            .get("arguments")
-                            .or_else(|| item.get("input"))
-                            .map(|value| match value {
-                                Value::String(text) => text.to_string(),
-                                other => other.to_string(),
-                            })
-                            .unwrap_or_default();
-                        if arguments.trim().is_empty() {
-                            parts.push(format!("[{name}]"));
-                        } else {
-                            parts.push(format!("[{name}] {arguments}"));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            parts.join("\n")
-        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter(|item| {
+                matches!(item.get("type").and_then(Value::as_str), Some("text" | "output_text"))
+            })
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => String::new(),
     }
-}
-
-fn extract_tool_result_content(message: &Value) -> String {
-    let content = extract_content(message.get("content"));
-    if content.trim().is_empty() {
-        return String::new();
-    }
-
-    let tool_name = message
-        .get("toolName")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("tool");
-    format!("[{tool_name} result]\n{content}")
 }
 
 fn extract_bash_execution_content(message: &Value) -> String {
@@ -874,7 +977,7 @@ mod tests {
                         "role": "assistant",
                         "content": [
                             {"type": "thinking", "thinking": "hidden chain of thought"},
-                            {"type": "toolCall", "name": "read", "arguments": {"path": "README.md"}},
+                            {"type": "toolCall", "id": "read-call", "name": "read", "arguments": {"path": "README.md"}},
                             {"type": "text", "text": "done"},
                             {"type": "image", "mimeType": "image/png"}
                         ],
@@ -899,6 +1002,8 @@ mod tests {
                     "message": {
                         "role": "toolResult",
                         "toolName": "read",
+                        "toolCallId": "read-call",
+                        "isError": false,
                         "content": [{"type": "text", "text": "file content"}],
                         "timestamp": 4000
                     }
@@ -916,6 +1021,7 @@ mod tests {
                 directory: Some("/wrong".to_string()),
             },
             mtime,
+            true,
         )
         .unwrap()
         .unwrap();
@@ -926,14 +1032,34 @@ mod tests {
         assert_eq!(raw.started_at, 1_000);
         assert_eq!(raw.updated_at, Some(mtime));
         assert_eq!(raw.source_file_path.as_deref(), path.to_str());
-        assert_eq!(raw.messages.len(), 3);
+        assert_eq!(raw.messages.len(), 2);
         assert_eq!(raw.messages[0].role, Role::User);
         assert_eq!(raw.messages[0].content, "hello omp");
         assert!(raw.messages[1].content.contains("done"));
-        assert!(raw.messages[1].content.contains("[read]"));
+        assert_eq!(raw.messages[1].content, "done");
         assert!(!raw.messages[1].content.contains("hidden chain of thought"));
         assert!(!raw.messages[1].content.contains("image/png"));
-        assert!(raw.messages[2].content.contains("[read result]"));
+
+        assert_eq!(raw.events.len(), 2);
+        let call = &raw.events[0];
+        assert_eq!(call.tool_call_id.as_deref(), Some("read-call"));
+        assert!(call.source_event_id.as_deref().unwrap().starts_with("assistant1:line:"));
+        assert_eq!(call.source_path.as_deref(), path.to_str());
+        assert_eq!(call.timestamp, Some(3_000));
+        assert_eq!(call.message_seq, Some(0));
+        assert_eq!(call.files.len(), 1);
+        assert_eq!(call.files[0].path, "README.md");
+        assert_eq!(call.files[0].operation, FileOperation::Read);
+        assert_eq!(call.files[0].kind, FileEvidenceKind::Call);
+        assert_eq!(call.files[0].cwd, raw.directory);
+        let result = &raw.events[1];
+        assert_eq!(result.tool_call_id, call.tool_call_id);
+        assert_eq!(result.message_seq, Some(1));
+        assert_eq!(result.status.as_deref(), Some("success"));
+        assert!(result.files.is_empty());
+        let payload: Value = serde_json::from_str(result.attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload.pointer("/message/content/0/text"), Some(&Value::from("file content")));
+        assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
 
         assert_eq!(raw.usage_events.len(), 1);
         let event = &raw.usage_events[0];
@@ -1023,6 +1149,7 @@ mod tests {
                 directory: None,
             },
             mtime,
+            true,
         )
         .unwrap()
         .unwrap();
@@ -1075,11 +1202,6 @@ mod tests {
                     "timestamp": "1970-01-01T00:00:01.000Z", "cwd": "/tmp/omp-project"
                 }),
                 serde_json::json!({
-                    "type": "message", "id": "user1", "parentId": null,
-                    "timestamp": "1970-01-01T00:00:02.000Z",
-                    "message": {"role": "user", "content": "visible", "timestamp": 2000}
-                }),
-                serde_json::json!({
                     "type": "message", "id": "bash1", "parentId": "user1",
                     "timestamp": "1970-01-01T00:00:03.000Z",
                     "message": {
@@ -1087,6 +1209,8 @@ mod tests {
                         "command": "cat secret.txt",
                         "output": "secret output",
                         "excludeFromContext": true,
+                        "exitCode": 7,
+                        "cancelled": true,
                         "timestamp": 3000
                     }
                 }),
@@ -1100,12 +1224,22 @@ mod tests {
                 directory: None,
             },
             mtime,
+            true,
         )
         .unwrap()
         .unwrap();
 
-        assert_eq!(raw.messages.len(), 1);
-        assert_eq!(raw.messages[0].content, "visible");
+        assert!(raw.messages.is_empty());
+        assert_eq!(raw.events.len(), 1);
+        let event = &raw.events[0];
+        assert_eq!(event.kind, "tool_result");
+        assert_eq!(event.visibility, Some(EvidenceVisibility::Hidden));
+        assert_eq!(event.status.as_deref(), Some("cancelled"));
+        assert_eq!(event.target.as_deref(), Some("cat secret.txt"));
+        assert!(event.tool_call_id.is_none());
+        assert!(event.files.is_empty());
+        let payload: Value = serde_json::from_str(event.attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload.pointer("/message/exitCode"), Some(&Value::from(7)));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1127,18 +1261,21 @@ mod tests {
                 }),
                 serde_json::json!({
                     "type": "message", "id": "parent-assistant", "timestamp": "1970-01-01T00:00:02.000Z",
-                    "message": {"role": "assistant", "content": "old", "usage": {"input": 10}, "timestamp": 2000}
+                    "message": {"role": "assistant", "content": [{"type":"toolCall","id":"old-call","name":"read","arguments":{"path":"old.rs"}}], "usage": {"input": 10}, "timestamp": 2000}
                 }),
                 serde_json::json!({
                     "type": "message", "id": "child-assistant", "timestamp": "1970-01-01T00:00:04.000Z",
-                    "message": {"role": "assistant", "content": "new", "usage": {"input": 5}, "timestamp": 4000}
+                    "message": {"role": "assistant", "content": [{"type":"toolCall","id":"new-call","name":"read","arguments":{"path":"new.rs"}}], "usage": {"input": 5}, "timestamp": 4000}
                 }),
             ],
         );
 
-        let parsed = parse_omp_session(&path, 0).unwrap();
+        let parsed = parse_omp_session(&path, 0, true).unwrap();
 
-        assert_eq!(parsed.messages.len(), 2);
+        assert!(parsed.messages.is_empty());
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].tool_call_id.as_deref(), Some("new-call"));
+        assert_eq!(parsed.events[0].files[0].path, "new.rs");
         assert_eq!(parsed.usage_events.len(), 1);
         assert_eq!(parsed.usage_events[0].event_key, "message:child-assistant");
         assert_eq!(parsed.usage_events[0].input_tokens, 5);
@@ -1200,6 +1337,45 @@ mod tests {
             )
             .unwrap();
 
+        let usage_only = scan_for_sync_impl(
+            std::slice::from_ref(&session_dir),
+            &AdapterSyncContext::from_store_for_test(&store, "omp").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(usage_only.stats.skipped_sessions, 1);
+        for previous_version in [None, Some(EVENT_PARSER_VERSION - 1)] {
+            if let Some(version) = previous_version {
+                store
+                    .persist_session_events_for_existing_session(
+                        "omp",
+                        session_id,
+                        &[],
+                        version,
+                        Some(mtime),
+                    )
+                    .unwrap();
+            }
+            let backfill = scan_for_sync_impl(
+                std::slice::from_ref(&session_dir),
+                &AdapterSyncContext::from_store_for_test(&store, "omp").unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(backfill.sessions.len(), 1);
+            assert_eq!(backfill.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
+        }
+        store
+            .persist_session_events_for_existing_session(
+                "omp",
+                session_id,
+                &[],
+                EVENT_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
         let result = scan_for_sync_impl(
             &[session_dir],
             &AdapterSyncContext::from_store_for_test(&store, "omp").unwrap(),
@@ -1250,7 +1426,7 @@ mod tests {
             directory: None,
         };
 
-        let raw = parse_omp_session_file(entry, mtime).unwrap().unwrap();
+        let raw = parse_omp_session_file(entry, mtime, true).unwrap().unwrap();
 
         assert_eq!(raw.thread_role, Some(ThreadRole::Primary));
         assert_eq!(
@@ -1303,7 +1479,7 @@ mod tests {
             directory: None,
         };
 
-        let raw = parse_omp_session_file(entry, mtime).unwrap().unwrap();
+        let raw = parse_omp_session_file(entry, mtime, true).unwrap().unwrap();
 
         assert_eq!(raw.thread_role, Some(ThreadRole::Primary));
         assert!(raw.parent_links.is_empty());
