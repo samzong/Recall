@@ -13,11 +13,14 @@ use crate::adapters::{
     InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
     SyncScanOutput, SyncScanResult, SyncScanStats, first_timestamp, last_timestamp,
 };
-use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
+use crate::types::{
+    FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation, RawSessionEvent,
+    RawUsageEvent, Role, ThreadRole,
+};
 
 const SOURCE: &str = "goose";
 const USAGE_PARSER_VERSION: u32 = 1;
-const EVENT_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 2;
 const METADATA_PARSER_VERSION: u32 = 2;
 const MS_THRESHOLD: i64 = 10_000_000_000;
 
@@ -48,6 +51,7 @@ impl SessionRow {
 }
 
 struct MessageRow {
+    record_id: i64,
     message_id: Option<String>,
     role: String,
     content_json: String,
@@ -326,12 +330,7 @@ fn scan_session(
     let mut events = Vec::new();
 
     for row in message_rows {
-        if !is_user_visible(row.metadata_json.as_deref()) {
-            continue;
-        }
-        let Some(role) = parse_role(&row.role) else {
-            continue;
-        };
+        let visible = is_user_visible(row.metadata_json.as_deref());
         let parts = match serde_json::from_str::<Vec<Value>>(&row.content_json) {
             Ok(parts) => parts,
             Err(err) => {
@@ -340,17 +339,40 @@ fn scan_session(
             }
         };
         let timestamp = row.created_timestamp;
-        if let Some(content) = extract_text(&parts) {
+        if visible
+            && let Some(role) = parse_role(&row.role)
+            && let Some(content) = extract_text(&parts)
+        {
             messages.push(RawMessage { role, content, timestamp });
         }
         if include_events {
-            for part in &parts {
-                if let Some(event) = parse_tool_event(
-                    part,
+            for (part_index, part) in parts.iter().enumerate() {
+                let context = events::EventContext {
+                    event_seq: events.len() as u32,
                     timestamp,
-                    events.len() as u32,
-                    row.message_id.as_deref(),
-                ) {
+                    source_path: db_path.to_str().map(str::to_string),
+                    source_event_id: Some(format!(
+                        "messages:{}:content:{part_index}",
+                        row.record_id
+                    )),
+                    message_seq: visible
+                        .then(|| messages.len().checked_sub(1))
+                        .flatten()
+                        .map(|seq| seq as u32),
+                    parser_version: EVENT_PARSER_VERSION,
+                };
+                if let Some(mut event) = parse_tool_event(part, context, &session.working_dir) {
+                    if !visible {
+                        event.visibility = Some(crate::types::EvidenceVisibility::Hidden);
+                    }
+                    event.attrs_json = Some(
+                        serde_json::json!({
+                            "message_id": row.message_id.as_deref(),
+                            "content": part,
+                            "metadata_json": row.metadata_json,
+                        })
+                        .to_string(),
+                    );
                     events.push(event);
                 }
             }
@@ -398,7 +420,7 @@ fn load_message_rows(conn: &Connection, session_id: &str) -> anyhow::Result<Vec<
     let order =
         if columns.contains("id") { "created_timestamp, id" } else { "created_timestamp, rowid" };
     let sql = format!(
-        "SELECT {}, role, content_json, created_timestamp, {}
+        "SELECT {}, role, content_json, created_timestamp, {}, rowid
          FROM messages
          WHERE session_id = ?1
          ORDER BY {order}",
@@ -408,6 +430,7 @@ fn load_message_rows(conn: &Connection, session_id: &str) -> anyhow::Result<Vec<
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![session_id], |row| {
         Ok(MessageRow {
+            record_id: row.get(5)?,
             message_id: row.get(0)?,
             role: row.get(1)?,
             content_json: row.get(2)?,
@@ -543,29 +566,102 @@ fn part_text(part: &Value) -> Option<&str> {
 
 fn parse_tool_event(
     part: &Value,
-    timestamp: Option<i64>,
-    event_seq: u32,
-    message_id: Option<&str>,
+    context: events::EventContext,
+    directory: &str,
 ) -> Option<RawSessionEvent> {
-    let content_type = part.get("type").and_then(Value::as_str)?;
-    let source_event_id = part.get("id").and_then(Value::as_str).or(message_id).map(str::to_string);
-    let context = events::EventContext {
-        event_seq,
-        timestamp,
-        source_path: None,
-        source_event_id,
-        message_seq: None,
-        parser_version: EVENT_PARSER_VERSION,
-    };
-    match content_type {
+    let mut event = match part.get("type").and_then(Value::as_str)? {
         "toolRequest" => {
-            let value = part.get("toolCall")?.get("value")?;
-            let name = value.get("name").and_then(Value::as_str).filter(|name| !name.is_empty())?;
-            Some(events::tool_call_event(context, name.to_string(), value.get("arguments")))
+            let call = part.get("toolCall")?;
+            let value = call.get("value");
+            let name = value.and_then(|value| value.get("name")).and_then(Value::as_str);
+            let args = value.and_then(|value| value.get("arguments"));
+            let mut event =
+                events::tool_call_event(context, name.unwrap_or("tool").to_string(), args);
+            event.name = name.map(str::to_string);
+            event.status = (call.get("status").and_then(Value::as_str) == Some("error"))
+                .then(|| "error".to_string());
+            event.kind = "tool_call".to_string();
+            event.target = None;
+            if let Some(args) = args {
+                let operation = match name {
+                    Some("developer__write" | "developer__edit") => Some(FileOperation::Write),
+                    Some("developer__text_editor") => {
+                        match args.get("command").and_then(Value::as_str) {
+                            Some("view") => Some(FileOperation::Read),
+                            Some("write" | "insert" | "undo_edit") => Some(FileOperation::Write),
+                            Some("str_replace") if args.get("diff").is_none_or(Value::is_null) => {
+                                Some(FileOperation::Write)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(operation) = operation
+                    && let Some(path) = args.get("path").and_then(Value::as_str)
+                    && !path.trim().is_empty()
+                {
+                    event.kind =
+                        if operation == FileOperation::Read { "file_read" } else { "file_write" }
+                            .to_string();
+                    event.target = Some(path.to_string());
+                    event.files.push(FileEvidence {
+                        path: path.to_string(),
+                        operation,
+                        kind: FileEvidenceKind::Call,
+                        cwd: Some(directory.to_string()).filter(|cwd| !cwd.trim().is_empty()),
+                        target: None,
+                    });
+                } else if name == Some("developer__shell") {
+                    event.kind = "command".to_string();
+                    event.target = args.get("command").and_then(Value::as_str).map(str::to_string);
+                    if let Some(command) = event.target.as_deref() {
+                        let (files, status) = events::shell_file_evidence(
+                            command,
+                            Some(directory).filter(|cwd| !cwd.trim().is_empty()),
+                        );
+                        event.files = files;
+                        event.command_evidence_status = Some(status);
+                    }
+                }
+            }
+            event
         }
-        "toolResponse" => Some(events::tool_result_event(context, None, None)),
-        _ => None,
-    }
+        "toolResponse" => {
+            let result = part.get("toolResult");
+            let value = result.and_then(|result| result.get("value"));
+            let content = value.and_then(|value| {
+                value.as_array().or_else(|| value.get("content").and_then(Value::as_array))
+            });
+            let summary = content.and_then(|content| extract_text(content)).or_else(|| {
+                result
+                    .and_then(|result| result.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            let mut event = events::tool_result_event(context, None, summary);
+            event.status =
+                match result.and_then(|result| result.get("status")).and_then(Value::as_str) {
+                    Some("error") => Some("error"),
+                    Some("success") => match value {
+                        Some(Value::Array(_)) => Some("success"),
+                        Some(Value::Object(value)) => match value.get("isError") {
+                            Some(Value::Bool(true)) => Some("error"),
+                            Some(Value::Bool(false)) | None => Some("success"),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                }
+                .map(str::to_string);
+            event
+        }
+        _ => return None,
+    };
+    event.tool_call_id = part.get("id").and_then(Value::as_str).map(str::to_string);
+    event.attrs_json = Some(part.to_string());
+    Some(event)
 }
 
 fn is_user_visible(metadata_json: Option<&str>) -> bool {
@@ -959,7 +1055,15 @@ mod tests {
             &conn,
             "20250310_2",
             "assistant",
-            r#"[{"type":"text","text":"done"},{"type":"toolRequest","id":"tool123","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo/hello.txt"}}}}]"#,
+            r#"[{"type":"text","text":"done"},{"type":"toolRequest","id":"tool123","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo/hello.txt","command":"write","file_text":"hello"}}}}]"#,
+            1_741_615_823,
+            None,
+        );
+        insert_message(
+            &conn,
+            "20250310_2",
+            "user",
+            r#"[{"type":"toolResponse","id":"tool123","toolResult":{"status":"success","value":{"content":[{"type":"text","text":"written"}],"isError":false}}}]"#,
             1_741_615_823,
             None,
         );
@@ -967,7 +1071,7 @@ mod tests {
             &conn,
             "20250310_2",
             "assistant",
-            r#"[{"type":"text","text":"hidden"}]"#,
+            r#"[{"type":"text","text":"hidden"},{"type":"toolRequest","id":"hidden-shell","toolCall":{"status":"success","value":{"name":"developer__shell","arguments":{"command":"git restore -- hello.txt"}}}}]"#,
             1_741_615_824,
             Some(r#"{"userVisible":false}"#),
         );
@@ -1001,9 +1105,35 @@ mod tests {
         assert_eq!(raw.usage_events[0].output_tokens, 4);
         assert_eq!(raw.usage_events[0].cache_read_tokens, 2);
         assert_eq!(raw.usage_events[0].cache_write_tokens, 1);
-        assert_eq!(raw.events.len(), 1);
+        assert_eq!(raw.events.len(), 3);
         assert_eq!(raw.events[0].name.as_deref(), Some("developer__text_editor"));
         assert_eq!(raw.events[0].target.as_deref(), Some("/repo/hello.txt"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("tool123"));
+        assert_eq!(raw.events[1].tool_call_id, raw.events[0].tool_call_id);
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("messages:2:content:1"));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("messages:3:content:0"));
+        assert_eq!(raw.events[0].source_path.as_deref(), db_path.to_str());
+        assert_eq!(raw.events[0].files[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(raw.events[0].status, None);
+        assert_eq!(raw.events[0].message_seq, Some(1));
+        assert_eq!(raw.events[2].visibility, Some(crate::types::EvidenceVisibility::Hidden));
+        assert_eq!(raw.events[2].message_seq, None);
+        assert_eq!(raw.events[2].kind, "command");
+        assert_eq!(raw.events[2].files[0].path, "hello.txt");
+        assert_eq!(raw.events[2].files[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(raw.events[2].files[0].kind, FileEvidenceKind::Command);
+        assert_eq!(
+            raw.events[2].command_evidence_status,
+            Some(crate::types::CommandEvidenceStatus::Complete)
+        );
+        assert_eq!(raw.events[1].status.as_deref(), Some("success"));
+        assert!(raw.events[1].files.is_empty());
+        let native: Value =
+            serde_json::from_str(raw.events[0].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            native.pointer("/content/toolCall/status").and_then(Value::as_str),
+            Some("success")
+        );
         assert!(raw.thread_role.is_none());
     }
 
@@ -1175,6 +1305,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.scan.stats.skipped_sessions, 1);
+        store
+            .persist_session_events_for_existing_session(
+                SOURCE,
+                "s1",
+                &[],
+                EVENT_PARSER_VERSION - 1,
+                Some(200_000),
+            )
+            .unwrap();
+        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
+        let stale = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(stale.scan.sessions.len(), 1);
+        assert_eq!(stale.scan.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
         assert!(result.scan.sessions.is_empty());
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
@@ -1267,6 +1417,101 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_status_and_file_operations_are_independent() {
+        let parse = |part: &Value| {
+            parse_tool_event(
+                part,
+                events::EventContext {
+                    event_seq: 0,
+                    timestamp: Some(1000),
+                    source_path: Some("sessions.db".into()),
+                    source_event_id: Some("messages:7:content:0".into()),
+                    message_seq: None,
+                    parser_version: EVENT_PARSER_VERSION,
+                },
+                "/repo",
+            )
+            .unwrap()
+        };
+        for (result, status) in [
+            (serde_json::json!({"status":"error","error":"transport failed"}), Some("error")),
+            (
+                serde_json::json!({"status":"success","value":{"content":[],"isError":true}}),
+                Some("error"),
+            ),
+            (
+                serde_json::json!({"status":"success","value":{"content":[],"isError":false}}),
+                Some("success"),
+            ),
+            (serde_json::json!({"status":"success","value":{"content":[]}}), Some("success")),
+            (
+                serde_json::json!({"status":"success","value":[{"type":"text","text":"legacy result"}]}),
+                Some("success"),
+            ),
+            (serde_json::json!({"value":{"content":[]}}), None),
+        ] {
+            let part = serde_json::json!({"type":"toolResponse","id":"call-1","toolResult":result});
+            let event = parse(&part);
+            assert_eq!(event.status.as_deref(), status);
+            assert_eq!(event.tool_call_id.as_deref(), Some("call-1"));
+            assert!(event.files.is_empty());
+            assert_eq!(
+                serde_json::from_str::<Value>(event.attrs_json.as_deref().unwrap()).unwrap(),
+                part
+            );
+        }
+        for (name, args, operation) in [
+            (
+                "developer__text_editor",
+                serde_json::json!({"path":"a.rs","command":"view"}),
+                FileOperation::Read,
+            ),
+            (
+                "developer__text_editor",
+                serde_json::json!({"path":"a.rs","command":"str_replace","old_str":"old","new_str":"new"}),
+                FileOperation::Write,
+            ),
+            (
+                "developer__text_editor",
+                serde_json::json!({"path":"a.rs","command":"undo_edit"}),
+                FileOperation::Write,
+            ),
+            (
+                "developer__write",
+                serde_json::json!({"path":"a.rs","content":"new"}),
+                FileOperation::Write,
+            ),
+            (
+                "developer__edit",
+                serde_json::json!({"path":"a.rs","before":"old","after":"new"}),
+                FileOperation::Write,
+            ),
+        ] {
+            let part = serde_json::json!({"type":"toolRequest","id":"call-1","toolCall":{"status":"success","value":{"name":name,"arguments":args}}});
+            let event = parse(&part);
+            assert_eq!(event.status, None);
+            assert_eq!(event.files.len(), 1);
+            assert_eq!(event.files[0].operation, operation);
+            assert_eq!(event.files[0].kind, FileEvidenceKind::Call);
+            assert_eq!(event.files[0].path, "a.rs");
+            assert_eq!(event.files[0].cwd.as_deref(), Some("/repo"));
+        }
+        let diff = serde_json::json!({"type":"toolRequest","id":"diff-1","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo","command":"str_replace","diff":"--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n"}}}});
+        let event = parse(&diff);
+        assert!(event.files.iter().all(|file| file.path != "/repo"));
+        assert_ne!(event.target.as_deref(), Some("/repo"));
+        assert_eq!(
+            serde_json::from_str::<Value>(event.attrs_json.as_deref().unwrap()).unwrap(),
+            diff
+        );
+        let error = serde_json::json!({"type":"toolRequest","id":"invalid-1","toolCall":{"status":"error","error":"invalid arguments"}});
+        let event = parse(&error);
+        assert_eq!(event.status.as_deref(), Some("error"));
+        assert_eq!(event.tool_call_id.as_deref(), Some("invalid-1"));
+        assert!(event.files.is_empty());
+    }
+
+    #[test]
     fn tool_only_session_uses_event_timestamps() {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("sessions.db");
@@ -1279,7 +1524,7 @@ mod tests {
             &conn,
             "s1",
             "assistant",
-            r#"[{"type":"toolRequest","id":"tool123","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo/hello.txt"}}}}]"#,
+            r#"[{"type":"toolRequest","id":"tool123","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo/hello.txt","command":"write","file_text":"hello"}}}}]"#,
             400,
             None,
         );
