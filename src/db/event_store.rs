@@ -228,3 +228,22 @@ pub(crate) fn replace_session_events(
 
     Ok(())
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EventReference {
+    pub(crate) version: u8,
+    pub(crate) index_id: String,
+    pub(crate) event_id: i64,
+}
+
+pub(crate) fn event_reference(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: i64,
+) -> Result<EventReference> {
+    let index_id = tx.query_row(
+        "SELECT h.index_id FROM file_history_state h JOIN session_events e ON e.id = ?1 WHERE h.id = 1",
+        [event_id],
+        |row| row.get(0),
+    )?;
+    Ok(EventReference { version: 1, index_id, event_id })
+}

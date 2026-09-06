@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 const V12_SCHEMA_VERSION: i64 = 12;
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -60,6 +60,28 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 15 {
         migrate_v15(conn)?;
     }
+    if version < 16 {
+        migrate_v16(conn)?;
+    }
+    Ok(())
+}
+
+fn migrate_v16(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("
+        CREATE TABLE IF NOT EXISTS file_history_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            index_id TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO file_history_state VALUES (1, lower(hex(randomblob(16))));
+        CREATE INDEX IF NOT EXISTS idx_event_files_remote_relative ON event_files(json_extract(evidence_json, '$.target.repo_remote'), json_extract(evidence_json, '$.target.repo_relative_path'), event_id);
+        CREATE INDEX IF NOT EXISTS idx_event_files_root_relative ON event_files(json_extract(evidence_json, '$.target.repo_root'), json_extract(evidence_json, '$.target.repo_relative_path'), event_id);
+        CREATE INDEX IF NOT EXISTS idx_event_files_absolute ON event_files(json_extract(evidence_json, '$.target.absolute_path'), event_id);
+        ")?;
+    if read_schema_version(&tx)? >= 15 {
+        tx.execute_batch("PRAGMA user_version = 16;")?;
+    }
+    tx.commit()?;
     Ok(())
 }
 

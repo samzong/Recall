@@ -371,10 +371,7 @@ fn sync_resolves_cross_repository_files_and_keeps_native_paths() {
     let events = store.list_session_events_for_session(&session.id).unwrap();
     assert!(events[0].files[2].target.is_none());
     assert_eq!(events[0].files[3].target, events[0].files[0].target);
-    assert_eq!(
-        events[0].files[4].target.as_ref().unwrap().repo_remote.as_deref(),
-        Some("github.com/fixture/other")
-    );
+    assert!(events[0].files[4].target.is_none());
     assert_eq!(events[0].files[0].path, raw_path);
     assert_eq!(events[0].files[0].target, events[0].files[1].target);
     let file = events[0].files[0].target.as_ref().unwrap();

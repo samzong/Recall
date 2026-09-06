@@ -14,7 +14,7 @@ use crate::query::resolve_source_filter;
 use crate::repo_identity::{RepoIdentity, RepoIdentityCache};
 use crate::semantic;
 use crate::sync_progress::{SyncProgress, format_bytes, format_elapsed};
-use crate::types::{FileEvidenceKind, Message, Role, Session};
+use crate::types::{Message, Role, Session};
 use crate::utils;
 
 #[derive(Debug, Clone)]
@@ -720,12 +720,7 @@ impl SyncJob {
 
         for event in &mut raw.events {
             for file in &mut event.files {
-                let cwd = if file.kind == FileEvidenceKind::Command {
-                    file.cwd.as_deref()
-                } else {
-                    file.cwd.as_deref().or(raw.directory.as_deref())
-                };
-                file.target = self.repo_cache.resolve_file(&file.path, cwd);
+                file.target = self.repo_cache.resolve_file(&file.path, file.cwd.as_deref());
             }
         }
 

@@ -27,7 +27,7 @@ use crate::types::{
 pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 6;
-const EVENT_PARSER_VERSION: u32 = 6;
+const EVENT_PARSER_VERSION: u32 = 7;
 const METADATA_PARSER_VERSION: u32 = 3;
 
 impl SourceAdapter for ClaudeCodeAdapter {
@@ -432,7 +432,7 @@ fn parse_claude_session_file(
     }
 
     let meta = indexes.live.get(&entry.session_id);
-    let fallback_cwd = meta.and_then(|m| m.cwd.as_deref()).or(entry.directory.as_deref());
+    let fallback_cwd = meta.and_then(|m| m.cwd.as_deref());
     for file in parsed.events.iter_mut().flat_map(|event| &mut event.files) {
         if file.cwd.is_none() && file.kind != FileEvidenceKind::Command {
             file.cwd = fallback_cwd.map(str::to_string);
@@ -1106,6 +1106,12 @@ mod tests {
             stat_target: path,
             directory: Some("/tmp/foo".to_string()),
         };
+        let without_index =
+            parse_claude_session_file(entry.clone(), mtime, &SessionIndexes::default(), true)
+                .unwrap()
+                .unwrap();
+        assert!(without_index.events[0].files[0].cwd.is_none());
+        assert_eq!(without_index.events[2].files[0].cwd.as_deref(), Some("/tmp/target-worktree"));
         let raw = parse_claude_session_file(entry, mtime, &indexes, false).unwrap().unwrap();
         assert!(raw.events.is_empty());
         assert_eq!(raw.event_parser_version, None);

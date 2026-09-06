@@ -28,7 +28,7 @@ pub(crate) struct CursorAdapter;
 
 const METADATA_PARSER_VERSION: u32 = 2;
 const USAGE_PARSER_VERSION: u32 = 3;
-const EVENT_PARSER_VERSION: u32 = 5;
+const EVENT_PARSER_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Default)]
 struct ComposerMeta {
@@ -283,6 +283,11 @@ fn load_transcript(
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let Some(mut raw) = parse_agent_transcript(path, include_events)? else { return Ok(None) };
+    for file in raw.events.iter_mut().flat_map(|event| &mut event.files) {
+        if file.cwd.is_none() && file.kind != FileEvidenceKind::Command {
+            file.cwd = meta.and_then(|meta| meta.directory.clone());
+        }
+    }
     raw.source_id = session_id.into();
     raw.directory = meta.and_then(|meta| meta.directory.clone()).or(raw.directory).or(directory);
     raw.entrypoint = meta.and_then(|meta| meta.unified_mode.clone()).or(raw.entrypoint);
@@ -456,6 +461,12 @@ fn parse_composer_session(
             )
         {
             bubble_usage_events.push(event);
+        }
+    }
+
+    for file in session_events.iter_mut().flat_map(|event| &mut event.files) {
+        if file.cwd.is_none() && file.kind != FileEvidenceKind::Command {
+            file.cwd.clone_from(&meta.directory);
         }
     }
 
@@ -1248,9 +1259,12 @@ fn resolve_projects_dir() -> anyhow::Result<Option<PathBuf>> {
     resolve_home_dir(".cursor/projects", "~/.cursor/projects not found, skipping Cursor")
 }
 
+fn global_state_db_candidate() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("Cursor/User/globalStorage/state.vscdb"))
+}
+
 fn resolve_global_state_db_path() -> Option<PathBuf> {
-    let db = dirs::config_dir()?.join("Cursor/User/globalStorage/state.vscdb");
-    if db.exists() { Some(db) } else { None }
+    global_state_db_candidate().filter(|path| path.exists())
 }
 
 fn resolve_workspace_storage_dir() -> Option<PathBuf> {
@@ -1336,6 +1350,123 @@ fn read_item_value(conn: &Connection, key: &str) -> Option<String> {
         row.get::<_, String>(0)
     })
     .ok()
+}
+
+pub(crate) fn read_content_evidence(
+    composer_id: &str,
+    bubble_id: &str,
+    call_id: Option<&str>,
+    attrs: &str,
+    before: bool,
+    remaining: &mut usize,
+) -> anyhow::Result<String> {
+    let path = global_state_db_candidate().ok_or_else(|| anyhow::anyhow!("source_unverified"))?;
+    fs::metadata(&path).map_err(|error| {
+        anyhow::anyhow!(if error.kind() == std::io::ErrorKind::NotFound {
+            "source_missing"
+        } else {
+            "source_unverified"
+        })
+    })?;
+    let canonical = path.canonicalize()?;
+    anyhow::ensure!(
+        canonical.parent()
+            == Some(
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("source_unverified"))?
+                    .canonicalize()?
+                    .as_path()
+            ),
+        "source_unverified"
+    );
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let tx = conn.unchecked_transaction()?;
+    content_evidence_from_conn(&tx, composer_id, bubble_id, call_id, attrs, before, remaining)
+}
+
+fn content_evidence_from_conn(
+    conn: &Connection,
+    composer_id: &str,
+    bubble_id: &str,
+    call_id: Option<&str>,
+    attrs: &str,
+    before: bool,
+    remaining: &mut usize,
+) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    anyhow::ensure!(
+        uuid::Uuid::parse_str(composer_id).is_ok() && uuid::Uuid::parse_str(bubble_id).is_ok(),
+        "source_unverified"
+    );
+    let mut read = |key: &str| -> anyhow::Result<String> {
+        use rusqlite::OptionalExtension;
+        let length: Option<usize> = conn
+            .query_row(
+                "SELECT length(CAST(value AS BLOB)) FROM cursorDiskKV WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let length = length.ok_or_else(|| anyhow::anyhow!("source_missing"))?;
+        anyhow::ensure!(length <= *remaining, "evidence_budget_exceeded");
+        *remaining -= length;
+        let bytes: Vec<u8> = conn.query_row(
+            "SELECT CAST(value AS BLOB) FROM cursorDiskKV WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )?;
+        Ok(String::from_utf8(bytes)?)
+    };
+    let composer: Value = serde_json::from_str(&read(&format!("composerData:{composer_id}"))?)?;
+    let owns_bubble = composer
+        .get("fullConversationHeadersOnly")
+        .and_then(Value::as_array)
+        .is_some_and(|headers| {
+            headers
+                .iter()
+                .any(|header| header.get("bubbleId").and_then(Value::as_str) == Some(bubble_id))
+        });
+    anyhow::ensure!(owns_bubble, "source_changed");
+    let key = format!("bubbleId:{composer_id}:{bubble_id}");
+    let stored: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM cursorDiskKV WHERE key=?1)", [&key], |row| {
+            row.get(0)
+        })?;
+    let bubble: Value = if stored {
+        serde_json::from_str(&read(&key)?)?
+    } else {
+        composer
+            .get("conversationMap")
+            .and_then(|map| map.get(bubble_id))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("source_missing"))?
+    };
+    let tool = bubble.get("toolFormerData").ok_or_else(|| anyhow::anyhow!("source_changed"))?;
+    let native_call_id = cursor_native_id(tool.get("toolCallId").and_then(Value::as_str))
+        .unwrap_or_else(|| bubble_id.into());
+    anyhow::ensure!(call_id == Some(native_call_id.as_str()), "source_changed");
+    let result = tool.get("result").ok_or_else(|| anyhow::anyhow!("source_changed"))?;
+    let decoded = result.as_str().map(serde_json::from_str::<Value>).transpose()?;
+    let result = decoded.as_ref().unwrap_or(result);
+    let expected: Value = serde_json::from_str(attrs)?;
+    anyhow::ensure!(*result == expected, "source_changed");
+    let content_id = result
+        .get(if before { "beforeContentId" } else { "afterContentId" })
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("content_reference_not_recorded"))?;
+    let digest = content_id
+        .strip_prefix("composer.content.")
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|ch| ch.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("source_unverified"))?;
+    let content = read(content_id)?;
+    anyhow::ensure!(
+        format!("{:x}", Sha256::digest(content.as_bytes())) == digest,
+        "source_changed"
+    );
+    Ok(content)
 }
 
 fn read_disk_kv(conn: &Connection, key: &str) -> Option<String> {
@@ -2042,6 +2173,10 @@ mod tests {
                     Some(if orphan { "chat" } else { "agent" })
                 );
                 assert_eq!(session.events[0].files[0].operation, FileOperation::Write);
+                assert_eq!(
+                    session.events[0].files[0].cwd.as_deref(),
+                    orphan.then_some("/metadata/repo")
+                );
                 assert_eq!(session.events.len(), 3);
                 assert_eq!(session.events[0].status, None);
                 assert_eq!(
@@ -2119,6 +2254,21 @@ mod tests {
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.events[0].source_event_id.as_deref(), Some(bubble_id.as_str()));
         assert_eq!(parsed.events[0].message_seq, None);
+
+        tool_only["conversationMap"][&bubble_id]["toolFormerData"] = serde_json::json!({
+            "name": "edit_file_v2", "params": {"relativeWorkspacePath": "src/file.rs"}
+        });
+        conn.execute(
+            "UPDATE cursorDiskKV SET value=?1 WHERE key=?2",
+            rusqlite::params![tool_only.to_string(), format!("composerData:{composer_id}")],
+        )
+        .unwrap();
+        let parsed = parse_composer_session(&conn, &composer_id, &meta, true).unwrap().unwrap();
+        assert_eq!(parsed.events[0].files[0].cwd.as_deref(), Some("/Users/x/project"));
+        let unknown = parse_composer_session(&conn, &composer_id, &ComposerMeta::default(), true)
+            .unwrap()
+            .unwrap();
+        assert!(unknown.events[0].files[0].cwd.is_none());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2230,5 +2380,157 @@ mod tests {
         assert_eq!(infer_cursor_provider("claude-sonnet-4"), "anthropic");
         assert_eq!(infer_cursor_provider("composer-2.5"), "cursor");
         assert_eq!(infer_cursor_provider("gpt-4.1"), "openai");
+    }
+
+    #[test]
+    fn content_evidence_verifies_ownership_hash_and_read_budget() {
+        use sha2::{Digest, Sha256};
+        let root = temp_root("content-evidence");
+        let composer = uuid::Uuid::new_v4().to_string();
+        let bubble = uuid::Uuid::new_v4().to_string();
+        let conn = seed_global_db(&root, &composer, &bubble);
+        let content = "原始文件\n";
+        let content_id = format!("composer.content.{:x}", Sha256::digest(content.as_bytes()));
+        let attrs = serde_json::json!({"beforeContentId":content_id,"afterContentId":content_id})
+            .to_string();
+        let native = serde_json::json!({"toolFormerData":{"toolCallId":"call-id","result":attrs}});
+        conn.execute(
+            "UPDATE cursorDiskKV SET value=?1 WHERE key=?2",
+            rusqlite::params![native.to_string(), format!("bubbleId:{composer}:{bubble}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cursorDiskKV(key,value) VALUES(?1,?2)",
+            rusqlite::params![content_id, content],
+        )
+        .unwrap();
+        assert_eq!(
+            content_evidence_from_conn(
+                &conn,
+                &composer,
+                &bubble,
+                Some("call-id"),
+                &attrs,
+                true,
+                &mut 65536
+            )
+            .unwrap(),
+            content
+        );
+        let key = format!("composerData:{composer}");
+        let mut mapped: Value = serde_json::from_str(&read_disk_kv(&conn, &key).unwrap()).unwrap();
+        mapped["conversationMap"] = serde_json::json!({bubble.clone():native});
+        conn.execute(
+            "UPDATE cursorDiskKV SET value=?1 WHERE key=?2",
+            rusqlite::params![mapped.to_string(), key],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM cursorDiskKV WHERE key=?1",
+            [format!("bubbleId:{composer}:{bubble}")],
+        )
+        .unwrap();
+        assert_eq!(
+            content_evidence_from_conn(
+                &conn,
+                &composer,
+                &bubble,
+                Some("call-id"),
+                &attrs,
+                true,
+                &mut 65536
+            )
+            .unwrap(),
+            content
+        );
+        let mut orphaned = mapped.clone();
+        orphaned["fullConversationHeadersOnly"] = serde_json::json!([]);
+        conn.execute(
+            "UPDATE cursorDiskKV SET value=?1 WHERE key=?2",
+            rusqlite::params![orphaned.to_string(), key],
+        )
+        .unwrap();
+        assert_eq!(
+            content_evidence_from_conn(
+                &conn,
+                &composer,
+                &bubble,
+                Some("call-id"),
+                &attrs,
+                true,
+                &mut 65536
+            )
+            .unwrap_err()
+            .to_string(),
+            "source_changed"
+        );
+        conn.execute(
+            "UPDATE cursorDiskKV SET value=?1 WHERE key=?2",
+            rusqlite::params![mapped.to_string(), key],
+        )
+        .unwrap();
+        assert_eq!(
+            content_evidence_from_conn(
+                &conn,
+                &composer,
+                &bubble,
+                Some("call-id"),
+                &attrs,
+                true,
+                &mut 1
+            )
+            .unwrap_err()
+            .to_string(),
+            "evidence_budget_exceeded"
+        );
+        assert_eq!(
+            content_evidence_from_conn(
+                &conn,
+                &composer,
+                &bubble,
+                Some("different-call"),
+                &attrs,
+                false,
+                &mut 65536
+            )
+            .unwrap_err()
+            .to_string(),
+            "source_changed"
+        );
+        conn.execute(
+            "UPDATE cursorDiskKV SET value=?1 WHERE key=?2",
+            rusqlite::params!["changed bytes", content_id],
+        )
+        .unwrap();
+        assert_eq!(
+            content_evidence_from_conn(
+                &conn,
+                &composer,
+                &bubble,
+                Some("call-id"),
+                &attrs,
+                false,
+                &mut 65536
+            )
+            .unwrap_err()
+            .to_string(),
+            "source_changed"
+        );
+        conn.execute("DELETE FROM cursorDiskKV WHERE key=?1", [&content_id]).unwrap();
+        assert_eq!(
+            content_evidence_from_conn(
+                &conn,
+                &composer,
+                &bubble,
+                Some("call-id"),
+                &attrs,
+                false,
+                &mut 65536
+            )
+            .unwrap_err()
+            .to_string(),
+            "source_missing"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

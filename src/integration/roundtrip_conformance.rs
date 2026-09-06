@@ -92,8 +92,7 @@ fn expected_contract(source: &str, raw: &RawSession) -> Value {
         .map(|event| {
             let mut files = event.files.clone();
             for file in &mut files {
-                file.target = identities
-                    .resolve_file(&file.path, file.cwd.as_deref().or(raw.directory.as_deref()));
+                file.target = identities.resolve_file(&file.path, file.cwd.as_deref());
             }
             json!({
                 "event_seq": event.event_seq,
