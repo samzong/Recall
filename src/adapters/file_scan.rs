@@ -56,19 +56,6 @@ impl FileMetadataSnapshot {
     }
 }
 
-pub(crate) fn run_file_scan<I, F>(
-    context: &AdapterSyncContext,
-    since_ts: Option<i64>,
-    entries: I,
-    parse_fn: F,
-) -> Result<SyncScanResult>
-where
-    I: IntoIterator<Item = FileScanEntry>,
-    F: Fn(FileScanEntry, i64) -> Result<Option<RawSession>>,
-{
-    run_file_scan_with_options(context, since_ts, FileScanOptions::default(), entries, parse_fn)
-}
-
 pub(crate) fn run_file_scan_with_options<I, F>(
     context: &AdapterSyncContext,
     since_ts: Option<i64>,
@@ -312,9 +299,13 @@ mod tests {
     #[test]
     fn empty_input_returns_empty_result() {
         let context = AdapterSyncContext::empty_for_test("test-source");
-        let result = run_file_scan(&context, None, Vec::<FileScanEntry>::new(), |_, _| {
-            panic!("parse should not be called")
-        })
+        let result = run_file_scan_with_options(
+            &context,
+            None,
+            FileScanOptions::default(),
+            Vec::<FileScanEntry>::new(),
+            |_, _| panic!("parse should not be called"),
+        )
         .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert!(result.observations.is_empty());
@@ -332,9 +323,13 @@ mod tests {
             directory: None,
         };
 
-        let result = run_file_scan(&sync_context(&store), None, vec![entry], |entry, mtime_ms| {
-            Ok(Some(stub_raw_session(&entry.session_id, mtime_ms)))
-        })
+        let result = run_file_scan_with_options(
+            &sync_context(&store),
+            None,
+            FileScanOptions::default(),
+            vec![entry],
+            |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
+        )
         .unwrap();
 
         assert_eq!(result.sessions.len(), 1);
@@ -412,9 +407,13 @@ mod tests {
             directory: None,
         };
 
-        let result = run_file_scan(&sync_context(&store), None, vec![entry], |_, _| {
-            panic!("parse should not be called for skipped entry")
-        })
+        let result = run_file_scan_with_options(
+            &sync_context(&store),
+            None,
+            FileScanOptions::default(),
+            vec![entry],
+            |_, _| panic!("parse should not be called for skipped entry"),
+        )
         .unwrap();
 
         assert_eq!(result.sessions.len(), 0);
@@ -440,8 +439,14 @@ mod tests {
             directory: None,
         };
 
-        let result =
-            run_file_scan(&sync_context(&store), None, vec![entry], |_, _| Ok(None)).unwrap();
+        let result = run_file_scan_with_options(
+            &sync_context(&store),
+            None,
+            FileScanOptions::default(),
+            vec![entry],
+            |_, _| Ok(None),
+        )
+        .unwrap();
 
         assert!(result.sessions.is_empty());
         assert!(result.observations.is_empty());
@@ -637,10 +642,16 @@ mod tests {
             directory: None,
         };
 
-        let result = run_file_scan(&sync_context(&store), None, vec![entry], |entry, mtime_ms| {
-            assert_eq!(mtime_ms, actual_mtime);
-            Ok(Some(stub_raw_session(&entry.session_id, mtime_ms)))
-        })
+        let result = run_file_scan_with_options(
+            &sync_context(&store),
+            None,
+            FileScanOptions::default(),
+            vec![entry],
+            |entry, mtime_ms| {
+                assert_eq!(mtime_ms, actual_mtime);
+                Ok(Some(stub_raw_session(&entry.session_id, mtime_ms)))
+            },
+        )
         .unwrap();
 
         assert_eq!(result.sessions.len(), 1);
@@ -662,11 +673,14 @@ mod tests {
             directory: None,
         };
 
-        let result =
-            run_file_scan(&sync_context(&store), Some(future_cutoff), vec![entry], |_, _| {
-                panic!("parse should not be called for filtered entry")
-            })
-            .unwrap();
+        let result = run_file_scan_with_options(
+            &sync_context(&store),
+            Some(future_cutoff),
+            FileScanOptions::default(),
+            vec![entry],
+            |_, _| panic!("parse should not be called for filtered entry"),
+        )
+        .unwrap();
 
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.filtered_sessions, 1);
@@ -687,9 +701,13 @@ mod tests {
             directory: None,
         };
 
-        let result = run_file_scan(&sync_context(&store), None, vec![entry], |_, _| {
-            panic!("parse should not be called for missing stat target")
-        })
+        let result = run_file_scan_with_options(
+            &sync_context(&store),
+            None,
+            FileScanOptions::default(),
+            vec![entry],
+            |_, _| panic!("parse should not be called for missing stat target"),
+        )
         .unwrap();
 
         assert_eq!(result.sessions.len(), 0);

@@ -1404,9 +1404,13 @@ mod tests {
                     stat_target: path.clone(),
                     directory: None,
                 };
-                let scan = file_scan::run_file_scan(context, since_ts, vec![entry], |_, _| {
-                    anyhow::bail!("injected parse failure")
-                })?;
+                let scan = file_scan::run_file_scan_with_options(
+                    context,
+                    since_ts,
+                    Default::default(),
+                    vec![entry],
+                    |_, _| anyhow::bail!("injected parse failure"),
+                )?;
                 return Ok(Some(SyncScanOutput { scan, reconcile: None }));
             }
             Ok(Some(SyncScanOutput {
