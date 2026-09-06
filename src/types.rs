@@ -207,8 +207,74 @@ impl EvidenceVisibility {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CommandEvidenceStatus {
+    Complete,
+    Unsupported,
+    LimitExceeded,
+}
+
+impl CommandEvidenceStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Unsupported => "unsupported",
+            Self::LimitExceeded => "limit_exceeded",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "complete" => Some(Self::Complete),
+            "unsupported" => Some(Self::Unsupported),
+            "limit_exceeded" => Some(Self::LimitExceeded),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileEvidenceKind {
+    Call,
+    Observation,
+    Command,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileOperation {
+    Read,
+    Write,
+    Delete,
+    MoveFrom,
+    MoveTo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileEvidence {
+    pub(crate) path: String,
+    pub(crate) operation: FileOperation,
+    pub(crate) kind: FileEvidenceKind,
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    #[serde(default)]
+    pub(crate) target: Option<FileTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileTarget {
+    pub(crate) absolute_path: String,
+    pub(crate) repo_root: Option<String>,
+    pub(crate) repo_relative_path: Option<String>,
+    pub(crate) repo_remote: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RawSessionEvent {
+    pub(crate) command_evidence_status: Option<CommandEvidenceStatus>,
+    pub(crate) files: Vec<FileEvidence>,
     pub(crate) event_seq: u32,
     pub(crate) timestamp: Option<i64>,
     pub(crate) kind: String,
@@ -247,6 +313,8 @@ pub(crate) struct UsageEventRecord {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionEventRecord {
+    pub(crate) command_evidence_status: Option<CommandEvidenceStatus>,
+    pub(crate) files: Vec<FileEvidence>,
     pub(crate) event_seq: u32,
     pub(crate) timestamp: Option<i64>,
     pub(crate) kind: String,

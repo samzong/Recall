@@ -7,15 +7,19 @@ use tracing::warn;
 use walkdir::WalkDir;
 
 use crate::adapters::AdapterSyncContext;
+use crate::adapters::events::{
+    EventContext, shell_file_evidence, tool_call_event, tool_result_event,
+};
 use crate::adapters::file_scan::{self, FileMetadataSnapshot, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
 use crate::adapters::usage::usage_count;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
 };
-use crate::types::{RawUsageEvent, Role};
+use crate::types::{FileEvidence, FileEvidenceKind, FileOperation, RawUsageEvent, Role};
 
 const USAGE_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 1;
 
 pub(crate) struct DroidAdapter;
 
@@ -54,7 +58,7 @@ impl SourceAdapter for DroidAdapter {
         &self,
         context: &AdapterSyncContext,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(sessions_dir) = resolve_sessions_dir() else {
             return Ok(Some(SyncScanResult {
@@ -68,12 +72,12 @@ impl SourceAdapter for DroidAdapter {
             since_ts,
             FileScanOptions {
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
-                event_parser_version: None,
+                event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
                 metadata_parser_version: None,
             },
             collect_session_entries(&sessions_dir),
             droid_session_snapshot,
-            parse_droid_session_file,
+            |entry, mtime| parse_droid_session_file(entry, mtime, include_events),
         )?))
     }
 }
@@ -116,7 +120,10 @@ fn scan_droid_sessions(sessions_dir: &Path) -> anyhow::Result<Vec<RawSession>> {
         let Some(snapshot) = droid_session_snapshot(&entry) else {
             continue;
         };
-        if let Some(raw) = parse_droid_session_file(entry, snapshot.effective_mtime_ms())? {
+        if let Some(raw) =
+            parse_droid_session_file(entry.clone(), snapshot.effective_mtime_ms(), true)?
+            && droid_session_snapshot(&entry).as_ref() == Some(&snapshot)
+        {
             sessions.push(raw);
         }
     }
@@ -186,8 +193,9 @@ fn droid_session_snapshot(
 fn parse_droid_session_file(
     entry: FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    match parse_droid_session_file_impl(&entry, mtime_ms) {
+    match parse_droid_session_file_impl(&entry, mtime_ms, include_events) {
         Ok(raw) => Ok(raw),
         Err(error) => {
             warn!("failed to parse {}: {error}", entry.stat_target.display());
@@ -199,6 +207,7 @@ fn parse_droid_session_file(
 fn parse_droid_session_file_impl(
     entry: &FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let file = fs::File::open(&entry.stat_target)?;
     let reader = std::io::BufReader::new(file);
@@ -208,13 +217,14 @@ fn parse_droid_session_file_impl(
                 if index == 0 { value.trim_start_matches('\u{feff}').to_string() } else { value }
             })
         });
-    let settings = read_settings(&settings_path(&entry.stat_target));
+    let settings = read_settings(&settings_path(&entry.stat_target))?;
     parse_droid_jsonl(
         lines,
         entry.session_id.clone(),
         mtime_ms,
         entry.stat_target.to_str().map(str::to_string),
         settings,
+        include_events,
     )
 }
 
@@ -225,10 +235,16 @@ struct SettingsMeta {
     source_path: Option<String>,
 }
 
-fn read_settings(path: &Path) -> Option<SettingsMeta> {
-    let content = fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&content).ok()?;
+fn read_settings(path: &Path) -> anyhow::Result<Option<SettingsMeta>> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let value: Value = serde_json::from_str(&content)?;
     settings_meta_from_value(value, path.to_str().map(str::to_string))
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("invalid Droid session settings"))
 }
 
 fn settings_meta_from_value(value: Value, source_path: Option<String>) -> Option<SettingsMeta> {
@@ -254,14 +270,16 @@ fn parse_droid_jsonl(
     mtime_ms: i64,
     source_path: Option<String>,
     settings: Option<SettingsMeta>,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let mut messages = Vec::new();
+    let mut events = Vec::new();
     let mut directory = None;
     let mut custom_title = None;
     let mut started_meta = None;
 
     for item in jsonl_indexed(lines) {
-        let (_line_index, record) = item?;
+        let (line_index, record) = item?;
         match record.get("type").and_then(Value::as_str).unwrap_or("") {
             "session_start" => {
                 if directory.is_none() {
@@ -287,6 +305,116 @@ fn parse_droid_jsonl(
                 }
             }
             "message" => {
+                if include_events {
+                    for (part_index, part) in record
+                        .pointer("/message/content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                    {
+                        let context = EventContext {
+                            event_seq: events.len() as u32,
+                            timestamp: rfc3339_ms(record.get("timestamp"))
+                                .or_else(|| json_i64(record.get("timestamp"))),
+                            source_path: source_path.clone(),
+                            source_event_id: Some(format!(
+                                "{}:line:{line_index}:part:{part_index}",
+                                record.get("id").and_then(Value::as_str).unwrap_or("")
+                            )),
+                            message_seq: messages
+                                .len()
+                                .checked_sub(1)
+                                .and_then(|index| u32::try_from(index).ok()),
+                            parser_version: EVENT_PARSER_VERSION,
+                        };
+                        let mut event = match part.get("type").and_then(Value::as_str) {
+                            Some("tool_use") => {
+                                let Some(name) = part
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .filter(|name| !name.trim().is_empty())
+                                else {
+                                    continue;
+                                };
+                                let args = part.get("input");
+                                let mut event = tool_call_event(context, name.to_string(), args);
+                                event.kind = "tool_call".to_string();
+                                event.target = None;
+                                event.tool_call_id = part
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty())
+                                    .map(str::to_string);
+                                let operation = match name {
+                                    "Read" => Some(FileOperation::Read),
+                                    "Edit" | "Create" => Some(FileOperation::Write),
+                                    _ => None,
+                                };
+                                if let (Some(operation), Some(path)) = (
+                                    operation,
+                                    args.and_then(|args| args.get("file_path"))
+                                        .and_then(Value::as_str)
+                                        .filter(|path| !path.trim().is_empty()),
+                                ) {
+                                    event.kind = if operation == FileOperation::Read {
+                                        "file_read"
+                                    } else {
+                                        "file_write"
+                                    }
+                                    .to_string();
+                                    event.target = Some(path.to_string());
+                                    event.files.push(FileEvidence {
+                                        path: path.to_string(),
+                                        operation,
+                                        kind: FileEvidenceKind::Call,
+                                        cwd: directory.clone(),
+                                        target: None,
+                                    });
+                                }
+                                if name == "Execute" {
+                                    event.kind = "command".to_string();
+                                    event.target = args
+                                        .and_then(|args| args.get("command"))
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string);
+                                    if let Some(command) = event.target.as_deref() {
+                                        let (files, status) =
+                                            shell_file_evidence(command, directory.as_deref());
+                                        event.files = files;
+                                        event.command_evidence_status = Some(status);
+                                    }
+                                }
+                                event
+                            }
+                            Some("tool_result") => {
+                                let mut event = tool_result_event(
+                                    context,
+                                    None,
+                                    part.get("content").map(|content| {
+                                        content
+                                            .as_str()
+                                            .map(str::to_string)
+                                            .unwrap_or_else(|| content.to_string())
+                                    }),
+                                );
+                                event.tool_call_id = part
+                                    .get("tool_use_id")
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty())
+                                    .map(str::to_string);
+                                event.status =
+                                    part.get("is_error").and_then(Value::as_bool).map(|error| {
+                                        if error { "error" } else { "success" }.to_string()
+                                    });
+                                event
+                            }
+                            _ => continue,
+                        };
+                        event.attrs_json = Some(record.to_string());
+                        events.push(event);
+                    }
+                }
                 let role = match record.pointer("/message/role").and_then(Value::as_str) {
                     Some("user") => Role::User,
                     Some("assistant") => Role::Assistant,
@@ -320,18 +448,21 @@ fn parse_droid_jsonl(
         .into_iter()
         .collect::<Vec<_>>();
 
-    if messages.is_empty() && usage_events.is_empty() {
+    if messages.is_empty() && usage_events.is_empty() && events.is_empty() {
         return Ok(None);
     }
 
     let started_at =
-        first_timestamp(started_meta, &messages, &usage_events, &[]).unwrap_or(mtime_ms);
+        first_timestamp(started_meta, &messages, &usage_events, &events).unwrap_or(mtime_ms);
     let mut session =
         RawSession::search_only(session_id, directory, started_at, Some(mtime_ms), None, messages);
     session.source_file_path = source_path;
     session.custom_title = custom_title;
     session.duration_minutes = settings.as_ref().and_then(|meta| meta.duration_minutes);
     session = session.with_usage(usage_events, USAGE_PARSER_VERSION);
+    if include_events {
+        session = session.with_events(events, EVENT_PARSER_VERSION);
+    }
     Ok(Some(session))
 }
 
@@ -408,7 +539,8 @@ fn parse_droid_session(
             Some("/tmp/session.settings.json".to_string()),
         )
     });
-    parse_droid_jsonl(lines, session_id.to_string(), 1_700_000_000_000, None, settings).unwrap()
+    parse_droid_jsonl(lines, session_id.to_string(), 1_700_000_000_000, None, settings, true)
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -421,9 +553,9 @@ mod tests {
     fn fixture_jsonl() -> String {
         [
             r#"{"type":"session_start","id":"550e8400-e29b-41d4-a716-446655440000","sessionTitle":"Fix auth","title":"ignored","cwd":"/Users/x/git/demo","timestamp":"2024-01-01T00:00:00.000Z"}"#,
-            r#"{"type":"message","timestamp":"2024-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"fix the login"},{"type":"text","text":"<system-reminder>hide</system-reminder>"},{"type":"tool_result","text":"noise"}]}}"#,
-            r#"{"type":"message","timestamp":"2024-01-01T00:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"working on it"},{"type":"tool_use","name":"Read"}]}}"#,
-            r#"{"type":"message","timestamp":"2024-01-01T00:00:06.000Z","message":{"role":"user","content":[{"type":"tool_result","content":"skip"}]}}"#,
+            r#"{"type":"message","id":"user-1","parentId":null,"timestamp":"2024-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"fix the login"},{"type":"text","text":"<system-reminder>hide</system-reminder>"},{"type":"tool_result","text":"noise"}]}}"#,
+            r#"{"type":"message","id":"assistant-1","parentId":"user-1","timestamp":"2024-01-01T00:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"working on it"},{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"src/auth.rs"}},{"type":"tool_use","id":"edit-1","name":"Edit","input":{"file_path":"src/auth.rs","old_str":"old","new_str":"new","change_all":false},"thought_signature":"signature","namespace":"native","script_execution":{"run_id":"run-1","outer_tool_use_id":"outer-1"}}]}}"#,
+            r#"{"type":"message","id":"result-1","parentId":"assistant-1","timestamp":"2024-01-01T00:00:06.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","is_error":false,"content":"skip"},{"type":"tool_result","tool_use_id":"edit-1","content":"result without status"}]}}"#,
         ]
         .join("\n")
     }
@@ -458,6 +590,19 @@ mod tests {
         assert_eq!(session.started_at, 1_704_067_200_000);
         assert_eq!(session.duration_minutes, Some(3));
 
+        assert_eq!(session.events.len(), 5);
+        let read = &session.events[1];
+        assert_eq!(read.tool_call_id.as_deref(), Some("read-1"));
+        assert_eq!(read.message_seq, Some(0));
+        assert_eq!(read.source_event_id.as_deref(), Some("assistant-1:line:2:part:1"));
+        assert_eq!(read.files[0].cwd.as_deref(), Some("/Users/x/git/demo"));
+        assert_eq!(session.events[2].files[0].operation, FileOperation::Write);
+        assert!(session.events[2].attrs_json.as_deref().unwrap().contains("thought_signature"));
+        assert_eq!(session.events[3].status.as_deref(), Some("success"));
+        assert!(session.events[4].status.is_none());
+        assert!(session.events[4].files.is_empty());
+        assert_eq!(session.events[4].message_seq, Some(1));
+        assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
         assert_eq!(session.usage_events.len(), 1);
         let event = &session.usage_events[0];
         assert_eq!(event.event_key, format!("settings:{SESSION_ID}"));
@@ -486,8 +631,49 @@ mod tests {
     }
 
     #[test]
-    fn parse_skips_empty_or_non_chat() {
+    fn parse_distinguishes_empty_and_tool_only_records() {
         assert!(parse_droid_session("", None, SESSION_ID).is_none());
+        let jsonl = r#"{"type":"message","id":"write-message","message":{"role":"assistant","content":[{"type":"tool_use","id":"write-1","name":"Create","input":{"file_path":"/repo/new.rs","content":"new contents"}}]}}"#;
+        let session = parse_droid_session(jsonl, None, SESSION_ID).unwrap();
+        assert!(session.messages.is_empty());
+        assert!(session.usage_events.is_empty());
+        assert_eq!(session.events[0].files[0].operation, FileOperation::Write);
+        assert!(session.events[0].message_seq.is_none());
+        for cwd in [Some("/repo"), None] {
+            let header = serde_json::json!({"type":"session_start","cwd":cwd});
+            let call = serde_json::json!({"type":"message","id":"execute-record","message":{"role":"assistant","content":[{"type":"tool_use","id":"execute-1","name":"Execute","input":{"command":"git restore -- src/auth.rs"}}]}});
+            let command = parse_droid_session(
+                &(header.to_string() + "\n" + &call.to_string()),
+                None,
+                SESSION_ID,
+            )
+            .unwrap();
+            assert!(command.messages.is_empty());
+            assert_eq!(command.events[0].kind, "command");
+            assert_eq!(command.events[0].files[0].path, "src/auth.rs");
+            assert_eq!(command.events[0].files[0].cwd.as_deref(), cwd);
+            assert_eq!(command.events[0].files[0].kind, FileEvidenceKind::Command);
+            assert_eq!(
+                command.events[0].command_evidence_status,
+                Some(if cwd.is_some() {
+                    crate::types::CommandEvidenceStatus::Complete
+                } else {
+                    crate::types::CommandEvidenceStatus::Unsupported
+                })
+            );
+        }
+        assert!(
+            parse_droid_jsonl(
+                jsonl.lines().map(|line| Ok(line.to_string())),
+                SESSION_ID.to_string(),
+                0,
+                None,
+                None,
+                false
+            )
+            .unwrap()
+            .is_none()
+        );
         assert!(
             parse_droid_session(r#"{"type":"session_start","cwd":"/repo"}"#, None, SESSION_ID)
                 .is_none()
@@ -505,6 +691,17 @@ mod tests {
         let session = parse_droid_session(&jsonl, None, SESSION_ID).unwrap();
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].content, "kept");
+        assert!(
+            parse_droid_jsonl(
+                std::iter::once(Err(std::io::Error::from(std::io::ErrorKind::InvalidData))),
+                SESSION_ID.to_string(),
+                0,
+                None,
+                None,
+                true
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -519,6 +716,14 @@ mod tests {
         assert_eq!(sessions[0].source_id, SESSION_ID);
         assert_eq!(sessions[0].directory.as_deref(), Some("/Users/x/git/demo"));
         assert_eq!(sessions[0].usage_events.len(), 1);
+        let path =
+            root.path().join("-Users-x-git-demo").join(format!("{SESSION_ID}.settings.json"));
+        fs::write(&path, "{\"model\":").unwrap();
+        assert!(scan_droid_sessions(root.path()).unwrap().is_empty());
+        fs::write(&path, [0xff]).unwrap();
+        assert!(scan_droid_sessions(root.path()).unwrap().is_empty());
+        fs::write(&path, fixture_settings()).unwrap();
+        assert_eq!(scan_droid_sessions(root.path()).unwrap()[0].usage_events.len(), 1);
     }
 
     #[test]
@@ -580,7 +785,7 @@ mod tests {
             },
             collect_session_entries(root.path()),
             droid_session_snapshot,
-            parse_droid_session_file,
+            |entry, mtime| parse_droid_session_file(entry, mtime, false),
         )
         .unwrap();
         assert_eq!(first.stats.parsed, 1);
@@ -621,11 +826,41 @@ mod tests {
             },
             collect_session_entries(root.path()),
             droid_session_snapshot,
-            parse_droid_session_file,
+            |entry, mtime| parse_droid_session_file(entry, mtime, false),
         )
         .unwrap();
         assert_eq!(second.stats.parsed, 0);
         assert!(second.sessions.is_empty());
+        for version in [None, Some(EVENT_PARSER_VERSION - 1), Some(EVENT_PARSER_VERSION)] {
+            if let Some(version) = version {
+                store
+                    .persist_session_events_for_existing_session(
+                        "droid",
+                        SESSION_ID,
+                        &[],
+                        version,
+                        first.sessions[0].updated_at,
+                    )
+                    .unwrap();
+            }
+            let result = file_scan::run_file_scan_with_options_and_snapshot(
+                &AdapterSyncContext::from_store_for_test(&store, "droid").unwrap(),
+                None,
+                FileScanOptions {
+                    usage_parser_version: Some(USAGE_PARSER_VERSION),
+                    event_parser_version: Some(EVENT_PARSER_VERSION),
+                    metadata_parser_version: None,
+                },
+                collect_session_entries(root.path()),
+                droid_session_snapshot,
+                |entry, mtime| parse_droid_session_file(entry, mtime, true),
+            )
+            .unwrap();
+            assert_eq!(result.sessions.len(), usize::from(version != Some(EVENT_PARSER_VERSION)));
+            if let Some(session) = result.sessions.first() {
+                assert_eq!(session.events.len(), 5);
+            }
+        }
     }
 
     #[test]

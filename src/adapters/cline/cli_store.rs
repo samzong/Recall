@@ -6,11 +6,14 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::adapters::AdapterSyncContext;
+use crate::adapters::events::{self, EventContext};
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util;
 use crate::adapters::paths;
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SyncScanResult};
-use crate::types::Role;
+use crate::types::{FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, Role};
+
+use super::{EVENT_PARSER_VERSION, METADATA_PARSER_VERSION};
 
 pub(super) fn resume_command(source_id: &str) -> Option<ResumeCommand> {
     let sessions_dir = resolve_sessions_dir().ok().flatten()?;
@@ -32,6 +35,7 @@ pub(super) fn scan_for_sync(
     context: &AdapterSyncContext,
     since_ts: Option<i64>,
     covered: &HashSet<String>,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let Some(sessions_dir) = resolve_sessions_dir()? else {
         return Ok(SyncScanResult {
@@ -41,12 +45,16 @@ pub(super) fn scan_for_sync(
         });
     };
     let entries = collect_session_entries(&sessions_dir, covered);
-    file_scan::run_file_scan_with_options_and_mtime(
+    file_scan::run_file_scan_with_options_and_snapshot(
         context,
         since_ts,
-        Default::default(),
+        file_scan::FileScanOptions {
+            event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+            metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
+            ..Default::default()
+        },
         entries,
-        scan_timestamp_ms,
+        session_snapshot,
         parse_session_entry,
     )
 }
@@ -57,10 +65,16 @@ fn scan_session_dirs(
 ) -> anyhow::Result<Vec<RawSession>> {
     let mut sessions = Vec::new();
     for entry in collect_session_entries(sessions_dir, covered) {
-        let Some(mtime_ms) = scan_timestamp_ms(&entry) else {
+        let Some(snapshot) = session_snapshot(&entry) else {
             continue;
         };
-        match parse_session_entry(entry, mtime_ms) {
+        let mtime_ms = snapshot.effective_mtime_ms();
+        let observed = entry.clone();
+        let parsed = parse_session_entry(entry, mtime_ms);
+        if session_snapshot(&observed).as_ref() != Some(&snapshot) {
+            continue;
+        }
+        match parsed {
             Ok(Some(raw)) => sessions.push(raw),
             Ok(None) => {}
             Err(err) => {
@@ -143,17 +157,22 @@ fn find_messages_path(sessions_dir: &Path, session_id: &str) -> Option<PathBuf> 
     path.is_file().then_some(path)
 }
 
+#[cfg(test)]
 fn scan_timestamp_ms(entry: &FileScanEntry) -> Option<i64> {
-    let messages_mtime = file_scan::stat_mtime_ms(&entry.stat_target);
-    let manifest_mtime = entry
-        .stat_target
-        .parent()
-        .map(|dir| dir.join(format!("{}.json", entry.session_id)))
-        .and_then(|path| file_scan::stat_mtime_ms(&path));
-    match (messages_mtime, manifest_mtime) {
-        (Some(messages), Some(manifest)) => Some(messages.max(manifest)),
-        (mtime, sidecar) => mtime.or(sidecar),
-    }
+    session_snapshot(entry).map(|snapshot| snapshot.effective_mtime_ms())
+}
+
+fn session_snapshot(
+    entry: &FileScanEntry,
+) -> Option<file_scan::FileScanSnapshot<Vec<Option<file_scan::FileMetadataSnapshot>>>> {
+    let primary = file_scan::file_metadata_snapshot(&entry.stat_target)?;
+    let sidecar = entry.stat_target.parent().and_then(|dir| {
+        file_scan::file_metadata_snapshot(&dir.join(format!("{}.json", entry.session_id)))
+    });
+    let effective_mtime = primary
+        .mtime_ms()?
+        .max(sidecar.as_ref().and_then(file_scan::FileMetadataSnapshot::mtime_ms).unwrap_or(0));
+    Some(file_scan::FileScanSnapshot::new(effective_mtime, vec![Some(primary), sidecar]))
 }
 
 fn parse_session_entry(entry: FileScanEntry, mtime_ms: i64) -> anyhow::Result<Option<RawSession>> {
@@ -165,14 +184,14 @@ fn parse_session(
     session_id: &str,
     mtime_ms: i64,
 ) -> anyhow::Result<Option<RawSession>> {
-    let messages = match load_messages(messages_path) {
+    let (messages, mut events) = match load_records(messages_path) {
         Ok(messages) => messages,
         Err(err) => {
             debug!("failed to parse Cline CLI messages {}: {err}", messages_path.display());
             return Ok(None);
         }
     };
-    if messages.is_empty() {
+    if messages.is_empty() && events.is_empty() {
         return Ok(None);
     }
 
@@ -188,6 +207,19 @@ fn parse_session(
     let directory = manifest.as_ref().and_then(directory_from_manifest);
     let custom_title = manifest.as_ref().and_then(title_from_manifest);
 
+    let event_cwd = manifest
+        .as_ref()
+        .and_then(|value| value.get("cwd"))
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(str::to_string);
+    for event in &mut events {
+        for file in &mut event.files {
+            if file.kind != FileEvidenceKind::Command {
+                file.cwd = event_cwd.clone();
+            }
+        }
+    }
     let mut raw = RawSession::search_only(
         session_id.to_string(),
         directory,
@@ -196,19 +228,30 @@ fn parse_session(
         Some("cli".to_string()),
         messages,
     );
+    raw = raw.with_events(events, EVENT_PARSER_VERSION);
+    raw.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    raw.refresh_session_on_metadata_backfill = true;
     raw.source_file_path = messages_path.to_str().map(str::to_string);
     raw.custom_title = custom_title;
     Ok(Some(raw))
 }
 
-fn load_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
+fn load_records(path: &Path) -> anyhow::Result<(Vec<RawMessage>, Vec<RawSessionEvent>)> {
     let root = read_json(path).ok_or_else(|| anyhow::anyhow!("unreadable messages file"))?;
     let Some(messages) = root.get("messages").and_then(Value::as_array) else {
-        return Ok(vec![]);
+        return Ok((vec![], vec![]));
     };
 
     let mut result = Vec::new();
-    for message in messages {
+    let mut events = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        append_tool_events(
+            message,
+            index,
+            path,
+            result.len().checked_sub(1).map(|seq| seq as u32),
+            &mut events,
+        );
         let role = match message.get("role").and_then(Value::as_str) {
             Some("user") => Role::User,
             Some("assistant") => Role::Assistant,
@@ -220,7 +263,147 @@ fn load_messages(path: &Path) -> anyhow::Result<Vec<RawMessage>> {
         let timestamp = json_util::json_i64(message.get("ts"));
         result.push(RawMessage { role, content, timestamp });
     }
-    Ok(result)
+    Ok((result, events))
+}
+
+pub(super) fn append_tool_events(
+    message: &Value,
+    index: usize,
+    path: &Path,
+    message_seq: Option<u32>,
+    events: &mut Vec<RawSessionEvent>,
+) {
+    let role = message.get("role").and_then(Value::as_str);
+    if let Some(parts) = message.get("content").and_then(Value::as_array) {
+        for (part_index, part) in parts.iter().enumerate() {
+            let context = EventContext {
+                event_seq: events.len() as u32,
+                timestamp: json_util::json_i64(message.get("ts")),
+                source_path: path.to_str().map(str::to_string),
+                source_event_id: Some(format!(
+                    "{}:{index}:{part_index}",
+                    message.get("id").and_then(Value::as_str).unwrap_or("message")
+                )),
+                message_seq,
+                parser_version: EVENT_PARSER_VERSION,
+            };
+            let mut event = match (role, part.get("type").and_then(Value::as_str)) {
+                (Some("assistant"), Some("tool_use")) => {
+                    let name = part.get("name").and_then(Value::as_str).unwrap_or("tool");
+                    let input = part.get("input");
+                    let mut event = events::tool_call_event(context, name.to_string(), input);
+                    event.kind = "tool_call".to_string();
+                    event.target = None;
+                    event.tool_call_id = part.get("id").and_then(Value::as_str).map(str::to_string);
+                    if matches!(name, "read_files" | "read_file") {
+                        if let Some(input) = input {
+                            let requests = input.get("files").unwrap_or(input);
+                            let requests = requests
+                                .as_array()
+                                .map(Vec::as_slice)
+                                .unwrap_or_else(|| std::slice::from_ref(requests));
+                            for request in requests {
+                                let path = request.get("path").and_then(Value::as_str);
+                                if let Some(path) = path.filter(|path| !path.trim().is_empty()) {
+                                    event.files.push(FileEvidence {
+                                        path: path.to_string(),
+                                        operation: FileOperation::Read,
+                                        kind: FileEvidenceKind::Call,
+                                        cwd: None,
+                                        target: None,
+                                    });
+                                }
+                            }
+                        }
+                    } else if name == "apply_diff"
+                        && input.and_then(|value| value.get("path")).is_none()
+                    {
+                        if let Some(files) =
+                            input.and_then(|value| value.get("files")).and_then(Value::as_array)
+                        {
+                            for file in files {
+                                if let Some(path) = file
+                                    .get("path")
+                                    .and_then(Value::as_str)
+                                    .filter(|path| !path.trim().is_empty())
+                                {
+                                    event.files.push(FileEvidence {
+                                        path: path.to_string(),
+                                        operation: FileOperation::Write,
+                                        kind: FileEvidenceKind::Call,
+                                        cwd: None,
+                                        target: None,
+                                    });
+                                }
+                            }
+                        }
+                    } else if matches!(
+                        name,
+                        "editor"
+                            | "write_to_file"
+                            | "replace_in_file"
+                            | "apply_diff"
+                            | "insert_content"
+                    ) {
+                        if let Some(path) = input
+                            .and_then(|value| value.get("path"))
+                            .and_then(Value::as_str)
+                            .filter(|path| !path.trim().is_empty())
+                        {
+                            event.files.push(FileEvidence {
+                                path: path.to_string(),
+                                operation: FileOperation::Write,
+                                kind: FileEvidenceKind::Call,
+                                cwd: None,
+                                target: None,
+                            });
+                        }
+                    } else if name == "apply_patch"
+                        && let Some(patch) =
+                            input.and_then(|value| value.get("input")).and_then(Value::as_str)
+                    {
+                        event.files = events::patch_file_evidence(patch);
+                    }
+                    event.target = event.files.first().map(|file| file.path.clone());
+                    if name == "execute_command"
+                        && let Some(command) =
+                            input.and_then(|input| input.get("command")).and_then(Value::as_str)
+                    {
+                        let cwd = input
+                            .and_then(|input| input.get("cwd"))
+                            .and_then(Value::as_str)
+                            .filter(|path| Path::new(path).is_absolute());
+                        let (files, status) = events::shell_file_evidence(command, cwd);
+                        event.kind = "command".to_string();
+                        event.target = Some(command.to_string());
+                        event.files = files;
+                        event.command_evidence_status = Some(status);
+                    }
+                    event
+                }
+                (Some("user"), Some("tool_result")) => {
+                    let mut event = events::tool_result_event(
+                        context,
+                        None,
+                        part.get("content").map(|value| {
+                            value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string())
+                        }),
+                    );
+                    event.tool_call_id =
+                        part.get("tool_use_id").and_then(Value::as_str).map(str::to_string);
+                    event.status = part
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .map(|failed| if failed { "error" } else { "success" }.to_string());
+                    event
+                }
+                _ => continue,
+            };
+            event.attrs_json = Some(message.to_string());
+            event.is_meta = message.get("isSummary").and_then(Value::as_bool);
+            events.push(event);
+        }
+    }
 }
 
 fn extract_message_text(message: &Value) -> Option<String> {
@@ -413,6 +596,12 @@ mod tests {
         assert_eq!(raw.updated_at, Some(mtime));
         assert_eq!(raw.source_file_path.as_deref(), path.to_str());
         assert_eq!(raw.custom_title.as_deref(), Some("hello, analyze"));
+        assert_eq!(raw.events.len(), 1);
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(raw.events[0].message_seq, Some(0));
+        assert_eq!(raw.events[0].files[0].path, "/tmp/x");
+        assert_eq!(raw.events[0].files[0].operation, FileOperation::Read);
+        assert_eq!(raw.events[0].files[0].cwd.as_deref(), Some("/tmp/other"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -429,9 +618,16 @@ mod tests {
                 },
                 {
                     "role": "assistant",
-                    "content": [],
+                    "content": [
+                        {"type":"tool_use","id":"write-1","name":"editor","input":{"path":"src/main.rs","new_text":"updated"}},
+                        {"type":"tool_use","id":"read-1","name":"read_files","input":{"files":[{"path":"a.rs"},{"path":"b.rs"},{"path":"  "}]}}
+                    ],
                     "ts": 11
-                }
+                },
+                {"id":"result-message","role":"user","ts":12,"content":[
+                    {"type":"tool_result","tool_use_id":"write-1","is_error":true,"content":"permission denied"},
+                    {"type":"tool_result","tool_use_id":"read-1","content":"x".repeat(5000)}
+                ]}
             ]
         })
         .to_string();
@@ -440,6 +636,20 @@ mod tests {
         assert_eq!(raw.messages.len(), 1);
         assert_eq!(raw.messages[0].content, "pong");
         assert_eq!(raw.started_at, 10);
+        assert_eq!(raw.events.len(), 4);
+        assert!(raw.events.iter().all(|event| event.message_seq == Some(0)));
+        assert_eq!(raw.events[0].files[0].operation, FileOperation::Write);
+        assert_eq!(
+            raw.events[1].files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            ["a.rs", "b.rs"]
+        );
+        assert_eq!(raw.events[2].status.as_deref(), Some("error"));
+        assert_eq!(raw.events[2].tool_call_id.as_deref(), Some("write-1"));
+        assert!(raw.events[2].files.is_empty());
+        assert_eq!(raw.events[3].status, None);
+        let attrs: Value =
+            serde_json::from_str(raw.events[3].attrs_json.as_ref().unwrap()).unwrap();
+        assert_eq!(attrs["content"][1]["content"].as_str().unwrap().len(), 5000);
         let _ = fs::remove_dir_all(root);
     }
 

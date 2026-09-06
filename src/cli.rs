@@ -45,6 +45,17 @@ enum Commands {
     },
     #[command(about = "Scan configured AI coding session sources")]
     Sync {
+        #[arg(
+            long,
+            help = "Backfill native file evidence without rebuilding existing discussions"
+        )]
+        backfill_events: bool,
+        #[arg(
+            long,
+            requires = "backfill_events",
+            help = "Preview event backfill without changing the index"
+        )]
+        dry_run: bool,
         #[arg(long, help = "Reprocess every session, even if unchanged")]
         force: bool,
         #[arg(short, long, help = "Show per-source scan progress and settings")]
@@ -269,8 +280,15 @@ pub(crate) fn run() -> Result<()> {
 
     match cli.command {
         Some(Commands::Info { format }) => crate::info::run(format)?,
-        Some(Commands::Sync { force, verbose, source, project }) => {
-            crate::sync::run_cli(force, verbose, source.as_deref(), project.as_deref())?
+        Some(Commands::Sync { force, verbose, source, project, backfill_events, dry_run }) => {
+            crate::sync::run_cli(
+                force,
+                verbose,
+                source.as_deref(),
+                project.as_deref(),
+                backfill_events,
+                dry_run,
+            )?
         }
         Some(Commands::BackgroundWorker { sync_first }) => {
             crate::sync::run_background_worker(sync_first)?
@@ -468,9 +486,6 @@ mod tests {
     use super::{
         Cli, Commands, ExtensionCommands, McpCommands, ShareCommands, Shell, SkillCommands,
         generate, insert_installed_help,
-    };
-    use crate::adapters::{
-        adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
     };
     use crate::session;
     use clap::{CommandFactory, Parser};
@@ -926,22 +941,6 @@ mod tests {
                 assert_eq!(args, ["reflect", "--limit", "3"]);
             }
             _ => panic!("expected external command"),
-        }
-    }
-
-    #[test]
-    fn dashboard_sync_skips_sources_without_usage_or_events() {
-        for adapter in all_adapters() {
-            let id = adapter.id();
-            if matches!(id, "cline" | "roo" | "antigravity-cli" | "kiro-cli" | "copilot-chat") {
-                assert!(
-                    !adapter_supports_usage_dashboard(adapter.as_ref(), true),
-                    "{id} should be skipped during dashboard sync"
-                );
-            }
-            if source_supports_event_backfill(id) {
-                assert!(adapter_supports_usage_dashboard(adapter.as_ref(), true));
-            }
         }
     }
 }

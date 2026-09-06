@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+
+use crate::types::FileTarget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoIdentity {
@@ -12,9 +15,55 @@ pub(crate) struct RepoIdentity {
 pub(crate) struct RepoIdentityCache {
     by_directory: HashMap<String, Option<RepoIdentity>>,
     by_toplevel: HashMap<String, Option<RepoIdentity>>,
+    file_roots: HashMap<PathBuf, Option<String>>,
 }
 
 impl RepoIdentityCache {
+    pub(crate) fn resolve_file(&mut self, path: &str, cwd: Option<&str>) -> Option<FileTarget> {
+        if path.trim().is_empty() || path.contains('\0') || path.starts_with('~') {
+            return None;
+        }
+        if cfg!(not(windows))
+            && (path.starts_with("\\\\")
+                || (path.as_bytes().get(1) == Some(&b':')
+                    && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)))
+        {
+            return None;
+        }
+        let path = Path::new(path);
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            if path.has_root() {
+                return None;
+            }
+            let cwd = Path::new(cwd?);
+            if !cwd.is_absolute() {
+                return None;
+            }
+            cwd.join(path)
+        };
+        let absolute = normalize_file_path(&absolute)?;
+        let parent = absolute.parent()?.ancestors().find(|dir| dir.is_dir())?;
+        let root = self
+            .file_roots
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| git_toplevel(parent.to_str()?))
+            .clone();
+        let identity = root.as_deref().and_then(|root| self.resolve_toplevel(root));
+        let relative = root
+            .as_deref()
+            .and_then(|root| absolute.strip_prefix(root).ok())
+            .and_then(Path::to_str)
+            .map(str::to_string);
+        Some(FileTarget {
+            absolute_path: absolute.to_str()?.to_string(),
+            repo_root: root,
+            repo_relative_path: relative,
+            repo_remote: identity.map(|repo| repo.remote),
+        })
+    }
+
     pub(crate) fn resolve(&mut self, directory: Option<&str>) -> Option<RepoIdentity> {
         let directory = directory?.trim();
         if directory.is_empty() {
@@ -29,17 +78,31 @@ impl RepoIdentityCache {
             return None;
         };
 
-        if let Some(identity) = self.by_toplevel.get(&toplevel) {
-            let identity = identity.clone();
-            self.by_directory.insert(directory.to_string(), identity.clone());
-            return identity;
-        }
-
-        let identity = origin_identity(&toplevel);
-        self.by_toplevel.insert(toplevel, identity.clone());
+        let identity = self.resolve_toplevel(&toplevel);
         self.by_directory.insert(directory.to_string(), identity.clone());
         identity
     }
+
+    fn resolve_toplevel(&mut self, toplevel: &str) -> Option<RepoIdentity> {
+        self.by_toplevel.entry(toplevel.into()).or_insert_with(|| origin_identity(toplevel)).clone()
+    }
+}
+
+fn normalize_file_path(path: &Path) -> Option<PathBuf> {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+        if result.exists() || result.is_symlink() {
+            result = std::fs::canonicalize(&result).ok()?;
+        }
+    }
+    Some(result)
 }
 
 pub(crate) fn git_toplevel(directory: &str) -> Option<String> {
@@ -205,5 +268,21 @@ mod tests {
         let mut cache = RepoIdentityCache::default();
         assert_eq!(cache.resolve(root.to_str()), None);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_symlink_before_parent_components() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("actual/child")).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("actual/child"), temp.path().join("link"))
+            .unwrap();
+        let target = RepoIdentityCache::default()
+            .resolve_file("link/../file.rs", temp.path().to_str())
+            .unwrap();
+        assert_eq!(
+            Path::new(&target.absolute_path),
+            temp.path().canonicalize().unwrap().join("actual/file.rs")
+        );
     }
 }

@@ -72,6 +72,8 @@ fn make_usage_event(key: &str, timestamp: i64, model: &str) -> RawUsageEvent {
 
 fn make_session_event(kind: &str, name: Option<&str>, target: Option<&str>) -> RawSessionEvent {
     RawSessionEvent {
+        command_evidence_status: None,
+        files: Vec::new(),
         event_seq: 0,
         timestamp: Some(1_800_000_001_000),
         kind: kind.to_string(),
@@ -291,6 +293,100 @@ fn persist_session_writes_session_events_and_state() {
 }
 
 #[test]
+fn sync_resolves_cross_repository_files_and_keeps_native_paths() {
+    use crate::adapters::{RawMessage, RawSession};
+    use crate::types::{FileEvidence, FileEvidenceKind, FileOperation};
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    let other = temp.path().join("other");
+    for (root, name) in [(&target, "target"), (&other, "other")] {
+        std::fs::create_dir_all(root).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init"])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    &format!("https://github.com/fixture/{name}.git")
+                ])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let raw_path = target.join("src/deleted.rs").to_str().unwrap().to_string();
+    let mut event = make_session_event("file_write", Some("Edit"), Some(&raw_path));
+    event.files =
+        [(raw_path.clone(), None), ("src/deleted.rs".into(), target.to_str().map(str::to_string))]
+            .into_iter()
+            .map(|(path, cwd)| FileEvidence {
+                path,
+                operation: FileOperation::Write,
+                kind: FileEvidenceKind::Call,
+                cwd,
+                target: None,
+            })
+            .collect();
+    for (path, kind) in [
+        ("src/unknown.rs".to_string(), FileEvidenceKind::Command),
+        (raw_path.clone(), FileEvidenceKind::Command),
+        ("src/fallback.rs".to_string(), FileEvidenceKind::Call),
+    ] {
+        event.files.push(FileEvidence {
+            path,
+            operation: FileOperation::Write,
+            kind,
+            cwd: None,
+            target: None,
+        });
+    }
+    let raw = RawSession::search_only(
+        "cross",
+        other.to_str().map(str::to_string),
+        1000,
+        None,
+        None,
+        vec![RawMessage {
+            role: Role::User,
+            content: "Update the target file".into(),
+            timestamp: Some(1000),
+        }],
+    )
+    .with_events(vec![event], 1);
+    let store = crate::sync::persist_raw_session_for_conformance(setup(), "codex", raw).unwrap();
+    let session = store.get_session_by_source_id("codex", "cross").unwrap().unwrap();
+    assert_eq!(session.directory.as_deref(), other.to_str());
+    assert_eq!(session.repo_remote.as_deref(), Some("github.com/fixture/other"));
+    let events = store.list_session_events_for_session(&session.id).unwrap();
+    assert!(events[0].files[2].target.is_none());
+    assert_eq!(events[0].files[3].target, events[0].files[0].target);
+    assert!(events[0].files[4].target.is_none());
+    assert_eq!(events[0].files[0].path, raw_path);
+    assert_eq!(events[0].files[0].target, events[0].files[1].target);
+    let file = events[0].files[0].target.as_ref().unwrap();
+    assert_eq!(file.repo_remote.as_deref(), Some("github.com/fixture/target"));
+    assert_eq!(file.repo_relative_path.as_deref(), Some("src/deleted.rs"));
+    let alternate = temp.path().join("TARGET");
+    if alternate.is_dir() {
+        let resolved = crate::repo_identity::RepoIdentityCache::default()
+            .resolve_file("src/deleted.rs", alternate.to_str())
+            .unwrap();
+        assert_eq!(&resolved, file);
+    }
+}
+
+#[test]
 fn export_jsonl_emits_session_messages_and_usage_events() {
     let store = setup();
     let mut session = make_session("s1", "codex", "raw1", "Export session");
@@ -337,7 +433,7 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     let lines: Vec<_> = text.lines().collect();
     assert_eq!(lines.len(), 1);
     let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(value["schema_version"], 6);
+    assert_eq!(value["schema_version"], 7);
     assert_eq!(value["record_type"], "session");
     assert_eq!(value["session"]["source"], "codex");
     assert_eq!(value["session"]["source_id"], "raw1");
@@ -1662,17 +1758,13 @@ fn gemini_parser_indexes_tool_calls() {
         "prose preserved: {}",
         assistant.content
     );
-    assert!(assistant.content.contains("[read_file]"), "tool name indexed: {}", assistant.content);
-    assert!(
-        assistant.content.contains("/tmp/README.md"),
-        "tool args indexed: {}",
-        assistant.content
-    );
-    assert!(
-        assistant.content.contains("Hello world"),
-        "tool result indexed: {}",
-        assistant.content
-    );
+    assert_eq!(assistant.content, "Let me read the file.");
+    assert_eq!(session.events.len(), 2);
+    assert_eq!(session.events[0].tool_call_id.as_deref(), Some("t1"));
+    assert_eq!(session.events[1].tool_call_id, session.events[0].tool_call_id);
+    let attrs: serde_json::Value =
+        serde_json::from_str(session.events[1].attrs_json.as_deref().unwrap()).unwrap();
+    assert_eq!(attrs["toolCalls"][0]["result"][0]["text"], "# My Project\nHello world.");
 }
 
 #[test]
@@ -1779,7 +1871,7 @@ fn kiro_parser_assistant_tool_use() {
                     "message_id": "m1",
                     "content": "Let me look around.",
                     "tool_uses": [
-                        {"id": "t1", "name": "fs_read", "args": {"path": "/src"}},
+                        {"id": "t1", "name": "fs_read", "args": {"operations": [{"mode":"Line","path":"/src"}]}},
                         {"id": "t2", "name": "execute_bash", "args": {"command": "ls"}}
                     ]
                 }
@@ -1795,13 +1887,14 @@ fn kiro_parser_assistant_tool_use() {
         "prose preserved: {}",
         assistant.content
     );
-    assert!(assistant.content.contains("[fs_read]"), "first tool indexed: {}", assistant.content);
-    assert!(
-        assistant.content.contains("[execute_bash]"),
-        "second tool indexed: {}",
-        assistant.content
-    );
-    assert!(assistant.content.contains("/src"), "fs_read args indexed: {}", assistant.content);
+    assert_eq!(assistant.content, "Let me look around.");
+    assert_eq!(session.events.len(), 2);
+    assert_eq!(session.events[0].tool_call_id.as_deref(), Some("t1"));
+    assert_eq!(session.events[0].files[0].path, "/src");
+    assert_eq!(session.events[1].tool_call_id.as_deref(), Some("t2"));
+    let native: serde_json::Value =
+        serde_json::from_str(session.events[1].attrs_json.as_deref().unwrap()).unwrap();
+    assert_eq!(native["ToolUse"]["tool_uses"][1]["args"]["command"], "ls");
 }
 
 #[test]
@@ -1829,14 +1922,23 @@ fn kiro_parser_tool_use_results_text_and_json() {
     }"#;
 
     let session = parse_kiro_conversation("c", "/proj", json, 0, 0).unwrap().unwrap();
-    let user_msg = &session.messages[0];
-    assert!(
-        user_msg.content.contains("file contents here"),
-        "Text variant indexed: {}",
-        user_msg.content
-    );
-    assert!(user_msg.content.contains("\"status\""), "Json variant indexed: {}", user_msg.content);
-    assert!(user_msg.content.contains("42"), "Json values indexed: {}", user_msg.content);
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].content, "done");
+    assert_eq!(session.events.len(), 2);
+    for (event, id) in session.events.iter().zip(["t1", "t2"]) {
+        assert_eq!(event.tool_call_id.as_deref(), Some(id));
+        assert_eq!(event.message_seq, None);
+        let native: serde_json::Value =
+            serde_json::from_str(event.attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            native["content"]["ToolUseResults"]["tool_use_results"][0]["content"][0]["Text"],
+            "file contents here"
+        );
+        assert_eq!(
+            native["content"]["ToolUseResults"]["tool_use_results"][1]["content"][0]["Json"]["rows"],
+            42
+        );
+    }
 }
 
 #[test]
@@ -1855,8 +1957,8 @@ fn kiro_v2_parser_prompt_and_assistant_text() {
         "title": "hello, analyze this project"
     }"#;
     let jsonl = r#"{"version":"v1","kind":"Prompt","data":{"message_id":"p1","content":[{"kind":"text","data":"hello, analyze this project"}],"meta":{"timestamp":1788285089}}}
-{"version":"v1","kind":"AssistantMessage","data":{"message_id":"a1","content":[{"kind":"thinking","data":{"text":"plan"}},{"kind":"text","data":"This is Recall."},{"kind":"toolUse","data":{"toolUseId":"t1","name":"read","input":{"path":"/src"}}}]}}
-{"version":"v1","kind":"ToolResults","data":{"message_id":"t1","content":[{"kind":"toolResult","data":{"content":[{"kind":"text","data":"secret dump"}]}}]}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"a1","content":[{"kind":"thinking","data":{"text":"plan"}},{"kind":"text","data":"This is Recall."},{"kind":"toolUse","data":{"toolUseId":"t1","name":"fs_read","input":{"operations":[{"mode":"Image","image_paths":["/src/a.png","/src/b.png"]}]}}}]}}
+{"version":"v1","kind":"ToolResults","data":{"message_id":"t1","content":[{"kind":"toolResult","data":{"toolUseId":"t1","status":"error","content":[{"kind":"text","data":"secret dump"}]}}]}}
 {"version":"v1","kind":"Prompt","data":{"message_id":"p2","content":[{"kind":"text","data":"find a bug"}],"meta":{"timestamp":1788285145}}}
 {"version":"v1","kind":"AssistantMessage","data":{"message_id":"a2","content":[{"kind":"text","data":"No bug found."}]}}"#;
 
@@ -1877,6 +1979,14 @@ fn kiro_v2_parser_prompt_and_assistant_text() {
     assert!(!session.messages.iter().any(|message| message.content.contains("[read]")));
     assert_eq!(session.messages[2].content, "find a bug");
     assert_eq!(session.messages[3].content, "No bug found.");
+    assert_eq!(session.events.len(), 2);
+    assert_eq!(
+        session.events[0].files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+        ["/src/a.png", "/src/b.png"]
+    );
+    assert_eq!(session.events[1].tool_call_id, session.events[0].tool_call_id);
+    assert_eq!(session.events[1].status.as_deref(), Some("error"));
+    assert!(session.events[1].attrs_json.as_ref().unwrap().contains("secret dump"));
 }
 
 #[test]
@@ -1897,8 +2007,8 @@ fn kiro_v3_parser_user_and_say_skips_reasoning() {
     }"#;
     let jsonl = r#"{"id":"u1","timestamp":"2026-09-01T17:52:55.268Z","payload":{"type":"user","content":"analyze the current project","images":[],"documents":[]}}
 {"id":"r1","timestamp":"2026-09-01T17:53:01.908Z","payload":{"type":"assistant","content":"...","operationType":"Reasoning"}}
-{"id":"t1","timestamp":"2026-09-01T17:53:02.000Z","payload":{"type":"tool_call","toolName":"read","args":{"path":"/src"}}}
-{"id":"t2","timestamp":"2026-09-01T17:53:03.000Z","payload":{"type":"tool_result","content":"file dump"}}
+{"id":"t1","timestamp":"2026-09-01T17:53:02.000Z","payload":{"type":"tool_call","toolName":"fs_read","toolCallId":"native-call"}}
+{"id":"t2","timestamp":"2026-09-01T17:53:03.000Z","payload":{"type":"tool_result","toolCallId":"native-call","success":false,"content":"file dump"}}
 {"id":"a1","timestamp":"2026-09-01T17:56:06.468Z","payload":{"type":"assistant","content":"Recall indexes local sessions.","operationType":"Say"}}
 {"id":"s1","timestamp":"2026-09-01T17:56:06.506Z","payload":{"type":"session_start","content":"You are Kiro CLI"}}"#;
 
@@ -1920,6 +2030,12 @@ fn kiro_v3_parser_user_and_say_skips_reasoning() {
     assert_eq!(session.messages[1].content, "Recall indexes local sessions.");
     assert!(!session.messages.iter().any(|message| message.content.contains("You are Kiro")));
     assert!(!session.messages.iter().any(|message| message.content.contains("file dump")));
+    assert_eq!(session.events.len(), 2);
+    assert_eq!(session.events[0].tool_call_id.as_deref(), Some("native-call"));
+    assert!(session.events[0].files.is_empty());
+    assert_eq!(session.events[1].tool_call_id, session.events[0].tool_call_id);
+    assert_eq!(session.events[1].status.as_deref(), Some("error"));
+    assert!(session.events[1].attrs_json.as_ref().unwrap().contains("file dump"));
 }
 
 #[test]
@@ -1952,30 +2068,19 @@ fn copilot_parser_indexes_tool_requests_and_results() {
 {"type":"tool.execution_complete","data":{"toolCallId":"tc1","success":true,"result":{"content":"short summary","detailedContent":"# My Project\nHello world."}},"id":"e4","timestamp":"2026-02-26T06:30:00.500Z","parentId":"e3"}"##;
 
     let session = parse_copilot_events(jsonl, "fallback").unwrap().unwrap();
-    assert_eq!(session.messages.len(), 2);
-    let assistant = &session.messages[0];
-    assert!(
-        assistant.content.contains("Let me read the file"),
-        "prose preserved: {}",
-        assistant.content
-    );
-    assert!(assistant.content.contains("[read_file]"), "tool name indexed: {}", assistant.content);
-    assert!(
-        assistant.content.contains("/tmp/README.md"),
-        "tool args indexed: {}",
-        assistant.content
-    );
-    let tool_result = &session.messages[1];
-    assert!(
-        tool_result.content.contains("[read_file]"),
-        "tool result tagged with name: {}",
-        tool_result.content
-    );
-    assert!(
-        tool_result.content.contains("Hello world"),
-        "detailedContent preferred over content: {}",
-        tool_result.content
-    );
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].content, "Let me read the file.");
+    assert_eq!(session.events.len(), 3);
+    assert_eq!(session.events[2].summary.as_deref(), Some("# My Project\nHello world."));
+    for (event, record) in session.events.iter().zip(jsonl.lines().skip(1)) {
+        assert_eq!(event.tool_call_id.as_deref(), Some("tc1"));
+        assert_eq!(event.message_seq, Some(0));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(event.attrs_json.as_deref().unwrap())
+                .unwrap(),
+            serde_json::from_str::<serde_json::Value>(record).unwrap()
+        );
+    }
 }
 
 #[test]

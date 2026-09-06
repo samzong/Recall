@@ -15,7 +15,10 @@ use serde_json::Value;
 
 use crate::adapters;
 use crate::db::message_store::{MessageRead, MessageWindow};
-use crate::db::search::{SearchEngine, SearchFilters, SessionEventQuery, TimeRange};
+use crate::db::search::{
+    FileHistoryCoverage, FileHistoryEvidence, FileHistoryQuery, FileHistoryTarget, SearchEngine,
+    SearchFilters, SessionEventQuery, TimeRange,
+};
 use crate::db::store::Store;
 use crate::project_scope::ProjectScope;
 use crate::query::{query_embedding, resolve_source_filter};
@@ -68,6 +71,13 @@ struct SearchSessionsArgs {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct GetSessionArgs {
+    #[serde(default)]
+    event_ref: Option<String>,
+    #[serde(default)]
+    evidence_part: Option<crate::event_evidence::EvidencePart>,
+    #[serde(default)]
+    #[schemars(range(min = 1024, max = 65536))]
+    max_bytes: Option<u32>,
     /// Recall session id from search_sessions or list_recent_sessions.
     session_id: String,
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
@@ -163,13 +173,30 @@ struct FileHistoryArgs {
     /// Optional tool id or label such as claude-code or CUR.
     #[serde(default)]
     source: Option<String>,
-    /// Optional event kind. When omitted, only file_write and file_read.
     #[serde(default)]
+    #[schemars(
+        description = "Optional event kind. Defaults to file_write/file_read in legacy mode, or all event kinds with target_project."
+    )]
     kind: Option<String>,
     /// Maximum events to return. Defaults to 20, capped at 50.
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(range(min = 1, max = 50))]
     limit: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Enable structured file evidence for this target repository or directory, independently of the session project. Accepts a local directory, remote URL, or unique indexed target repository name/slug. Mutually exclusive with project."
+    )]
+    target_project: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Include command evidence matched by target identity or native absolute path. Inspect match_basis; commands do not prove a modification succeeded. Only valid with target_project."
+    )]
+    include_command_candidates: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        description = "Opaque next_cursor from structured file history. Repeat the same path, target_project, source, kind and candidate selection; target-relevant index changes invalidate it. Only valid with target_project."
+    )]
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -327,12 +354,28 @@ struct EventHit {
     target: Option<String>,
     event_seq: u32,
     summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<FileHistoryEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility: Option<EvidenceVisibility>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_meta: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 struct EventList {
     message: Option<String>,
     events: Vec<EventHit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_file: Option<FileHistoryTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    has_more: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ordering: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<FileHistoryCoverage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -519,7 +562,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Load one indexed session by Recall session_id. After search_messages, pass around_seq to read the matched message and its neighbors (default three before and after). Alternatively use inclusive from_seq/to_seq. These selectors cannot be combined with tail. Selected reads return up to 50 messages and 6000 Unicode content characters, with first_message_byte_offset and next_cursor for lossless continuation. Resume using session_id and cursor without selectors; reindexing invalidates cursors. Without selectors, cursor, or max_chars, the legacy head/tail behavior follows. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 bytes. Set include_events only when structured evidence is needed; it returns at most 50 events anchored to the returned message range plus unanchored events, caps each event string field at 200 characters and all event string fields at 10000 characters total, and never returns raw arguments, results, source paths, or parser internals. Returns metadata, including source-native source_session_id and the first_message_seq and last_message_seq represented by the response, plus messages as plain text in sequence order.",
+        description = "Read indexed evidence with event_ref copied from file_history: returns lossless UTF-8 chunks, a continuation cursor, and a content digest. Default evidence_part=payload includes full indexed attrs and same-session related refs; concatenate data before parsing its JSON. For native Cursor before/after content, first read payload.related_event_refs and select the result event holding beforeContentId/afterContentId; content is opt-in and hash-verified. max_bytes defaults to 16384, maximum 65536; each call has a 64 MiB read budget. Copy event_ref, evidence_part, session_id and cursor to continue. Read the returned discussion window separately. Without event_ref, Load one indexed session by Recall session_id. After search_messages, pass around_seq to read the matched message and its neighbors (default three before and after). Alternatively use inclusive from_seq/to_seq. These selectors cannot be combined with tail. Selected reads return up to 50 messages and 6000 Unicode content characters, with first_message_byte_offset and next_cursor for lossless continuation. Resume using session_id and cursor without selectors; reindexing invalidates cursors. Without selectors, cursor, or max_chars, the legacy head/tail behavior follows. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 bytes. Set include_events only when structured evidence is needed; it returns at most 50 events anchored to the returned message range plus unanchored events, caps each event string field at 200 characters and all event string fields at 10000 characters total, and never returns raw arguments, results, source paths, or parser internals. Returns metadata, including source-native source_session_id and the first_message_seq and last_message_seq represented by the response, plus messages as plain text in sequence order.",
         annotations(
             title = "Get session",
             read_only_hint = true,
@@ -531,6 +574,12 @@ impl RecallMcp {
         &self,
         Parameters(args): Parameters<GetSessionArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if args.event_ref.is_some() {
+            return Ok(json_result(
+                get_event_evidence(&lock_index(&self.index), &args)
+                    .map_err(|message| serde_json::json!({"message":message})),
+            ));
+        }
         Ok(json_result(
             get_session(&lock_index(&self.index), &args)
                 .map_err(|message| empty_detail(Some(message))),
@@ -558,7 +607,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Which indexed sessions touched a file. An event matches when its target equals the given path, or when either one ends with `/` or `\\` followed by the other, so relative and absolute forms of the same path find each other. Defaults to file_write and file_read events. Returns session id, source, project, title, kind, name, target, event_seq, truncated summary, and event timestamp.",
+        description = "Which indexed sessions touched a file. An event matches when its target equals the given path, or when either one ends with `/` or `\\` followed by the other, so relative and absolute forms of the same path find each other. Defaults to file_write and file_read events. Returns session id, source, project, title, kind, name, target, event_seq, truncated summary, event timestamp, and optional visibility and is_meta flags. Set target_project to explicitly use structured target-file evidence across session projects; it is mutually exclusive with project. This mode matches exact file identities, includes all evidence kinds by default, and returns evidence classifications, event_ref, coverage on the first page, and continuation. include_command_candidates and cursor require this mode. Command evidence and approval do not prove a write succeeded. Unknown event timestamps sort after known timestamps; ties use indexed event identity. Target-relevant changes invalidate continuation. No sync or native source-file read is performed.",
         annotations(
             title = "File history",
             read_only_hint = true,
@@ -698,7 +747,15 @@ fn empty_hits_with_current(message: impl Into<String>, current_session: CurrentS
 }
 
 fn empty_events(message: impl Into<String>) -> EventList {
-    EventList { message: Some(message.into()), events: Vec::new() }
+    EventList {
+        message: Some(message.into()),
+        events: Vec::new(),
+        target_file: None,
+        has_more: None,
+        next_cursor: None,
+        ordering: None,
+        coverage: None,
+    }
 }
 
 #[cfg(test)]
@@ -867,10 +924,12 @@ fn list_ready(
 fn file_history(
     index: &IndexState,
     args: &FileHistoryArgs,
-) -> std::result::Result<EventList, EventList> {
+) -> std::result::Result<EventList, Box<EventList>> {
     match index {
-        IndexState::Unavailable { message, .. } => Err(empty_events(message.clone())),
-        IndexState::Ready(store) => file_history_ready(store, args).map_err(empty_events),
+        IndexState::Unavailable { message, .. } => Err(Box::new(empty_events(message.clone()))),
+        IndexState::Ready(store) => {
+            file_history_ready(store, args).map_err(|message| Box::new(empty_events(message)))
+        }
     }
 }
 
@@ -881,6 +940,54 @@ fn file_history_ready(
     let path = args.path.trim();
     if path.is_empty() {
         return Err(PATH_REQUIRED.to_string());
+    }
+    if let Some(project) = &args.target_project {
+        if args.project.is_some() {
+            return Err("project and target_project cannot be combined".to_string());
+        }
+        let engine = SearchEngine::new(&store.conn);
+        let target =
+            engine.resolve_file_history_target(project, path).map_err(|error| error.to_string())?;
+        let (_, sources) = resolve_filters(store, None, args.source.as_deref())?;
+        let query = FileHistoryQuery {
+            target: target.clone(),
+            sources,
+            kind: opt_trimmed(args.kind.as_deref()).map(str::to_string),
+            include_command_candidates: args.include_command_candidates.unwrap_or(false),
+        };
+        let page = engine
+            .file_history_page(
+                &query,
+                clamp_limit(args.limit, EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX),
+                args.cursor.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+        let events = page
+            .events
+            .into_iter()
+            .map(|mut hit| {
+                hit.hit.target =
+                    hit.hit.target.map(|target| truncate_chars(&target, EXCERPT_CHAR_CAP).0);
+                let mut event = event_hit(hit.hit);
+                event.evidence = Some(hit.evidence);
+                event
+            })
+            .collect::<Vec<_>>();
+        return Ok(EventList {
+            message: events.is_empty().then(|| "No matching file evidence.".to_string()),
+            events,
+            target_file: Some(target),
+            has_more: Some(page.next_cursor.is_some()),
+            next_cursor: page.next_cursor,
+            ordering: Some(
+                "known_event_timestamp_desc_then_indexed_event_id_desc; unknown_timestamps_last"
+                    .to_string(),
+            ),
+            coverage: page.coverage,
+        });
+    }
+    if args.include_command_candidates.is_some() || args.cursor.is_some() {
+        return Err("include_command_candidates and cursor require target_project".to_string());
     }
     let kinds = match opt_trimmed(args.kind.as_deref()) {
         Some(kind) => vec![kind.to_string()],
@@ -898,9 +1005,25 @@ fn file_history_ready(
         .map_err(|error| error.to_string())?;
     if hits.is_empty() {
         let message = if store_is_empty(store) { EMPTY_INDEX } else { SEARCH_EMPTY };
-        return Ok(EventList { message: Some(message.to_string()), events: Vec::new() });
+        return Ok(EventList {
+            message: Some(message.to_string()),
+            events: Vec::new(),
+            target_file: None,
+            has_more: None,
+            next_cursor: None,
+            ordering: None,
+            coverage: None,
+        });
     }
-    Ok(EventList { message: None, events: hits.into_iter().map(event_hit).collect() })
+    Ok(EventList {
+        message: None,
+        events: hits.into_iter().map(event_hit).collect(),
+        target_file: None,
+        has_more: None,
+        next_cursor: None,
+        ordering: None,
+        coverage: None,
+    })
 }
 
 fn opt_trimmed(value: Option<&str>) -> Option<&str> {
@@ -919,6 +1042,9 @@ fn event_hit(hit: crate::db::search::SessionEventHit) -> EventHit {
         target: hit.target,
         event_seq: hit.event_seq,
         summary: hit.summary.map(|text| truncate_chars(&text, EXCERPT_CHAR_CAP).0),
+        evidence: None,
+        visibility: hit.visibility,
+        is_meta: hit.is_meta,
     }
 }
 
@@ -932,7 +1058,43 @@ fn get_session(
     }
 }
 
+fn get_event_evidence(
+    index: &IndexState,
+    args: &GetSessionArgs,
+) -> std::result::Result<crate::event_evidence::EvidencePage, String> {
+    let IndexState::Ready(store) = index else {
+        return Err(MISSING_INDEX.into());
+    };
+    if args.tail
+        || args.include_events
+        || args.from_seq.is_some()
+        || args.to_seq.is_some()
+        || args.around_seq.is_some()
+        || args.before.is_some()
+        || args.after.is_some()
+        || args.max_messages.is_some()
+        || args.max_chars.is_some()
+    {
+        return Err(
+            "event_ref cannot be combined with message selectors; read discussion separately"
+                .into(),
+        );
+    }
+    crate::event_evidence::read(
+        store,
+        &args.session_id,
+        args.event_ref.as_deref().ok_or_else(|| "event_ref is required".to_string())?,
+        args.evidence_part.unwrap_or_default(),
+        args.cursor.as_deref(),
+        args.max_bytes.unwrap_or(16384) as usize,
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn get_ready(store: &Store, args: &GetSessionArgs) -> std::result::Result<SessionDetail, String> {
+    if args.max_bytes.is_some() || args.evidence_part.is_some() {
+        return Err("evidence parameters require event_ref".into());
+    }
     let Some(session) =
         store.get_session_by_id(&args.session_id).map_err(|error| error.to_string())?
     else {
@@ -2438,6 +2600,8 @@ mod tests {
         name: Option<&str>,
     ) -> RawSessionEvent {
         RawSessionEvent {
+            command_evidence_status: None,
+            files: Vec::new(),
             event_seq: seq,
             timestamp,
             kind: kind.to_string(),
@@ -2549,6 +2713,9 @@ mod tests {
     fn file_history_args(path: &str) -> FileHistoryArgs {
         FileHistoryArgs {
             path: path.to_string(),
+            target_project: None,
+            include_command_candidates: None,
+            cursor: None,
             project: None,
             source: None,
             kind: None,
@@ -2571,9 +2738,15 @@ mod tests {
 
     #[test]
     fn file_history_defaults_to_file_kinds_and_suffix_match() {
-        let index = ready(seed_agent_events());
+        let store = seed_agent_events();
+        store.conn.execute("UPDATE session_events SET visibility = 'hidden', is_meta = 1 WHERE session_id = 'codex-demo' AND kind = 'file_write'", []).unwrap();
+        let index = ready(store);
         let list = file_history(&index, &file_history_args("src/db/schema.rs")).unwrap();
         assert!(list.message.is_none());
+        assert!(
+            list.events.iter().any(|event| event.visibility == Some(EvidenceVisibility::Hidden)
+                && event.is_meta == Some(true))
+        );
         let targets: Vec<_> = list.events.iter().map(|event| event.target.clone()).collect();
         assert!(targets.contains(&Some("/tmp/demo/src/db/schema.rs".into())));
         assert!(targets.contains(&Some("src/db/schema.rs".into())));
@@ -2618,6 +2791,9 @@ mod tests {
         let commands = file_history(
             &index,
             &FileHistoryArgs {
+                target_project: None,
+                include_command_candidates: None,
+                cursor: None,
                 path: "src/db/schema.rs".into(),
                 project: None,
                 source: None,
@@ -2637,6 +2813,9 @@ mod tests {
         let scoped = file_history(
             &index,
             &FileHistoryArgs {
+                target_project: None,
+                include_command_candidates: None,
+                cursor: None,
                 path: "src/db/schema.rs".into(),
                 project: Some("/tmp/demo".into()),
                 source: None,
@@ -2651,6 +2830,9 @@ mod tests {
         let by_source = file_history(
             &index,
             &FileHistoryArgs {
+                target_project: None,
+                include_command_candidates: None,
+                cursor: None,
                 path: "src/db/schema.rs".into(),
                 project: Some("/tmp/demo".into()),
                 source: Some("claude-code".into()),
@@ -2665,6 +2847,9 @@ mod tests {
         let unknown = file_history(
             &index,
             &FileHistoryArgs {
+                target_project: None,
+                include_command_candidates: None,
+                cursor: None,
                 path: "src/db/schema.rs".into(),
                 project: None,
                 source: Some("not-a-source".into()),
@@ -2702,6 +2887,9 @@ mod tests {
         let list = file_history(
             &index,
             &FileHistoryArgs {
+                target_project: None,
+                include_command_candidates: None,
+                cursor: None,
                 path: "src/db/schema.rs".into(),
                 project: None,
                 source: None,
@@ -2740,6 +2928,9 @@ mod tests {
         let list = file_history(
             &ready(store),
             &FileHistoryArgs {
+                target_project: None,
+                include_command_candidates: None,
+                cursor: None,
                 path: "src/db/schema.rs".into(),
                 project: None,
                 source: None,
@@ -2838,5 +3029,160 @@ mod tests {
             };
         }
         assert_eq!(text, original);
+    }
+    #[test]
+    fn file_history_requires_explicit_target_mode_for_new_parameters() {
+        let index = ready(seed_agent_events());
+        let legacy = file_history(&index, &file_history_args("src/db/schema.rs")).unwrap();
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("next_cursor").is_none());
+        assert!(json.get("target_file").is_none());
+        let mut args = file_history_args("src/db/schema.rs");
+        args.include_command_candidates = Some(false);
+        assert!(file_history(&index, &args).is_err());
+        args.target_project = Some("https://github.com/example/project.git".to_string());
+        let page = file_history(&index, &args).unwrap();
+        assert_eq!(page.has_more, Some(false));
+        assert_eq!(
+            page.target_file.unwrap().repo_remote.as_deref(),
+            Some("github.com/example/project")
+        );
+        assert!(page.coverage.is_some());
+        args.project = Some("/tmp/demo".to_string());
+        assert!(file_history(&index, &args).is_err());
+    }
+    #[test]
+    fn event_evidence_pages_native_payload_and_binds_related_revisions() {
+        let store = setup();
+        for id in ["s1", "s2"] {
+            store.insert_session(&session(id, "cursor", "Evidence", 1000)).unwrap();
+        }
+        store
+            .insert_messages(&[message("s1", Role::User, "Explain the requested change", 10)])
+            .unwrap();
+        let mut call =
+            event(3, "tool_call", Some("file"), None, Some("summary"), Some("apply_patch"));
+        call.message_seq = Some(10);
+        call.tool_call_id = Some("shared-call-id".into());
+        call.source_event_id = Some("call-record".into());
+        call.source_path = Some("composer:src-s1".into());
+        call.attrs_json = Some(serde_json::json!({"input":"汉\n\\\"".repeat(900)}).to_string());
+        let mut result = event(4, "tool_result", None, None, Some("result"), None);
+        result.tool_call_id = call.tool_call_id.clone();
+        result.source_event_id = Some("r".repeat(3500));
+        persist_events(&store, "cursor", "s1", &[call.clone(), result.clone()]);
+        persist_events(&store, "cursor", "s2", &[result.clone()]);
+        let reference = {
+            let tx = store.conn.unchecked_transaction().unwrap();
+            let id = tx
+                .query_row(
+                    "SELECT id FROM session_events WHERE session_id='s1' AND event_seq=3",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::to_string(&crate::db::event_store::event_reference(&tx, id).unwrap())
+                .unwrap()
+        };
+        let index = ready(store);
+        let mut args = GetSessionArgs {
+            session_id: "s1".into(),
+            event_ref: Some(reference.clone()),
+            max_bytes: Some(2048),
+            ..Default::default()
+        };
+        args.evidence_part = Some(crate::event_evidence::EvidencePart::Before);
+        let missing = get_event_evidence(&index, &args).unwrap_err();
+        assert!(missing.starts_with("content_reference_not_recorded"));
+        assert!(missing.contains("payload.related_event_refs"));
+        args.evidence_part = None;
+        let mut body = String::new();
+        let mut first_cursor = None;
+        for _ in 0..200 {
+            let page = get_event_evidence(&index, &args).unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= 2048);
+            let page = serde_json::to_value(page).unwrap();
+            assert_eq!(page["byte_offset"].as_u64().unwrap() as usize, body.len());
+            body.push_str(page["data"].as_str().unwrap());
+            args.cursor = page["next_cursor"].as_str().map(str::to_string);
+            if first_cursor.is_none() {
+                first_cursor = args.cursor.clone();
+            }
+            if args.cursor.is_none() {
+                break;
+            }
+        }
+        assert!(args.cursor.is_none());
+        let document: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(document["event"]["attrs_json"], call.attrs_json.as_deref().unwrap());
+        assert_eq!(document["related_event_refs"].as_array().unwrap().len(), 1);
+        let related = GetSessionArgs {
+            session_id: "s1".into(),
+            event_ref: document["related_event_refs"][0].as_str().map(str::to_string),
+            ..Default::default()
+        };
+        assert!(get_event_evidence(&index, &related).is_ok());
+        let discussion: GetSessionArgs =
+            serde_json::from_value(document["discussion"].clone()).unwrap();
+        assert!(get_session(&index, &discussion).unwrap().messages.contains("requested change"));
+        let IndexState::Ready(store) = &index else { panic!() };
+        persist_events(store, "cursor", "s1", &[call.clone(), result.clone()]);
+        assert!(get_event_evidence(&index, &args).unwrap_err().contains("stale"));
+        result.attrs_json = Some("changed result".into());
+        persist_events(store, "cursor", "s1", &[call.clone(), result.clone()]);
+        args.cursor = first_cursor;
+        assert!(get_event_evidence(&index, &args).unwrap_err().contains("stale"));
+        args.cursor = None;
+        let tx = store.conn.unchecked_transaction().unwrap();
+        let id = tx
+            .query_row(
+                "SELECT id FROM session_events WHERE session_id = 's1' AND event_seq = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        args.event_ref = Some(
+            serde_json::to_string(&crate::db::event_store::event_reference(&tx, id).unwrap())
+                .unwrap(),
+        );
+        drop(tx);
+        assert!(get_event_evidence(&index, &args).is_ok());
+        call.attrs_json = Some("changed call".into());
+        persist_events(store, "cursor", "s1", &[call, result]);
+        assert!(get_event_evidence(&index, &args).unwrap_err().contains("stale"));
+    }
+
+    #[test]
+    fn event_evidence_never_reads_imported_locators_and_rejects_oversized_reads() {
+        let store = setup();
+        let mut imported = session("s1", "cursor", "Imported evidence", 1000);
+        imported.is_import = true;
+        store.insert_session(&imported).unwrap();
+        let mut record = event(0, "tool_result", None, None, None, None);
+        record.source_path = Some("/private/untrusted/source.sqlite".into());
+        record.attrs_json = Some("{\"afterContentId\":\"composer.content.opaque\"}".into());
+        persist_events(&store, "cursor", "s1", &[record]);
+        let reference = {
+            let tx = store.conn.unchecked_transaction().unwrap();
+            let id = tx.query_row("SELECT id FROM session_events", [], |row| row.get(0)).unwrap();
+            serde_json::to_string(&crate::db::event_store::event_reference(&tx, id).unwrap())
+                .unwrap()
+        };
+        let index = ready(store);
+        let mut args = GetSessionArgs {
+            session_id: "s1".into(),
+            event_ref: Some(reference),
+            evidence_part: Some(crate::event_evidence::EvidencePart::After),
+            ..Default::default()
+        };
+        assert_eq!(get_event_evidence(&index, &args).unwrap_err(), "source_unverified");
+        args.evidence_part = None;
+        assert!(get_event_evidence(&index, &args).is_ok());
+        let IndexState::Ready(store) = &index else { panic!() };
+        store
+            .conn
+            .execute("UPDATE session_events SET attrs_json = CAST(zeroblob(67108865) AS TEXT)", [])
+            .unwrap();
+        assert_eq!(get_event_evidence(&index, &args).unwrap_err(), "evidence_budget_exceeded");
     }
 }

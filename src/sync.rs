@@ -36,7 +36,39 @@ pub(crate) fn run_cli(
     verbose: bool,
     source_filter: Option<&str>,
     project_filter: Option<&str>,
+    backfill_events: bool,
+    dry_run: bool,
 ) -> Result<()> {
+    if backfill_events {
+        let run = || {
+            let store = if dry_run {
+                Store::open_event_preview_at(&Store::default_db_path()?)?
+            } else {
+                Store::open()?
+            };
+            let labels = adapters::source_labels();
+            let sources = resolve_source_filter(source_filter, &labels)?;
+            let scope = store.resolve_scope(project_filter, None)?.announce();
+            let available = adapters::all_adapters();
+            let mut job = SyncJob::new(
+                SyncRunOptions {
+                    force,
+                    verbose,
+                    emit: true,
+                    usage_only: true,
+                    backfill_events: true,
+                    sources,
+                    scope,
+                },
+                store,
+                AppConfig::load()?,
+                &available,
+            )?;
+            job.event_backfill = Some(EventBackfillReport { dry_run, ..Default::default() });
+            job.run_with(&available, None)
+        };
+        return if dry_run { run() } else { run_with_sync_lock(run) };
+    }
     run_with_sync_lock(|| {
         let labels = adapters::source_labels();
         let sources = resolve_source_filter(source_filter, &labels)?;
@@ -178,6 +210,21 @@ impl SyncStats {
     }
 }
 
+#[derive(Default)]
+struct EventBackfillReport {
+    dry_run: bool,
+    scanned: u32,
+    missing_original: u32,
+    unknown_original: u32,
+    unstable: u32,
+    no_events: u32,
+    unsupported_sessions: u32,
+    failed_writes: u32,
+    disabled: Vec<String>,
+    unsupported_sources: Vec<String>,
+    unavailable: Vec<String>,
+}
+
 struct ExistingState {
     meta: HashMap<String, IndexedSessionMeta>,
     paths: HashMap<String, SessionPath>,
@@ -268,6 +315,7 @@ fn run_sync_job_with(
 
 struct SyncJob {
     store: Store,
+    event_backfill: Option<EventBackfillReport>,
     options: SyncRunOptions,
     config: AppConfig,
     labels: Vec<(String, String)>,
@@ -296,6 +344,7 @@ impl SyncJob {
         let path_excluder = config.build_path_excluder()?;
         let mut job = Self {
             store,
+            event_backfill: None,
             options,
             config,
             labels,
@@ -350,6 +399,9 @@ impl SyncJob {
         adapter: &dyn adapters::SourceAdapter,
         on_source: &mut Option<&mut dyn FnMut(&str)>,
     ) -> Result<()> {
+        if self.event_backfill.is_some() {
+            return self.sync_event_backfill_adapter(adapter);
+        }
         let source_id = adapter.id();
         let label = adapter.label();
 
@@ -428,6 +480,107 @@ impl SyncJob {
         });
 
         info!("{label} done");
+        Ok(())
+    }
+
+    fn sync_event_backfill_adapter(&mut self, adapter: &dyn adapters::SourceAdapter) -> Result<()> {
+        let source = adapter.id();
+        if self
+            .options
+            .sources
+            .as_ref()
+            .is_some_and(|sources| !sources.iter().any(|id| id == source))
+        {
+            return Ok(());
+        }
+        if !self.config.is_source_enabled(source) {
+            self.event_backfill.as_mut().unwrap().disabled.push(source.to_string());
+            return Ok(());
+        }
+        if !adapters::source_supports_event_backfill(source) {
+            self.event_backfill.as_mut().unwrap().unsupported_sources.push(source.to_string());
+            return Ok(());
+        }
+        let context = self.load_adapter_sync_context(source)?;
+        let paths = context
+            .session_paths()
+            .filter(|path| {
+                let repo = self.repo_cache.resolve(path.directory.as_deref());
+                self.options.scope.matches(SessionScopeFields {
+                    directory: path.directory.as_deref(),
+                    repo_remote: path
+                        .repo_remote
+                        .as_deref()
+                        .or_else(|| repo.as_ref().map(|repo| repo.remote.as_str())),
+                    repo_slug: path
+                        .repo_slug
+                        .as_deref()
+                        .or_else(|| repo.as_ref().map(|repo| repo.slug.as_str())),
+                    repo_name: path
+                        .repo_name
+                        .as_deref()
+                        .or_else(|| repo.as_ref().map(|repo| repo.name.as_str())),
+                }) && !self.path_excluder.as_ref().is_some_and(|matcher| {
+                    paths_match_excluded(
+                        path.directory.as_deref(),
+                        path.source_file_path.as_deref(),
+                        matcher,
+                    )
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let scan = self.scan_sessions(adapter, adapter.label(), &context)?;
+        let Some(scan) = scan else {
+            self.event_backfill.as_mut().unwrap().unavailable.push(source.to_string());
+            self.event_backfill.as_mut().unwrap().unknown_original += paths.len() as u32;
+            return Ok(());
+        };
+        let observed = scan
+            .scan
+            .sessions
+            .iter()
+            .map(|raw| raw.source_id.as_str())
+            .chain(scan.scan.observations.iter().map(|observation| observation.source_id.as_str()))
+            .collect::<HashSet<_>>();
+        for path in &paths {
+            if observed.contains(path.source_id.as_str()) {
+                continue;
+            }
+            let missing_record = matches!(&scan.reconcile, Some(adapters::ReconcilePlan::CompleteLiveSet(live)) if !live.contains(&path.source_id));
+            let missing_path = path
+                .source_file_path
+                .as_deref()
+                .is_some_and(|path| matches!(std::path::Path::new(path).try_exists(), Ok(false)));
+            if missing_record || missing_path {
+                self.event_backfill.as_mut().unwrap().missing_original += 1;
+            } else {
+                self.event_backfill.as_mut().unwrap().unknown_original += 1;
+            }
+        }
+        let report = self.event_backfill.as_mut().unwrap();
+        report.scanned += scan.scan.stats.parsed;
+        report.unstable += scan.scan.stats.unstable_sessions;
+        if matches!(
+            scan.reconcile,
+            Some(
+                adapters::ReconcilePlan::PartialInventory(_)
+                    | adapters::ReconcilePlan::UnavailableInventory(_)
+            )
+        ) {
+            report.unavailable.push(source.to_string());
+        }
+        let mut existing = self.prepare_existing_state(source, context)?;
+        for raw in scan.scan.sessions {
+            if let Err(error) =
+                self.process_raw_session(source, raw, &mut existing, &mut HashSet::new())
+            {
+                self.event_backfill.as_mut().unwrap().failed_writes += 1;
+                if self.options.emit {
+                    eprintln!("Event backfill failed for {source}: {error}");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -633,10 +786,8 @@ impl SyncJob {
             event_state: event_meta,
             metadata_state: metadata_meta,
         } = context.into_parts();
-        // Backfilling identity for every session of a source is global
-        // maintenance; a scoped run only writes identity for the sessions it
-        // actually processes.
-        let backfill_identity = matches!(self.options.scope, ProjectScope::Global);
+        let backfill_identity =
+            self.event_backfill.is_none() && matches!(self.options.scope, ProjectScope::Global);
         for path in paths.values_mut() {
             if backfill_identity
                 && path.directory.is_some()
@@ -659,7 +810,7 @@ impl SyncJob {
     fn process_raw_session(
         &mut self,
         source_id: &str,
-        raw: adapters::RawSession,
+        mut raw: adapters::RawSession,
         existing: &mut ExistingState,
         purged_excluded_ids: &mut HashSet<String>,
     ) -> Result<()> {
@@ -684,7 +835,7 @@ impl SyncJob {
                 matcher,
             )
         {
-            if existing.remove(&raw_source_id) {
+            if self.event_backfill.is_none() && existing.remove(&raw_source_id) {
                 self.store.delete_session_data(source_id, &raw_source_id)?;
             }
             if purged_excluded_ids.insert(raw_source_id) {
@@ -693,9 +844,8 @@ impl SyncJob {
             return Ok(());
         }
 
-        // Path evidence drives exclusions, so backfill it after scope/exclusion
-        // checks even when content falls outside the configured sync window.
-        if let Some(source_file_path) = raw.source_file_path.as_deref()
+        if self.event_backfill.is_none()
+            && let Some(source_file_path) = raw.source_file_path.as_deref()
             && let Some(stored) = existing.paths.get_mut(&raw_source_id)
             && stored.source_file_path.as_deref() != Some(source_file_path)
         {
@@ -714,6 +864,51 @@ impl SyncJob {
             let ts = raw.updated_at.unwrap_or(raw.started_at);
             if ts < cutoff {
                 self.stats.filtered_out += 1;
+                return Ok(());
+            }
+        }
+
+        for event in &mut raw.events {
+            for file in &mut event.files {
+                file.target = self.repo_cache.resolve_file(&file.path, file.cwd.as_deref());
+            }
+        }
+
+        if let Some(report) = &mut self.event_backfill {
+            let Some(version) = raw.event_parser_version else {
+                report.unsupported_sessions += 1;
+                return Ok(());
+            };
+            if raw.events.is_empty() {
+                report.no_events += 1;
+                return Ok(());
+            }
+            if existing.meta.contains_key(&raw_source_id) {
+                if !self.options.force
+                    && crate::adapters::sync_state::event_state_is_current(
+                        version,
+                        existing.event_meta.get(&raw_source_id).copied(),
+                        raw.updated_at,
+                    )
+                {
+                    self.stats.skipped += 1;
+                    return Ok(());
+                }
+                if report.dry_run {
+                    self.stats.reprocessed_sessions += 1;
+                    return Ok(());
+                }
+                return self.apply_backfill(
+                    source_id,
+                    &raw_source_id,
+                    &mut raw,
+                    BackfillPlan { usage: false, events: true, metadata: false },
+                    false,
+                    existing,
+                );
+            }
+            if report.dry_run {
+                self.stats.new_sessions += 1;
                 return Ok(());
             }
         }
@@ -785,7 +980,7 @@ impl SyncJob {
                         self.apply_backfill(
                             source_id,
                             &raw_source_id,
-                            &raw,
+                            &mut raw,
                             plan,
                             was_imported,
                             existing,
@@ -886,11 +1081,39 @@ impl SyncJob {
         &mut self,
         source_id: &str,
         raw_source_id: &str,
-        raw: &adapters::RawSession,
+        raw: &mut adapters::RawSession,
         plan: BackfillPlan,
         was_imported: bool,
         existing: &mut ExistingState,
     ) -> Result<()> {
+        if (plan.usage && raw.usage_events.iter().any(|event| event.message_seq.is_some()))
+            || (plan.events && raw.events.iter().any(|event| event.message_seq.is_some()))
+        {
+            let stored = existing
+                .meta
+                .get(raw_source_id)
+                .map(|session| self.store.get_messages(&session.id))
+                .transpose()?;
+            let same_messages = stored.as_ref().is_some_and(|stored| {
+                stored.len() == raw.messages.len()
+                    && stored.iter().zip(&raw.messages).enumerate().all(
+                        |(index, (stored, parsed))| {
+                            stored.seq == index as u32
+                                && stored.role == parsed.role
+                                && stored.content == parsed.content
+                                && stored.timestamp == parsed.timestamp
+                        },
+                    )
+            });
+            if !same_messages {
+                for event in &mut raw.events {
+                    event.message_seq = None;
+                }
+                for event in &mut raw.usage_events {
+                    event.message_seq = None;
+                }
+            }
+        }
         let mut reprocessed = false;
         if plan.usage
             && let Some(parser_version) = raw.usage_parser_version
@@ -944,7 +1167,11 @@ impl SyncJob {
                 reprocessed = true;
             }
         }
-        if raw.custom_title.is_some() || raw.summary.is_some() || raw.duration_minutes.is_some() {
+        if self.event_backfill.is_none()
+            && (raw.custom_title.is_some()
+                || raw.summary.is_some()
+                || raw.duration_minutes.is_some())
+        {
             self.store.update_session_fields(
                 source_id,
                 raw_source_id,
@@ -1003,6 +1230,42 @@ impl SyncJob {
     }
 
     fn report_progress(&self) -> Result<()> {
+        if let Some(report) = &self.event_backfill {
+            if self.options.emit {
+                println!(
+                    "Event backfill {}: scanned={}, new={}, updated={}, unchanged={}, excluded={}, out_of_scope={}, no_events={}, unsupported_sessions={}, missing_original={}, unknown_original={}, unstable={}, failed_writes={}, parse_failures=unknown",
+                    if report.dry_run { "preview" } else { "finished" },
+                    report.scanned,
+                    self.stats.new_sessions,
+                    self.stats.reprocessed_sessions,
+                    self.stats.skipped,
+                    self.stats.excluded_out,
+                    self.stats.out_of_scope,
+                    report.no_events,
+                    report.unsupported_sessions,
+                    report.missing_original,
+                    report.unknown_original,
+                    report.unstable,
+                    report.failed_writes
+                );
+                for (label, sources) in [
+                    ("disabled", &report.disabled),
+                    ("unsupported", &report.unsupported_sources),
+                    ("unavailable", &report.unavailable),
+                ] {
+                    if !sources.is_empty() {
+                        println!("{label}: {}", sources.join(", "));
+                    }
+                }
+            }
+            anyhow::ensure!(
+                report.failed_writes == 0,
+                "event backfill could not persist {} sessions",
+                report.failed_writes
+            );
+            return Ok(());
+        }
+
         let SyncStats {
             new_sessions,
             updated_sessions,
@@ -1365,9 +1628,13 @@ mod tests {
                     stat_target: path.clone(),
                     directory: None,
                 };
-                let scan = file_scan::run_file_scan(context, since_ts, vec![entry], |_, _| {
-                    anyhow::bail!("injected parse failure")
-                })?;
+                let scan = file_scan::run_file_scan_with_options(
+                    context,
+                    since_ts,
+                    Default::default(),
+                    vec![entry],
+                    |_, _| anyhow::bail!("injected parse failure"),
+                )?;
                 return Ok(Some(SyncScanOutput { scan, reconcile: None }));
             }
             Ok(Some(SyncScanOutput {
@@ -1516,6 +1783,329 @@ mod tests {
                 metadata: false
             })
         );
+        for (old_texts, expected_anchor) in [
+            (vec!["question", "tool payload", "answer"], None),
+            (vec!["question", "different answer"], None),
+            (vec!["question", "answer"], Some(1)),
+        ] {
+            for backfill_events in [false, true] {
+                let mut job = global_job(&[]);
+                job.options.usage_only = true;
+                job.options.backfill_events = backfill_events;
+                let mut old = session("anchor-test", "test", "raw1");
+                old.message_count = old_texts.len() as u32;
+                job.store.insert_session(&old).unwrap();
+                job.store
+                    .insert_messages(
+                        &old_texts
+                            .iter()
+                            .enumerate()
+                            .map(|(index, text)| Message {
+                                session_id: old.id.clone(),
+                                role: if index == 0 { Role::User } else { Role::Assistant },
+                                content: text.to_string(),
+                                timestamp: Some(1),
+                                seq: index as u32,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                let make_raw = || {
+                    let event = crate::adapters::events::tool_call_event(
+                        crate::adapters::events::EventContext {
+                            event_seq: 0,
+                            timestamp: Some(1),
+                            source_path: Some("native.jsonl".to_string()),
+                            source_event_id: Some("native-record".to_string()),
+                            message_seq: Some(1),
+                            parser_version: 2,
+                        },
+                        "Edit".to_string(),
+                        Some(&serde_json::json!({"file_path": "a.rs"})),
+                    );
+                    let usage = crate::types::RawUsageEvent {
+                        event_key: "usage-1".to_string(),
+                        event_seq: 0,
+                        message_seq: Some(1),
+                        timestamp: 1,
+                        model: "model".to_string(),
+                        provider: "provider".to_string(),
+                        input_tokens: 10,
+                        output_tokens: 2,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        reasoning_tokens: 0,
+                        token_source: crate::types::TokenSource::Observed,
+                        parser_version: 2,
+                        source_path: Some("native.jsonl".to_string()),
+                        raw_usage_json: None,
+                    };
+                    let mut raw = RawSession::search_only(
+                        "raw1",
+                        None,
+                        0,
+                        Some(1),
+                        None,
+                        vec![
+                            RawMessage {
+                                role: Role::User,
+                                content: "question".to_string(),
+                                timestamp: Some(1),
+                            },
+                            RawMessage {
+                                role: Role::Assistant,
+                                content: "answer".to_string(),
+                                timestamp: Some(1),
+                            },
+                        ],
+                    )
+                    .with_usage(vec![usage], 2)
+                    .with_events(vec![event], 2);
+                    raw.metadata_parser_version = Some(1);
+                    raw.refresh_session_on_metadata_backfill = true;
+                    raw
+                };
+                let context = job.load_adapter_sync_context("test").unwrap();
+                let mut existing = job.prepare_existing_state("test", context).unwrap();
+                job.process_raw_session("test", make_raw(), &mut existing, &mut HashSet::new())
+                    .unwrap();
+                assert_eq!(
+                    job.store
+                        .get_messages(&old.id)
+                        .unwrap()
+                        .iter()
+                        .map(|message| message.content.as_str())
+                        .collect::<Vec<_>>(),
+                    old_texts
+                );
+                assert_eq!(
+                    job.store.list_usage_events_for_session(&old.id).unwrap()[0].message_seq,
+                    expected_anchor
+                );
+                let events = job.store.list_session_events_for_session(&old.id).unwrap();
+                if backfill_events {
+                    assert_eq!(events[0].message_seq, expected_anchor);
+                    assert_eq!(events[0].source_event_id.as_deref(), Some("native-record"));
+                } else {
+                    assert!(events.is_empty());
+                }
+                job.options.usage_only = false;
+                job.process_raw_session("test", make_raw(), &mut existing, &mut HashSet::new())
+                    .unwrap();
+                assert_eq!(
+                    job.store
+                        .get_messages(&old.id)
+                        .unwrap()
+                        .iter()
+                        .map(|message| message.content.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["question", "answer"]
+                );
+                assert_eq!(
+                    job.store.list_session_events_for_session(&old.id).unwrap()[0].message_seq,
+                    Some(1)
+                );
+                assert_eq!(
+                    job.store.list_usage_events_for_session(&old.id).unwrap()[0].message_seq,
+                    Some(1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn event_maintenance_preserves_discussions_and_is_resumable() {
+        struct HistoryAdapter;
+        impl SourceAdapter for HistoryAdapter {
+            fn id(&self) -> &str {
+                "claude-code"
+            }
+            fn label(&self) -> &str {
+                "Claude Code"
+            }
+            fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
+                Ok(["existing", "new", "excluded"]
+                    .into_iter()
+                    .map(|id| {
+                        let mut raw = RawSession::search_only(
+                            id,
+                            Some(format!("/work/{id}")),
+                            0,
+                            Some(1),
+                            None,
+                            vec![RawMessage {
+                                role: Role::User,
+                                content: "native discussion".to_string(),
+                                timestamp: Some(1),
+                            }],
+                        );
+                        raw.custom_title = Some("native title".to_string());
+                        raw.thread_role = Some(crate::types::ThreadRole::Subagent);
+                        raw.parent_links = vec![crate::types::ParentLink {
+                            relation: crate::types::ParentRelation::Spawn,
+                            source: "claude-code".into(),
+                            source_id: "parent".into(),
+                        }];
+                        raw.metadata_parser_version = Some(1);
+                        raw.source_file_path = Some(format!("/native/{id}"));
+                        raw.with_events(
+                            vec![crate::adapters::events::tool_call_event(
+                                crate::adapters::events::EventContext {
+                                    event_seq: 0,
+                                    timestamp: Some(1),
+                                    source_path: Some(format!("/native/{id}")),
+                                    source_event_id: Some("record".to_string()),
+                                    message_seq: Some(0),
+                                    parser_version: 2,
+                                },
+                                "Edit".to_string(),
+                                Some(&serde_json::json!({"file_path":"a.rs"})),
+                            )],
+                            2,
+                        )
+                    })
+                    .collect())
+            }
+            fn scan_for_sync_output(
+                &self,
+                _: &AdapterSyncContext,
+                since: Option<i64>,
+                include_events: bool,
+                _: bool,
+            ) -> anyhow::Result<Option<SyncScanOutput>> {
+                assert_eq!(since, None);
+                assert!(include_events);
+                let sessions = self.scan()?;
+                Ok(Some(SyncScanOutput {
+                    reconcile: Some(ReconcilePlan::CompleteLiveSet(
+                        sessions.iter().map(|raw| raw.source_id.clone()).collect(),
+                    )),
+                    scan: SyncScanResult {
+                        sessions,
+                        stats: crate::adapters::SyncScanStats { parsed: 3, ..Default::default() },
+                        observations: Vec::new(),
+                    },
+                }))
+            }
+            fn resume_command(&self, _: &str) -> Option<ResumeCommand> {
+                None
+            }
+        }
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(HistoryAdapter)];
+        let mut job = global_job(&adapters);
+        job.options.usage_only = true;
+        job.options.backfill_events = true;
+        job.since_ts = None;
+        job.path_excluder = Some(matcher("/work/excluded"));
+        for id in ["existing", "missing", "excluded"] {
+            let mut old = session(id, "claude-code", id);
+            old.directory = Some(format!("/work/{id}"));
+            old.source_file_path = Some(format!("/old/{id}"));
+            old.is_import = true;
+            old.message_count = 1;
+            job.store.insert_session(&old).unwrap();
+            job.store
+                .insert_messages(&[Message {
+                    session_id: id.to_string(),
+                    role: Role::User,
+                    content: "stored discussion".to_string(),
+                    timestamp: Some(1),
+                    seq: 0,
+                }])
+                .unwrap();
+        }
+        let usage = crate::types::RawUsageEvent {
+            event_key: "usage".to_string(),
+            event_seq: 0,
+            message_seq: Some(0),
+            timestamp: 1,
+            model: "model".to_string(),
+            provider: "provider".to_string(),
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            token_source: crate::types::TokenSource::Observed,
+            parser_version: 1,
+            source_path: None,
+            raw_usage_json: None,
+        };
+        job.store
+            .persist_usage_events_for_existing_session(
+                "claude-code",
+                "existing",
+                &[usage],
+                1,
+                Some(1),
+            )
+            .unwrap();
+        job.event_backfill =
+            Some(super::EventBackfillReport { dry_run: true, ..Default::default() });
+        job.run_with(&adapters, None).unwrap();
+        assert_eq!(
+            (job.stats.new_sessions, job.stats.reprocessed_sessions, job.stats.excluded_out),
+            (1, 1, 1)
+        );
+        assert_eq!(job.event_backfill.as_ref().unwrap().missing_original, 1);
+        assert!(job.store.list_session_events_for_session("existing").unwrap().is_empty());
+        assert!(!job.store.session_meta_map("claude-code").unwrap().contains_key("new"));
+        job.stats = Default::default();
+        job.event_backfill = Some(super::EventBackfillReport::default());
+        job.run_with(&adapters, None).unwrap();
+        assert_eq!(
+            (job.stats.new_sessions, job.stats.reprocessed_sessions, job.stats.excluded_out),
+            (1, 1, 1)
+        );
+        for id in ["existing", "missing", "excluded"] {
+            let stored = job.store.get_session_by_id(id).unwrap().unwrap();
+            assert!(stored.is_import);
+            assert_eq!(stored.title, "t");
+            assert_eq!(stored.source_file_path.as_deref(), Some(format!("/old/{id}").as_str()));
+            assert_eq!(job.store.get_messages(id).unwrap()[0].content, "stored discussion");
+        }
+        let events = job.store.list_session_events_for_session("existing").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].message_seq, None);
+        assert_eq!(
+            job.store.list_usage_events_for_session("existing").unwrap()[0].input_tokens,
+            10
+        );
+        let new_id = job.store.session_meta_map("claude-code").unwrap()["new"].id.clone();
+        assert_eq!(job.store.get_messages(&new_id).unwrap()[0].content, "native discussion");
+        assert_eq!(
+            job.store.list_session_events_for_session(&new_id).unwrap()[0].message_seq,
+            Some(0)
+        );
+        assert!(job.store.list_usage_events_for_session(&new_id).unwrap().is_empty());
+        let (embedding_id, status): (String, String) = job
+            .store
+            .conn
+            .query_row("SELECT session_id, status FROM session_embedding_state", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(embedding_id, new_id);
+        assert_eq!(status, "pending");
+        let role: String = job
+            .store
+            .conn
+            .query_row("SELECT thread_role FROM sessions WHERE id = ?1", [&new_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(role, "subagent");
+        let links = job.store.session_topology(&new_id).unwrap();
+        assert_eq!(links.parents.len(), 1);
+        assert_eq!(links.parents[0].source_id, "parent");
+        job.stats = Default::default();
+        job.event_backfill = Some(super::EventBackfillReport::default());
+        job.run_with(&adapters, None).unwrap();
+        assert_eq!(
+            (job.stats.new_sessions, job.stats.reprocessed_sessions, job.stats.skipped),
+            (0, 0, 2)
+        );
+        assert_eq!(job.store.list_session_events_for_session("existing").unwrap().len(), 1);
     }
 
     #[test]

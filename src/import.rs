@@ -129,6 +129,10 @@ struct ImportUsageEvent {
 
 #[derive(Deserialize)]
 struct ImportEvent {
+    #[serde(default)]
+    command_evidence_status: Option<crate::types::CommandEvidenceStatus>,
+    #[serde(default)]
+    files: Vec<crate::types::FileEvidence>,
     event_seq: u32,
     #[serde(default)]
     timestamp: Option<i64>,
@@ -180,7 +184,7 @@ pub(crate) fn import_jsonl<R: BufRead>(
         if record.record_type != RECORD_TYPE {
             bail!("line {line_no}: unsupported record_type '{}'", record.record_type);
         }
-        if !matches!(record.schema_version, 2..=6) {
+        if !matches!(record.schema_version, 2..=7) {
             bail!("line {line_no}: unsupported schema_version {}", record.schema_version);
         }
 
@@ -278,6 +282,8 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
         .events
         .into_iter()
         .map(|e| RawSessionEvent {
+            command_evidence_status: e.command_evidence_status,
+            files: e.files,
             event_seq: e.event_seq,
             timestamp: e.timestamp,
             kind: e.kind,
@@ -403,15 +409,37 @@ mod tests {
 
     fn full_event() -> RawSessionEvent {
         RawSessionEvent {
+            command_evidence_status: Some(crate::types::CommandEvidenceStatus::Unsupported),
+            files: vec![
+                crate::types::FileEvidence {
+                    path: "src/alpha.rs".into(),
+                    operation: crate::types::FileOperation::Write,
+                    kind: crate::types::FileEvidenceKind::Call,
+                    cwd: Some("/workspace/project".into()),
+                    target: Some(crate::types::FileTarget {
+                        absolute_path: "/workspace/project/src/alpha.rs".into(),
+                        repo_root: Some("/workspace/project".into()),
+                        repo_relative_path: Some("src/alpha.rs".into()),
+                        repo_remote: Some("github.com/fixture/project".into()),
+                    }),
+                },
+                crate::types::FileEvidence {
+                    path: "src/β.rs".into(),
+                    operation: crate::types::FileOperation::Delete,
+                    kind: crate::types::FileEvidenceKind::Call,
+                    cwd: None,
+                    target: None,
+                },
+            ],
             event_seq: 0,
             timestamp: Some(1_200),
-            kind: "tool".to_string(),
+            kind: "file_write".to_string(),
             actor: "assistant".to_string(),
-            name: Some("Shell".to_string()),
+            name: Some("apply_patch".to_string()),
             status: Some("ok".to_string()),
-            target: Some("ls".to_string()),
+            target: Some("src/alpha.rs".to_string()),
             message_seq: Some(0),
-            summary: Some("ran ls".to_string()),
+            summary: Some("updated alpha and removed beta".to_string()),
             source_path: Some("/home/origin/raw.jsonl".to_string()),
             source_event_id: Some("ev-1".to_string()),
             tool_call_id: Some("call-1".to_string()),
@@ -489,9 +517,71 @@ mod tests {
         let reexported = export_all(&b);
         let mut orig: serde_json::Value = serde_json::from_str(exported.trim()).unwrap();
         let mut copy: serde_json::Value = serde_json::from_str(reexported.trim()).unwrap();
+        assert_eq!(orig["events"][0]["command_evidence_status"], "unsupported");
         orig["session"]["id"] = serde_json::Value::Null;
         copy["session"]["id"] = serde_json::Value::Null;
         assert_eq!(orig, copy, "export -> import -> export must be lossless");
+        let mut legacy: serde_json::Value = serde_json::from_str(exported.trim()).unwrap();
+        legacy["events"][0].as_object_mut().unwrap().remove("command_evidence_status");
+        let legacy_store = setup();
+        import_jsonl(&legacy_store, false, legacy.to_string().as_bytes()).unwrap();
+        let restored: serde_json::Value =
+            serde_json::from_str(export_all(&legacy_store).trim()).unwrap();
+        assert_eq!(restored["events"][0]["command_evidence_status"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn event_replacement_preserves_files_on_failure_and_removes_old_associations() {
+        let store = setup();
+        persist_full(&store, "codex", "src-1", "Files");
+        let before = export_all(&store);
+        let first_id: i64 =
+            store.conn.query_row("SELECT id FROM session_events", [], |row| row.get(0)).unwrap();
+        let mut invalid_replacement = full_event();
+        invalid_replacement.command_evidence_status =
+            Some(crate::types::CommandEvidenceStatus::Complete);
+        assert!(
+            store
+                .persist_session_events_for_existing_session(
+                    "codex",
+                    "src-1",
+                    &[invalid_replacement.clone(), invalid_replacement],
+                    6,
+                    None,
+                )
+                .is_err()
+        );
+        assert_eq!(export_all(&store), before);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 2);
+        let mut replacement = full_event();
+        replacement.files.remove(0);
+        replacement.command_evidence_status =
+            Some(crate::types::CommandEvidenceStatus::LimitExceeded);
+        store
+            .persist_session_events_for_existing_session(
+                "codex",
+                "src-1",
+                &[replacement.clone()],
+                6,
+                None,
+            )
+            .unwrap();
+        let next_id: i64 =
+            store.conn.query_row("SELECT id FROM session_events", [], |row| row.get(0)).unwrap();
+        assert!(next_id > first_id);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 1);
+        let session_id: String =
+            store.conn.query_row("SELECT id FROM sessions", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            store.list_session_events_for_session(&session_id).unwrap()[0].files,
+            replacement.files
+        );
+        assert_eq!(
+            store.list_session_events_for_session(&session_id).unwrap()[0].command_evidence_status,
+            replacement.command_evidence_status
+        );
+        store.conn.execute("DELETE FROM sessions", []).unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 0);
     }
 
     #[test]
@@ -656,6 +746,7 @@ mod tests {
 
         let session = store.get_session_by_source_id("claude-code", "v5-1").unwrap().unwrap();
         let events = store.list_session_events_for_session(&session.id).unwrap();
+        assert_eq!(events[0].command_evidence_status, None);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source_event_id.as_deref(), Some("2:0"));
         assert_eq!(events[0].tool_call_id, None);

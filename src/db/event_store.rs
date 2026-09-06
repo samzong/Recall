@@ -5,7 +5,9 @@ use chrono::Utc;
 use rusqlite::OptionalExtension;
 
 use super::store::{EventSessionStateMeta, Store};
-use crate::types::{EvidenceVisibility, RawSessionEvent, SessionEventRecord};
+use crate::types::{
+    CommandEvidenceStatus, EvidenceVisibility, RawSessionEvent, SessionEventRecord,
+};
 
 impl Store {
     pub(crate) fn event_state_meta_map(
@@ -70,16 +72,47 @@ impl Store {
         &self,
         session_id: &str,
     ) -> Result<Vec<SessionEventRecord>> {
-        let mut stmt = self.conn.prepare(
+        let has_files: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'event_files')",
+            [], |row| row.get(0),
+        )?;
+        let files_sql = if has_files {
+            "(SELECT json_group_array(json(evidence_json)) FROM
+                (SELECT evidence_json FROM event_files
+                 WHERE event_id = session_events.id ORDER BY position))"
+        } else {
+            "'[]'"
+        };
+        let has_command_status: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_events')
+                           WHERE name = 'command_evidence_status')",
+            [],
+            |row| row.get(0),
+        )?;
+        let command_status_sql =
+            if has_command_status { "command_evidence_status" } else { "NULL" };
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT event_seq, timestamp, kind, actor, name, status, target,
                     message_seq, summary, source_path, source_event_id, tool_call_id,
-                    is_meta, visibility, attrs_json, parser_version
+                    is_meta, visibility, attrs_json, parser_version,
+                    {files_sql}, {command_status_sql}
              FROM session_events
              WHERE session_id = ?1
              ORDER BY event_seq ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map(rusqlite::params![session_id], |row| {
             Ok(SessionEventRecord {
+                command_evidence_status: row
+                    .get::<_, Option<String>>(17)?
+                    .as_deref()
+                    .and_then(CommandEvidenceStatus::parse),
+                files: serde_json::from_str(&row.get::<_, String>(16)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        16,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
                 event_seq: row.get(0)?,
                 timestamp: row.get(1)?,
                 kind: row.get(2)?,
@@ -122,12 +155,15 @@ pub(crate) fn replace_session_events(
             session_id, source, source_id, event_seq, timestamp,
             kind, actor, name, status, target, message_seq, summary,
             source_path, source_event_id, tool_call_id, is_meta, visibility,
-            attrs_json, parser_version, created_at
+            attrs_json, parser_version, created_at, command_evidence_status
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
          )",
+    )?;
+    let mut file_stmt = tx.prepare(
+        "INSERT INTO event_files(event_id, position, path, evidence_json) VALUES (?1, ?2, ?3, ?4)",
     )?;
     for event in session_events {
         stmt.execute(rusqlite::params![
@@ -151,7 +187,18 @@ pub(crate) fn replace_session_events(
             event.attrs_json,
             event.parser_version,
             created_at,
+            event.command_evidence_status.map(CommandEvidenceStatus::as_str),
         ])?;
+        let event_id = tx.last_insert_rowid();
+        for (position, file) in event.files.iter().enumerate() {
+            anyhow::ensure!(!file.path.trim().is_empty(), "file evidence requires a path");
+            file_stmt.execute(rusqlite::params![
+                event_id,
+                position as i64,
+                file.path,
+                serde_json::to_string(file)?,
+            ])?;
+        }
     }
 
     if let Some(parser_version) = event_parser_version {
@@ -180,4 +227,23 @@ pub(crate) fn replace_session_events(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EventReference {
+    pub(crate) version: u8,
+    pub(crate) index_id: String,
+    pub(crate) event_id: i64,
+}
+
+pub(crate) fn event_reference(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: i64,
+) -> Result<EventReference> {
+    let index_id = tx.query_row(
+        "SELECT h.index_id FROM file_history_state h JOIN session_events e ON e.id = ?1 WHERE h.id = 1",
+        [event_id],
+        |row| row.get(0),
+    )?;
+    Ok(EventReference { version: 1, index_id, event_id })
 }

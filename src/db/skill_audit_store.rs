@@ -15,7 +15,7 @@ impl Store {
                     e.name, e.target, e.attrs_json
              FROM session_events e
              JOIN sessions s ON s.id = e.session_id
-             WHERE (LOWER(e.name) IN ('skill', 'use_skill') OR e.target LIKE '%/skills/%/SKILL.md%'
+             WHERE e.kind != 'tool_result' AND (LOWER(e.name) IN ('skill', 'use_skill') OR e.target LIKE '%/skills/%/SKILL.md%'
                     OR e.target LIKE '%/skills/%/references/%')",
         );
 

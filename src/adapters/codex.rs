@@ -19,12 +19,15 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
 };
-use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
+use crate::types::{
+    FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation, RawSessionEvent,
+    RawUsageEvent, Role, ThreadRole,
+};
 
 pub(crate) struct CodexAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 6;
-const EVENT_PARSER_VERSION: u32 = 4;
+const EVENT_PARSER_VERSION: u32 = 6;
 const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for CodexAdapter {
@@ -444,6 +447,7 @@ pub(crate) fn parse_codex_session_with_options(
     let fallback_timestamp = file_scan::stat_mtime_ms(path).unwrap_or(0);
     let mut meta_id: Option<String> = None;
     let mut meta_cwd: Option<String> = None;
+    let mut event_cwd: Option<String> = None;
     let mut meta_timestamp: Option<i64> = None;
     let mut meta_topologies: Vec<CodexMetaTopology> = Vec::new();
     let mut messages = Vec::new();
@@ -502,6 +506,7 @@ pub(crate) fn parse_codex_session_with_options(
                 if let Some(payload) = payload {
                     meta_id = payload.get("id").and_then(|s| s.as_str()).map(String::from);
                     meta_cwd = payload.get("cwd").and_then(|s| s.as_str()).map(String::from);
+                    event_cwd.clone_from(&meta_cwd);
                     provider = payload
                         .get("model_provider")
                         .and_then(|s| s.as_str())
@@ -530,6 +535,11 @@ pub(crate) fn parse_codex_session_with_options(
                 }
             }
             "turn_context" => {
+                if let Some(cwd) =
+                    payload.and_then(|value| value.get("cwd")).and_then(Value::as_str)
+                {
+                    event_cwd = Some(cwd.into());
+                }
                 if let Some(payload) = payload
                     && let Some(model) = extract_codex_model(payload)
                 {
@@ -544,6 +554,21 @@ pub(crate) fn parse_codex_session_with_options(
             "event_msg" => {
                 if let Some(payload) = payload {
                     match payload_type {
+                        "item_completed" if include_events => {
+                            collect_codex_file_change(
+                                payload,
+                                events::EventContext {
+                                    event_seq: events.len() as u32,
+                                    timestamp: parse_timestamp(&v),
+                                    source_path: Some(source_path.clone()),
+                                    source_event_id: Some(line_index.to_string()),
+                                    message_seq: last_visible_message_seq,
+                                    parser_version: EVENT_PARSER_VERSION,
+                                },
+                                event_cwd.as_deref(),
+                                &mut events,
+                            );
+                        }
                         "token_count" => {
                             if let Some(info) = payload.get("info") {
                                 let total_usage = info
@@ -639,11 +664,16 @@ pub(crate) fn parse_codex_session_with_options(
                         if include_events {
                             collect_codex_content_events(
                                 payload.get("content"),
-                                timestamp,
-                                &source_path,
-                                line_index,
-                                last_visible_message_seq,
+                                events::EventContext {
+                                    event_seq: events.len() as u32,
+                                    timestamp,
+                                    source_path: Some(source_path.clone()),
+                                    source_event_id: Some(line_index.to_string()),
+                                    message_seq: last_visible_message_seq,
+                                    parser_version: EVENT_PARSER_VERSION,
+                                },
                                 message_seq,
+                                event_cwd.as_deref(),
                                 &mut events,
                             );
                         }
@@ -664,10 +694,15 @@ pub(crate) fn parse_codex_session_with_options(
                     } else if include_events {
                         collect_codex_response_item_event(
                             payload,
-                            timestamp,
-                            &source_path,
-                            line_index,
-                            last_visible_message_seq,
+                            events::EventContext {
+                                event_seq: events.len() as u32,
+                                timestamp,
+                                source_path: Some(source_path.clone()),
+                                source_event_id: Some(line_index.to_string()),
+                                message_seq: last_visible_message_seq,
+                                parser_version: EVENT_PARSER_VERSION,
+                            },
+                            event_cwd.as_deref(),
                             &mut events,
                         );
                     }
@@ -723,95 +758,144 @@ pub(crate) fn parse_codex_session_with_options(
     }))
 }
 
-fn collect_codex_response_item_event(
+fn collect_codex_file_change(
     payload: &Value,
-    timestamp: Option<i64>,
-    source_path: &str,
-    line_index: usize,
-    message_seq: Option<u32>,
+    context: events::EventContext,
+    cwd: Option<&str>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
-    let Some(payload_type) = payload.get("type").and_then(|t| t.as_str()) else {
+    let Some(item) = payload
+        .get("item")
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("FileChange"))
+    else {
         return;
     };
-    let source_event_id = Some(line_index.to_string());
-    let tool_call_id = codex_tool_call_id(payload);
-
-    if payload_type.ends_with("_output") {
-        let mut event = events::tool_result_event(
-            events::EventContext {
-                event_seq: events_out.len() as u32,
-                timestamp,
-                source_path: Some(source_path.to_string()),
-                source_event_id,
-                message_seq,
-                parser_version: EVENT_PARSER_VERSION,
-            },
-            payload.get("name").and_then(|name| name.as_str()).map(String::from),
-            codex_output_summary(payload),
-        );
-        event.status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
-        event.tool_call_id = tool_call_id;
-        events_out.push(event);
-        return;
-    }
-
-    if payload_type.ends_with("_call") {
-        let name = codex_call_name(payload_type, payload);
-        let status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
-        if let Some(Value::String(text)) = codex_call_args(payload) {
-            let patch_targets = events::patch_file_targets(text);
-            if !patch_targets.is_empty() {
-                for target in patch_targets {
-                    let mut event = events::file_write_event(
-                        events::EventContext {
-                            event_seq: events_out.len() as u32,
-                            timestamp,
-                            source_path: Some(source_path.to_string()),
-                            source_event_id: source_event_id.clone(),
-                            message_seq,
-                            parser_version: EVENT_PARSER_VERSION,
-                        },
-                        name.clone(),
-                        target,
-                    );
-                    event.status = status.clone();
-                    event.tool_call_id = tool_call_id.clone();
-                    events_out.push(event);
-                }
-                return;
+    let mut event = events::tool_result_event(
+        context,
+        Some("FileChange".into()),
+        item.get("stdout").and_then(Value::as_str).map(str::to_string),
+    );
+    event.kind = "file_change".into();
+    event.status = item.get("status").and_then(Value::as_str).map(str::to_string);
+    event.attrs_json = Some(payload.to_string());
+    if let Some(changes) = item.get("changes").and_then(Value::as_object) {
+        for (path, change) in changes {
+            if path.trim().is_empty() {
+                continue;
+            }
+            let operation = match change.get("type").and_then(Value::as_str) {
+                Some("add" | "update") => FileOperation::Write,
+                Some("delete") => FileOperation::Delete,
+                _ => continue,
+            };
+            let destination = change
+                .get("move_path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty());
+            event.files.push(FileEvidence {
+                path: path.clone(),
+                operation: if destination.is_some() { FileOperation::MoveFrom } else { operation },
+                kind: FileEvidenceKind::Observation,
+                cwd: cwd.map(str::to_string),
+                target: None,
+            });
+            if let Some(path) = destination {
+                event.files.push(FileEvidence {
+                    path: path.into(),
+                    operation: FileOperation::MoveTo,
+                    kind: FileEvidenceKind::Observation,
+                    cwd: cwd.map(str::to_string),
+                    target: None,
+                });
             }
         }
-        let mut event = match codex_call_args(payload) {
-            Some(Value::String(text)) => events::tool_call_event_from_text(
-                events::EventContext {
-                    event_seq: events_out.len() as u32,
-                    timestamp,
-                    source_path: Some(source_path.to_string()),
-                    source_event_id: source_event_id.clone(),
-                    message_seq,
-                    parser_version: EVENT_PARSER_VERSION,
-                },
-                name,
-                Some(text),
-            ),
-            args => events::tool_call_event(
-                events::EventContext {
-                    event_seq: events_out.len() as u32,
-                    timestamp,
-                    source_path: Some(source_path.to_string()),
-                    source_event_id,
-                    message_seq,
-                    parser_version: EVENT_PARSER_VERSION,
-                },
-                name,
-                args,
-            ),
-        };
-        event.status = status;
-        event.tool_call_id = tool_call_id;
-        events_out.push(event);
     }
+    event.target = event.files.first().map(|file| file.path.clone());
+    events_out.push(event);
+}
+
+fn collect_codex_response_item_event(
+    payload: &Value,
+    context: events::EventContext,
+    cwd: Option<&str>,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let Some(payload_type) = payload.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let mut command_evidence_status = None;
+    let mut event = if payload_type.ends_with("_output") {
+        events::tool_result_event(
+            context,
+            payload.get("name").and_then(Value::as_str).map(String::from),
+            codex_output_summary(payload),
+        )
+    } else if payload_type.ends_with("_call") {
+        let name = codex_call_name(payload_type, payload);
+        let input = codex_call_args(payload);
+        let decoded =
+            input.and_then(Value::as_str).and_then(|text| serde_json::from_str::<Value>(text).ok());
+        let args = decoded.as_ref().or(input);
+        let effective_cwd = args
+            .and_then(|args| args.get("workdir").or_else(|| args.get("cwd")))
+            .and_then(Value::as_str)
+            .or(cwd);
+        let files = if matches!(
+            name.as_str(),
+            "exec" | "functions.exec" | "exec_command" | "functions.exec_command"
+        ) {
+            let (files, status) = events::command_file_evidence(&name, args, cwd);
+            command_evidence_status = Some(status);
+            files
+        } else if matches!(name.as_str(), "apply_patch" | "functions.apply_patch") {
+            args.and_then(Value::as_str).map(events::patch_file_evidence).unwrap_or_default()
+        } else {
+            let operation = match name.as_str() {
+                "read_file" => Some(FileOperation::Read),
+                "write_file" | "edit_file" => Some(FileOperation::Write),
+                _ => None,
+            };
+            operation
+                .zip(
+                    args.and_then(|args| args.get("path").or_else(|| args.get("file_path")))
+                        .and_then(Value::as_str),
+                )
+                .filter(|(_, path)| !path.trim().is_empty())
+                .map(|(operation, path)| {
+                    vec![FileEvidence {
+                        path: path.into(),
+                        operation,
+                        kind: FileEvidenceKind::Call,
+                        cwd: None,
+                        target: None,
+                    }]
+                })
+                .unwrap_or_default()
+        };
+        let mut event = if matches!(name.as_str(), "apply_patch" | "functions.apply_patch")
+            && !files.is_empty()
+        {
+            events::file_write_event(context, name, files[0].path.clone())
+        } else if let Some(text) = args.and_then(Value::as_str) {
+            events::tool_call_event_from_text(context, name, Some(text))
+        } else {
+            events::tool_call_event(context, name, args)
+        };
+        event.files = files;
+        for file in &mut event.files {
+            if file.kind != FileEvidenceKind::Command {
+                file.cwd = effective_cwd.map(str::to_string);
+            }
+        }
+        event
+    } else {
+        return;
+    };
+    event.status = payload.get("status").and_then(Value::as_str).map(String::from);
+    event.command_evidence_status = command_evidence_status;
+    event.tool_call_id = codex_tool_call_id(payload);
+    event.attrs_json = Some(payload.to_string());
+    events_out.push(event);
 }
 
 fn codex_tool_call_id(payload: &Value) -> Option<String> {
@@ -853,58 +937,38 @@ fn codex_value_summary(value: &Value) -> String {
 
 fn collect_codex_content_events(
     content: Option<&Value>,
-    timestamp: Option<i64>,
-    source_path: &str,
-    line_index: usize,
-    prior_message_seq: Option<u32>,
+    mut context: events::EventContext,
     current_message_seq: Option<u32>,
+    cwd: Option<&str>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
-    let Some(Value::Array(arr)) = content else {
+    let Some(Value::Array(items)) = content else {
         return;
     };
-    let mut message_seq = prior_message_seq;
-    for (item_index, item) in arr.iter().enumerate() {
-        match item.get("type").and_then(|t| t.as_str()) {
+    for (item_index, item) in items.iter().enumerate() {
+        match item.get("type").and_then(Value::as_str) {
             Some("text" | "output_text") => {
                 if item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty()) {
-                    message_seq = current_message_seq;
+                    context.message_seq = current_message_seq;
                 }
             }
-            Some("function_call") => {
-                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
-                let args = item.get("arguments").and_then(|a| a.as_str());
-                let mut event = events::tool_call_event_from_text(
+            Some(kind) if kind.ends_with("_call") || kind.ends_with("_output") => {
+                collect_codex_response_item_event(
+                    item,
                     events::EventContext {
                         event_seq: events_out.len() as u32,
-                        timestamp,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: Some(format!("{line_index}:{item_index}")),
-                        message_seq,
-                        parser_version: EVENT_PARSER_VERSION,
+                        timestamp: context.timestamp,
+                        source_path: context.source_path.clone(),
+                        source_event_id: context
+                            .source_event_id
+                            .as_ref()
+                            .map(|id| format!("{id}:{item_index}")),
+                        message_seq: context.message_seq,
+                        parser_version: context.parser_version,
                     },
-                    name,
-                    args,
+                    cwd,
+                    events_out,
                 );
-                event.tool_call_id = codex_tool_call_id(item);
-                events_out.push(event);
-            }
-            Some("function_call_output") => {
-                let output = item.get("output").and_then(|o| o.as_str()).map(String::from);
-                let mut event = events::tool_result_event(
-                    events::EventContext {
-                        event_seq: events_out.len() as u32,
-                        timestamp,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: Some(format!("{line_index}:{item_index}")),
-                        message_seq,
-                        parser_version: EVENT_PARSER_VERSION,
-                    },
-                    None,
-                    output,
-                );
-                event.tool_call_id = codex_tool_call_id(item);
-                events_out.push(event);
             }
             _ => {}
         }
@@ -938,6 +1002,8 @@ fn collect_codex_meta_event(
         return;
     }
     events_out.push(RawSessionEvent {
+        command_evidence_status: None,
+        files: Vec::new(),
         event_seq: events_out.len() as u32,
         timestamp,
         kind: "message".to_string(),
@@ -1449,10 +1515,26 @@ mod tests {
         writeln!(f, "{tool_result}").unwrap();
         writeln!(f, "{custom_call}").unwrap();
         writeln!(f, "{custom_result}").unwrap();
+        let turn = serde_json::json!({"type":"turn_context","payload":{"cwd":"/target/repo"}});
+        let mut moved_call = custom_call.clone();
+        moved_call["payload"]["call_id"] = "call_target".into();
+        let legacy = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[
+            {"type":"function_call","name":"read_file","call_id":"legacy","arguments":{"path":"src/lib.rs","workdir":"/explicit/repo"}},
+            {"type":"function_call_output","call_id":"legacy","status":"failed","output":"permission denied"}
+        ]}});
+        let wrapped = serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"functions.exec","call_id":"wrapper","input":format!("await tools.apply_patch({:?})", custom_call["payload"]["input"].as_str().unwrap())}});
+        for value in [turn, moved_call, legacy, wrapped] {
+            writeln!(f, "{value}").unwrap();
+        }
 
+        let observation = serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":uuid,"item":{"type":"FileChange","id":"native-change","status":"completed","changes":{
+            "/target/repo/old.rs":{"type":"update","move_path":"/target/repo/new.rs","unified_diff":"@@\n-old\n+new"},
+            "/target/repo/removed.rs":{"type":"delete","content":"old content"}
+        }}}});
+        writeln!(f, "{observation}").unwrap();
         let raw = parse_codex_session(&path).unwrap().unwrap();
 
-        assert_eq!(raw.events.len(), 5);
+        assert_eq!(raw.events.len(), 9);
         assert_eq!(raw.events[0].kind, "command");
         assert_eq!(raw.events[0].name.as_deref(), Some("exec_command"));
         assert_eq!(raw.events[0].target.as_deref(), Some("sed -n '1,220p' CLAUDE.md"));
@@ -1467,16 +1549,50 @@ mod tests {
         assert_eq!(raw.events[2].target.as_deref(), Some("src/lib.rs"));
         assert_eq!(raw.events[2].source_event_id.as_deref(), Some("3"));
         assert_eq!(raw.events[2].tool_call_id.as_deref(), Some("call_patch"));
-        assert_eq!(raw.events[3].kind, "file_write");
-        assert_eq!(raw.events[3].name.as_deref(), Some("apply_patch"));
-        assert_eq!(raw.events[3].target.as_deref(), Some("docs/new.md"));
-        assert_eq!(raw.events[3].event_seq, 3);
-        assert_eq!(raw.events[3].source_event_id.as_deref(), Some("3"));
+        assert_eq!(
+            raw.events[2].files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            ["src/lib.rs", "docs/new.md"]
+        );
+        assert!(raw.events[2].files.iter().all(|file| file.cwd.as_deref() == Some("/tmp/foo")));
+        assert_eq!(raw.events[3].kind, "tool_result");
+        assert_eq!(raw.events[3].source_event_id.as_deref(), Some("4"));
         assert_eq!(raw.events[3].tool_call_id.as_deref(), Some("call_patch"));
-        assert_eq!(raw.events[4].kind, "tool_result");
-        assert_eq!(raw.events[4].source_event_id.as_deref(), Some("4"));
-        assert_eq!(raw.events[4].tool_call_id.as_deref(), Some("call_patch"));
+        let attrs: Value =
+            serde_json::from_str(raw.events[2].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs, custom_call["payload"]);
+        let attrs: Value =
+            serde_json::from_str(raw.events[3].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs, custom_result["payload"]);
 
+        assert_eq!(raw.directory.as_deref(), Some("/tmp/foo"));
+        assert_eq!(raw.events[4].files[0].cwd.as_deref(), Some("/target/repo"));
+        assert_eq!(raw.events[5].files[0].cwd.as_deref(), Some("/explicit/repo"));
+        assert_eq!(raw.events[5].source_event_id.as_deref(), Some("7:0"));
+        assert_eq!(raw.events[6].tool_call_id.as_deref(), Some("legacy"));
+        assert_eq!(raw.events[6].status.as_deref(), Some("failed"));
+        assert_eq!(raw.events[7].files.len(), 2);
+        assert!(
+            raw.events[7]
+                .files
+                .iter()
+                .all(|file| file.kind == FileEvidenceKind::Command && file.cwd.is_none())
+        );
+        assert_eq!(
+            raw.events[7].command_evidence_status,
+            Some(crate::types::CommandEvidenceStatus::Unsupported)
+        );
+        assert_eq!(raw.events[7].tool_call_id.as_deref(), Some("wrapper"));
+        assert_eq!(raw.events[8].kind, "file_change");
+        assert!(raw.events[8].tool_call_id.is_none());
+        assert_eq!(
+            raw.events[8].files.iter().map(|file| file.operation.clone()).collect::<Vec<_>>(),
+            [FileOperation::MoveFrom, FileOperation::MoveTo, FileOperation::Delete]
+        );
+        assert!(raw.events[8].files.iter().all(|file| file.kind == FileEvidenceKind::Observation));
+        assert_eq!(
+            serde_json::from_str::<Value>(raw.events[8].attrs_json.as_deref().unwrap()).unwrap(),
+            observation["payload"]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

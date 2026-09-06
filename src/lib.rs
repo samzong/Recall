@@ -6,6 +6,7 @@ pub(crate) mod cli;
 pub(crate) mod config;
 pub(crate) mod db;
 pub(crate) mod embedding;
+pub(crate) mod event_evidence;
 pub(crate) mod export;
 pub(crate) mod extension;
 pub(crate) mod handoff;

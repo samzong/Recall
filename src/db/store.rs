@@ -159,6 +159,20 @@ impl Store {
         Ok(Store { conn, trigram_message_flag })
     }
 
+    pub(crate) fn open_event_preview_at(path: &Path) -> Result<Self> {
+        if !path.try_exists()? {
+            return Self::open_in_memory();
+        }
+        let store = Self::open_read_only_at(path)?;
+        let version: i64 = store.conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < crate::db::schema::SCHEMA_VERSION {
+            anyhow::bail!(
+                "requires_index_upgrade: run recall sync to upgrade the index before previewing event backfill"
+            );
+        }
+        Ok(store)
+    }
+
     pub(crate) fn open_read_only_at(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.execute_batch(
@@ -170,7 +184,6 @@ impl Store {
         Ok(Store { conn, trigram_message_flag })
     }
 
-    #[cfg(any(test, feature = "bench"))]
     pub(crate) fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
@@ -352,9 +365,29 @@ mod exclusion_tests {
             let store = Store::open_at(&path).unwrap();
             store.insert_session(&sess("a", None)).unwrap();
         }
-        let store = Store::open_read_only_at(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let store = Store::open_event_preview_at(&path).unwrap();
         let loaded = store.get_session_by_id("a").unwrap().unwrap();
         assert_eq!(loaded.title, "t");
         assert!(store.insert_session(&sess("b", None)).is_err());
+        drop(store);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let legacy = dir.path().join("legacy.db");
+        rusqlite::Connection::open(&legacy)
+            .unwrap()
+            .execute_batch("PRAGMA user_version=1; CREATE TABLE sessions(id TEXT);")
+            .unwrap();
+        let before = std::fs::read(&legacy).unwrap();
+        assert!(Store::open_event_preview_at(&legacy).is_err());
+        assert_eq!(std::fs::read(&legacy).unwrap(), before);
+        let absent = dir.path().join("absent.db");
+        assert!(
+            Store::open_event_preview_at(&absent)
+                .unwrap()
+                .list_sessions_by_ids(&[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!absent.exists());
     }
 }

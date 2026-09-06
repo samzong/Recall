@@ -32,9 +32,14 @@ impl SourceAdapter for RooAdapter {
         &self,
         context: &AdapterSyncContext,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        Ok(Some(cline::scan_task_dirs_for_sync(&resolve_tasks_dirs(), context, since_ts)?))
+        Ok(Some(cline::scan_task_dirs_for_sync(
+            &resolve_tasks_dirs(),
+            context,
+            since_ts,
+            include_events,
+        )?))
     }
 }
 
@@ -72,6 +77,7 @@ mod tests {
             &[],
             &AdapterSyncContext::from_store_for_test(&store, "roo").unwrap(),
             None,
+            false,
         )
         .unwrap();
         assert!(result.sessions.is_empty());

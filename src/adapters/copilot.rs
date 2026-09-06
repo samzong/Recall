@@ -18,11 +18,15 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp, last_timestamp,
 };
-use crate::types::{RawSessionEvent, RawUsageEvent, Role};
+use crate::types::{
+    CommandEvidenceStatus, FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent,
+    RawUsageEvent, Role,
+};
 
 pub(crate) struct CopilotAdapter;
 
-const EVENT_PARSER_VERSION: u32 = 2;
+const METADATA_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 3;
 const USAGE_PARSER_VERSION: u32 = 2;
 
 impl SourceAdapter for CopilotAdapter {
@@ -292,7 +296,7 @@ fn scan_for_sync_impl(
         FileScanOptions {
             usage_parser_version: usage.is_available().then_some(USAGE_PARSER_VERSION),
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
-            metadata_parser_version: None,
+            metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
         },
         entries,
         |entry| entry_mtime(entry, &usage),
@@ -416,17 +420,25 @@ where
 {
     let mut session_id: Option<String> = None;
     let mut directory: Option<String> = None;
+    let mut current_directory: Option<String> = None;
+    let mut external_calls: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
     let mut meta_started_at: Option<i64> = None;
+    let mut last_event_timestamp = None;
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut messages = Vec::new();
     let mut session_events = Vec::new();
 
     for item in jsonl_indexed(lines) {
-        let (_, v) = item?;
+        let (line_index, v) = item?;
 
         let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let timestamp = parse_timestamp(&v);
-        let line_id = v.get("id").and_then(|id| id.as_str()).map(str::to_string);
+        last_event_timestamp = last_event_timestamp.max(timestamp);
+        let line_id = v
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| line_index.to_string());
 
         match event_type {
             "session.start" => {
@@ -438,7 +450,66 @@ where
                         .and_then(|c| c.get("cwd"))
                         .and_then(|c| c.as_str())
                         .map(String::from);
+                    current_directory.clone_from(&directory);
                 }
+            }
+            "session.resume" => {
+                current_directory = v
+                    .pointer("/data/context/cwd")
+                    .and_then(Value::as_str)
+                    .filter(|cwd| !cwd.trim().is_empty())
+                    .map(str::to_string);
+            }
+            "external_tool.requested" if include_events => {
+                let Some(data) = v.get("data") else { continue };
+                let call_id = data.get("toolCallId").and_then(Value::as_str).map(str::to_string);
+                let name = data.get("toolName").and_then(Value::as_str).map(str::to_string);
+                if let Some(request_id) = data.get("requestId").and_then(Value::as_str) {
+                    external_calls.insert(request_id.to_string(), (call_id.clone(), name.clone()));
+                }
+                let cwd = data
+                    .get("workingDirectory")
+                    .and_then(Value::as_str)
+                    .filter(|cwd| !cwd.trim().is_empty());
+                let mut event = copilot_tool_call(
+                    events::EventContext {
+                        event_seq: session_events.len() as u32,
+                        timestamp,
+                        source_path: source_path.clone(),
+                        source_event_id: Some(line_id),
+                        message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    name.as_deref().unwrap_or("tool"),
+                    data.get("arguments"),
+                    cwd,
+                    cwd,
+                );
+                event.kind = "tool_start".to_string();
+                event.tool_call_id = call_id;
+                event.attrs_json = Some(v.to_string());
+                session_events.push(event);
+            }
+            "external_tool.completed" if include_events => {
+                let request = v
+                    .pointer("/data/requestId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| external_calls.get(id));
+                let mut event = events::tool_result_event(
+                    events::EventContext {
+                        event_seq: session_events.len() as u32,
+                        timestamp,
+                        source_path: source_path.clone(),
+                        source_event_id: Some(line_id),
+                        message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    request.and_then(|(_, name)| name.clone()),
+                    None,
+                );
+                event.tool_call_id = request.and_then(|(id, _)| id.clone());
+                event.attrs_json = Some(v.to_string());
+                session_events.push(event);
             }
             "user.message" => {
                 let Some(data) = v.get("data") else { continue };
@@ -451,91 +522,110 @@ where
             }
             "assistant.message" => {
                 let Some(data) = v.get("data") else { continue };
-                let prose =
-                    data.get("content").and_then(|c| c.as_str()).unwrap_or("").trim().to_string();
-                let tool_text = extract_tool_requests(data.get("toolRequests"));
-                let content = match (prose.is_empty(), tool_text.is_empty()) {
-                    (true, true) => continue,
-                    (false, true) => prose,
-                    (true, false) => tool_text,
-                    (false, false) => format!("{prose}\n{tool_text}"),
-                };
-                let message_seq = messages.len() as u32;
-                if include_events {
-                    collect_tool_request_events(
-                        data.get("toolRequests"),
+                let prose = data.get("content").and_then(Value::as_str).unwrap_or("").trim();
+                if !prose.is_empty() {
+                    messages.push(RawMessage {
+                        role: Role::Assistant,
+                        content: prose.to_string(),
                         timestamp,
-                        source_path.as_deref(),
-                        line_id.as_deref(),
-                        message_seq,
-                        &mut session_events,
-                    );
+                    });
                 }
-                messages.push(RawMessage { role: Role::Assistant, content, timestamp });
+                if let Some(requests) = data.get("toolRequests").and_then(Value::as_array) {
+                    for (index, request) in requests.iter().enumerate() {
+                        let name = request.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let call_id = request.get("toolCallId").and_then(Value::as_str);
+                        if let Some(call_id) = call_id {
+                            tool_names.insert(call_id.to_string(), name.to_string());
+                        }
+                        if include_events {
+                            let context = events::EventContext {
+                                event_seq: session_events.len() as u32,
+                                timestamp,
+                                source_path: source_path.clone(),
+                                source_event_id: Some(format!("{line_id}:tool:{index}")),
+                                message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                                parser_version: EVENT_PARSER_VERSION,
+                            };
+                            let mut event = copilot_tool_call(
+                                context,
+                                name,
+                                request.get("arguments"),
+                                current_directory.as_deref(),
+                                None,
+                            );
+                            event.tool_call_id = call_id.map(str::to_string);
+                            event.attrs_json = Some(v.to_string());
+                            session_events.push(event);
+                        }
+                    }
+                }
             }
             "tool.execution_start" => {
-                if let Some(data) = v.get("data")
-                    && let (Some(id), Some(name)) = (
-                        data.get("toolCallId").and_then(|s| s.as_str()),
-                        data.get("toolName").and_then(|s| s.as_str()),
-                    )
-                {
+                let Some(data) = v.get("data") else { continue };
+                let call_id = data.get("toolCallId").and_then(Value::as_str);
+                let name = data.get("toolName").and_then(Value::as_str);
+                if let (Some(id), Some(name)) = (call_id, name) {
                     tool_names.insert(id.to_string(), name.to_string());
                 }
-            }
-            "tool.execution_complete" => {
-                let Some(data) = v.get("data") else { continue };
-                let Some(result) = data.get("result") else { continue };
-                let text = result
-                    .get("detailedContent")
-                    .and_then(|c| c.as_str())
-                    .or_else(|| result.get("content").and_then(|c| c.as_str()))
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
                 if include_events {
-                    let tool_name = data
-                        .get("toolCallId")
-                        .and_then(|s| s.as_str())
-                        .and_then(|id| tool_names.get(id).cloned())
-                        .or_else(|| {
-                            data.get("toolName").and_then(|s| s.as_str()).map(str::to_string)
-                        })
-                        .unwrap_or_else(|| "tool".to_string());
-                    let summary = if text.is_empty() { None } else { Some(text.clone()) };
-                    let mut event = events::tool_result_event(
-                        events::EventContext {
-                            event_seq: session_events.len() as u32,
-                            timestamp,
-                            source_path: source_path.clone(),
-                            source_event_id: line_id.clone().or_else(|| {
-                                data.get("toolCallId").and_then(|s| s.as_str()).map(str::to_string)
-                            }),
-                            message_seq: None,
-                            parser_version: EVENT_PARSER_VERSION,
-                        },
-                        Some(tool_name),
-                        summary,
+                    let context = events::EventContext {
+                        event_seq: session_events.len() as u32,
+                        timestamp,
+                        source_path: source_path.clone(),
+                        source_event_id: Some(line_id),
+                        message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                        parser_version: EVENT_PARSER_VERSION,
+                    };
+                    let mut event = copilot_tool_call(
+                        context,
+                        name.unwrap_or("tool"),
+                        data.get("arguments"),
+                        current_directory.as_deref(),
+                        None,
                     );
-                    if let Some(success) = data.get("success").and_then(|value| value.as_bool()) {
-                        event.status =
-                            Some(if success { "success".to_string() } else { "error".to_string() });
-                    }
+                    event.kind = "tool_start".to_string();
+                    event.tool_call_id = call_id.map(str::to_string);
+                    event.attrs_json = Some(v.to_string());
                     session_events.push(event);
                 }
-                if text.is_empty() {
-                    continue;
-                }
-                let tool_name = data
-                    .get("toolCallId")
-                    .and_then(|s| s.as_str())
-                    .and_then(|id| tool_names.get(id).cloned())
-                    .unwrap_or_else(|| "tool".to_string());
-                messages.push(RawMessage {
-                    role: Role::Assistant,
-                    content: format!("[{tool_name}] {text}"),
-                    timestamp,
-                });
+            }
+            "tool.execution_complete" if include_events => {
+                let Some(data) = v.get("data") else { continue };
+                let call_id = data.get("toolCallId").and_then(Value::as_str);
+                let name = data
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| call_id.and_then(|id| tool_names.get(id).cloned()));
+                let text = data
+                    .get("result")
+                    .and_then(|result| {
+                        result
+                            .get("detailedContent")
+                            .and_then(Value::as_str)
+                            .or_else(|| result.get("content").and_then(Value::as_str))
+                    })
+                    .map(str::to_string)
+                    .or_else(|| data.get("error").and_then(Value::as_str).map(str::to_string));
+                let mut event = events::tool_result_event(
+                    events::EventContext {
+                        event_seq: session_events.len() as u32,
+                        timestamp,
+                        source_path: source_path.clone(),
+                        source_event_id: Some(line_id),
+                        message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    name,
+                    text,
+                );
+                event.tool_call_id = call_id.map(str::to_string);
+                event.status = data
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .map(|success| if success { "success" } else { "error" }.to_string());
+                event.attrs_json = Some(v.to_string());
+                session_events.push(event);
             }
             _ => {}
         }
@@ -546,64 +636,68 @@ where
     }
 
     let source_id = session_id.unwrap_or_else(|| fallback_id.to_string());
-    let started_at = first_timestamp(meta_started_at, &messages, &[], &[]).unwrap_or(0);
-    let updated_at = last_timestamp(None, &messages, &[], &[]);
+    let started_at = first_timestamp(meta_started_at, &messages, &[], &session_events).unwrap_or(0);
+    let updated_at =
+        last_event_timestamp.or_else(|| last_timestamp(None, &messages, &[], &session_events));
 
     let mut session =
         RawSession::search_only(source_id, directory, started_at, updated_at, None, messages);
+    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    session.refresh_session_on_metadata_backfill = true;
     if include_events {
         session = session.with_events(session_events, EVENT_PARSER_VERSION);
     }
     Ok(Some(session))
 }
 
-fn collect_tool_request_events(
-    tool_requests: Option<&Value>,
-    timestamp: Option<i64>,
-    source_path: Option<&str>,
-    source_event_id: Option<&str>,
-    message_seq: u32,
-    events_out: &mut Vec<RawSessionEvent>,
-) {
-    let Some(requests) = tool_requests.and_then(|value| value.as_array()) else {
-        return;
-    };
-    for (index, request) in requests.iter().enumerate() {
-        let name =
-            request.get("name").and_then(|value| value.as_str()).unwrap_or("tool").to_string();
-        let call_id =
-            request.get("toolCallId").and_then(|value| value.as_str()).map(str::to_string);
-        events_out.push(events::tool_call_event(
-            events::EventContext {
-                event_seq: events_out.len() as u32,
-                timestamp,
-                source_path: source_path.map(str::to_string),
-                source_event_id: call_id
-                    .or_else(|| source_event_id.map(|id| format!("{id}:tool:{index}"))),
-                message_seq: Some(message_seq),
-                parser_version: EVENT_PARSER_VERSION,
-            },
-            name,
-            request.get("arguments"),
-        ));
+fn copilot_tool_call(
+    context: events::EventContext,
+    name: &str,
+    args: Option<&Value>,
+    directory: Option<&str>,
+    command_cwd: Option<&str>,
+) -> RawSessionEvent {
+    let mut event = events::tool_call_event(context, name.to_string(), args);
+    event.kind = "tool_call".to_string();
+    event.target = None;
+    if name == "apply_patch" {
+        if let Some(patch) = args.and_then(Value::as_str) {
+            event.files = events::patch_file_evidence(patch);
+            for file in &mut event.files {
+                file.cwd = directory.map(str::to_string);
+            }
+            if !event.files.is_empty() {
+                event.kind = "file_write".to_string();
+            }
+            event.target = event.files.first().map(|file| file.path.clone());
+        }
+    } else if name == "view" {
+        if let Some(path) = args.and_then(|args| args.get("path")).and_then(Value::as_str)
+            && !path.trim().is_empty()
+        {
+            event.kind = "file_read".to_string();
+            event.target = Some(path.to_string());
+            event.files.push(FileEvidence {
+                path: path.to_string(),
+                operation: FileOperation::Read,
+                kind: FileEvidenceKind::Call,
+                cwd: directory.map(str::to_string),
+                target: None,
+            });
+        }
+    } else if name == "bash" {
+        event.kind = "command".to_string();
+        event.target =
+            args.and_then(|args| args.get("command")).and_then(Value::as_str).map(str::to_string);
+        if let Some(command) = event.target.as_deref() {
+            let (files, status) = events::shell_file_evidence(command, command_cwd);
+            event.files = files;
+            event.command_evidence_status = Some(status);
+        } else {
+            event.command_evidence_status = Some(CommandEvidenceStatus::Unsupported);
+        }
     }
-}
-
-fn extract_tool_requests(tool_requests: Option<&Value>) -> String {
-    let Some(arr) = tool_requests.and_then(|v| v.as_array()) else {
-        return String::new();
-    };
-
-    let mut parts = Vec::new();
-    for req in arr {
-        let name = req.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-        let args = req
-            .get("arguments")
-            .map(|a| serde_json::to_string(a).unwrap_or_default())
-            .unwrap_or_default();
-        parts.push(format!("[{name}] {args}"));
-    }
-    parts.join("\n")
+    event
 }
 
 fn parse_timestamp(v: &Value) -> Option<i64> {
@@ -752,17 +846,95 @@ mod tests {
     #[test]
     fn parse_copilot_events_extracts_tool_events() {
         let jsonl = r##"{"type":"session.start","data":{"sessionId":"sess-2","startTime":"2026-04-13T10:00:00Z","context":{"cwd":"/proj"}},"id":"e1","timestamp":"2026-04-13T10:00:00Z","parentId":null}
-{"type":"assistant.message","data":{"messageId":"m1","content":"Let me read the file.","toolRequests":[{"toolCallId":"tc1","name":"read_file","arguments":{"path":"/tmp/README.md"},"type":"function"}]},"id":"e2","timestamp":"2026-04-13T10:00:05Z","parentId":"e1"}
-{"type":"tool.execution_complete","data":{"toolCallId":"tc1","toolName":"read_file","success":true,"result":{"content":"short summary","detailedContent":"# My Project\nHello world."}},"id":"e4","timestamp":"2026-04-13T10:00:06Z","parentId":"e3"}"##;
+{"type":"assistant.message","data":{"messageId":"m1","content":"Let me read the file.","toolRequests":[{"toolCallId":"tc1","name":"view","arguments":{"path":"/tmp/README.md"},"type":"function"}]},"id":"e2","timestamp":"2026-04-13T10:00:05Z","parentId":"e1"}
+{"type":"tool.execution_complete","data":{"toolCallId":"tc1","toolName":"view","success":true,"result":{"content":"short summary","detailedContent":"# My Project\nHello world."}},"id":"e4","timestamp":"2026-04-13T10:00:06Z","parentId":"e3"}"##;
 
         let session = parse_copilot_events(jsonl, "fallback").unwrap().unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "Let me read the file.");
         assert_eq!(session.events.len(), 2);
+        assert_eq!(session.events[0].tool_call_id.as_deref(), Some("tc1"));
+        assert_eq!(session.events[1].tool_call_id, session.events[0].tool_call_id);
+        assert_eq!(session.events[0].source_event_id.as_deref(), Some("e2:tool:0"));
+        assert_eq!(session.events[1].source_event_id.as_deref(), Some("e4"));
+        assert_eq!(session.events[0].files[0].cwd.as_deref(), Some("/proj"));
+        assert_eq!(session.events[0].files[0].operation, FileOperation::Read);
+        assert!(session.events[1].files.is_empty());
         assert_eq!(session.events[0].kind, "file_read");
-        assert_eq!(session.events[0].name.as_deref(), Some("read_file"));
+        assert_eq!(session.events[0].name.as_deref(), Some("view"));
         assert_eq!(session.events[0].target.as_deref(), Some("/tmp/README.md"));
         assert_eq!(session.events[1].kind, "tool_result");
         assert_eq!(session.events[1].status.as_deref(), Some("success"));
         assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
+    }
+
+    #[test]
+    fn native_patch_lifecycle_keeps_failures_and_visible_anchors() {
+        let jsonl = r#"{"type":"session.start","data":{"sessionId":"native","context":{"cwd":"/repo"}}}
+{"type":"assistant.message","id":"request-1","data":{"content":"","toolRequests":[{"toolCallId":"patch-1","name":"apply_patch","arguments":"*** Begin Patch\n*** Update File: a.rs\n@@\n-old\n+new\n*** Delete File: b.rs\n*** End Patch"}]}}
+{"type":"tool.execution_start","id":"start-1","data":{"toolCallId":"patch-1","toolName":"apply_patch"}}
+{"type":"tool.execution_complete","id":"failed-1","data":{"toolCallId":"patch-1","success":false,"error":"No matching lines"}}
+{"type":"user.message","data":{"content":"Try again"}}
+{"type":"assistant.message","id":"request-2","data":{"content":"","toolRequests":[{"toolCallId":"read-2","name":"view","arguments":{"path":"a.rs"}}]}}
+{"type":"tool.execution_complete","id":"result-2","data":{"toolCallId":"read-2","result":{"detailedContent":"file text"}}}
+{"type":"session.resume","data":{"context":{"cwd":"/resumed"}}}
+{"type":"assistant.message","id":"shell-request","data":{"content":"","toolRequests":[{"toolCallId":"shell-1","name":"bash","arguments":{"command":"mv input.rs output.rs"}},{"toolCallId":"read-3","name":"view","arguments":{"path":"output.rs"}}]}}
+{"type":"external_tool.requested","id":"external-start","data":{"requestId":"external-1","toolCallId":"shell-1","toolName":"bash","arguments":{"command":"mv input.rs output.rs"},"workingDirectory":"/explicit"}}
+{"type":"external_tool.completed","id":"external-complete","data":{"requestId":"external-1"}}
+"#;
+        let raw = parse_copilot_events_from_lines(
+            jsonl.lines().map(|line| Ok(line.to_string())),
+            "fallback",
+            true,
+            Some("events.jsonl".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(raw.messages.len(), 1);
+        assert_eq!(raw.events.len(), 9);
+        assert_eq!(raw.directory.as_deref(), Some("/repo"));
+        assert_eq!(raw.events[5].kind, "command");
+        assert_eq!(raw.events[5].files.len(), 2);
+        assert!(raw.events[5].files.iter().all(|file| file.cwd.is_none()));
+        assert_eq!(raw.events[5].command_evidence_status, Some(CommandEvidenceStatus::Unsupported));
+        assert_eq!(raw.events[6].files[0].cwd.as_deref(), Some("/resumed"));
+        assert_eq!(raw.events[7].files.len(), 2);
+        assert!(raw.events[7].files.iter().all(|file| file.cwd.as_deref() == Some("/explicit")));
+        assert_eq!(raw.events[7].tool_call_id, raw.events[8].tool_call_id);
+        assert!(raw.events[8].files.is_empty());
+        assert_eq!(raw.events[8].status, None);
+        assert_eq!(raw.events[0].files.len(), 2);
+        assert_eq!(raw.events[0].files[0].path, "a.rs");
+        assert_eq!(raw.events[0].files[1].operation, FileOperation::Delete);
+        assert_eq!(raw.events[0].message_seq, None);
+        assert_eq!(raw.events[1].kind, "tool_start");
+        assert!(raw.events[1].files.is_empty());
+        assert_eq!(raw.events[1].status, None);
+        assert_eq!(raw.events[2].status.as_deref(), Some("error"));
+        assert_eq!(raw.events[2].tool_call_id.as_deref(), Some("patch-1"));
+        assert_eq!(raw.events[3].message_seq, Some(0));
+        assert_eq!(raw.events[4].status, None);
+        assert_eq!(raw.events[4].message_seq, Some(0));
+        assert_eq!(raw.events[0].source_path.as_deref(), Some("events.jsonl"));
+        let original: Value = serde_json::from_str(jsonl.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(raw.events[0].attrs_json.as_deref().unwrap()).unwrap(),
+            original
+        );
+        let mut interrupted: Vec<io::Result<String>> =
+            jsonl.lines().map(|line| Ok(line.to_string())).collect();
+        interrupted.push(Err(io::Error::other("interrupted read")));
+        assert!(parse_copilot_events_from_lines(interrupted, "fallback", true, None).is_err());
+        let raw = parse_copilot_events_from_lines(
+            jsonl.lines().map(|line| Ok(line.to_string())),
+            "fallback",
+            false,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(raw.messages.len(), 1);
+        assert!(raw.events.is_empty());
     }
 
     #[test]
@@ -794,6 +966,27 @@ mod tests {
             )
             .unwrap();
 
+        let refreshed = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(refreshed.sessions.len(), 1);
+        assert!(refreshed.sessions[0].refresh_session_on_metadata_backfill);
+        store
+            .persist_topology_for_existing_session(
+                "copilot-cli",
+                uuid,
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION),
+                },
+            )
+            .unwrap();
         let result = scan_for_sync_impl(
             &sessions_dir,
             &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
@@ -804,6 +997,25 @@ mod tests {
         .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
+        store
+            .persist_session_events_for_existing_session(
+                "copilot-cli",
+                uuid,
+                &[],
+                EVENT_PARSER_VERSION - 1,
+                Some(mtime),
+            )
+            .unwrap();
+        let stale = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stale.sessions.len(), 1);
+        assert_eq!(stale.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1063,6 +1275,17 @@ mod tests {
             )
             .unwrap();
 
+        store
+            .persist_topology_for_existing_session(
+                "copilot-cli",
+                uuid,
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION),
+                },
+            )
+            .unwrap();
         let skipped = scan_for_sync_impl(
             &sessions_dir,
             &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),

@@ -427,6 +427,20 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "zcode"
             | "goose"
             | "openhands"
+            | "kimi-code"
+            | "grok"
+            | "copilot-chat"
+            | "amp"
+            | "droid"
+            | "deepseek-harness"
+            | "antigravity-cli"
+            | "kiro-cli"
+            | "cline"
+            | "roo"
+            | "qwen-code"
+            | "gemini-cli"
+            | "pi"
+            | "omp"
     )
 }
 

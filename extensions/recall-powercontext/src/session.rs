@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 
 pub const MIN_RECORD_SCHEMA_VERSION: u32 = 5;
-pub const RECORD_SCHEMA_VERSION: u32 = 6;
+pub const RECORD_SCHEMA_VERSION: u32 = 7;
 pub const MAX_SOURCE_ID_LENGTH: usize = 256;
 pub const MAX_CONTENT_LENGTH: usize = 200_000;
 
@@ -200,14 +200,14 @@ mod tests {
     }
 
     #[test]
-    fn accepts_five_and_six_but_rejects_versions_outside_the_supported_range() {
-        for version in [5, 6] {
+    fn accepts_supported_export_versions() {
+        for version in [5, 6, 7] {
             let line = format!(
                 r#"{{"schema_version":{version},"record_type":"session","session":{{"id":"s","source":"codex"}},"messages":[]}}"#
             );
             parse_export_line(&line, 1).unwrap();
         }
-        for version in [4, 7] {
+        for version in [4, 8] {
             let line = format!(
                 r#"{{"schema_version":{version},"record_type":"session","session":{{"id":"s","source":"codex"}},"messages":[]}}"#
             );

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::adapters::AdapterSyncContext;
+use crate::adapters::events::{EventContext, tool_call_event, tool_result_event};
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::{self, resolve_home_dir};
@@ -14,9 +16,13 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
     first_timestamp,
 };
-use crate::types::{RawUsageEvent, Role};
+use crate::types::{
+    EvidenceVisibility, FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent,
+    RawUsageEvent, Role,
+};
 
 const USAGE_PARSER_VERSION: u32 = 2;
+const EVENT_PARSER_VERSION: u32 = 1;
 
 pub(crate) struct QwenAdapter;
 
@@ -55,7 +61,7 @@ impl SourceAdapter for QwenAdapter {
         &self,
         context: &AdapterSyncContext,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(runtime_dir) = resolve_qwen_runtime_dir()? else {
             return Ok(Some(SyncScanResult {
@@ -64,16 +70,20 @@ impl SourceAdapter for QwenAdapter {
                 observations: Vec::new(),
             }));
         };
-        Ok(Some(file_scan::run_file_scan_with_options(
+        Ok(Some(file_scan::run_file_scan_with_options_and_snapshot(
             context,
             since_ts,
             FileScanOptions {
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
-                event_parser_version: None,
+                event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
                 metadata_parser_version: None,
             },
             collect_session_entries(&runtime_dir),
-            parse_qwen_session_file,
+            |entry| {
+                let snapshot = file_scan::file_metadata_snapshot(&entry.stat_target)?;
+                Some(file_scan::FileScanSnapshot::new(snapshot.mtime_ms()?, snapshot))
+            },
+            |entry, mtime_ms| parse_qwen_session_file(entry, mtime_ms, include_events),
         )?))
     }
 }
@@ -99,10 +109,19 @@ fn existing_dir(dir: PathBuf, missing_message: &str) -> anyhow::Result<Option<Pa
 fn scan_qwen_sessions(runtime_dir: &Path) -> anyhow::Result<Vec<RawSession>> {
     let mut sessions = Vec::new();
     for entry in collect_session_entries(runtime_dir) {
-        let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+        let Some(snapshot) = file_scan::file_metadata_snapshot(&entry.stat_target) else {
             continue;
         };
-        if let Some(raw) = parse_qwen_session_file(entry, mtime_ms)? {
+        let Some(mtime_ms) = snapshot.mtime_ms() else {
+            continue;
+        };
+        let path = entry.stat_target.clone();
+        let raw = parse_qwen_session_file(entry, mtime_ms, true)?;
+        if file_scan::file_metadata_snapshot(&path).as_ref() != Some(&snapshot) {
+            warn!("skipping unstable Qwen session {}", path.display());
+            continue;
+        }
+        if let Some(raw) = raw {
             sessions.push(raw);
         }
     }
@@ -156,8 +175,9 @@ fn is_qwen_session_file(name: &str) -> bool {
 fn parse_qwen_session_file(
     entry: FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    match parse_qwen_session_file_impl(&entry, mtime_ms) {
+    match parse_qwen_session_file_impl(&entry, mtime_ms, include_events) {
         Ok(raw) => Ok(raw),
         Err(error) => {
             warn!("failed to parse {}: {error}", entry.stat_target.display());
@@ -169,11 +189,18 @@ fn parse_qwen_session_file(
 fn parse_qwen_session_file_impl(
     entry: &FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let file = fs::File::open(&entry.stat_target)?;
     let reader = BufReader::new(file);
     let source_path = entry.stat_target.to_str().map(str::to_string);
-    parse_qwen_jsonl(reader.lines(), entry.session_id.clone(), mtime_ms, source_path)
+    parse_qwen_jsonl(
+        reader.lines(),
+        entry.session_id.clone(),
+        mtime_ms,
+        source_path,
+        include_events,
+    )
 }
 
 fn parse_qwen_jsonl(
@@ -181,15 +208,38 @@ fn parse_qwen_jsonl(
     session_id: String,
     mtime_ms: i64,
     source_path: Option<String>,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
+    let mut events = Vec::new();
+    let mut parents = HashMap::new();
+    let mut leaf = None;
+    let mut has_rewind = false;
+    let mut event_records = Vec::new();
     let mut directory = None;
     let mut custom_title = None;
     let mut summary = None;
 
     for item in jsonl_indexed(lines) {
         let (line_index, record) = item?;
+        let artifact = record.get("type").and_then(Value::as_str) == Some("system")
+            && matches!(
+                record.get("subtype").and_then(Value::as_str),
+                Some("session_artifact_event" | "session_artifact_snapshot")
+            );
+        if include_events
+            && !artifact
+            && let Some(uuid) =
+                record.get("uuid").and_then(Value::as_str).filter(|uuid| !uuid.is_empty())
+            && let Some(parent) =
+                record.get("parentUuid").filter(|parent| parent.is_string() || parent.is_null())
+        {
+            parents.entry(uuid.to_string()).or_insert_with(|| parent.as_str().map(str::to_string));
+            leaf = Some(uuid.to_string());
+            has_rewind |= record.get("type").and_then(Value::as_str) == Some("system")
+                && record.get("subtype").and_then(Value::as_str) == Some("rewind");
+        }
         if directory.is_none() {
             directory = record
                 .get("cwd")
@@ -211,6 +261,30 @@ fn parse_qwen_jsonl(
         }
 
         let record_type = record.get("type").and_then(|value| value.as_str()).unwrap_or("");
+        let timestamp = rfc3339_ms(record.get("timestamp"));
+        if include_events && matches!(record_type, "assistant" | "tool_result" | "user") {
+            let first_event = events.len();
+            extract_qwen_events(
+                &record,
+                EventContext {
+                    event_seq: events.len() as u32,
+                    timestamp,
+                    source_path: source_path.clone(),
+                    source_event_id: Some(format!(
+                        "{}:line:{line_index}",
+                        record.get("uuid").and_then(Value::as_str).unwrap_or("record")
+                    )),
+                    message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                    parser_version: EVENT_PARSER_VERSION,
+                },
+                record.get("cwd").and_then(Value::as_str).or(directory.as_deref()),
+                &mut events,
+            );
+            if let Some(uuid) = record.get("uuid").and_then(Value::as_str) {
+                event_records
+                    .extend((first_event..events.len()).map(|index| (index, uuid.to_string())));
+            }
+        }
         let role = match record_type {
             "user" if record.get("subtype").is_none() => Role::User,
             "assistant" => Role::Assistant,
@@ -218,7 +292,6 @@ fn parse_qwen_jsonl(
         };
 
         let content = extract_text_parts(record.pointer("/message/parts"));
-        let timestamp = rfc3339_ms(record.get("timestamp"));
         let message_seq = if content.is_empty() {
             None
         } else {
@@ -240,18 +313,169 @@ fn parse_qwen_jsonl(
         }
     }
 
-    if messages.is_empty() && usage_events.is_empty() {
+    if has_rewind {
+        let mut active = HashSet::new();
+        let mut complete = true;
+        while let Some(uuid) = leaf {
+            if !active.insert(uuid.clone()) {
+                complete = false;
+                break;
+            }
+            let Some(parent) = parents.get(&uuid) else {
+                complete = false;
+                break;
+            };
+            leaf = parent.clone();
+        }
+        if complete {
+            for (index, uuid) in event_records {
+                if !active.contains(&uuid) {
+                    events[index].visibility = Some(EvidenceVisibility::Inactive);
+                }
+            }
+        }
+    }
+    if messages.is_empty() && usage_events.is_empty() && events.is_empty() {
         return Ok(None);
     }
 
-    let started_at = first_timestamp(None, &messages, &usage_events, &[]).unwrap_or(mtime_ms);
+    let started_at = first_timestamp(None, &messages, &usage_events, &events).unwrap_or(mtime_ms);
     let mut session =
         RawSession::search_only(session_id, directory, started_at, Some(mtime_ms), None, messages);
     session.source_file_path = source_path;
     session.custom_title = custom_title;
     session.summary = summary;
     session = session.with_usage(usage_events, USAGE_PARSER_VERSION);
+    if include_events {
+        session = session.with_events(events, EVENT_PARSER_VERSION);
+    }
     Ok(Some(session))
+}
+
+fn extract_qwen_events(
+    record: &Value,
+    context: EventContext,
+    cwd: Option<&str>,
+    events: &mut Vec<RawSessionEvent>,
+) {
+    let Some(parts) = record.pointer("/message/parts").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, part) in parts.iter().enumerate() {
+        let context = EventContext {
+            event_seq: events.len() as u32,
+            timestamp: context.timestamp,
+            source_path: context.source_path.clone(),
+            source_event_id: context
+                .source_event_id
+                .as_ref()
+                .map(|id| format!("{id}:part:{index}")),
+            message_seq: context.message_seq,
+            parser_version: EVENT_PARSER_VERSION,
+        };
+        let mut event = if let Some(call) = part.get("functionCall")
+            && record.get("type").and_then(Value::as_str) == Some("assistant")
+        {
+            let Some(name) = call.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let args = call.get("args");
+            let mut event = tool_call_event(context, name.to_string(), args);
+            event.kind = "tool_call".to_string();
+            event.target = None;
+            let operation = match name {
+                "read_file" => Some(FileOperation::Read),
+                "edit" | "write_file" => Some(FileOperation::Write),
+                _ => None,
+            };
+            if let Some(operation) = operation
+                && let Some(path) = args
+                    .and_then(|args| args.get("file_path"))
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.trim().is_empty())
+            {
+                event.kind =
+                    if operation == FileOperation::Read { "file_read" } else { "file_write" }
+                        .to_string();
+                event.target = Some(path.to_string());
+                event.files.push(FileEvidence {
+                    path: path.to_string(),
+                    operation,
+                    kind: FileEvidenceKind::Call,
+                    cwd: cwd.map(str::to_string),
+                    target: None,
+                });
+            } else if name == "run_shell_command" {
+                event.kind = "command".to_string();
+                event.target = args
+                    .and_then(|args| args.get("command"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(command) = event.target.as_deref() {
+                    let cwd = match args.and_then(|args| args.get("directory")) {
+                        Some(directory) => {
+                            directory.as_str().filter(|path| Path::new(path).is_absolute())
+                        }
+                        None => cwd,
+                    };
+                    let (files, status) =
+                        crate::adapters::events::shell_file_evidence(command, cwd);
+                    event.files = files;
+                    event.command_evidence_status = Some(status);
+                }
+            }
+            event.tool_call_id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+            event
+        } else if let Some(response) = part.get("functionResponse") {
+            let mut event = tool_result_event(
+                context,
+                response.get("name").and_then(Value::as_str).map(str::to_string),
+                response.get("response").map(Value::to_string),
+            );
+            event.tool_call_id = response
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+            let metadata = record.get("toolCallResult").filter(|metadata| {
+                event
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| metadata.get("callId").and_then(Value::as_str) == Some(id))
+            });
+            event.status = metadata
+                .and_then(|metadata| {
+                    metadata.get("executionStatus").or_else(|| metadata.get("status"))
+                })
+                .and_then(Value::as_str)
+                .filter(|status| {
+                    matches!(*status, "not_started" | "success" | "error" | "cancelled")
+                })
+                .map(str::to_string)
+                .or_else(|| {
+                    response
+                        .pointer("/response/error")
+                        .and_then(Value::as_str)
+                        .filter(|error| !error.is_empty())
+                        .map(|_| "error".to_string())
+                });
+            event
+        } else {
+            continue;
+        };
+        if part.get("thought").and_then(Value::as_bool) == Some(true)
+            || record.get("subtype").is_some()
+        {
+            event.visibility = Some(EvidenceVisibility::Hidden);
+            event.message_seq = None;
+        }
+        event.attrs_json = Some(record.to_string());
+        events.push(event);
+    }
 }
 
 fn custom_title_from(record: &Value) -> Option<(String, Option<&str>)> {
@@ -336,7 +560,7 @@ fn extract_usage_event(
 #[cfg(test)]
 fn parse_qwen_session(jsonl: &str, session_id: &str) -> Option<RawSession> {
     let lines = jsonl.lines().map(|line| Ok(line.to_string()));
-    parse_qwen_jsonl(lines, session_id.to_string(), 1_700_000_000_000, None).unwrap()
+    parse_qwen_jsonl(lines, session_id.to_string(), 1_700_000_000_000, None, true).unwrap()
 }
 
 #[cfg(test)]
@@ -350,8 +574,8 @@ mod tests {
         format!(
             "{}\n{}\n{}\n{}\n{}",
             r#"{"uuid":"a1","parentUuid":null,"sessionId":"550e8400-e29b-41d4-a716-446655440000","timestamp":"2024-01-01T00:00:00.000Z","type":"user","message":{"role":"user","parts":[{"text":"hello session a"}]},"cwd":"/test/project/root","version":"1.0.0"}"#,
-            r#"{"uuid":"a2","parentUuid":"a1","sessionId":"550e8400-e29b-41d4-a716-446655440000","timestamp":"2024-01-01T00:00:05.000Z","type":"assistant","message":{"role":"model","parts":[{"thought":true,"text":"hidden"},{"text":"hey back"}]},"cwd":"/test/project/root","version":"1.0.0","model":"qwen3-coder-plus","usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20,"cachedContentTokenCount":30,"thoughtsTokenCount":5}}"#,
-            r#"{"uuid":"a3","parentUuid":"a2","sessionId":"550e8400-e29b-41d4-a716-446655440000","timestamp":"2024-01-01T00:00:06.000Z","type":"tool_result","message":{"role":"user","parts":[{"functionResponse":{"name":"read"}}]},"cwd":"/test/project/root","version":"1.0.0"}"#,
+            r#"{"uuid":"a2","parentUuid":"a1","sessionId":"550e8400-e29b-41d4-a716-446655440000","timestamp":"2024-01-01T00:00:05.000Z","type":"assistant","message":{"role":"model","parts":[{"thought":true,"text":"hidden"},{"text":"hey back"},{"functionCall":{"id":"edit-1","name":"edit","args":{"file_path":"/repo/ spaced.rs ","old_string":"old","new_string":"new"}}}]},"cwd":"/test/project/root","version":"1.0.0","model":"qwen3-coder-plus","usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20,"cachedContentTokenCount":30,"thoughtsTokenCount":5}}"#,
+            r#"{"uuid":"a3","parentUuid":"a2","sessionId":"550e8400-e29b-41d4-a716-446655440000","timestamp":"2024-01-01T00:00:06.000Z","type":"tool_result","message":{"role":"user","parts":[{"functionResponse":{"id":"edit-1","name":"edit","response":{"output":"saved"}}}]},"toolCallResult":{"callId":"edit-1","status":"error","executionStatus":"success","error":{}},"cwd":"/test/project/root","version":"1.0.0"}"#,
             r#"{"uuid":"a4","parentUuid":"a3","sessionId":"550e8400-e29b-41d4-a716-446655440000","timestamp":"2024-01-01T00:00:07.000Z","type":"user","subtype":"notification","message":{"role":"user","parts":[{"text":"cron noise"}]},"cwd":"/test/project/root","version":"1.0.0"}"#,
             r#"{"uuid":"a5","parentUuid":"a4","sessionId":"550e8400-e29b-41d4-a716-446655440000","timestamp":"2024-01-01T00:00:08.000Z","type":"system","subtype":"custom_title","systemPayload":{"customTitle":"hello session a","titleSource":"manual"},"cwd":"/test/project/root","version":"1.0.0"}"#,
         )
@@ -381,6 +605,55 @@ mod tests {
         assert_eq!(event.reasoning_tokens, 5);
         assert_eq!(event.token_source, crate::types::TokenSource::Observed);
         assert_eq!(session.usage_parser_version, Some(USAGE_PARSER_VERSION));
+        assert_eq!(session.events.len(), 2);
+        let call = &session.events[0];
+        assert_eq!(call.tool_call_id.as_deref(), Some("edit-1"));
+        assert_eq!(call.message_seq, Some(0));
+        assert_eq!(call.files[0].path, "/repo/ spaced.rs ");
+        assert_eq!(call.files[0].operation, FileOperation::Write);
+        assert_eq!(call.files[0].cwd.as_deref(), Some("/test/project/root"));
+        let attrs: Value = serde_json::from_str(call.attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            attrs.pointer("/message/parts/2/functionCall/args/old_string"),
+            Some(&Value::from("old"))
+        );
+        let result = &session.events[1];
+        assert_eq!(result.tool_call_id, call.tool_call_id);
+        assert_eq!(result.message_seq, Some(1));
+        assert_eq!(result.status.as_deref(), Some("success"));
+        assert!(result.files.is_empty());
+        assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
+        for (parent, expected) in [("a1", Some(EvidenceVisibility::Inactive)), ("missing", None)] {
+            let wire = format!(
+                "{}\n{}",
+                fixture_jsonl(),
+                serde_json::json!({
+                    "uuid":"rewind", "parentUuid":parent, "sessionId":SESSION_ID,
+                    "type":"system", "subtype":"rewind", "systemPayload":{"truncatedCount":2}
+                })
+            );
+            let rewound = parse_qwen_session(&wire, SESSION_ID).unwrap();
+            assert_eq!(rewound.events[0].visibility, expected);
+            assert_eq!(rewound.events[1].visibility, expected);
+            assert_eq!(rewound.messages.len(), 2);
+            assert_eq!(rewound.usage_events.len(), 1);
+        }
+        for (metadata, expected) in [
+            (
+                serde_json::json!({"callId":"edit-1","executionStatus":"not_started","status":"error"}),
+                Some("not_started"),
+            ),
+            (serde_json::json!({"callId":"other","executionStatus":"success"}), None),
+            (serde_json::json!({"callId":"edit-1","error":{}}), None),
+        ] {
+            let original = fixture_jsonl();
+            let mut records: Vec<Value> =
+                original.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            records[2]["toolCallResult"] = metadata;
+            let wire = records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+            let parsed = parse_qwen_session(&wire, SESSION_ID).unwrap();
+            assert_eq!(parsed.events[1].status.as_deref(), expected);
+        }
     }
 
     #[test]
@@ -403,6 +676,16 @@ mod tests {
         assert_eq!(session.usage_events.len(), 1);
         assert_eq!(session.usage_events[0].input_tokens, 12);
         assert_eq!(session.usage_events[0].message_seq, None);
+        let record = serde_json::json!({
+            "uuid":"tool-only", "type":"assistant", "cwd":"/repo", "timestamp":"2024-01-01T00:00:05.000Z",
+            "message":{"role":"model","parts":[{"thought":true,"functionCall":{"id":"read-1","name":"read_file","args":{"file_path":"/repo/a.rs"}}}]}
+        }).to_string();
+        let parsed = parse_qwen_session(&record, SESSION_ID).unwrap();
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.usage_events.is_empty());
+        assert_eq!(parsed.events[0].files[0].operation, FileOperation::Read);
+        assert_eq!(parsed.events[0].visibility, Some(EvidenceVisibility::Hidden));
+        assert_eq!(parsed.events[0].message_seq, None);
     }
 
     #[test]
@@ -465,11 +748,11 @@ mod tests {
             None,
             FileScanOptions {
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
-                event_parser_version: None,
+                event_parser_version: Some(EVENT_PARSER_VERSION),
                 metadata_parser_version: None,
             },
             collect_session_entries(root.path()),
-            parse_qwen_session_file,
+            |entry, mtime_ms| parse_qwen_session_file(entry, mtime_ms, true),
         )
         .unwrap();
         assert_eq!(first.stats.parsed, 1);
@@ -500,16 +783,51 @@ mod tests {
             )
             .unwrap();
 
+        for previous_version in [None, Some(EVENT_PARSER_VERSION - 1)] {
+            if let Some(version) = previous_version {
+                store
+                    .persist_session_events_for_existing_session(
+                        "qwen-code",
+                        SESSION_ID,
+                        &[],
+                        version,
+                        first.sessions[0].updated_at,
+                    )
+                    .unwrap();
+            }
+            let backfill = file_scan::run_file_scan_with_options(
+                &AdapterSyncContext::from_store_for_test(&store, "qwen-code").unwrap(),
+                None,
+                FileScanOptions {
+                    event_parser_version: Some(EVENT_PARSER_VERSION),
+                    ..Default::default()
+                },
+                collect_session_entries(root.path()),
+                |entry, mtime_ms| parse_qwen_session_file(entry, mtime_ms, true),
+            )
+            .unwrap();
+            assert_eq!(backfill.sessions.len(), 1);
+            assert_eq!(backfill.sessions[0].events.len(), 2);
+        }
+        store
+            .persist_session_events_for_existing_session(
+                "qwen-code",
+                SESSION_ID,
+                &[],
+                EVENT_PARSER_VERSION,
+                first.sessions[0].updated_at,
+            )
+            .unwrap();
         let second = file_scan::run_file_scan_with_options(
             &AdapterSyncContext::from_store_for_test(&store, "qwen-code").unwrap(),
             None,
             FileScanOptions {
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
-                event_parser_version: None,
+                event_parser_version: Some(EVENT_PARSER_VERSION),
                 metadata_parser_version: None,
             },
             collect_session_entries(root.path()),
-            parse_qwen_session_file,
+            |entry, mtime_ms| parse_qwen_session_file(entry, mtime_ms, true),
         )
         .unwrap();
         assert_eq!(second.stats.parsed, 0);
