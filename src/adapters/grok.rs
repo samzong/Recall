@@ -20,8 +20,8 @@ use crate::types::{
 };
 
 const USAGE_PARSER_VERSION: u32 = 2;
-const METADATA_PARSER_VERSION: u32 = 1;
-const EVENT_PARSER_VERSION: u32 = 1;
+const METADATA_PARSER_VERSION: u32 = 2;
+const EVENT_PARSER_VERSION: u32 = 2;
 
 pub(crate) struct GrokAdapter;
 
@@ -406,9 +406,18 @@ fn parse_grok_session_for_entry(
     if messages.is_empty() {
         let chat_history_path = session_dir.join("chat_history.jsonl");
         if chat_history_path.is_file() {
-            messages = parse_chat_history_fallback(&chat_history_path);
+            let (history_messages, history_events) = parse_chat_history_fallback(
+                &chat_history_path,
+                directory.as_deref(),
+                include_events,
+            )?;
+            messages = history_messages;
             for event in &mut session_events {
                 event.message_seq = None;
+            }
+            for mut event in history_events {
+                event.event_seq = session_events.len() as u32;
+                session_events.push(event);
             }
             source_path = chat_history_path.to_str().map(str::to_string);
         }
@@ -486,40 +495,90 @@ fn load_grok_summary(session_dir: &Path, fallback_id: &str) -> anyhow::Result<Gr
     Ok(GrokSummary { session_id, directory, started_at, updated_at, current_model_id })
 }
 
-fn parse_chat_history_fallback(path: &Path) -> Vec<RawMessage> {
-    let Ok(file) = fs::File::open(path) else {
-        return Vec::new();
-    };
+fn parse_chat_history_fallback(
+    path: &Path,
+    cwd: Option<&str>,
+    include_events: bool,
+) -> anyhow::Result<(Vec<RawMessage>, Vec<RawSessionEvent>)> {
+    let file = fs::File::open(path)?;
     let mut messages = Vec::new();
+    let mut session_events = Vec::new();
     for item in jsonl_indexed(BufReader::new(file).lines()) {
-        let Ok((_, val)) = item else {
-            continue;
-        };
+        let (line, val) = item?;
         let msg_type = val.get("type").and_then(Value::as_str).unwrap_or("");
         match msg_type {
             "user" => {
-                if val.get("synthetic_reason").is_some() || val.get("prompt_index").is_none() {
+                if val.get("synthetic_reason").is_some_and(|reason| !reason.is_null()) {
                     continue;
                 }
                 let text = grok_history_text(val.get("content"));
                 let queries = extract_user_queries(&text);
                 let body = if queries.is_empty() { text } else { queries.join("\n\n") };
-                if body.is_empty() {
-                    continue;
+                if !body.is_empty() {
+                    messages.push(RawMessage { role: Role::User, content: body, timestamp: None });
                 }
-                messages.push(RawMessage { role: Role::User, content: body, timestamp: None });
             }
             "assistant" => {
                 let text = grok_history_text(val.get("content"));
-                if text.is_empty() {
-                    continue;
+                if !text.is_empty() {
+                    messages.push(RawMessage {
+                        role: Role::Assistant,
+                        content: text,
+                        timestamp: None,
+                    });
                 }
-                messages.push(RawMessage { role: Role::Assistant, content: text, timestamp: None });
+                if include_events
+                    && let Some(calls) = val.get("tool_calls").and_then(Value::as_array)
+                {
+                    for (index, call) in calls.iter().enumerate() {
+                        let input = call.get("arguments").and_then(|value| {
+                            value.as_str().and_then(|text| serde_json::from_str::<Value>(text).ok())
+                        });
+                        let update = serde_json::json!({
+                            "sessionUpdate":"tool_call", "title":call.get("name"),
+                            "toolCallId":call.get("id"), "rawInput":input
+                        });
+                        session_events.push(parse_grok_tool_event(
+                            &val,
+                            &update,
+                            EventContext {
+                                event_seq: session_events.len() as u32,
+                                timestamp: None,
+                                source_path: path.to_str().map(str::to_string),
+                                source_event_id: Some(format!("history:{line}:tool:{index}")),
+                                message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                                parser_version: EVENT_PARSER_VERSION,
+                            },
+                            cwd,
+                        ));
+                    }
+                }
+            }
+            "tool_result" if include_events => {
+                let mut event = events::tool_result_event(
+                    EventContext {
+                        event_seq: session_events.len() as u32,
+                        timestamp: None,
+                        source_path: path.to_str().map(str::to_string),
+                        source_event_id: Some(format!("history:{line}")),
+                        message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    None,
+                    val.get("content").and_then(Value::as_str).map(str::to_string),
+                );
+                event.tool_call_id = val
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string);
+                event.attrs_json = Some(val.to_string());
+                session_events.push(event);
             }
             _ => {}
         }
     }
-    messages
+    Ok((messages, session_events))
 }
 
 fn grok_history_text(content: Option<&Value>) -> String {
@@ -812,7 +871,11 @@ fn parse_grok_tool_event(
         events::tool_result_event(context, name.map(str::to_string), None)
     };
     event.status = update.get("status").and_then(Value::as_str).map(str::to_string);
-    event.tool_call_id = update.get("toolCallId").and_then(Value::as_str).map(str::to_string);
+    event.tool_call_id = update
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string);
     event.attrs_json = Some(doc.to_string());
     event.files = grok_file_evidence(update, cwd);
     if is_call
@@ -1120,9 +1183,10 @@ mod tests {
         let chat_history_path = session_dir.join("chat_history.jsonl");
         fs::write(
             &chat_history_path,
-            r#"{"type":"user","prompt_index":0,"content":"<user_query>hello from history</user_query>"}
+            r#"{"type":"user","content":[{"type":"text","text":"<user_query>hello from history</user_query>"}]}
 {"type":"user","synthetic_reason":"env","content":"ignore"}
-{"type":"assistant","content":"hi"}
+{"type":"assistant","content":"hi","tool_calls":[{"id":"call-1","name":"search_replace","arguments":"{\"file_path\":\"/repo/a.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}"}]}
+{"type":"tool_result","tool_call_id":"call-1","content":"edited"}
 "#,
         )
         .unwrap();
@@ -1139,7 +1203,46 @@ mod tests {
         .unwrap();
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
-        assert!(session.events.is_empty());
+        assert_eq!(session.events.len(), 2);
+        assert_eq!(session.events[0].files[0].path, "/repo/a.rs");
+        assert_eq!(session.events[0].files[0].kind, FileEvidenceKind::Call);
+        assert!(session.events[1].files.is_empty());
+        assert!(session.events.iter().all(|event| event.tool_call_id.as_deref() == Some("call-1")
+            && event.status.is_none()
+            && event.message_seq == Some(1)));
+        let attrs: Value =
+            serde_json::from_str(session.events[0].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs["tool_calls"][0]["id"], "call-1");
+        let repeated_update = r#"{"timestamp":11,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","title":"search_replace","toolCallId":"call-1","rawOutput":{"partial":"working"}}}}
+"#;
+        let mut updates = fs::read_to_string(&updates_path).unwrap();
+        updates.push_str(repeated_update);
+        fs::write(&updates_path, updates).unwrap();
+        let combined = parse_grok_session_for_entry(
+            &FileScanEntry {
+                session_id: session_id.to_string(),
+                stat_target: updates_path.clone(),
+                directory: None,
+            },
+            2,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(combined.events.len(), 3);
+        assert_eq!(combined.events[0].actor, "tool");
+        assert_eq!(combined.events[2].actor, "tool");
+        let partial: Value =
+            serde_json::from_str(combined.events[0].attrs_json.as_deref().unwrap()).unwrap();
+        let terminal: Value =
+            serde_json::from_str(combined.events[2].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(partial["params"]["update"]["rawOutput"]["partial"], "working");
+        assert_eq!(terminal["type"], "tool_result");
+        assert_eq!(terminal["tool_call_id"], "call-1");
+        assert_eq!(combined.events[0].source_path.as_deref(), updates_path.to_str());
+        assert_eq!(combined.events[0].message_seq, None);
+        assert_eq!(combined.events[1].source_path.as_deref(), chat_history_path.to_str());
+        assert_eq!(combined.events[1].message_seq, Some(1));
         assert_eq!(session.messages[0].content, "hello from history");
         assert_eq!(session.messages[1].content, "hi");
         assert_eq!(session.source_file_path.as_deref(), chat_history_path.to_str());
