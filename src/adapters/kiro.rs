@@ -7,6 +7,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::adapters::AdapterSyncContext;
+use crate::adapters::events::{self, EventContext};
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
 use crate::adapters::{
@@ -14,7 +15,12 @@ use crate::adapters::{
     SyncScanStats, first_timestamp, last_timestamp,
 };
 use crate::db::store::SessionPath;
-use crate::types::Role;
+use crate::types::{
+    CommandEvidenceStatus, FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, Role,
+};
+
+const EVENT_PARSER_VERSION: u32 = 1;
+const METADATA_PARSER_VERSION: u32 = 1;
 
 pub(crate) struct KiroAdapter;
 
@@ -49,14 +55,19 @@ impl SourceAdapter for KiroAdapter {
         &self,
         context: &AdapterSyncContext,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let mut result = if let Some(sessions_dir) = resolve_sessions_dir() {
-            file_scan::run_file_scan_with_options(
+            file_scan::run_file_scan_with_options_and_snapshot(
                 context,
                 since_ts,
-                file_scan::FileScanOptions::default(),
+                file_scan::FileScanOptions {
+                    event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+                    metadata_parser_version: Some(METADATA_PARSER_VERSION),
+                    ..Default::default()
+                },
                 collect_file_entries(&sessions_dir),
+                kiro_file_snapshot,
                 parse_kiro_file_entry,
             )?
         } else {
@@ -114,10 +125,15 @@ fn scan_file_sessions() -> Vec<RawSession> {
     };
     let mut sessions = Vec::new();
     for entry in collect_file_entries(&sessions_dir) {
-        let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+        let Some(snapshot) = kiro_file_snapshot(&entry) else {
             continue;
         };
-        match parse_kiro_file_entry(entry, mtime_ms) {
+        let observed = entry.clone();
+        let parsed = parse_kiro_file_entry(entry, snapshot.effective_mtime_ms());
+        if kiro_file_snapshot(&observed).as_ref() != Some(&snapshot) {
+            continue;
+        }
+        match parsed {
             Ok(Some(session)) => sessions.push(session),
             Ok(None) => {}
             Err(error) => warn!("failed to parse kiro session: {error}"),
@@ -205,6 +221,23 @@ fn collect_v3_entries(sessions_dir: &Path, entries: &mut Vec<FileScanEntry>) {
     }
 }
 
+fn kiro_file_snapshot(
+    entry: &FileScanEntry,
+) -> Option<file_scan::FileScanSnapshot<Vec<Option<file_scan::FileMetadataSnapshot>>>> {
+    let primary = file_scan::file_metadata_snapshot(&entry.stat_target)?;
+    let sidecar_path =
+        if entry.stat_target.file_name().and_then(|name| name.to_str()) == Some("messages.jsonl") {
+            entry.stat_target.parent()?.join("session.json")
+        } else {
+            entry.stat_target.with_extension("json")
+        };
+    let sidecar = file_scan::file_metadata_snapshot(&sidecar_path);
+    let effective_mtime = primary
+        .mtime_ms()?
+        .max(sidecar.as_ref().and_then(file_scan::FileMetadataSnapshot::mtime_ms).unwrap_or(0));
+    Some(file_scan::FileScanSnapshot::new(effective_mtime, vec![Some(primary), sidecar]))
+}
+
 fn parse_kiro_file_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
@@ -219,19 +252,19 @@ fn parse_kiro_file_entry(
         }
     };
     let source_path = entry.stat_target.to_str().map(str::to_string);
+    let sidecar_path = if is_v3 {
+        entry.stat_target.parent().map(|parent| parent.join("session.json"))
+    } else {
+        Some(entry.stat_target.with_extension("json"))
+    };
+    let sidecar = match sidecar_path.map(fs::read_to_string).transpose() {
+        Ok(sidecar) => sidecar,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let parsed = if is_v3 {
-        let sidecar = entry
-            .stat_target
-            .parent()
-            .map(|parent| parent.join("session.json"))
-            .and_then(|path| fs::read_to_string(path).ok());
         parse_kiro_v3_session(&jsonl, sidecar.as_deref(), &entry.session_id, mtime_ms, source_path)
     } else {
-        let sidecar = entry
-            .stat_target
-            .with_extension("json")
-            .to_str()
-            .and_then(|path| fs::read_to_string(path).ok());
         parse_kiro_v2_session(&jsonl, sidecar.as_deref(), &entry.session_id, mtime_ms, source_path)
     };
     match parsed {
@@ -250,7 +283,7 @@ pub(crate) fn parse_kiro_v2_session(
     mtime_ms: i64,
     source_path: Option<String>,
 ) -> anyhow::Result<Option<RawSession>> {
-    let meta = sidecar.and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let meta = sidecar.map(serde_json::from_str::<Value>).transpose()?;
     let session_id = meta
         .as_ref()
         .and_then(|value| value.get("session_id"))
@@ -272,10 +305,64 @@ pub(crate) fn parse_kiro_v2_session(
     let meta_started = meta.as_ref().and_then(|value| rfc3339_ms(value.get("created_at")));
 
     let mut messages = Vec::new();
+    let mut events = Vec::new();
     let mut last_prompt_ts = None;
     for item in jsonl_indexed(jsonl.lines().map(|line| Ok(line.to_string()))) {
-        let (_, record) = item?;
+        let (line, record) = item?;
         let kind = record.get("kind").and_then(Value::as_str).unwrap_or("");
+        let data = record.get("data");
+        let timestamp = data
+            .and_then(|data| data.get("meta"))
+            .and_then(|meta| json_i64(meta.get("timestamp")))
+            .map(unix_ts_to_ms);
+        if let Some(content) = data.and_then(|data| data.get("content")).and_then(Value::as_array) {
+            for (index, block) in content.iter().enumerate() {
+                let Some(tool) = block.get("data") else {
+                    continue;
+                };
+                let context = EventContext {
+                    event_seq: events.len() as u32,
+                    timestamp,
+                    source_path: source_path.clone(),
+                    source_event_id: Some(format!(
+                        "{}:{line}:{index}",
+                        data.and_then(|data| data.get("message_id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("record")
+                    )),
+                    message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                    parser_version: EVENT_PARSER_VERSION,
+                };
+                let mut event = match (kind, block.get("kind").and_then(Value::as_str)) {
+                    ("AssistantMessage", Some("toolUse")) => {
+                        let name = tool.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let mut event =
+                            kiro_tool_call(context, name, tool.get("input"), directory.as_deref());
+                        event.tool_call_id =
+                            tool.get("toolUseId").and_then(Value::as_str).map(str::to_string);
+                        event
+                    }
+                    ("ToolResults", Some("toolResult")) => {
+                        let mut event = events::tool_result_event(
+                            context,
+                            None,
+                            tool.get("content").map(Value::to_string),
+                        );
+                        event.tool_call_id =
+                            tool.get("toolUseId").and_then(Value::as_str).map(str::to_string);
+                        event.status = tool
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .filter(|status| matches!(*status, "error" | "success"))
+                            .map(str::to_string);
+                        event
+                    }
+                    _ => continue,
+                };
+                event.attrs_json = Some(record.to_string());
+                events.push(event);
+            }
+        }
         match kind {
             "Prompt" => {
                 let content =
@@ -310,6 +397,7 @@ pub(crate) fn parse_kiro_v2_session(
         mtime_ms,
         source_path,
         messages,
+        events,
     )
 }
 
@@ -320,7 +408,7 @@ pub(crate) fn parse_kiro_v3_session(
     mtime_ms: i64,
     source_path: Option<String>,
 ) -> anyhow::Result<Option<RawSession>> {
-    let meta = sidecar.and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let meta = sidecar.map(serde_json::from_str::<Value>).transpose()?;
     let session_id = meta
         .as_ref()
         .and_then(|value| {
@@ -344,8 +432,9 @@ pub(crate) fn parse_kiro_v3_session(
     let meta_started = meta.as_ref().and_then(|value| rfc3339_ms(value.get("createdAt")));
 
     let mut messages = Vec::new();
+    let mut events = Vec::new();
     for item in jsonl_indexed(jsonl.lines().map(|line| Ok(line.to_string()))) {
-        let (_, record) = item?;
+        let (line, record) = item?;
         let payload = record.get("payload").unwrap_or(&record);
         let kind = payload
             .get("type")
@@ -354,6 +443,45 @@ pub(crate) fn parse_kiro_v3_session(
             .unwrap_or("");
         let timestamp = rfc3339_ms(record.get("timestamp"))
             .or_else(|| json_i64(record.get("timestamp")).map(unix_ts_to_ms));
+        if matches!(kind, "tool_call" | "tool_result") {
+            let context = EventContext {
+                event_seq: events.len() as u32,
+                timestamp,
+                source_path: source_path.clone(),
+                source_event_id: record
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| Some(format!("line:{line}"))),
+                message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                parser_version: EVENT_PARSER_VERSION,
+            };
+            let mut event = if kind == "tool_call" {
+                kiro_tool_call(
+                    context,
+                    payload.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
+                    None,
+                    directory.as_deref(),
+                )
+            } else {
+                let mut event = events::tool_result_event(
+                    context,
+                    None,
+                    payload.get("content").map(|value| {
+                        value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string())
+                    }),
+                );
+                event.status = payload
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .map(|success| if success { "success" } else { "error" }.to_string());
+                event
+            };
+            event.tool_call_id =
+                payload.get("toolCallId").and_then(Value::as_str).map(str::to_string);
+            event.attrs_json = Some(record.to_string());
+            events.push(event);
+        }
         match kind {
             "user" => {
                 let content = extract_v3_text(payload.get("content"));
@@ -379,7 +507,77 @@ pub(crate) fn parse_kiro_v3_session(
         mtime_ms,
         source_path,
         messages,
+        events,
     )
+}
+
+fn kiro_tool_call(
+    context: EventContext,
+    name: &str,
+    input: Option<&Value>,
+    cwd: Option<&str>,
+) -> RawSessionEvent {
+    let mut event = events::tool_call_event(context, name.to_string(), input);
+    event.kind = "tool_call".to_string();
+    event.target = None;
+    let mut paths = Vec::new();
+    if let Some(input) = input {
+        if name == "fs_write" {
+            if let Some(path) = input.get("path").and_then(Value::as_str) {
+                paths.push((path, FileOperation::Write));
+            }
+        } else if name == "fs_read"
+            && let Some(operations) = input.get("operations").and_then(Value::as_array)
+        {
+            for operation in operations {
+                match operation.get("mode").and_then(Value::as_str) {
+                    Some("Line") => {
+                        if let Some(path) = operation.get("path").and_then(Value::as_str) {
+                            paths.push((path, FileOperation::Read));
+                        }
+                    }
+                    Some("Image") => {
+                        if let Some(images) = operation.get("image_paths").and_then(Value::as_array)
+                        {
+                            paths.extend(
+                                images
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(|path| (path, FileOperation::Read)),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if name == "execute_bash" {
+        event.kind = "command".to_string();
+        if let Some(command) = input.and_then(|input| input.get("command")).and_then(Value::as_str)
+        {
+            let (files, status) = events::shell_file_evidence(command, None);
+            event.files = files;
+            event.command_evidence_status = Some(status);
+        } else {
+            event.command_evidence_status = Some(CommandEvidenceStatus::Unsupported);
+        }
+        return event;
+    }
+
+    event.files = paths
+        .into_iter()
+        .filter(|(path, _)| !path.trim().is_empty())
+        .map(|(path, operation)| FileEvidence {
+            path: path.to_string(),
+            operation,
+            kind: FileEvidenceKind::Call,
+            cwd: cwd.map(str::to_string),
+            target: None,
+        })
+        .collect();
+    event.target = event.files.first().map(|file| file.path.clone());
+    event
 }
 
 struct FileMeta {
@@ -394,11 +592,12 @@ fn finish_session(
     mtime_ms: i64,
     source_path: Option<String>,
     messages: Vec<RawMessage>,
+    events: Vec<RawSessionEvent>,
 ) -> anyhow::Result<Option<RawSession>> {
-    if messages.is_empty() {
+    if messages.is_empty() && events.is_empty() {
         return Ok(None);
     }
-    let started_at = first_timestamp(meta.started_at, &messages, &[], &[]).unwrap_or(mtime_ms);
+    let started_at = first_timestamp(meta.started_at, &messages, &[], &events).unwrap_or(mtime_ms);
     let mut session = RawSession::search_only(
         meta.session_id,
         meta.directory,
@@ -407,6 +606,9 @@ fn finish_session(
         None,
         messages,
     );
+    session = session.with_events(events, EVENT_PARSER_VERSION);
+    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    session.refresh_session_on_metadata_backfill = true;
     session.source_file_path = source_path;
     session.custom_title = meta.title;
     Ok(Some(session))
@@ -454,6 +656,9 @@ fn extract_v3_text(content: Option<&Value>) -> String {
             if !text.is_empty() {
                 parts.push(text);
             }
+            continue;
+        }
+        if item.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "text") {
             continue;
         }
         if let Some(text) = item.get("text").or_else(|| item.get("content")).and_then(Value::as_str)
@@ -612,7 +817,12 @@ fn push_sqlite_v2(conn: &Connection, sessions: &mut Vec<RawSession>, seen: &mut 
             continue;
         }
         match parse_kiro_conversation(&conversation_id, &cwd, &value_json, created_at, updated_at) {
-            Ok(Some(session)) => sessions.push(session),
+            Ok(Some(mut session)) => {
+                for event in &mut session.events {
+                    event.source_path = conn.path().map(str::to_string);
+                }
+                sessions.push(session);
+            }
             Ok(None) => {}
             Err(error) => debug!("failed to parse kiro conversation {conversation_id}: {error}"),
         }
@@ -663,6 +873,9 @@ fn push_sqlite_v1(conn: &Connection, sessions: &mut Vec<RawSession>, seen: &mut 
         match parse_kiro_conversation(conversation_id, &cwd, &value_json, 0, 0) {
             Ok(Some(mut session)) => {
                 apply_v1_timestamps(&mut session);
+                for event in &mut session.events {
+                    event.source_path = conn.path().map(str::to_string);
+                }
                 sessions.push(session);
             }
             Ok(None) => {}
@@ -673,10 +886,11 @@ fn push_sqlite_v1(conn: &Connection, sessions: &mut Vec<RawSession>, seen: &mut 
 
 fn apply_v1_timestamps(session: &mut RawSession) {
     if session.started_at == 0 {
-        session.started_at = first_timestamp(None, &session.messages, &[], &[]).unwrap_or(0);
+        session.started_at =
+            first_timestamp(None, &session.messages, &[], &session.events).unwrap_or(0);
     }
     if session.updated_at == Some(0) {
-        session.updated_at = last_timestamp(None, &session.messages, &[], &[]);
+        session.updated_at = last_timestamp(None, &session.messages, &[], &session.events);
     }
 }
 
@@ -688,117 +902,118 @@ pub(crate) fn parse_kiro_conversation(
     updated_at: i64,
 ) -> anyhow::Result<Option<RawSession>> {
     let doc: Value = serde_json::from_str(value_json)?;
-
-    let history = match doc.get("history").and_then(|h| h.as_array()) {
-        Some(arr) => arr,
-        None => return Ok(None),
+    let Some(history) = doc.get("history").and_then(Value::as_array) else {
+        return Ok(None);
     };
-
     let mut messages = Vec::new();
-
-    for turn in history {
-        if let Some(user_obj) = turn.get("user") {
-            let content = extract_user_content(user_obj);
-            let timestamp = parse_kiro_timestamp(user_obj.get("timestamp"));
-            if !content.is_empty() {
-                messages.push(RawMessage { role: Role::User, content, timestamp });
+    let mut events = Vec::new();
+    for (turn_index, turn) in history.iter().enumerate() {
+        if let Some(user) = turn.get("user") {
+            let timestamp = parse_kiro_timestamp(user.get("timestamp"));
+            if let Some(results) =
+                user.pointer("/content/ToolUseResults/tool_use_results").and_then(Value::as_array)
+            {
+                for (index, result) in results.iter().enumerate() {
+                    let mut event = events::tool_result_event(
+                        EventContext {
+                            event_seq: events.len() as u32,
+                            timestamp,
+                            source_path: None,
+                            source_event_id: Some(format!(
+                                "{conversation_id}:history:{turn_index}:result:{index}"
+                            )),
+                            message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                            parser_version: EVENT_PARSER_VERSION,
+                        },
+                        None,
+                        result.get("content").map(Value::to_string),
+                    );
+                    event.tool_call_id =
+                        result.get("tool_use_id").and_then(Value::as_str).map(str::to_string);
+                    event.status = match result.get("status").and_then(Value::as_str) {
+                        Some("Error") => Some("error".to_string()),
+                        Some("Success") => Some("success".to_string()),
+                        _ => None,
+                    };
+                    event.attrs_json = Some(user.to_string());
+                    events.push(event);
+                }
+            }
+            if let Some(content) = user
+                .pointer("/content/Prompt/prompt")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                messages.push(RawMessage {
+                    role: Role::User,
+                    content: content.to_string(),
+                    timestamp,
+                });
             }
         }
-
-        if let Some(assistant_obj) = turn.get("assistant") {
-            let content = extract_assistant_content(assistant_obj);
+        if let Some(assistant) = turn.get("assistant") {
             let timestamp = turn
-                .get("request_metadata")
-                .and_then(|m| m.get("request_start_timestamp_ms"))
-                .and_then(|t| t.as_i64());
-            if !content.is_empty() {
-                messages.push(RawMessage { role: Role::Assistant, content, timestamp });
+                .pointer("/request_metadata/request_start_timestamp_ms")
+                .and_then(Value::as_i64);
+            if let Some(tool_use) = assistant.get("ToolUse")
+                && let Some(tools) = tool_use.get("tool_uses").and_then(Value::as_array)
+            {
+                for (index, tool) in tools.iter().enumerate() {
+                    let name = tool.get("name").and_then(Value::as_str).unwrap_or("tool");
+                    let mut event = kiro_tool_call(
+                        EventContext {
+                            event_seq: events.len() as u32,
+                            timestamp,
+                            source_path: None,
+                            source_event_id: Some(format!(
+                                "{conversation_id}:history:{turn_index}:{}:{index}",
+                                tool_use
+                                    .get("message_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("assistant")
+                            )),
+                            message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                            parser_version: EVENT_PARSER_VERSION,
+                        },
+                        name,
+                        tool.get("args"),
+                        Some(cwd),
+                    );
+                    event.tool_call_id = tool.get("id").and_then(Value::as_str).map(str::to_string);
+                    event.attrs_json = Some(assistant.to_string());
+                    events.push(event);
+                }
+            }
+            if let Some(content) = assistant
+                .get("Response")
+                .or_else(|| assistant.get("ToolUse"))
+                .and_then(|value| value.get("content"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                messages.push(RawMessage {
+                    role: Role::Assistant,
+                    content: content.to_string(),
+                    timestamp,
+                });
             }
         }
     }
-
-    if messages.is_empty() {
+    if messages.is_empty() && events.is_empty() {
         return Ok(None);
     }
-
-    Ok(Some(RawSession::search_only(
+    let mut session = RawSession::search_only(
         conversation_id.to_string(),
         Some(cwd.to_string()),
         created_at,
         Some(updated_at),
         None,
         messages,
-    )))
-}
-
-fn extract_user_content(user_obj: &Value) -> String {
-    let content = match user_obj.get("content") {
-        Some(c) => c,
-        None => return String::new(),
-    };
-
-    if let Some(prompt_obj) = content.get("Prompt")
-        && let Some(text) = prompt_obj.get("prompt").and_then(|p| p.as_str())
-    {
-        return text.to_string();
-    }
-
-    if let Some(tool_results) = content.get("ToolUseResults")
-        && let Some(arr) = tool_results.get("tool_use_results").and_then(|v| v.as_array())
-    {
-        let mut parts = Vec::new();
-        for result in arr {
-            let Some(inner) = result.get("content").and_then(|c| c.as_array()) else {
-                continue;
-            };
-            for item in inner {
-                if let Some(text) = item.get("Text").and_then(|t| t.as_str()) {
-                    parts.push(text.to_string());
-                } else if let Some(json_val) = item.get("Json")
-                    && let Ok(s) = serde_json::to_string(json_val)
-                {
-                    parts.push(s);
-                }
-            }
-        }
-        if !parts.is_empty() {
-            return parts.join("\n");
-        }
-    }
-
-    String::new()
-}
-
-fn extract_assistant_content(assistant_obj: &Value) -> String {
-    if let Some(response) = assistant_obj.get("Response")
-        && let Some(text) = response.get("content").and_then(|c| c.as_str())
-    {
-        return text.to_string();
-    }
-
-    if let Some(tool_use) = assistant_obj.get("ToolUse") {
-        let mut parts = Vec::new();
-        if let Some(prose) = tool_use.get("content").and_then(|c| c.as_str())
-            && !prose.is_empty()
-        {
-            parts.push(prose.to_string());
-        }
-        if let Some(tool_uses) = tool_use.get("tool_uses").and_then(|v| v.as_array()) {
-            for tu in tool_uses {
-                let name = tu.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                let args = tu
-                    .get("args")
-                    .map(|a| serde_json::to_string(a).unwrap_or_default())
-                    .unwrap_or_default();
-                parts.push(format!("[{name}] {args}"));
-            }
-        }
-        if !parts.is_empty() {
-            return parts.join("\n");
-        }
-    }
-
-    String::new()
+    )
+    .with_events(events, EVENT_PARSER_VERSION);
+    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    session.refresh_session_on_metadata_backfill = true;
+    Ok(Some(session))
 }
 
 fn parse_kiro_timestamp(ts: Option<&Value>) -> Option<i64> {
@@ -841,6 +1056,14 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&"790bb539-44be-40bd-85ac-0bb1a3fc6b47"));
         assert!(ids.contains(&"sess_90e28400-458e-47f0-8793-70137f0c92c5"));
+        let entry = entries
+            .iter()
+            .find(|entry| entry.stat_target == v3.join("messages.jsonl"))
+            .unwrap()
+            .clone();
+        assert!(parse_kiro_file_entry(entry.clone(), 100).unwrap().is_some());
+        fs::write(v3.join("session.json"), "{broken").unwrap();
+        assert!(parse_kiro_file_entry(entry, 100).unwrap().is_none());
     }
 
     fn session_path(source_id: &str, file: Option<&str>) -> SessionPath {

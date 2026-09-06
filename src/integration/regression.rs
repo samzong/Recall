@@ -1874,7 +1874,7 @@ fn kiro_parser_assistant_tool_use() {
                     "message_id": "m1",
                     "content": "Let me look around.",
                     "tool_uses": [
-                        {"id": "t1", "name": "fs_read", "args": {"path": "/src"}},
+                        {"id": "t1", "name": "fs_read", "args": {"operations": [{"mode":"Line","path":"/src"}]}},
                         {"id": "t2", "name": "execute_bash", "args": {"command": "ls"}}
                     ]
                 }
@@ -1890,13 +1890,14 @@ fn kiro_parser_assistant_tool_use() {
         "prose preserved: {}",
         assistant.content
     );
-    assert!(assistant.content.contains("[fs_read]"), "first tool indexed: {}", assistant.content);
-    assert!(
-        assistant.content.contains("[execute_bash]"),
-        "second tool indexed: {}",
-        assistant.content
-    );
-    assert!(assistant.content.contains("/src"), "fs_read args indexed: {}", assistant.content);
+    assert_eq!(assistant.content, "Let me look around.");
+    assert_eq!(session.events.len(), 2);
+    assert_eq!(session.events[0].tool_call_id.as_deref(), Some("t1"));
+    assert_eq!(session.events[0].files[0].path, "/src");
+    assert_eq!(session.events[1].tool_call_id.as_deref(), Some("t2"));
+    let native: serde_json::Value =
+        serde_json::from_str(session.events[1].attrs_json.as_deref().unwrap()).unwrap();
+    assert_eq!(native["ToolUse"]["tool_uses"][1]["args"]["command"], "ls");
 }
 
 #[test]
@@ -1924,14 +1925,23 @@ fn kiro_parser_tool_use_results_text_and_json() {
     }"#;
 
     let session = parse_kiro_conversation("c", "/proj", json, 0, 0).unwrap().unwrap();
-    let user_msg = &session.messages[0];
-    assert!(
-        user_msg.content.contains("file contents here"),
-        "Text variant indexed: {}",
-        user_msg.content
-    );
-    assert!(user_msg.content.contains("\"status\""), "Json variant indexed: {}", user_msg.content);
-    assert!(user_msg.content.contains("42"), "Json values indexed: {}", user_msg.content);
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].content, "done");
+    assert_eq!(session.events.len(), 2);
+    for (event, id) in session.events.iter().zip(["t1", "t2"]) {
+        assert_eq!(event.tool_call_id.as_deref(), Some(id));
+        assert_eq!(event.message_seq, None);
+        let native: serde_json::Value =
+            serde_json::from_str(event.attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            native["content"]["ToolUseResults"]["tool_use_results"][0]["content"][0]["Text"],
+            "file contents here"
+        );
+        assert_eq!(
+            native["content"]["ToolUseResults"]["tool_use_results"][1]["content"][0]["Json"]["rows"],
+            42
+        );
+    }
 }
 
 #[test]
@@ -1950,8 +1960,8 @@ fn kiro_v2_parser_prompt_and_assistant_text() {
         "title": "hello, analyze this project"
     }"#;
     let jsonl = r#"{"version":"v1","kind":"Prompt","data":{"message_id":"p1","content":[{"kind":"text","data":"hello, analyze this project"}],"meta":{"timestamp":1788285089}}}
-{"version":"v1","kind":"AssistantMessage","data":{"message_id":"a1","content":[{"kind":"thinking","data":{"text":"plan"}},{"kind":"text","data":"This is Recall."},{"kind":"toolUse","data":{"toolUseId":"t1","name":"read","input":{"path":"/src"}}}]}}
-{"version":"v1","kind":"ToolResults","data":{"message_id":"t1","content":[{"kind":"toolResult","data":{"content":[{"kind":"text","data":"secret dump"}]}}]}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"a1","content":[{"kind":"thinking","data":{"text":"plan"}},{"kind":"text","data":"This is Recall."},{"kind":"toolUse","data":{"toolUseId":"t1","name":"fs_read","input":{"operations":[{"mode":"Image","image_paths":["/src/a.png","/src/b.png"]}]}}}]}}
+{"version":"v1","kind":"ToolResults","data":{"message_id":"t1","content":[{"kind":"toolResult","data":{"toolUseId":"t1","status":"error","content":[{"kind":"text","data":"secret dump"}]}}]}}
 {"version":"v1","kind":"Prompt","data":{"message_id":"p2","content":[{"kind":"text","data":"find a bug"}],"meta":{"timestamp":1788285145}}}
 {"version":"v1","kind":"AssistantMessage","data":{"message_id":"a2","content":[{"kind":"text","data":"No bug found."}]}}"#;
 
@@ -1972,6 +1982,14 @@ fn kiro_v2_parser_prompt_and_assistant_text() {
     assert!(!session.messages.iter().any(|message| message.content.contains("[read]")));
     assert_eq!(session.messages[2].content, "find a bug");
     assert_eq!(session.messages[3].content, "No bug found.");
+    assert_eq!(session.events.len(), 2);
+    assert_eq!(
+        session.events[0].files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+        ["/src/a.png", "/src/b.png"]
+    );
+    assert_eq!(session.events[1].tool_call_id, session.events[0].tool_call_id);
+    assert_eq!(session.events[1].status.as_deref(), Some("error"));
+    assert!(session.events[1].attrs_json.as_ref().unwrap().contains("secret dump"));
 }
 
 #[test]
@@ -1992,8 +2010,8 @@ fn kiro_v3_parser_user_and_say_skips_reasoning() {
     }"#;
     let jsonl = r#"{"id":"u1","timestamp":"2026-09-01T17:52:55.268Z","payload":{"type":"user","content":"analyze the current project","images":[],"documents":[]}}
 {"id":"r1","timestamp":"2026-09-01T17:53:01.908Z","payload":{"type":"assistant","content":"...","operationType":"Reasoning"}}
-{"id":"t1","timestamp":"2026-09-01T17:53:02.000Z","payload":{"type":"tool_call","toolName":"read","args":{"path":"/src"}}}
-{"id":"t2","timestamp":"2026-09-01T17:53:03.000Z","payload":{"type":"tool_result","content":"file dump"}}
+{"id":"t1","timestamp":"2026-09-01T17:53:02.000Z","payload":{"type":"tool_call","toolName":"fs_read","toolCallId":"native-call"}}
+{"id":"t2","timestamp":"2026-09-01T17:53:03.000Z","payload":{"type":"tool_result","toolCallId":"native-call","success":false,"content":"file dump"}}
 {"id":"a1","timestamp":"2026-09-01T17:56:06.468Z","payload":{"type":"assistant","content":"Recall indexes local sessions.","operationType":"Say"}}
 {"id":"s1","timestamp":"2026-09-01T17:56:06.506Z","payload":{"type":"session_start","content":"You are Kiro CLI"}}"#;
 
@@ -2015,6 +2033,12 @@ fn kiro_v3_parser_user_and_say_skips_reasoning() {
     assert_eq!(session.messages[1].content, "Recall indexes local sessions.");
     assert!(!session.messages.iter().any(|message| message.content.contains("You are Kiro")));
     assert!(!session.messages.iter().any(|message| message.content.contains("file dump")));
+    assert_eq!(session.events.len(), 2);
+    assert_eq!(session.events[0].tool_call_id.as_deref(), Some("native-call"));
+    assert!(session.events[0].files.is_empty());
+    assert_eq!(session.events[1].tool_call_id, session.events[0].tool_call_id);
+    assert_eq!(session.events[1].status.as_deref(), Some("error"));
+    assert!(session.events[1].attrs_json.as_ref().unwrap().contains("file dump"));
 }
 
 #[test]

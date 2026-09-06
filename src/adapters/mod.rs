@@ -429,6 +429,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "openhands"
             | "kimi-code"
             | "grok"
+            | "kiro-cli"
             | "cline"
             | "roo"
             | "qwen-code"
