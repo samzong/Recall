@@ -19,7 +19,7 @@ use crate::types::{
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
 pub(crate) const USAGE_PARSER_VERSION: u32 = 2;
-pub(crate) const EVENT_PARSER_VERSION: u32 = 6;
+pub(crate) const EVENT_PARSER_VERSION: u32 = 7;
 pub(crate) const METADATA_PARSER_VERSION: u32 = 2;
 const PARSED_PART_FILTER_SQL: &str = "
     json_valid(m.data)
@@ -37,11 +37,12 @@ const TIMELINE_USAGE_FILTER_SQL: &str =
 pub(crate) struct ScanOptions {
     pub exclude_hidden_transcript: bool,
     pub exclude_timeline_usage: bool,
+    zcode_tools: bool,
 }
 
 impl ScanOptions {
     pub(crate) const ZCODE: Self =
-        Self { exclude_hidden_transcript: true, exclude_timeline_usage: true };
+        Self { exclude_hidden_transcript: true, exclude_timeline_usage: true, zcode_tools: true };
 
     fn transcript_sql(self) -> &'static str {
         if self.exclude_hidden_transcript { HIDDEN_TRANSCRIPT_FILTER_SQL } else { "" }
@@ -253,7 +254,7 @@ fn scan_session_messages(
         load_message_chunk(conn, chunk, &mut session_messages, options)?;
         load_usage_chunk(conn, chunk, &mut session_usage_events, options)?;
         if include_events {
-            load_event_chunk(conn, chunk, &mut session_events)?;
+            load_event_chunk(conn, chunk, &mut session_events, options)?;
         }
     }
 
@@ -263,7 +264,8 @@ fn scan_session_messages(
         let usage_events = session_usage_events.remove(&session.id).unwrap_or_default();
         let mut events = session_events.remove(&session.id).unwrap_or_default();
         for file in events.iter_mut().flat_map(|event| &mut event.files) {
-            if file.kind != FileEvidenceKind::Command
+            if !options.zcode_tools
+                && file.kind != FileEvidenceKind::Command
                 && file.cwd.is_none()
                 && !session.directory.trim().is_empty()
             {
@@ -302,6 +304,7 @@ fn load_event_chunk(
     conn: &Connection,
     session_ids: &[String],
     session_events: &mut HashMap<String, Vec<RawSessionEvent>>,
+    options: ScanOptions,
 ) -> anyhow::Result<()> {
     let placeholders = std::iter::repeat_n("?", session_ids.len()).collect::<Vec<_>>().join(", ");
     let sql = format!(
@@ -346,6 +349,7 @@ fn load_event_chunk(
             conn.path().filter(|path| !path.is_empty()),
             &message_id,
             cwd,
+            options,
         );
         events.extend(part_events);
     }
@@ -353,6 +357,7 @@ fn load_event_chunk(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_part_events(
     part_id: &str,
     part_data: &str,
@@ -361,6 +366,7 @@ fn parse_part_events(
     source_path: Option<&str>,
     message_id: &str,
     cwd: Option<&str>,
+    options: ScanOptions,
 ) -> Vec<RawSessionEvent> {
     let Some(part) = serde_json::from_str::<Value>(part_data).ok() else {
         return Vec::new();
@@ -462,19 +468,45 @@ fn parse_part_events(
     for event in &mut parsed {
         event.attrs_json = Some(attrs.to_string());
         event.tool_call_id = call_id.map(str::to_string);
+        if options.zcode_tools
+            && event.actor == "tool"
+            && part.pointer("/state/status").and_then(Value::as_str) == Some("completed")
+            && let Some(observation) = part.pointer("/state/metadata/readFileState")
+            && observation.get("schemaVersion").and_then(Value::as_u64) == Some(1)
+            && observation.get("tool").and_then(Value::as_str) == event.name.as_deref()
+            && let Some(operation) = match event.name.as_deref() {
+                Some("Read") => Some(FileOperation::Read),
+                Some("Write" | "Edit") => Some(FileOperation::Write),
+                _ => None,
+            }
+            && let Some(path) = observation.get("path").and_then(Value::as_str)
+            && Path::new(path).is_absolute()
+        {
+            event.files.push(FileEvidence {
+                path: path.to_string(),
+                operation,
+                kind: FileEvidenceKind::Observation,
+                cwd: None,
+                target: None,
+            });
+        }
         if matches!(part.get("type").and_then(Value::as_str), Some("tool" | "tool-invocation"))
             && event.actor == "assistant"
         {
             let input = part.get("input").or_else(|| part.pointer("/state/input"));
-            if event.name.as_deref() == Some("bash") {
+            if event.name.as_deref() == Some("bash")
+                || (options.zcode_tools && event.name.as_deref() == Some("Bash"))
+            {
                 event.kind = "command".to_string();
                 event.target = input
                     .and_then(|input| input.get("command"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 if let Some(command) = event.target.as_deref() {
-                    let base = cwd.filter(|cwd| Path::new(cwd).is_absolute());
+                    let base =
+                        cwd.filter(|cwd| !options.zcode_tools && Path::new(cwd).is_absolute());
                     let shell_cwd = match input.and_then(|input| input.get("workdir")) {
+                        _ if options.zcode_tools => None,
                         Some(Value::String(path)) if Path::new(path).is_absolute() => {
                             Some(PathBuf::from(path))
                         }
@@ -491,6 +523,10 @@ fn parse_part_events(
                 }
             }
             let selection = match event.name.as_deref() {
+                Some("Read") if options.zcode_tools => Some((FileOperation::Read, "file_path")),
+                Some("Write" | "Edit") if options.zcode_tools => {
+                    Some((FileOperation::Write, "file_path"))
+                }
                 Some("read") => Some((FileOperation::Read, "filePath")),
                 Some("write" | "edit") => Some((FileOperation::Write, "filePath")),
                 Some("readFile") => Some((FileOperation::Read, "path")),
@@ -506,7 +542,7 @@ fn parse_part_events(
                     path: path.to_string(),
                     operation,
                     kind: FileEvidenceKind::Call,
-                    cwd: cwd.map(str::to_string),
+                    cwd: cwd.filter(|_| !options.zcode_tools).map(str::to_string),
                     target: None,
                 });
             }
@@ -1680,6 +1716,7 @@ mod tests {
             conn.path(),
             "message",
             Some("/tmp/target-worktree"),
+            ScanOptions::default(),
         );
         assert_eq!(parsed[0].files[0].cwd.as_deref(), Some("/tmp/target-worktree/nested"));
         assert_eq!(parsed[0].files[0].kind, FileEvidenceKind::Command);
