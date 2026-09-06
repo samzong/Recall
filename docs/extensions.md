@@ -132,9 +132,11 @@ Core support in v0.1:
   that need transcript data must pass `--messages` or
   `--include metadata,messages,usage,events`.
 - every session record carries `session.topology` (`thread_role` plus portable
-  `parents[]`), and event records carry nullable `tool_call_id`, `is_meta`, and
-  `visibility`; both are additive and do not affect `protocol_version`. Import
-  accepts records from schema v2 through v6.
+  `parents[]`). Schema v7 event records retain `files` and nullable
+  `command_evidence_status`, alongside `tool_call_id`, `is_meta`, and
+  `visibility`. Import accepts schema v2 through v7; absent evidence fields in
+  older records default to empty files or null, which means unknown coverage.
+  These additions do not change `protocol_version`.
 
 `protocol_version` is `2`. Version 2 changed the default scope: a command
 without `--project` now resolves its scope from the current directory instead
@@ -454,16 +456,25 @@ demand.
 
 ## File History Compatibility Requirements
 
-File-history implementation follows the acceptance contract in
-[session.md](session.md#file-history-implementation-contract). Existing
-`file_history.project` denotes session scope; target-file scope must be an
-explicit additive selection, not a silent change to that parameter. Existing
-head/tail reads and message continuation retain their published meanings.
+The MCP file-history workflow is documented in
+[session.md](session.md#file-history-implementation-contract).
+`file_history.target_project` selects a target file across session projects;
+it cannot be combined with the older session-scope `project` parameter.
+Existing path matching and head/tail or message-cursor reads keep their meanings
+when the new selectors are absent. `get_session` evidence mode requires an
+explicit `event_ref` and reads discussion separately.
 
-New evidence fields must survive full export/import. Old records lacking those
-fields represent unknown evidence, not a claim that no operation occurred.
-Partial pages must not replace complete sessions during import. Schema changes
-belong to core migrations; extensions continue to use the CLI protocol.
+Extensions obtain complete event records through CLI export or session detail
+with `--include metadata,messages,events`. Preserve native payloads, file
+associations, visibility, and command scan status through export/import. A
+command candidate or `complete` scan status does not prove an operation ran or
+succeeded. Event rows and Git commits are not independent edit counts.
+
+MCP evidence pages are fragments, not export records; do not import a page as a
+complete session. Imported source locators do not authorize native filesystem
+reads. Missing source data and absent fields remain unknown. Schema migrations
+and event backfill belong to core; extensions do not read SQLite or resolve
+imported paths themselves.
 
 ## Non-Goals
 

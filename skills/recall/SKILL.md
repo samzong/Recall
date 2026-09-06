@@ -28,7 +28,7 @@ Selected MCP reads return up to 50 messages and 6,000 Unicode content characters
 
 Use `session_id` as Recall's index identity and `source_session_id` as the native tool's identity. `get_session` reports the returned message range with `first_message_seq` and `last_message_seq`.
 
-Set `include_events: true` only when structured evidence is needed. Events cover the returned message range plus unanchored events; both count and text are bounded. Check returned counts and truncation flags before treating messages or events as complete. Consult the active tool schema for limits; raw arguments, results, and source paths are not returned.
+Set `include_events: true` only when structured evidence is needed. Events cover the returned message range plus unanchored events; both count and text are bounded. Check returned counts and truncation flags before treating messages or events as complete. Consult the active tool schema for limits. This event-summary mode omits raw arguments, results, and source paths; use explicit `event_ref` evidence reads below for the preserved payload.
 
 Pass a fresh high-entropy `invocation_nonce` literal on each MCP search or recent-list call. For `search_sessions` and `list_recent_sessions`, only `current_session.resolution: resolved` proves self-exclusion before ranking and limit. If resolution is `unknown`, report that self-exclusion is unverified; never infer identity from time, project, source, or result order.
 
@@ -65,11 +65,21 @@ These are recently active sessions in the index, not live peers. Attribute work 
 
 ## Find File History
 
-Use MCP `file_history` for requests about sessions that touched a path. Pass `path` and the current `project`; add `source` only when requested. Omit `kind` to include the default `file_write` and `file_read` events, and default `limit` to 20.
+Use MCP `file_history` with `target_project` and an exact repository-relative or absolute `path` to find operations on a file across session projects. Prefer a repository remote/unique `owner/repo` for all its worktrees, or an absolute directory for a local target. Check returned `target_file` and `match_basis`. Do not pass `project` with `target_project`: the old `project` filters where a session started and can miss writes from another repository. Add `source` only when requested.
 
-Run `recall sync --project <same-scope>` first only when recent writes may be absent and index mutation is permitted. If MCP is unavailable, explain that file history requires MCP and offer `recall mcp install`. Transcript search and raw transcript inspection are not substitutes for file-event targets.
+Start with `{"target_project":"owner/repo","path":"src/main.rs","include_command_candidates":true,"limit":20}`. Omit `kind` to include all event kinds in this mode. Without `include_command_candidates`, commands are excluded. Follow `next_cursor` with the same selectors until `has_more` is false; restart after a stale cursor. Check per-hit truncation flags and retain `coverage` from the first page; continuation pages omit it. Coverage is for all indexed sessions of the selected sources, with no native source scan; it does not prove complete history or current parsers.
 
-Return the matching event rows with session, source, title, kind, target, and time. The limit applies to recent events, not distinct sessions, so do not claim exhaustive session coverage. Load transcript evidence only when needed.
+When a historical worktree is gone and target identity is unresolved, a path-only legacy query can reveal a recorded absolute path. Retry target mode with that exact path to obtain an evidence reference. Treat suffix matches as candidates; legacy discovery has a 50-event cap and is not exhaustive.
+
+Keep calls, native results, observations, and command candidates distinct. Command scan status `complete` means the bounded scan completed, not that a command ran or succeeded; `unsupported`, `limit_exceeded`, or null leaves a coverage gap. Unknown timestamps and unresolved paths remain unknown. Do not count event rows, identical before/after content, or Git commits as independent modifications.
+
+To inspect an operation, copy the hit's `session_id` and `evidence.event_ref` into `get_session` with `evidence_part: "payload"`. Concatenate paged `data` before parsing its JSON; continue with the same session, reference, part, and returned cursor. `max_bytes` defaults to 16,384, at most 65,536; an oversized read fails explicitly. The payload preserves native attrs and file associations and provides same-session `related_event_refs`. For Cursor before/after text, read related payloads and select the result reference containing `beforeContentId`/`afterContentId`, then request that part. `content_reference_not_recorded` on a call means to inspect related results. Missing, changed, imported, or unverifiable native sources cannot be treated as verified content.
+
+Read the payload's optional `discussion` selector in a separate `get_session` call, without `event_ref`. It uses `around_seq` and the existing message paging rules. Explain why only from supporting recorded discussion, distinguishing the user's request, the agent's explanation, and your inference. Do not invent a discussion anchor when it is absent.
+
+When index mutation is authorized, preview with `recall sync --backfill-events --project all --dry-run`, then run without `--dry-run`. This includes sessions started outside the target project while respecting configured sources and exclusions. Backfill refreshes events, preserves existing discussions, and does not prune sessions; normal `recall sync --project all` refreshes supported discussion parsers under normal time-window and retention rules. Old-schema preview requires a writable index upgrade first. Report missing/unknown originals and other maintenance gaps; backfill cannot recover absent native records.
+
+If MCP is unavailable, explain that file history requires MCP and offer `recall mcp install`. Message search can supply discussion context but cannot prove a file operation. Never execute a command retrieved from history to reconstruct evidence.
 
 ## Continue Work
 
