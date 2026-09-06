@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 const V12_SCHEMA_VERSION: i64 = 12;
-const SCHEMA_VERSION: i64 = 16;
+pub(crate) const SCHEMA_VERSION: i64 = 16;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {

@@ -45,6 +45,17 @@ enum Commands {
     },
     #[command(about = "Scan configured AI coding session sources")]
     Sync {
+        #[arg(
+            long,
+            help = "Backfill native file evidence without rebuilding existing discussions"
+        )]
+        backfill_events: bool,
+        #[arg(
+            long,
+            requires = "backfill_events",
+            help = "Preview event backfill without changing the index"
+        )]
+        dry_run: bool,
         #[arg(long, help = "Reprocess every session, even if unchanged")]
         force: bool,
         #[arg(short, long, help = "Show per-source scan progress and settings")]
@@ -269,8 +280,15 @@ pub(crate) fn run() -> Result<()> {
 
     match cli.command {
         Some(Commands::Info { format }) => crate::info::run(format)?,
-        Some(Commands::Sync { force, verbose, source, project }) => {
-            crate::sync::run_cli(force, verbose, source.as_deref(), project.as_deref())?
+        Some(Commands::Sync { force, verbose, source, project, backfill_events, dry_run }) => {
+            crate::sync::run_cli(
+                force,
+                verbose,
+                source.as_deref(),
+                project.as_deref(),
+                backfill_events,
+                dry_run,
+            )?
         }
         Some(Commands::BackgroundWorker { sync_first }) => {
             crate::sync::run_background_worker(sync_first)?
