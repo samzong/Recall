@@ -284,7 +284,7 @@ fn parse_sdk_layout(
     }
     let started_at = first_timestamp(event_timestamp(&base), &messages, &[], &events)
         .unwrap_or(mtime_ms.unwrap_or(0));
-    let updated_at = last_timestamp(mtime_ms, &messages, &[], &events).or(mtime_ms);
+    let updated_at = last_timestamp(mtime_ms, &messages, &[], &events);
     let mut raw = RawSession::search_only(
         source_id.to_string(),
         directory,
@@ -321,7 +321,7 @@ fn parse_docs_layout(
         id,
         workspace_dir(&value),
         started_at,
-        last_timestamp(mtime_ms, &messages, &[], &[]).or(mtime_ms),
+        last_timestamp(mtime_ms, &messages, &[], &[]),
         None,
         messages,
     );

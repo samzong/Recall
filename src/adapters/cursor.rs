@@ -39,16 +39,6 @@ struct ComposerMeta {
     last_updated_at: Option<i64>,
 }
 
-struct ParsedComposerSession {
-    messages: Vec<RawMessage>,
-    usage_events: Vec<RawUsageEvent>,
-    events: Vec<RawSessionEvent>,
-    started_at: i64,
-    updated_at: Option<i64>,
-    entrypoint: Option<String>,
-    directory: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 struct AgentTranscriptPath {
     session_id: String,
@@ -351,24 +341,9 @@ fn build_raw_session(
     transcript_paths: &HashMap<String, AgentTranscriptPath>,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    let Some(parsed) = parse_composer_session(conn, composer_id, meta, include_events)? else {
+    let Some(mut session) = parse_composer_session(conn, composer_id, meta, include_events)? else {
         return Ok(None);
     };
-
-    let mut session = RawSession::search_only(
-        composer_id.to_string(),
-        parsed.directory.or(meta.directory.clone()),
-        parsed.started_at,
-        parsed.updated_at,
-        parsed.entrypoint.or(meta.unified_mode.clone()),
-        parsed.messages,
-    )
-    .with_usage(parsed.usage_events, USAGE_PARSER_VERSION);
-    if include_events {
-        session = session.with_events(parsed.events, EVENT_PARSER_VERSION);
-    }
-    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
-    session.refresh_session_on_metadata_backfill = true;
     session.source_file_path = transcript_paths
         .get(composer_id)
         .and_then(|transcript| transcript.path.to_str())
@@ -381,7 +356,7 @@ fn parse_composer_session(
     composer_id: &str,
     meta: &ComposerMeta,
     include_events: bool,
-) -> anyhow::Result<Option<ParsedComposerSession>> {
+) -> anyhow::Result<Option<RawSession>> {
     let Some(raw_json) = read_disk_kv(conn, &format!("composerData:{composer_id}")) else {
         return Ok(None);
     };
@@ -396,14 +371,13 @@ fn parse_composer_session(
     let headers = data
         .get("fullConversationHeadersOnly")
         .and_then(|value| value.as_array())
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default();
     let conversation_map = data.get("conversationMap").and_then(|value| value.as_object());
 
     let mut messages = Vec::new();
     let mut has_tool_records = false;
     let mut usage_events = Vec::new();
-    let mut bubble_usage_events = Vec::new();
     let mut session_events = Vec::new();
     let source_path = format!("composer:{composer_id}");
 
@@ -460,7 +434,7 @@ fn parse_composer_session(
                 &data,
             )
         {
-            bubble_usage_events.push(event);
+            usage_events.push(event);
         }
     }
 
@@ -470,9 +444,9 @@ fn parse_composer_session(
         }
     }
 
-    if !bubble_usage_events.is_empty() {
-        usage_events.extend(bubble_usage_events);
-    } else if let Some(event) = extract_session_usage_event(composer_id, &data, meta) {
+    if usage_events.is_empty()
+        && let Some(event) = extract_session_usage_event(composer_id, &data, meta)
+    {
         usage_events.push(event);
     }
 
@@ -500,19 +474,24 @@ fn parse_composer_session(
         &session_events,
     );
 
-    Ok(Some(ParsedComposerSession {
-        messages,
-        usage_events,
-        events: session_events,
+    let mut session = RawSession::search_only(
+        composer_id.to_string(),
+        meta.directory.clone(),
         started_at,
         updated_at,
-        entrypoint: data
-            .get("unifiedMode")
+        data.get("unifiedMode")
             .and_then(|value| value.as_str())
             .map(str::to_string)
             .or_else(|| meta.unified_mode.clone()),
-        directory: meta.directory.clone(),
-    }))
+        messages,
+    )
+    .with_usage(usage_events, USAGE_PARSER_VERSION);
+    if include_events {
+        session = session.with_events(session_events, EVENT_PARSER_VERSION);
+    }
+    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    session.refresh_session_on_metadata_backfill = true;
+    Ok(Some(session))
 }
 
 fn discover_composer_ids(conn: &Connection) -> anyhow::Result<BTreeSet<String>> {

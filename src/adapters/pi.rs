@@ -415,7 +415,7 @@ fn parse_pi_session(
                         &entry,
                         message,
                         line_index as u32,
-                        fallback_timestamp,
+                        timestamp,
                         current_provider.as_deref(),
                         current_model.as_deref(),
                         &source_path,
@@ -468,7 +468,7 @@ fn parse_pi_message(
     entry: &Value,
     message: &Value,
     line_index: u32,
-    fallback_timestamp: i64,
+    timestamp: i64,
     current_provider: Option<&str>,
     current_model: Option<&str>,
     source_path: &str,
@@ -476,12 +476,8 @@ fn parse_pi_message(
     messages: &mut Vec<RawMessage>,
     usage_events: &mut Vec<RawUsageEvent>,
 ) {
-    let timestamp = json_i64(message.get("timestamp"))
-        .or_else(|| parse_entry_timestamp(entry))
-        .unwrap_or(fallback_timestamp);
-
     match message.get("role").and_then(|value| value.as_str()).unwrap_or("") {
-        "user" => {
+        "user" | "custom" => {
             let content = extract_content(message.get("content"));
             if !content.trim().is_empty() {
                 messages.push(RawMessage { role: Role::User, content, timestamp: Some(timestamp) });
@@ -512,12 +508,6 @@ fn parse_pi_message(
                     content,
                     timestamp: Some(timestamp),
                 });
-            }
-        }
-        "custom" => {
-            let content = extract_content(message.get("content"));
-            if !content.trim().is_empty() {
-                messages.push(RawMessage { role: Role::User, content, timestamp: Some(timestamp) });
             }
         }
         _ => {}

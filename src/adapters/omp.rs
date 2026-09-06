@@ -410,7 +410,7 @@ fn parse_omp_session(
                         &entry,
                         message,
                         line_index as u32,
-                        fallback_timestamp,
+                        timestamp,
                         current_provider.as_deref(),
                         current_model.as_deref(),
                         &source_path,
@@ -464,7 +464,7 @@ fn parse_omp_message(
     entry: &Value,
     message: &Value,
     line_index: u32,
-    fallback_timestamp: i64,
+    timestamp: i64,
     current_provider: Option<&str>,
     current_model: Option<&str>,
     source_path: &str,
@@ -472,12 +472,8 @@ fn parse_omp_message(
     messages: &mut Vec<RawMessage>,
     usage_events: &mut Vec<RawUsageEvent>,
 ) {
-    let timestamp = json_i64(message.get("timestamp"))
-        .or_else(|| parse_entry_timestamp(entry))
-        .unwrap_or(fallback_timestamp);
-
     match message.get("role").and_then(|value| value.as_str()).unwrap_or("") {
-        "user" => {
+        "user" | "custom" => {
             let content = extract_content(message.get("content"));
             if !content.trim().is_empty() {
                 messages.push(RawMessage { role: Role::User, content, timestamp: Some(timestamp) });
@@ -508,12 +504,6 @@ fn parse_omp_message(
                     content,
                     timestamp: Some(timestamp),
                 });
-            }
-        }
-        "custom" => {
-            let content = extract_content(message.get("content"));
-            if !content.trim().is_empty() {
-                messages.push(RawMessage { role: Role::User, content, timestamp: Some(timestamp) });
             }
         }
         _ => {}
@@ -567,20 +557,14 @@ fn extract_omp_events(
                 );
                 event.kind = "tool_call".to_string();
                 event.target = None;
-                let operation = match name {
-                    "read" => Some(FileOperation::Read),
-                    _ => None,
-                };
-                if let Some(operation) = operation
+                if name == "read"
                     && let Some(path) = args.and_then(|args| non_empty_str(args.get("path")))
                 {
-                    event.kind =
-                        if operation == FileOperation::Read { "file_read" } else { "file_write" }
-                            .to_string();
+                    event.kind = "file_read".to_string();
                     event.target = Some(path.to_string());
                     event.files.push(FileEvidence {
                         path: path.to_string(),
-                        operation,
+                        operation: FileOperation::Read,
                         kind: FileEvidenceKind::Call,
                         cwd: cwd.map(str::to_string),
                         target: None,
