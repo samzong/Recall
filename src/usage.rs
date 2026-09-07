@@ -22,7 +22,13 @@ pub(crate) fn run_cli(
     json: bool,
     source_filter: Option<&str>,
     time_filter: Option<&str>,
+    card: bool,
+    period: crate::wrapped::WrappedPeriod,
 ) -> Result<()> {
+    if card {
+        return crate::wrapped::run_card(period);
+    }
+
     let time_range = parse_time_range(time_filter)?;
     let sources = usage_source_labels();
 

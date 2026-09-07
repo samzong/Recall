@@ -5,7 +5,6 @@ use anyhow::Result;
 use chrono::{
     DateTime, Datelike, Days, Local, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Timelike,
 };
-use serde::Serialize;
 use unicode_width::UnicodeWidthStr;
 
 use crate::db::store::Store;
@@ -16,19 +15,12 @@ const INNER: usize = 52;
 const WEEKDAYS: [&str; 7] =
     ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum WrappedPeriod {
     Week,
     Month,
     Year,
     All,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum WrappedFormat {
-    Text,
-    Json,
 }
 
 impl WrappedPeriod {
@@ -70,28 +62,27 @@ fn first_valid_local_millis(
         .expect("local period boundary resolves within 48 hours")
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WrappedTopModel {
     pub(crate) model: String,
     pub(crate) tokens: i64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WrappedTopSource {
     pub(crate) source: String,
     pub(crate) tokens: i64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WrappedSourceRow {
     pub(crate) source: String,
     pub(crate) sessions: usize,
     pub(crate) tokens: TokenTotals,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WrappedReport {
-    pub(crate) protocol_version: u32,
     pub(crate) period: WrappedPeriod,
     pub(crate) empty: bool,
     pub(crate) tokens: TokenTotals,
@@ -187,7 +178,6 @@ impl WrappedAcc {
             };
 
         WrappedReport {
-            protocol_version: crate::PROTOCOL_VERSION,
             period,
             empty,
             tokens: self.tokens,
@@ -203,7 +193,7 @@ impl WrappedAcc {
     }
 }
 
-pub(crate) fn run_cli(period: WrappedPeriod, format: WrappedFormat) -> Result<()> {
+pub(crate) fn run_card(period: WrappedPeriod) -> Result<()> {
     let mut progress = StderrProgress::new();
     let report = crate::sync::run_usage_sync_job_with_progress(&mut |source: &str| {
         progress.show_source(source);
@@ -211,11 +201,7 @@ pub(crate) fn run_cli(period: WrappedPeriod, format: WrappedFormat) -> Result<()
     .and_then(|()| Store::open())
     .and_then(|store| build_wrapped_report(&store, period));
     progress.clear();
-    let report = report?;
-    match format {
-        WrappedFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-        WrappedFormat::Text => print!("{}", render_card(&report, color_enabled())),
-    }
+    print!("{}", render_card(&report?, color_enabled()));
     Ok(())
 }
 
@@ -969,22 +955,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn json_uses_stable_snake_case_fields() {
-        let report = populated_report();
-        let value = serde_json::to_value(&report).unwrap();
-        assert_eq!(value["protocol_version"], crate::PROTOCOL_VERSION);
-        assert_eq!(value["period"], "month");
-        assert_eq!(value["empty"], false);
-        assert_eq!(value["busiest_weekday"], "thursday");
-        assert_eq!(value["busiest_hour"], 14);
-        assert_eq!(value["top_model"]["model"], "claude-sonnet");
-        assert_eq!(value["top_source"]["source"], "claude-code");
-        assert_eq!(value["tokens"]["input_tokens"], 990_000);
-        assert_eq!(value["by_source"][0]["source"], "claude-code");
-        assert!(value.get("costUsd").is_none());
-    }
-
     fn make_session(id: &str, source: &str) -> Session {
         Session {
             id: id.to_string(),
@@ -1041,14 +1011,6 @@ mod tests {
         assert_eq!(WrappedPeriod::Month.card_label(), "last 30 days");
         assert_eq!(WrappedPeriod::Year.card_label(), "last 365 days");
         assert_eq!(WrappedPeriod::All.card_label(), "all time");
-        let week = serde_json::to_value(WrappedPeriod::Week).unwrap();
-        let month = serde_json::to_value(WrappedPeriod::Month).unwrap();
-        let year = serde_json::to_value(WrappedPeriod::Year).unwrap();
-        let all = serde_json::to_value(WrappedPeriod::All).unwrap();
-        assert_eq!(week, "week");
-        assert_eq!(month, "month");
-        assert_eq!(year, "year");
-        assert_eq!(all, "all");
     }
 
     #[test]
@@ -1068,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn card_sanitizes_model_and_source_labels_json_stays_verbatim() {
+    fn card_sanitizes_model_and_source_labels_report_stays_verbatim() {
         let now = fixture_now();
         let model = "gpt-5\u{1b}]52;c;ZW1iZWQ=\u{07}\n\u{1b}[31m";
         let source = "claude-code\u{1b}[32m\ninjected";
@@ -1076,10 +1038,6 @@ mod tests {
         let report = aggregate_wrapped_events(&events, WrappedPeriod::All, now);
         assert_eq!(report.top_model.as_ref().map(|m| m.model.as_str()), Some(model));
         assert_eq!(report.top_source.as_ref().map(|s| s.source.as_str()), Some(source));
-        let json = serde_json::to_string(&report).unwrap();
-        assert!(json.contains("\\u001b]52;c;ZW1iZWQ=\\u0007"));
-        assert!(json.contains("claude-code\\u001b[32m\\ninjected"));
-
         let card = render_card(&report, false);
         assert!(card.contains("gpt-5"));
         assert!(card.contains("Claude Codeinjected"));
