@@ -1,6 +1,49 @@
 # Changelog
 
 
+## [0.6.0](https://github.com/samzong/Recall/compare/v0.5.9...v0.6.0) (2026-09-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **usage:** fold stats card into usage --card ([#254](https://github.com/samzong/Recall/issues/254))
+
+
+### Features
+
+* **mcp:** add antigravity mcp host ([#236](https://github.com/samzong/Recall/issues/236))
+* **session:** handoff via pointer and installed adapters ([#237](https://github.com/samzong/Recall/issues/237))
+* **mcp:** add grok MCP host ([#238](https://github.com/samzong/Recall/issues/238))
+* **tui:** add manual session sync ([#239](https://github.com/samzong/Recall/issues/239))
+* **search:** add anchored message retrieval ([#241](https://github.com/samzong/Recall/issues/241))
+* **extension:** add Cloudflare R2 remote transport ([#252](https://github.com/samzong/Recall/issues/252))
+* **remote:** report sync progress and upload objects concurrently ([#255](https://github.com/samzong/Recall/issues/255))
+
+
+### Fixes
+
+* **rx:** preserve pi credentials and malformed provider state ([#242](https://github.com/samzong/Recall/issues/242))
+* **rx:** tolerate out-of-range update timestamps ([#243](https://github.com/samzong/Recall/issues/243))
+* **rx:** respect shell completion argument contexts ([#244](https://github.com/samzong/Recall/issues/244))
+* **rx:** serialize provider updates and align provider selection ([#245](https://github.com/samzong/Recall/issues/245))
+* **rx:** preserve hosted routes and native launch inputs ([#246](https://github.com/samzong/Recall/issues/246))
+* **rx:** enforce provider catalog admission contracts ([#247](https://github.com/samzong/Recall/issues/247))
+* **rx:** preserve active native catalog identities ([#249](https://github.com/samzong/Recall/issues/249))
+* **remote:** release upload queue lock before transfer ([#256](https://github.com/samzong/Recall/issues/256))
+
+
+### Refactors
+
+* **rx:** remove unreachable dsh shell installer spec ([#248](https://github.com/samzong/Recall/issues/248))
+* **history:** simplify native file evidence ingestion ([#250](https://github.com/samzong/Recall/issues/250))
+
+
+### Documentation
+
+* **agents:** simplify guidance and repair skill workflows ([#240](https://github.com/samzong/Recall/issues/240))
+* **publishing:** define session dataset publication design ([#251](https://github.com/samzong/Recall/issues/251))
+
+
 ## [0.5.9](https://github.com/samzong/Recall/compare/v0.5.8...v0.5.9) (2026-09-03)
 
 
