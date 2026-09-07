@@ -60,7 +60,17 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
             } else {
                 format!("  ▾ {} subs", app.viewing_children.len())
             };
-            format!(" {}{role} — {dir} [{pos}/{count}]{}{subs} ", s.title, lineage_suffix(app))
+            let versions = if s.alternative_versions > 0 {
+                format!(" +{} versions", s.alternative_versions)
+            } else {
+                String::new()
+            };
+            format!(
+                " [{}] {}{role}{versions} — {dir} [{pos}/{count}]{}{subs} ",
+                crate::host::label(&s.locations),
+                s.title,
+                lineage_suffix(app)
+            )
         })
         .unwrap_or_else(|| " Conversation ".to_string());
 

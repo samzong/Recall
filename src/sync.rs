@@ -298,6 +298,21 @@ pub(crate) fn run_sync_job_inner(options: SyncRunOptions) -> Result<()> {
     run_with_sync_lock(|| run_sync_job_with(options, None))
 }
 
+pub(crate) fn scan_remote_scope(scope: ProjectScope) -> Result<()> {
+    run_sync_job_with(
+        SyncRunOptions {
+            force: false,
+            verbose: false,
+            emit: false,
+            usage_only: false,
+            backfill_events: false,
+            sources: None,
+            scope,
+        },
+        None,
+    )
+}
+
 fn run_with_sync_lock<T>(run: impl FnOnce() -> Result<T>) -> Result<T> {
     let _lock = utils::acquire_sync_lock()?;
     run()
@@ -309,8 +324,9 @@ fn run_sync_job_with(
 ) -> Result<()> {
     let available_adapters = adapters::all_adapters();
     let config = AppConfig::load()?;
-    SyncJob::new(options, Store::open()?, config, &available_adapters)?
-        .run_with(&available_adapters, on_source)
+    let mut job = SyncJob::new(options, Store::open()?, config, &available_adapters)?;
+    job.host = crate::remote::load_settings()?.map(|settings| settings.host);
+    job.run_with(&available_adapters, on_source)
 }
 
 struct SyncJob {
@@ -318,6 +334,7 @@ struct SyncJob {
     event_backfill: Option<EventBackfillReport>,
     options: SyncRunOptions,
     config: AppConfig,
+    host: Option<crate::host::Host>,
     labels: Vec<(String, String)>,
     since_ts: Option<i64>,
     path_excluder: Option<globset::GlobSet>,
@@ -347,6 +364,7 @@ impl SyncJob {
             event_backfill: None,
             options,
             config,
+            host: None,
             labels,
             since_ts,
             path_excluder,
@@ -689,6 +707,9 @@ impl SyncJob {
             if existing.imported_ids.remove(&observation.source_id) {
                 self.store.clear_import_marker(source_id, &observation.source_id)?;
             }
+            if let Some(host) = &self.host {
+                host.observe(&self.store.conn, source_id, &observation.source_id)?;
+            }
         }
         Ok(())
     }
@@ -973,6 +994,9 @@ impl SyncJob {
                         if was_imported {
                             self.store.clear_import_marker(source_id, &raw_source_id)?;
                         }
+                        if let Some(host) = &self.host {
+                            host.observe(&self.store.conn, source_id, &raw_source_id)?;
+                        }
                         self.stats.skipped += 1;
                         return Ok(());
                     }
@@ -985,6 +1009,9 @@ impl SyncJob {
                             was_imported,
                             existing,
                         )?;
+                        if let Some(host) = &self.host {
+                            host.observe(&self.store.conn, source_id, &raw_source_id)?;
+                        }
                         return Ok(());
                     }
                     ExistingSessionAction::RefreshSession => {}
@@ -1029,6 +1056,8 @@ impl SyncJob {
             duration_minutes: raw.duration_minutes,
             source_file_path: raw.source_file_path,
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         };
 
         let messages: Vec<Message> = raw
@@ -1067,6 +1096,9 @@ impl SyncJob {
             event_parser_version,
             &topology,
         )?;
+        if let Some(host) = &self.host {
+            host.observe(&self.store.conn, source_id, &raw_source_id)?;
+        }
         existing.record_replaced(
             &session,
             raw.usage_parser_version,
@@ -1727,6 +1759,8 @@ mod tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         }
     }
 

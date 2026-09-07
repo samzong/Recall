@@ -1,6 +1,7 @@
 pub(crate) mod event_store;
 pub(crate) mod message_store;
 pub(crate) mod project_store;
+pub(crate) mod remote_store;
 pub(crate) mod schema;
 pub(crate) mod search;
 pub(crate) mod semantic_store;

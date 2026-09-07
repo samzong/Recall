@@ -2293,6 +2293,8 @@ mod tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         }
     }
 

@@ -947,6 +947,7 @@ mod tests {
         let store = crate::db::store::Store::open_in_memory().unwrap();
         let mtime = file_scan::stat_mtime_ms(&plain).unwrap();
         store.conn.execute("INSERT INTO sessions (id, source, source_id, title, started_at, updated_at, message_count) VALUES ('stored-id', 'deepseek-harness', 'session/test', 'title', 1000, ?1, 2)", [mtime]).unwrap();
+        store.conn.execute_batch("INSERT INTO native_bindings SELECT source, source_id, id, NOT is_import FROM sessions;").unwrap();
         store
             .persist_usage_events_for_existing_session(
                 "deepseek-harness",

@@ -209,8 +209,62 @@ pub(crate) fn import_jsonl<R: BufRead>(
     Ok(summary)
 }
 
+pub(crate) struct DecodedSession {
+    pub(crate) session: Session,
+    pub(crate) messages: Vec<Message>,
+    pub(crate) usage_events: Vec<RawUsageEvent>,
+    pub(crate) events: Vec<RawSessionEvent>,
+    pub(crate) topology: crate::types::SessionTopology,
+}
+
+pub(crate) fn decode_remote(
+    value: serde_json::Value,
+    session_uuid: String,
+) -> Result<DecodedSession> {
+    for field in ["messages", "usage_events", "events"] {
+        anyhow::ensure!(value[field].is_array(), "remote record must include {field}");
+    }
+    anyhow::ensure!(
+        value["session"]["message_count"].as_u64()
+            == value["messages"].as_array().map(|messages| messages.len() as u64),
+        "remote message count mismatch"
+    );
+    let record: ImportRecord = serde_json::from_value(value)?;
+    anyhow::ensure!(
+        record.schema_version == crate::export::RECORD_SCHEMA_VERSION
+            && record.record_type == RECORD_TYPE,
+        "unsupported remote session record"
+    );
+    let parent_count = record.session.topology.parents.len();
+    let data = decode_record(record, session_uuid, 0)?;
+    anyhow::ensure!(data.topology.parents.len() == parent_count, "invalid remote topology");
+    let sequences: HashSet<_> = data.messages.iter().map(|message| message.seq).collect();
+    anyhow::ensure!(sequences.len() == data.messages.len(), "duplicate remote message sequence");
+    Ok(data)
+}
+
 fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result<()> {
-    let session_uuid = uuid::Uuid::new_v4().to_string();
+    let data = decode_record(record, uuid::Uuid::new_v4().to_string(), line_no)?;
+    store.persist_session_with_usage_and_events_with_topology(
+        &data.session,
+        &data.messages,
+        &data.usage_events,
+        None,
+        &data.events,
+        None,
+        &SessionTopologyWrite {
+            thread_role: data.topology.thread_role,
+            parents: &data.topology.parents,
+            parser_version: None,
+        },
+    )
+}
+
+fn decode_record(
+    record: ImportRecord,
+    session_uuid: String,
+    line_no: usize,
+) -> Result<DecodedSession> {
     let s = record.session;
 
     let session = Session {
@@ -231,6 +285,8 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
         duration_minutes: s.duration_minutes,
         source_file_path: s.source_file_path,
         is_import: true,
+        locations: Vec::new(),
+        alternative_versions: 0,
     };
 
     let messages = record
@@ -303,9 +359,6 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
         })
         .collect();
 
-    // Persist topology without a metadata parser version so a later local sync of
-    // the same source still backfills from source. Missing/invalid values default
-    // to unknown role and no parents, keeping v2-v4 imports safe.
     let thread_role = s.topology.thread_role.and_then(|role| role.parse().ok());
     let parents: Vec<ParentLink> = s
         .topology
@@ -319,17 +372,13 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
             })
         })
         .collect();
-    let topology = SessionTopologyWrite { thread_role, parents: &parents, parser_version: None };
-
-    store.persist_session_with_usage_and_events_with_topology(
-        &session,
-        &messages,
-        &usage_events,
-        None,
-        &events,
-        None,
-        &topology,
-    )
+    Ok(DecodedSession {
+        session,
+        messages,
+        usage_events,
+        events,
+        topology: crate::types::SessionTopology { thread_role, parents },
+    })
 }
 
 #[cfg(test)]
@@ -365,6 +414,8 @@ mod tests {
             duration_minutes: Some(7),
             source_file_path: Some("/home/origin/.codex/sessions/a.jsonl".to_string()),
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         }
     }
 

@@ -151,6 +151,8 @@ mod tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: true,
+            locations: Vec::new(),
+            alternative_versions: 0,
         }
     }
 

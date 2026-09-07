@@ -37,6 +37,8 @@ fn make_session(id: &str, source: &str, source_id: &str, title: &str) -> Session
         duration_minutes: None,
         source_file_path: None,
         is_import: false,
+        locations: Vec::new(),
+        alternative_versions: 0,
     }
 }
 
@@ -1493,6 +1495,8 @@ fn replace_session_rolls_back_delete_when_reinsert_fails() {
         duration_minutes: None,
         source_file_path: None,
         is_import: false,
+        locations: Vec::new(),
+        alternative_versions: 0,
     };
     old_session.is_import = true;
     let old_usage = [make_usage_event("old-usage", 1_800_000_000_000, "old-model")];
@@ -1528,6 +1532,8 @@ fn replace_session_rolls_back_delete_when_reinsert_fails() {
         duration_minutes: None,
         source_file_path: None,
         is_import: false,
+        locations: Vec::new(),
+        alternative_versions: 0,
     };
     // Foreign keys are enabled in setup(); this fails after the replacement deletes old rows.
     let invalid_messages = [make_message("missing-session", Role::User, "new message", 0)];
@@ -1582,6 +1588,8 @@ fn replace_session_clears_import_marker_on_success() {
         duration_minutes: None,
         source_file_path: None,
         is_import: false,
+        locations: Vec::new(),
+        alternative_versions: 0,
     };
     old_session.is_import = true;
     let old_usage = [make_usage_event("old-usage", 1_800_000_000_000, "old-model")];
@@ -1617,6 +1625,8 @@ fn replace_session_clears_import_marker_on_success() {
         duration_minutes: None,
         source_file_path: None,
         is_import: false,
+        locations: Vec::new(),
+        alternative_versions: 0,
     };
     let messages = [make_message("s2", Role::User, "newsuccesstoken", 0)];
 

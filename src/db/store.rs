@@ -7,7 +7,10 @@ use crate::types::{ParentLink, Session, ThreadRole};
 
 pub(crate) const SESSION_COLUMNS: &str = "id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import";
 
-pub(crate) fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+pub(crate) fn session_from_row(
+    row: &rusqlite::Row<'_>,
+    conn: &Connection,
+) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -26,6 +29,11 @@ pub(crate) fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sess
         duration_minutes: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
         source_file_path: row.get(15)?,
         is_import: row.get(16)?,
+        locations: crate::host::locations(conn, &row.get::<_, String>(0)?)?,
+        alternative_versions: super::remote_store::alternative_versions(
+            conn,
+            &row.get::<_, String>(0)?,
+        )?,
     })
 }
 
@@ -154,6 +162,7 @@ impl Store {
              PRAGMA busy_timeout=5000;
              PRAGMA foreign_keys=ON;",
         )?;
+        backup_before_remote_migration(&conn, &db_path)?;
         crate::db::schema::init(&conn)?;
         let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
         Ok(Store { conn, trigram_message_flag })
@@ -175,6 +184,11 @@ impl Store {
 
     pub(crate) fn open_read_only_at(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            version >= 17,
+            "requires_index_upgrade: upgrade this index with current Recall before opening it read-only (run recall info for the default index)"
+        );
         conn.execute_batch(
             "PRAGMA query_only=ON;
              PRAGMA busy_timeout=5000;
@@ -203,10 +217,30 @@ impl Store {
              PRAGMA busy_timeout=5000;
              PRAGMA foreign_keys=ON;",
         )?;
+        backup_before_remote_migration(&conn, path)?;
         crate::db::schema::init(&conn)?;
         let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
         Ok(Store { conn, trigram_message_flag })
     }
+}
+
+fn backup_before_remote_migration(conn: &Connection, path: &Path) -> Result<Option<PathBuf>> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if !(1..17).contains(&version) {
+        return Ok(None);
+    }
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("database path has no parent"))?;
+    let file = tempfile::Builder::new()
+        .prefix("recall-before-remote-")
+        .suffix(".db")
+        .tempfile_in(parent)?;
+    conn.backup(rusqlite::DatabaseName::Main, file.path(), None)?;
+    file.as_file().sync_all()?;
+    let (_, backup) = file.keep()?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    eprintln!("Index backup before remote migration: {}", backup.display());
+    Ok(Some(backup))
 }
 
 #[cfg(test)]
@@ -233,6 +267,8 @@ mod exclusion_tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         }
     }
 

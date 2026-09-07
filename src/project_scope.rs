@@ -15,7 +15,8 @@ use crate::repo_identity::{
 
 const GLOBAL_KEYWORDS: [&str; 2] = ["all", "global"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ProjectScope {
     Global,
     /// A directory and its children.

@@ -208,6 +208,10 @@ struct SessionHit {
     title: String,
     excerpt: Option<String>,
     timestamp: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    locations: Vec<crate::host::Location>,
+    #[serde(default, skip_serializing_if = "crate::db::remote_store::is_zero")]
+    alternative_versions: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -315,7 +319,7 @@ impl CurrentSessionContext {
     {
         if let Some(identity) = self.host_identity.as_ref()
             && let Ok(Some(session)) =
-                store.get_session_by_source_id(&identity.source, &identity.source_session_id)
+                store.get_native_session(&identity.source, &identity.source_session_id)
         {
             return CurrentSession::resolved(&session);
         }
@@ -329,7 +333,7 @@ impl CurrentSessionContext {
         }
         let candidate = &result.candidates[0];
         store
-            .get_session_by_source_id(&candidate.source, &candidate.source_id)
+            .get_native_session(&candidate.source, &candidate.source_id)
             .ok()
             .flatten()
             .as_ref()
@@ -389,6 +393,10 @@ struct SessionDetail {
     summary: Option<String>,
     timestamp: Option<String>,
     message_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    locations: Vec<crate::host::Location>,
+    #[serde(default, skip_serializing_if = "crate::db::remote_store::is_zero")]
+    alternative_versions: u32,
     returned_messages: usize,
     first_message_seq: Option<u32>,
     last_message_seq: Option<u32>,
@@ -1192,6 +1200,8 @@ fn get_ready(store: &Store, args: &GetSessionArgs) -> std::result::Result<Sessio
         summary: session.summary.clone(),
         timestamp: Some(iso8601(session.started_at)),
         message_count: Some(session.message_count),
+        locations: session.locations.clone(),
+        alternative_versions: session.alternative_versions,
         returned_messages: returned,
         first_message_seq,
         last_message_seq,
@@ -1216,6 +1226,8 @@ fn empty_detail(message: Option<String>) -> SessionDetail {
         summary: None,
         timestamp: None,
         message_count: None,
+        locations: Vec::new(),
+        alternative_versions: 0,
         returned_messages: 0,
         first_message_seq: None,
         last_message_seq: None,
@@ -1369,6 +1381,8 @@ fn session_hit(session: &Session, excerpt: Option<String>) -> SessionHit {
         title: session_title(session),
         excerpt,
         timestamp: iso8601(session.started_at),
+        locations: session.locations.clone(),
+        alternative_versions: session.alternative_versions,
     }
 }
 
@@ -1509,6 +1523,8 @@ mod tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         }
     }
 

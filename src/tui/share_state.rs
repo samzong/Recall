@@ -27,6 +27,7 @@ pub(crate) enum ResumeOrigin {
 }
 
 pub(crate) struct PendingResume {
+    pub(crate) native_session_id: Option<String>,
     pub(crate) command: ResumeCommand,
     pub(crate) action: PendingCommandAction,
     pub(crate) source_label: String,
