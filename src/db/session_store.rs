@@ -44,7 +44,8 @@ impl Store {
         source: &str,
     ) -> Result<HashMap<String, IndexedSessionMeta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT source_id, id, updated_at, message_count FROM sessions WHERE source = ?1",
+            "SELECT source_id, id, updated_at, message_count FROM sessions
+             WHERE source = ?1 AND id IN (SELECT session_id FROM native_bindings)",
         )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| {
             Ok((
@@ -96,18 +97,26 @@ impl Store {
     }
 
     pub(crate) fn imported_source_ids(&self, source: &str) -> Result<HashSet<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT source_id FROM sessions WHERE source = ?1 AND is_import = 1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT source_id FROM sessions WHERE source = ?1 AND is_import = 1
+                      AND id IN (SELECT session_id FROM native_bindings)",
+        )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| row.get(0))?;
         rows.collect::<Result<HashSet<_>, _>>().map_err(Into::into)
     }
 
     pub(crate) fn clear_import_marker(&self, source: &str, source_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET is_import = 0 WHERE source = ?1 AND source_id = ?2",
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE sessions SET is_import = 0 WHERE id =
+             (SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2)",
             rusqlite::params![source, source_id],
         )?;
+        tx.execute(
+            "UPDATE native_bindings SET confirmed = 1 WHERE source = ?1 AND source_id = ?2",
+            rusqlite::params![source, source_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -130,7 +139,7 @@ impl Store {
                         WHEN ?3 IS NOT NULL AND ?3 != '' THEN ?3
                         ELSE title
                     END
-              WHERE source = ?1 AND source_id = ?2",
+              WHERE id = (SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2)",
             rusqlite::params![
                 source,
                 source_id,
@@ -145,7 +154,8 @@ impl Store {
 
     #[cfg(test)]
     pub(crate) fn insert_session(&self, session: &Session) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             rusqlite::params![
@@ -168,6 +178,8 @@ impl Store {
                 session.is_import,
             ],
         )?;
+        bind_native_tx(&tx, session)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -241,6 +253,7 @@ impl Store {
             topology,
             self.trigram_message_flag,
         )?;
+        bind_native_tx(&tx, session)?;
         tx.commit()?;
         Ok(())
     }
@@ -285,7 +298,17 @@ impl Store {
         topology: &SessionTopologyWrite<'_>,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        delete_session_data_tx(&tx, old_source, old_source_id)?;
+        let old_id: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2",
+                rusqlite::params![old_source, old_source_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if old_id.as_deref().is_some_and(|id| id != session.id) {
+            delete_session_data_tx(&tx, old_source, old_source_id)?;
+        }
+        clear_session_contents_tx(&tx, &session.id)?;
         persist_session_with_usage_and_events_tx(
             &tx,
             session,
@@ -297,12 +320,11 @@ impl Store {
             topology,
             self.trigram_message_flag,
         )?;
+        bind_native_tx(&tx, session)?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Topology-only write for an already-indexed session: does not touch
-    /// messages, usage, events, embeddings, or the local session id.
     pub(crate) fn persist_topology_for_existing_session(
         &self,
         source: &str,
@@ -312,7 +334,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let session_id: Option<String> = tx
             .query_row(
-                "SELECT id FROM sessions WHERE source = ?1 AND source_id = ?2",
+                "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2",
                 rusqlite::params![source, source_id],
                 |row| row.get(0),
             )
@@ -366,18 +388,64 @@ impl Store {
     /// Sessions whose `spawn` parent is the given portable identity — the
     /// subagents this session directly spawned. `fork`/`resume` links are not
     /// subagents and are excluded. Uses `idx_session_parent_links_parent`.
-    pub(crate) fn child_subagents(&self, source: &str, source_id: &str) -> Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {SESSION_COLUMNS}
-             FROM sessions s
-             JOIN session_parent_links l ON l.session_id = s.id
-             WHERE l.parent_source = ?1
-               AND l.parent_source_id = ?2
-               AND l.relation = 'spawn'
-             ORDER BY s.started_at, s.id"
-        ))?;
-        let rows = stmt.query_map(rusqlite::params![source, source_id], session_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    pub(crate) fn resolve_parent(
+        &self,
+        child_id: &str,
+        parent: &ParentLink,
+    ) -> Result<Option<Session>> {
+        let sync_id: Option<String> = self.conn.query_row(
+            "SELECT parent_sync_id FROM session_parent_links
+             WHERE session_id = ?1 AND relation = ?2 AND parent_source = ?3 AND parent_source_id = ?4",
+            rusqlite::params![child_id, parent.relation.as_str(), parent.source, parent.source_id],
+            |row| row.get(0),
+        ).optional()?.flatten();
+        let parent_id: Option<String> =
+            if let Some(sync_id) = sync_id {
+                self.conn
+                    .query_row(
+                        "SELECT session_id FROM sync_aliases WHERE sync_id = ?1",
+                        [sync_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+            } else {
+                self.conn.query_row(
+                "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2
+                 AND EXISTS(SELECT 1 FROM native_bindings WHERE session_id = ?3)",
+                rusqlite::params![parent.source, parent.source_id, child_id], |row| row.get(0),
+            ).optional()?
+            };
+        parent_id.map(|id| self.get_session_by_id(&id)).transpose().map(Option::flatten)
+    }
+
+    pub(crate) fn child_subagents(&self, parent_id: &str) -> Result<Vec<Session>> {
+        let Some(parent) = self.get_session_by_id(parent_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id FROM sessions s JOIN session_parent_links l ON l.session_id = s.id
+             WHERE l.parent_source = ?1 AND l.parent_source_id = ?2 AND l.relation = 'spawn'
+             ORDER BY s.started_at, s.id",
+        )?;
+        let ids = stmt
+            .query_map(rusqlite::params![parent.source, parent.source_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let link = ParentLink {
+            relation: crate::types::ParentRelation::Spawn,
+            source: parent.source,
+            source_id: parent.source_id,
+        };
+        let mut children = Vec::new();
+        for id in ids {
+            if self.resolve_parent(&id, &link)?.is_some_and(|resolved| resolved.id == parent_id)
+                && let Some(child) = self.get_session_by_id(&id)?
+            {
+                children.push(child);
+            }
+        }
+        Ok(children)
     }
 
     pub(crate) fn metadata_state_meta_map(
@@ -387,7 +455,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT source_id, metadata_parser_version, updated_at
              FROM sessions
-             WHERE source = ?1 AND metadata_parser_version IS NOT NULL",
+             WHERE source = ?1 AND metadata_parser_version IS NOT NULL
+               AND id IN (SELECT session_id FROM native_bindings)",
         )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| {
             Ok((
@@ -423,7 +492,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let params: Vec<&dyn rusqlite::types::ToSql> =
             session_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt.query_map(params.as_slice(), session_from_row)?;
+        let rows = stmt.query_map(params.as_slice(), |row| session_from_row(row, &self.conn))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -432,7 +501,7 @@ impl Store {
             .query_row(
                 &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
                 rusqlite::params![session_id],
-                session_from_row,
+                |row| session_from_row(row, &self.conn),
             )
             .optional()
             .map_err(Into::into)
@@ -443,18 +512,36 @@ impl Store {
         source: &str,
         source_id: &str,
     ) -> Result<Option<Session>> {
-        self.conn
-            .query_row(
-                &format!(
-                    "SELECT {SESSION_COLUMNS}
-                     FROM sessions
-                     WHERE source = ?1 AND source_id = ?2"
-                ),
-                rusqlite::params![source, source_id],
-                session_from_row,
-            )
-            .optional()
-            .map_err(Into::into)
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ?1 AND source_id = ?2 LIMIT 2"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params![source, source_id])?;
+        let session = rows.next()?.map(|row| session_from_row(row, &self.conn)).transpose()?;
+        anyhow::ensure!(
+            rows.next()?.is_none(),
+            "session source ID is ambiguous; use its local UUID"
+        );
+        Ok(session)
+    }
+
+    pub(crate) fn get_native_session(
+        &self,
+        source: &str,
+        source_id: &str,
+    ) -> Result<Option<Session>> {
+        self.conn.query_row(
+            &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id =
+                (SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2 AND confirmed = 1)"),
+            rusqlite::params![source, source_id],
+            |row| session_from_row(row, &self.conn),
+        ).optional().map_err(Into::into)
+    }
+
+    pub(crate) fn has_native_binding(&self, session_id: &str) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_bindings WHERE session_id = ?1 AND confirmed = 1)",
+            [session_id], |row| row.get(0),
+        ).map_err(Into::into)
     }
 
     pub(crate) fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
@@ -557,7 +644,8 @@ impl Store {
                 params.iter().map(|param| param.as_ref()).collect();
             param_refs.push(&page_size);
             param_refs.push(&offset);
-            let rows = stmt.query_map(param_refs.as_slice(), session_from_row)?;
+            let rows =
+                stmt.query_map(param_refs.as_slice(), |row| session_from_row(row, &self.conn))?;
             let page = rows.collect::<std::result::Result<Vec<_>, _>>()?;
             let fetched = page.len();
             offset += fetched as i64;
@@ -590,6 +678,11 @@ impl Store {
              JOIN session_parent_links l ON l.session_id = s.id AND l.relation = 'spawn'
              JOIN sessions p ON p.source = l.parent_source AND p.source_id = l.parent_source_id
              WHERE s.thread_role = 'subagent'
+               AND ((l.parent_sync_id IS NOT NULL AND EXISTS(
+                   SELECT 1 FROM sync_aliases a WHERE a.sync_id = l.parent_sync_id AND a.session_id = p.id))
+                 OR (l.parent_sync_id IS NULL
+                   AND s.id IN (SELECT session_id FROM native_bindings)
+                   AND p.id IN (SELECT session_id FROM native_bindings)))
                AND s.id IN ({})
                AND p.id IN ({})",
             child_ph.join(", "),
@@ -631,10 +724,10 @@ impl Store {
             sql.push_str(thread_role.sql_predicate());
         }
         let order_by = match sort {
-            SessionListSort::Newest => "s.started_at DESC, source ASC, source_id ASC",
-            SessionListSort::Oldest => "s.started_at ASC, source ASC, source_id ASC",
+            SessionListSort::Newest => "s.started_at DESC, source ASC, source_id ASC, s.id ASC",
+            SessionListSort::Oldest => "s.started_at ASC, source ASC, source_id ASC, s.id ASC",
             SessionListSort::Updated => {
-                "COALESCE(s.updated_at, s.started_at) DESC, s.started_at DESC, source ASC, source_id ASC"
+                "COALESCE(s.updated_at, s.started_at) DESC, s.started_at DESC, source ASC, source_id ASC, s.id ASC"
             }
         };
         sql.push_str(&format!(" ORDER BY {order_by}"));
@@ -653,7 +746,8 @@ impl Store {
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), session_from_row)?;
+        let rows =
+            stmt.query_map(param_refs.as_slice(), |row| session_from_row(row, &self.conn))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -711,26 +805,74 @@ fn delete_session_data_tx(
     source_id: &str,
 ) -> Result<()> {
     let session_ids: Vec<String> = {
-        let mut stmt =
-            tx.prepare("SELECT id FROM sessions WHERE source = ?1 AND source_id = ?2")?;
+        let mut stmt = tx.prepare(
+            "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2",
+        )?;
         stmt.query_map(rusqlite::params![source, source_id], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
-    for sid in &session_ids {
+    for sid in session_ids {
+        tx.execute("DELETE FROM native_bindings WHERE session_id = ?1", [&sid])?;
+        let replicated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_sync WHERE session_id = ?1)",
+            [&sid],
+            |row| row.get(0),
+        )?;
+        if replicated {
+            tx.execute("UPDATE sessions SET is_import = 1 WHERE id = ?1", [&sid])?;
+            continue;
+        }
         tx.execute(
             "DELETE FROM message_vec WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
             rusqlite::params![sid],
         )?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", [&sid])?;
     }
+    Ok(())
+}
+
+fn bind_native_tx(tx: &rusqlite::Transaction<'_>, session: &Session) -> Result<()> {
     tx.execute(
-        "DELETE FROM sessions WHERE source = ?1 AND source_id = ?2",
-        rusqlite::params![source, source_id],
+        "INSERT INTO native_bindings(source, source_id, session_id, confirmed)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(source, source_id) DO UPDATE SET
+             confirmed = MAX(native_bindings.confirmed, excluded.confirmed)
+         WHERE native_bindings.session_id = excluded.session_id",
+        rusqlite::params![session.source, session.source_id, session.id, !session.is_import],
     )?;
+    let bound: String = tx.query_row(
+        "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2",
+        rusqlite::params![session.source, session.source_id],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(bound == session.id, "native session is already bound to another local UUID");
+    Ok(())
+}
+
+pub(super) fn clear_session_contents_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM message_vec WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
+        [session_id],
+    )?;
+    for table in [
+        "messages",
+        "usage_events",
+        "usage_session_state",
+        "session_events",
+        "event_session_state",
+        "session_embedding_state",
+        "session_parent_links",
+    ] {
+        tx.execute(&format!("DELETE FROM {table} WHERE session_id = ?1"), [session_id])?;
+    }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn persist_session_with_usage_and_events_tx(
+pub(super) fn persist_session_with_usage_and_events_tx(
     tx: &rusqlite::Transaction<'_>,
     session: &Session,
     messages: &[Message],
@@ -743,7 +885,17 @@ fn persist_session_with_usage_and_events_tx(
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import, thread_role, metadata_parser_version)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+         ON CONFLICT(id) DO UPDATE SET
+             source = excluded.source, source_id = excluded.source_id, title = excluded.title,
+             directory = excluded.directory, repo_remote = excluded.repo_remote,
+             repo_slug = excluded.repo_slug, repo_name = excluded.repo_name,
+             started_at = excluded.started_at, updated_at = excluded.updated_at,
+             message_count = excluded.message_count, entrypoint = excluded.entrypoint,
+             custom_title = excluded.custom_title, summary = excluded.summary,
+             duration_minutes = excluded.duration_minutes, source_file_path = excluded.source_file_path,
+             is_import = excluded.is_import, thread_role = excluded.thread_role,
+             metadata_parser_version = excluded.metadata_parser_version",
         rusqlite::params![
             session.id,
             session.source,
@@ -837,8 +989,7 @@ fn persist_session_with_usage_and_events_tx(
                 source_updated_at, event_count, synced_at
              )
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(source, source_id) DO UPDATE SET
-                session_id = excluded.session_id,
+             ON CONFLICT(session_id) DO UPDATE SET
                 parser_version = excluded.parser_version,
                 source_updated_at = excluded.source_updated_at,
                 event_count = excluded.event_count,
@@ -974,6 +1125,8 @@ mod topology_tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         }
     }
 
@@ -999,6 +1152,105 @@ mod topology_tests {
                 topology,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn native_refresh_and_removal_leave_same_id_replicas_and_sync_identity_intact() {
+        let store = store();
+        let mut native = sess("collision");
+        native.directory = Some("/work/project".into());
+        persist(&store, &native, &SessionTopologyWrite::none());
+        let mut replica = native.clone();
+        replica.id = "remote-copy".into();
+        replica.is_import = true;
+        let tx = store.conn.unchecked_transaction().unwrap();
+        persist_session_with_usage_and_events_tx(
+            &tx,
+            &replica,
+            &msg(&replica.id),
+            &[],
+            Some(1),
+            &[],
+            Some(1),
+            &SessionTopologyWrite::none(),
+            store.trigram_message_flag,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(store.get_session_by_source_id("codex", "collision").is_err());
+        assert_eq!(store.get_native_session("codex", "collision").unwrap().unwrap().id, native.id);
+        assert_eq!(store.session_meta_map("codex").unwrap().len(), 1);
+        assert!(store.usage_state_meta_map("codex").unwrap().is_empty());
+        assert!(store.event_state_meta_map("codex").unwrap().is_empty());
+        assert_eq!(
+            store
+                .list_indexed_sessions(
+                    None,
+                    TimeRange::All,
+                    &ProjectScope::Directory("/work/project".into()),
+                    None,
+                    None,
+                    0,
+                    SessionListSort::Newest
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .conn
+            .execute("INSERT INTO session_sync(session_id, sync_id, current_revision) VALUES (?1, 'shared-identity', NULL)", [&native.id])
+            .unwrap();
+        let mut host = crate::host::Host {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "macbook".into(),
+            revision: 1,
+        };
+        host.observe(&store.conn, "codex", "collision").unwrap();
+        native.title = "refreshed".into();
+        store
+            .replace_session_with_usage_and_events_with_topology(
+                "codex",
+                "collision",
+                &native,
+                &msg(&native.id),
+                &[],
+                None,
+                &[],
+                None,
+                &SessionTopologyWrite::none(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session_by_id(&native.id).unwrap().unwrap().locations[0].host.name,
+            "macbook"
+        );
+        assert_eq!(store.get_session_by_id(&replica.id).unwrap().unwrap().title, "t");
+        host.name = "renamed".into();
+        host.revision += 1;
+        host.observe(&store.conn, "codex", "collision").unwrap();
+        assert_eq!(
+            store.get_session_by_id(&native.id).unwrap().unwrap().locations[0].host.name,
+            "renamed"
+        );
+        assert!(store.get_session_by_id(&replica.id).unwrap().unwrap().locations.is_empty());
+        store.delete_session_data("codex", "collision").unwrap();
+        assert!(store.get_native_session("codex", "collision").unwrap().is_none());
+        assert_eq!(store.get_messages(&native.id).unwrap().len(), 1);
+        assert_eq!(store.get_messages(&replica.id).unwrap().len(), 1);
+        assert!(store.session_meta_map("codex").unwrap().is_empty());
+        assert!(store.get_session_by_id(&native.id).unwrap().unwrap().is_import);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT sync_id FROM session_sync WHERE session_id = ?1",
+                    [&native.id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "shared-identity"
+        );
     }
 
     #[test]
@@ -1421,6 +1673,8 @@ mod search_scope_stats_tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         }
     }
 

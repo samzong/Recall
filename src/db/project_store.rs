@@ -11,7 +11,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT source_id, directory, source_file_path, repo_remote, repo_slug, repo_name
              FROM sessions
-             WHERE source = ?1",
+             WHERE source = ?1 AND id IN (SELECT session_id FROM native_bindings)",
         )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| {
             Ok(SessionPath {
@@ -35,7 +35,7 @@ impl Store {
         self.conn.execute(
             "UPDATE sessions
              SET repo_remote = ?1, repo_slug = ?2, repo_name = ?3
-             WHERE source = ?4 AND source_id = ?5",
+             WHERE id = (SELECT session_id FROM native_bindings WHERE source = ?4 AND source_id = ?5)",
             rusqlite::params![
                 identity.remote.as_str(),
                 identity.slug.as_str(),
@@ -159,7 +159,8 @@ impl Store {
             .conn
             .query_row(
                 &format!(
-                    "SELECT 1 FROM sessions WHERE directory = ?1 OR {} LIMIT 1",
+                    "SELECT 1 FROM sessions WHERE id IN (SELECT session_id FROM native_bindings)
+                     AND (directory = ?1 OR {}) LIMIT 1",
                     directory_child_sql("directory", 2)
                 ),
                 rusqlite::params![directory_root(value), escaped_directory_root(value)],
@@ -175,6 +176,7 @@ impl Store {
             "SELECT directory, COUNT(*) AS sessions, MAX(COALESCE(updated_at, started_at)) AS last_seen
              FROM sessions
              WHERE directory IS NOT NULL AND directory != ''
+               AND id IN (SELECT session_id FROM native_bindings)
              GROUP BY directory
              ORDER BY last_seen DESC, sessions DESC, directory ASC",
         )?;
@@ -239,11 +241,9 @@ pub(crate) fn apply_project_scope(
                 *param_idx += 1;
                 return;
             };
-            // Sessions indexed before repo identity backfill have no repo
-            // columns, so an auto-derived scope also accepts the checkout it
-            // came from; otherwise they would silently disappear.
             sql.push_str(&format!(
-                " AND (s.{column} = ?{} OR s.directory = ?{} OR {})",
+                " AND (s.{column} = ?{} OR (s.id IN (SELECT session_id FROM native_bindings)
+                   AND (s.directory = ?{} OR {})))",
                 *param_idx,
                 *param_idx + 1,
                 directory_child_sql("s.directory", *param_idx + 2)
@@ -263,7 +263,7 @@ fn push_directory_predicate(
     directory: &str,
 ) {
     sql.push_str(&format!(
-        " AND (s.directory = ?{} OR {})",
+        " AND s.id IN (SELECT session_id FROM native_bindings) AND (s.directory = ?{} OR {})",
         *param_idx,
         directory_child_sql("s.directory", *param_idx + 1)
     ));

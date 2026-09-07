@@ -10,6 +10,17 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub(crate) mod transport;
+
+pub(crate) fn remote_binary(provider: &str) -> Result<PathBuf> {
+    validate_extension_name(provider)?;
+    let path = managed_binary_path(&extension_root()?, provider);
+    if !is_executable_file(&path) {
+        bail!("remote provider is not installed; run recall ext install {provider}");
+    }
+    Ok(path)
+}
+
 const CATALOG_URL: &str = "https://samzong.github.io/Recall/extensions/catalog.json";
 const EMPTY_INSTALLED_HELP: &str = "\nExtensions:\n  none\n";
 

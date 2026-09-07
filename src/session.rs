@@ -457,6 +457,7 @@ fn cmd_session_show(
     let sources = adapters::source_labels();
     let session = resolve_session_ref(&store, &sources, id, source_filter, source_id)?;
     let includes = parse_session_includes(include, messages_flag, format)?;
+    let revisions = store.revision_summaries(&session.id)?;
     window.validate()?;
     let paging = window.around_seq.is_some() || max_chars.is_some() || cursor.is_some();
     anyhow::ensure!(
@@ -495,6 +496,19 @@ fn cmd_session_show(
 
     match format {
         SessionDetailFormat::Text => {
+            for revision in &revisions {
+                println!(
+                    "Version: {}{}",
+                    revision["digest"].as_str().unwrap_or_default(),
+                    if revision["current"] == true { " (current)" } else { "" }
+                );
+            }
+            println!("Host: {}", crate::host::label(&session.locations));
+            for location in &session.locations {
+                if let Some(path) = &location.source_file_path {
+                    println!("  {}: {path}", location.host.name);
+                }
+            }
             print!("{}", transcript::render_plain(&session, &messages));
             if !usage_events.is_empty() {
                 println!("Usage events: {}", usage_events.len());
@@ -508,6 +522,7 @@ fn cmd_session_show(
         }
         SessionDetailFormat::Json | SessionDetailFormat::Jsonl => {
             let topology = store.session_topology(&session.id)?;
+            let locations = serde_json::to_value(&session.locations)?;
             let mut value = crate::export::session_record_value(
                 session,
                 topology,
@@ -515,6 +530,10 @@ fn cmd_session_show(
                 usage_events,
                 events,
             )?;
+            value["session"]["locations"] = locations;
+            if !revisions.is_empty() {
+                value["revisions"] = serde_json::to_value(revisions)?;
+            }
             if paging {
                 value["next_cursor"] = serde_json::json!(next_cursor);
                 value["truncated"] = serde_json::json!(next_cursor.is_some());
@@ -676,7 +695,7 @@ fn cmd_session_command(
     let store = Store::open()?;
     let sources = adapters::source_labels();
     let session = resolve_session_ref(&store, &sources, id, source_filter, source_id)?;
-    if session.is_import {
+    if session.is_import || !store.has_native_binding(&session.id)? {
         anyhow::bail!("imported session is not resumable on this machine");
     }
     let command = session_action::command_for(action, &session.source, &session.source_id)
@@ -832,6 +851,10 @@ fn print_session_list_table(rows: &[SessionListRow], sources: &[(String, String)
         if let Some(directory) = &session.directory {
             println!("  project: {directory}");
         }
+        println!("  host: {}", crate::host::label(&session.locations));
+        if session.alternative_versions > 0 {
+            println!("  alternative versions: {}", session.alternative_versions);
+        }
         if let Some(snippet) = &row.snippet {
             println!("  match: {}", snippet.chars().take(160).collect::<String>());
         }
@@ -940,6 +963,8 @@ fn session_json(
         "duration_minutes": session.duration_minutes,
         "source_file_path": session.source_file_path,
         "is_import": session.is_import,
+        "locations": session.locations,
+        "alternative_versions": session.alternative_versions,
         "topology": topology_json(topology)
     })
 }

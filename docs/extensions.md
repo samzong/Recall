@@ -68,6 +68,11 @@ Extensions own:
 Usage tracking stays in core. Token events are data-plane records written by
 source adapters during sync.
 
+Remote storage providers use the planned [remote synchronization
+contract](remote-sync.md). Core invokes a managed provider process for object
+transport; the provider never merges sessions or accesses the index. Provider
+transport versioning is independent of the existing CLI protocol version.
+
 Skills and extensions are different:
 
 - bundled skills (`recall skill install`) are agent-facing prompt bundles;

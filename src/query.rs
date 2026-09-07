@@ -56,6 +56,10 @@ pub(crate) fn run_message_search(
                     "{} #{} [{}] {}\n  {}",
                     hit.session_id, hit.seq, hit.role, hit.title, hit.excerpt
                 );
+                println!("  host: {}", crate::host::label(&hit.locations));
+                if hit.alternative_versions > 0 {
+                    println!("  alternative versions: {}", hit.alternative_versions);
+                }
             }
             if matches.is_empty() {
                 println!("No matching messages.");
@@ -133,6 +137,10 @@ pub(crate) fn run_search(
             println!("    {short}");
         }
         println!("    dir: {dir}");
+        println!("    host: {}", crate::host::label(&s.locations));
+        if s.alternative_versions > 0 {
+            println!("    alternative versions: {}", s.alternative_versions);
+        }
         println!();
     }
 

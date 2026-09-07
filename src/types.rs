@@ -150,6 +150,8 @@ pub(crate) struct Session {
     pub(crate) duration_minutes: Option<u32>,
     pub(crate) source_file_path: Option<String>,
     pub(crate) is_import: bool,
+    pub(crate) locations: Vec<crate::host::Location>,
+    pub(crate) alternative_versions: u32,
 }
 
 #[derive(Debug, Clone)]

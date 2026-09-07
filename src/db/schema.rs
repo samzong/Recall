@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 const V12_SCHEMA_VERSION: i64 = 12;
-pub(crate) const SCHEMA_VERSION: i64 = 16;
+pub(crate) const SCHEMA_VERSION: i64 = 17;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -63,6 +63,140 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 16 {
         migrate_v16(conn)?;
     }
+    if version < 17 {
+        migrate_v17(conn)?;
+    }
+    Ok(())
+}
+
+fn migrate_v17(conn: &Connection) -> anyhow::Result<()> {
+    let foreign_keys: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| -> anyhow::Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        if read_schema_version(&tx)? >= 17 {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute_batch(
+            "CREATE TABLE sessions_v17 (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                directory TEXT,
+                started_at INTEGER NOT NULL,
+                updated_at INTEGER,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                entrypoint TEXT,
+                custom_title TEXT,
+                summary TEXT,
+                duration_minutes INTEGER,
+                source_file_path TEXT,
+                is_import INTEGER NOT NULL DEFAULT 0,
+                repo_remote TEXT,
+                repo_slug TEXT,
+                repo_name TEXT,
+                thread_role TEXT CHECK (thread_role IN ('primary', 'subagent')),
+                metadata_parser_version INTEGER
+            );
+            INSERT INTO sessions_v17
+            SELECT id, source, source_id, title, directory, started_at, updated_at,
+                   message_count, entrypoint, custom_title, summary, duration_minutes,
+                   source_file_path, is_import, repo_remote, repo_slug, repo_name,
+                   thread_role, metadata_parser_version FROM sessions;
+            DROP TABLE sessions;
+            ALTER TABLE sessions_v17 RENAME TO sessions;
+            CREATE INDEX idx_sessions_source ON sessions(source, source_id);
+            CREATE INDEX idx_sessions_started_at ON sessions(started_at);
+            CREATE INDEX idx_sessions_directory ON sessions(directory);
+            CREATE INDEX idx_sessions_repo_remote ON sessions(repo_remote);
+            CREATE INDEX idx_sessions_repo_slug ON sessions(repo_slug);
+            CREATE INDEX idx_sessions_repo_name ON sessions(repo_name);",
+        )?;
+        for table in ["usage_session_state", "event_session_state"] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if exists {
+                tx.execute_batch(&format!(
+                    "CREATE TABLE {table}_v17 (
+                        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                        source TEXT NOT NULL,
+                        source_id TEXT NOT NULL,
+                        parser_version INTEGER NOT NULL,
+                        source_updated_at INTEGER,
+                        event_count INTEGER NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+                        synced_at INTEGER NOT NULL
+                    );
+                    INSERT INTO {table}_v17 SELECT * FROM {table};
+                    DROP TABLE {table};
+                    ALTER TABLE {table}_v17 RENAME TO {table};
+                    CREATE INDEX idx_{table}_source ON {table}(source, source_id);"
+                ))?;
+            }
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS native_bindings (
+                source TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
+                confirmed INTEGER NOT NULL CHECK (confirmed IN (0, 1)),
+                PRIMARY KEY(source, source_id)
+            );
+            INSERT OR IGNORE INTO native_bindings
+                SELECT source, source_id, id, NOT is_import FROM sessions;
+            CREATE TABLE IF NOT EXISTS session_sync (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                sync_id TEXT NOT NULL UNIQUE,
+                current_revision TEXT,
+                alternative_versions INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sync_aliases (
+                sync_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_aliases_session ON sync_aliases(session_id);
+            CREATE TABLE IF NOT EXISTS sync_revisions (
+                digest TEXT PRIMARY KEY,
+                sync_id TEXT NOT NULL,
+                body BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_revisions_identity ON sync_revisions(sync_id);
+            CREATE TABLE IF NOT EXISTS sync_objects (
+                digest TEXT PRIMARY KEY,
+                body BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS hosts (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision > 0)
+            );
+            CREATE TABLE IF NOT EXISTS session_locations (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                host_id TEXT NOT NULL REFERENCES hosts(id),
+                directory TEXT,
+                source_file_path TEXT,
+                observed_at INTEGER NOT NULL,
+                PRIMARY KEY(session_id, host_id)
+            );
+            PRAGMA user_version = 17;",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "ALTER TABLE session_parent_links ADD COLUMN parent_sync_id TEXT",
+        )?;
+        let violation: Option<String> =
+            tx.query_row("PRAGMA foreign_key_check", [], |row| row.get(0)).optional()?;
+        anyhow::ensure!(violation.is_none(), "foreign key violation after identity migration");
+        tx.commit()?;
+        Ok(())
+    })();
+    let restored = conn.pragma_update(None, "foreign_keys", foreign_keys);
+    result?;
+    restored?;
     Ok(())
 }
 
@@ -631,6 +765,106 @@ mod tests {
     use super::*;
     use crate::db::store::Store;
     use crate::types::{Message, Role};
+
+    #[test]
+    fn remote_identity_migration_preserves_v16_data_and_a_restorable_backup() {
+        register_sqlite_vec();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("recall.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;").unwrap();
+        for migrate in [
+            migrate_v1,
+            migrate_v2,
+            migrate_v3,
+            migrate_v4,
+            migrate_v5,
+            migrate_v6,
+            migrate_v7,
+            migrate_v8,
+            migrate_v9,
+            migrate_v10,
+            migrate_v11,
+            migrate_v12,
+            migrate_v13,
+            migrate_v14,
+            migrate_v15,
+            migrate_v16,
+        ] {
+            migrate(&conn).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO sessions(id, source, source_id, title, started_at) VALUES ('native', 'codex', 'raw', 'Original', 1);
+             INSERT INTO sessions(id, source, source_id, title, started_at, is_import) VALUES ('legacy', 'codex', 'old', 'Imported', 1, 1);
+             INSERT INTO messages(id, session_id, role, content, seq) VALUES (1, 'native', 'user', 'migrationpreserved', 0);
+             INSERT INTO usage_events(session_id, source, source_id, event_key, event_seq, timestamp, input_tokens, token_source, created_at)
+                 VALUES ('native', 'codex', 'raw', 'u1', 0, 1, 37, 'observed', 1);
+             INSERT INTO usage_session_state(session_id, source, source_id, parser_version, synced_at) VALUES ('native', 'codex', 'raw', 4, 1);
+             INSERT INTO session_events(id, session_id, source, source_id, event_seq, kind, actor, attrs_json, created_at)
+                 VALUES (1, 'native', 'codex', 'raw', 0, 'tool_call', 'assistant', '{\"kept\":true}', 1);
+             INSERT INTO event_session_state(session_id, source, source_id, parser_version, synced_at) VALUES ('native', 'codex', 'raw', 5, 1);
+             INSERT INTO event_files(event_id, position, path, evidence_json) VALUES (1, 0, '/work/file', '{}');
+             INSERT INTO session_parent_links VALUES ('native', 'fork', 'codex', 'old');",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO message_vec(message_id, embedding) VALUES (1, ?1)",
+            [serde_json::to_string(&vec![0.1_f32; 384]).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open_at(&path).unwrap();
+        assert_eq!(schema_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.get_messages("native").unwrap()[0].content, "migrationpreserved");
+        assert_eq!(store.list_usage_events_for_session("native").unwrap()[0].input_tokens, 37);
+        assert_eq!(store.session_topology("native").unwrap().parents[0].source_id, "old");
+        for table in [
+            "message_vec",
+            "usage_session_state",
+            "event_session_state",
+            "session_events",
+            "event_files",
+        ] {
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        assert!(store.has_native_binding("native").unwrap());
+        assert!(!store.has_native_binding("legacy").unwrap());
+        assert!(store.get_session_by_id("native").unwrap().unwrap().locations.is_empty());
+        assert!(store.get_session_by_id("legacy").unwrap().unwrap().locations.is_empty());
+        assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'migrationpreserved'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let backups = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("recall-before-remote-")
+                    .then_some(path)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        let restored = root.path().join("restored.db");
+        backup.backup(rusqlite::DatabaseName::Main, &restored, None).unwrap();
+        let restored = Connection::open(restored).unwrap();
+        assert_eq!(schema_version(&restored).unwrap(), 16);
+        assert_eq!(
+            restored
+                .query_row("SELECT content FROM messages WHERE session_id = 'native'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "migrationpreserved"
+        );
+        assert!(restored.execute("INSERT INTO sessions(id, source, source_id, title, started_at) VALUES ('collision', 'codex', 'raw', 'Duplicate', 1)", []).is_err());
+    }
 
     #[test]
     fn v14_preserves_existing_events_and_is_idempotent() {

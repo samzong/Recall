@@ -534,6 +534,8 @@ mod tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         };
         let event = RawSessionEvent {
             command_evidence_status: None,
@@ -612,6 +614,8 @@ mod tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         };
         let event = RawSessionEvent {
             command_evidence_status: None,

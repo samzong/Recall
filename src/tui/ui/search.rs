@@ -223,6 +223,22 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::raw(" "),
                 Span::styled(
+                    format!(
+                        "[{}] {}",
+                        crate::host::label(&s.locations).chars().take(18).collect::<String>(),
+                        if s.alternative_versions > 0 {
+                            format!("+{} versions ", s.alternative_versions)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    if selected {
+                        selected_text_style
+                    } else {
+                        Style::default().fg(THEME.text_muted)
+                    },
+                ),
+                Span::styled(
                     title,
                     if selected { selected_text_style } else { Style::default().fg(THEME.text) },
                 ),

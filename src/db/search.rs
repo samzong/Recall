@@ -46,7 +46,8 @@ pub(crate) struct SessionEventHit {
     pub(crate) is_meta: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RepoFilter {
     Remote(String),
     Slug(String),
@@ -131,6 +132,8 @@ pub(crate) struct MessageHit {
     pub(crate) role: String,
     pub(crate) timestamp: Option<i64>,
     pub(crate) excerpt: String,
+    pub(crate) locations: Vec<crate::host::Location>,
+    pub(crate) alternative_versions: u32,
 }
 
 impl<'a> SearchEngine<'a> {
@@ -191,6 +194,11 @@ impl<'a> SearchEngine<'a> {
                         role: row.get(6)?,
                         timestamp: row.get(7)?,
                         excerpt: message_excerpt(&row.get::<_, String>(8)?),
+                        locations: crate::host::locations(self.conn, &row.get::<_, String>(1)?)?,
+                        alternative_versions: super::remote_store::alternative_versions(
+                            self.conn,
+                            &row.get::<_, String>(1)?,
+                        )?,
                     },
                 ))
             })?;
@@ -274,7 +282,7 @@ impl<'a> SearchEngine<'a> {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(SessionEventHit {
-                session: session_from_row(row)?,
+                session: session_from_row(row, self.conn)?,
                 kind: row.get(17)?,
                 name: row.get(18)?,
                 target: row.get(19)?,
@@ -479,7 +487,7 @@ impl<'a> SearchEngine<'a> {
             let params: Vec<&dyn rusqlite::types::ToSql> =
                 ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(params.as_slice(), session_from_row)?;
+            let rows = stmt.query_map(params.as_slice(), |row| session_from_row(row, self.conn))?;
 
             for row in rows {
                 let session = row?;
@@ -980,7 +988,7 @@ impl SearchEngine<'_> {
         let mut stmt = tx.prepare(&sql)?;
         let mut rows = stmt
             .query_map(refs.as_slice(), |row| {
-                let session = session_from_row(row)?;
+                let session = session_from_row(row, self.conn)?;
                 Ok((
                     row.get::<_, i64>(23)?,
                     FileHistoryHit {
@@ -1288,6 +1296,8 @@ mod tests {
             duration_minutes: None,
             source_file_path: None,
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         }
     }
 

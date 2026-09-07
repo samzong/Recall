@@ -806,6 +806,7 @@ mod tests {
                 ],
             )
             .unwrap();
+        store.conn.execute_batch("INSERT INTO native_bindings SELECT source, source_id, id, NOT is_import FROM sessions;").unwrap();
         store
             .persist_usage_events_for_existing_session(
                 "droid",

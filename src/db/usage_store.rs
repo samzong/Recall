@@ -29,7 +29,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT source_id, parser_version, source_updated_at
              FROM usage_session_state
-             WHERE source = ?1",
+             WHERE source = ?1 AND session_id IN (SELECT session_id FROM native_bindings)",
         )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| {
             Ok((
@@ -54,7 +54,7 @@ impl Store {
         let session_id = self
             .conn
             .query_row(
-                "SELECT id FROM sessions WHERE source = ?1 AND source_id = ?2",
+                "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2",
                 rusqlite::params![source, source_id],
                 |row| row.get::<_, String>(0),
             )
@@ -114,8 +114,7 @@ impl Store {
                     source_updated_at, event_count, synced_at
                  )
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(source, source_id) DO UPDATE SET
-                    session_id = excluded.session_id,
+                 ON CONFLICT(session_id) DO UPDATE SET
                     parser_version = excluded.parser_version,
                     source_updated_at = excluded.source_updated_at,
                     event_count = excluded.event_count,

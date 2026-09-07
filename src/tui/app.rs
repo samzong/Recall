@@ -478,7 +478,7 @@ impl App {
             AppMode::Filters => self.handle_filters_key(key, store),
             AppMode::HandoffTarget => self.handle_handoff_target_key(key),
             AppMode::Subagents => self.handle_subagents_key(key, store),
-            AppMode::ConfirmResume => self.handle_confirm_resume_key(key),
+            AppMode::ConfirmResume => self.handle_confirm_resume_key(key, store),
         }
     }
 
@@ -1124,12 +1124,12 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-            self.start_resume_confirmation(ResumeOrigin::Search);
+            self.start_resume_confirmation(ResumeOrigin::Search, store);
             return;
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-            self.start_app_open_confirmation(ResumeOrigin::Search);
+            self.start_app_open_confirmation(ResumeOrigin::Search, store);
             return;
         }
 
@@ -1246,11 +1246,11 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-            self.start_resume_confirmation(ResumeOrigin::Viewing);
+            self.start_resume_confirmation(ResumeOrigin::Viewing, store);
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-            self.start_app_open_confirmation(ResumeOrigin::Viewing);
+            self.start_app_open_confirmation(ResumeOrigin::Viewing, store);
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
@@ -1453,19 +1453,21 @@ impl App {
         }
     }
 
-    fn start_resume_confirmation(&mut self, origin: ResumeOrigin) {
+    fn start_resume_confirmation(&mut self, origin: ResumeOrigin, store: &Store) {
         self.start_source_command_confirmation(
             origin,
             session_action::SessionAction::Resume,
             PendingCommandAction::Resume,
+            store,
         );
     }
 
-    fn start_app_open_confirmation(&mut self, origin: ResumeOrigin) {
+    fn start_app_open_confirmation(&mut self, origin: ResumeOrigin, store: &Store) {
         self.start_source_command_confirmation(
             origin,
             session_action::SessionAction::OpenApp,
             PendingCommandAction::OpenApp,
+            store,
         );
     }
 
@@ -1474,6 +1476,7 @@ impl App {
         origin: ResumeOrigin,
         source_action: session_action::SessionAction,
         action: PendingCommandAction,
+        store: &Store,
     ) {
         let session = match origin {
             ResumeOrigin::Viewing => self.viewing_session.clone(),
@@ -1484,7 +1487,7 @@ impl App {
         let Some(session) = session else {
             return;
         };
-        if session.is_import {
+        if session.is_import || !store.has_native_binding(&session.id).unwrap_or(false) {
             self.status_message =
                 Some("Imported session: not resumable on this machine".to_string());
             return;
@@ -1497,6 +1500,7 @@ impl App {
             return;
         };
         self.pending_resume = Some(PendingResume {
+            native_session_id: Some(session.id.clone()),
             command,
             action,
             source_label: self.source_label_for(&session.source).to_string(),
@@ -1559,6 +1563,7 @@ impl App {
             }
         };
         self.pending_resume = Some(PendingResume {
+            native_session_id: None,
             command,
             action: PendingCommandAction::Handoff,
             source_label: target.label.clone(),
@@ -1569,10 +1574,20 @@ impl App {
         self.mode = AppMode::ConfirmResume;
     }
 
-    fn handle_confirm_resume_key(&mut self, key: KeyEvent) {
+    fn handle_confirm_resume_key(&mut self, key: KeyEvent, store: &Store) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 if let Some(pending) = self.pending_resume.take() {
+                    if pending
+                        .native_session_id
+                        .as_deref()
+                        .is_some_and(|id| !store.has_native_binding(id).unwrap_or(false))
+                    {
+                        self.status_message =
+                            Some("Session is no longer native to this machine".into());
+                        self.mode = AppMode::Search;
+                        return;
+                    }
                     self.exec_on_exit = Some((pending.command, pending.cwd));
                     self.should_quit = true;
                 } else {
@@ -2552,7 +2567,7 @@ impl App {
             .iter()
             .map(|parent| {
                 let indexed = store
-                    .get_session_by_source_id(&parent.source, &parent.source_id)
+                    .resolve_parent(&session.id, parent)
                     .map(|found| found.is_some())
                     .unwrap_or(false);
                 ViewingParent {
@@ -2564,8 +2579,7 @@ impl App {
             })
             .collect();
         self.viewing_lineage = Some(ViewingLineage { role: topology.thread_role, parents });
-        self.viewing_children =
-            store.child_subagents(&session.source, &session.source_id).unwrap_or_default();
+        self.viewing_children = store.child_subagents(&session.id).unwrap_or_default();
         self.viewing_sanitized_lines = build_viewing_caches(&msgs);
         self.local_preview = Some(
             crate::share::create_session_preview(&session, &msgs, &events, &usage_events)
@@ -2989,6 +3003,8 @@ mod tests {
                 duration_minutes: None,
                 source_file_path: None,
                 is_import: false,
+                locations: Vec::new(),
+                alternative_versions: 0,
             },
             match_source: MatchSource::Fts,
             snippet: None,
@@ -3552,6 +3568,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let mut app = app_with_sources();
         app.results = vec![copilot_search_result()];
+        store.insert_session(&app.results[0].session).unwrap();
 
         app.handle_search_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), &store);
 
@@ -3573,6 +3590,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let mut app = app_with_sources();
         app.results = vec![codex_search_result()];
+        store.insert_session(&app.results[0].session).unwrap();
 
         app.handle_search_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), &store);
 
@@ -3586,6 +3604,11 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "codex://threads/019e6d8d-588b-7fd2-a326-c525469ed120")
         );
+        let session = &app.results[0].session;
+        store.delete_session_data(&session.source, &session.source_id).unwrap();
+        app.handle_confirm_resume_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &store);
+        assert!(app.exec_on_exit.is_none());
+        assert!(!app.should_quit);
     }
 
     #[test]

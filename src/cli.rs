@@ -17,6 +17,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(about = "Configure and synchronize a remote session library")]
+    Remote {
+        #[command(subcommand)]
+        command: crate::remote::RemoteCommands,
+    },
     #[command(about = "Search indexed coding sessions")]
     Search {
         #[arg(help = "Search query text")]
@@ -373,6 +378,7 @@ pub(crate) fn run() -> Result<()> {
             crate::extension::run_upgrade(name)?
         }
         Some(Commands::Session { command }) => session::cmd_session(command)?,
+        Some(Commands::Remote { command }) => crate::remote::run(command)?,
         Some(Commands::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "recall", &mut std::io::stdout());
         }

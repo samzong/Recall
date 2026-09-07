@@ -679,6 +679,7 @@ mod tests {
             "INSERT INTO sessions (id, source, source_id, title, started_at, updated_at, message_count) VALUES ('stored', 'gemini-cli', 'abc-123', 'hello', 0, ?1, 1)",
             rusqlite::params![session.updated_at],
         ).unwrap();
+        store.conn.execute_batch("INSERT INTO native_bindings SELECT source, source_id, id, NOT is_import FROM sessions;").unwrap();
         store
             .persist_usage_events_for_existing_session(
                 "gemini-cli",

@@ -13,7 +13,7 @@ default-members = ["."]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.9"
+version = "0.6.0"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -24,8 +24,8 @@ rmcp = { version = "3.1.4", default-features = false, features = [
     "schemars",
     "transport-io",
 ] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "time"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "time", "process"] }
 sqlite-vec = "0.1"
 hf-hub = { version = "0.5", features = ["ureq"] }
 ureq = "3"

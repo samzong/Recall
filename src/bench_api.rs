@@ -409,6 +409,8 @@ fn synthetic_session(index: usize, message_count: usize) -> Session {
         duration_minutes: Some(15),
         source_file_path: Some(format!("/home/dev/.claude/projects/p/session-{index}.jsonl")),
         is_import: false,
+        locations: Vec::new(),
+        alternative_versions: 0,
     }
 }
 
