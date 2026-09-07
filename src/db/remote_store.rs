@@ -12,7 +12,9 @@ use crate::host::Location;
 use crate::project_scope::ProjectScope;
 use crate::types::Session;
 
-pub(crate) const OBJECT_LIMIT: usize = 64 * 1024 * 1024;
+const SQLITE_MAX_LENGTH: usize = 1_000_000_000;
+pub(crate) const OBJECT_LIMIT: usize = 512 * 1024 * 1024;
+const _: () = assert!(OBJECT_LIMIT < SQLITE_MAX_LENGTH);
 
 pub(crate) fn is_zero(value: &u32) -> bool {
     *value == 0
@@ -94,14 +96,20 @@ impl Store {
         Ok(sync_id)
     }
 
-    pub(crate) fn prepare_remote(&self, scope: &ProjectScope) -> Result<()> {
+    pub(crate) fn prepare_remote(
+        &self,
+        scope: &ProjectScope,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         let sessions =
             self.list_export_sessions(None, super::search::TimeRange::All, scope, None, None)?;
         for session in &sessions {
             self.remote_identity(&session.id)?;
         }
-        for session in sessions {
+        let total = sessions.len();
+        for (index, session) in sessions.into_iter().enumerate() {
+            on_progress(index + 1, total);
             let id = session.id.clone();
             let sync_id = self.remote_identity(&id)?;
             let current: Option<String> = self.conn.query_row(
@@ -181,8 +189,20 @@ impl Store {
             .optional()?)
     }
 
+    pub(crate) fn cached_remote_size(&self, key: &str) -> Result<Option<u64>> {
+        let (table, hash) = object_parts(key)?;
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT LENGTH(body) FROM {table} WHERE digest = ?1"),
+                [hash],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub(crate) fn cache_remote(&self, key: &str, body: &[u8]) -> Result<()> {
-        ensure!(body.len() <= OBJECT_LIMIT, "remote object exceeds 64 MiB");
+        ensure!(body.len() <= OBJECT_LIMIT, "remote object exceeds 512 MiB");
         let (table, hash) = object_parts(key)?;
         ensure!(digest(body) == hash, "remote object content hash mismatch");
         if table == "sync_revisions" {
@@ -298,7 +318,11 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let hashes = self
             .conn
-            .prepare("SELECT digest FROM sync_revisions ORDER BY digest")?
+            .prepare(
+                "SELECT digest FROM sync_revisions r
+                 WHERE NOT EXISTS (SELECT 1 FROM sync_aliases a WHERE a.sync_id = r.sync_id)
+                 ORDER BY digest",
+            )?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for hash in &hashes {
@@ -514,11 +538,16 @@ impl Store {
                 .query_map([&session.id], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             identities.extend(aliases);
-            keys.extend(
-                self.session_revisions(&session.id)?
-                    .keys()
-                    .map(|hash| format!("v1/revisions/{hash}.json")),
-            );
+            let digests = self
+                .conn
+                .prepare(
+                    "SELECT r.digest FROM sync_revisions r
+                     JOIN sync_aliases a ON a.sync_id = r.sync_id
+                     WHERE a.session_id = ?1",
+                )?
+                .query_map([&session.id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            keys.extend(digests.into_iter().map(|hash| format!("v1/revisions/{hash}.json")));
         }
         let metadata = self
             .conn

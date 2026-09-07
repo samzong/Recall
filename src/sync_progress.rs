@@ -27,7 +27,15 @@ impl SyncProgress {
     }
 
     pub(crate) fn for_terminal(total: usize) -> Self {
-        if total == 0 || !io::stderr().is_terminal() {
+        if total == 0 { Self::disabled() } else { Self::rendering(total) }
+    }
+
+    pub(crate) fn for_phases() -> Self {
+        Self::rendering(0)
+    }
+
+    fn rendering(total: usize) -> Self {
+        if !io::stderr().is_terminal() {
             return Self { total, index: 0, line: None, stop: None, ticker: None };
         }
         let line = Arc::new(Mutex::new(Line {
@@ -47,6 +55,15 @@ impl SyncProgress {
             })
         };
         Self { total, index: 0, line: Some(line), stop: Some(stop), ticker: Some(ticker) }
+    }
+
+    pub(crate) fn phase(&mut self, text: &str) {
+        let text = text.to_string();
+        self.with_line(|line| line.set_transient(text, true));
+    }
+
+    pub(crate) fn detail(&mut self, text: String) {
+        self.with_line(|line| line.set_transient(text, false));
     }
 
     pub(crate) fn begin_source(&mut self, label: &str) {
@@ -152,8 +169,17 @@ impl Line {
 pub(crate) fn format_bytes(bytes: u64) -> String {
     const GIB: f64 = (1u64 << 30) as f64;
     const MIB: f64 = (1u64 << 20) as f64;
+    const KIB: f64 = (1u64 << 10) as f64;
     let bytes = bytes as f64;
-    if bytes >= GIB { format!("{:.1} GiB", bytes / GIB) } else { format!("{:.0} MiB", bytes / MIB) }
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.0} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.0} KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
+    }
 }
 
 pub(crate) fn format_elapsed(elapsed_ms: u128) -> String {

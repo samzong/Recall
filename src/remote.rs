@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -121,6 +123,8 @@ pub(crate) fn run(command: RemoteCommands) -> Result<()> {
     }
 }
 
+const UPLOAD_CONCURRENCY: usize = 16;
+
 #[derive(Default, Serialize)]
 struct SyncSummary {
     downloaded: usize,
@@ -134,15 +138,18 @@ fn synchronize(format: crate::info::InfoFormat) -> Result<()> {
         load_settings()?.context("remote is not connected; run recall remote connect")?;
     let connection =
         settings.connection.context("remote is disconnected; run recall remote connect")?;
+    let mut progress = crate::sync_progress::SyncProgress::for_phases();
+    progress.phase("Scanning sources");
     crate::sync::scan_remote_scope(connection.scope.clone())?;
     let store = Store::open()?;
-    let summary = exchange(&store, &connection, &mut |operation| {
+    let summary = exchange(&store, &connection, &mut progress, &|operation| {
         crate::extension::transport::invoke(
             &connection.provider,
             operation,
             Duration::from_secs(120),
         )
     })?;
+    progress.finish();
     match format {
         crate::info::InfoFormat::Json => println!("{}", serde_json::to_string(&summary)?),
         crate::info::InfoFormat::Text => println!(
@@ -156,9 +163,14 @@ fn synchronize(format: crate::info::InfoFormat) -> Result<()> {
 fn exchange(
     store: &Store,
     connection: &Connection,
-    transport: &mut dyn FnMut(&Operation) -> Result<Reply>,
+    progress: &mut crate::sync_progress::SyncProgress,
+    transport: &(dyn Fn(&Operation) -> Result<Reply> + Sync),
 ) -> Result<SyncSummary> {
-    store.prepare_remote(&connection.scope)?;
+    progress.phase("Preparing sessions");
+    store.prepare_remote(&connection.scope, &mut |done, total| {
+        progress.detail(format!("Preparing sessions {done}/{total}"))
+    })?;
+    progress.phase("Enumerating remote objects");
     let mut summary = SyncSummary::default();
     let mut cursor = None;
     let mut cursors = HashSet::new();
@@ -166,21 +178,21 @@ fn exchange(
     let temporary = tempfile::tempdir()?;
     loop {
         let Reply::Listed(page) =
-            transport(&Operation::List { prefix: "v1/".into(), cursor, page_size: 500 })?
+            transport(&Operation::List { prefix: "v1/".into(), cursor, page_size: 1000 })?
         else {
             anyhow::bail!("provider returned an invalid list result");
         };
         for object in page.objects {
             ensure!(
                 object.size <= crate::db::remote_store::OBJECT_LIMIT as u64,
-                "remote object exceeds 64 MiB"
+                "remote object exceeds 512 MiB"
             );
             if !remote_keys.insert(object.key.clone()) {
                 continue;
             }
-            if let Some(cached) = store.cached_remote(&object.key)? {
+            if let Some(cached) = store.cached_remote_size(&object.key)? {
                 ensure!(
-                    cached.len() as u64 == object.size,
+                    cached == object.size,
                     "remote object size differs from its cached content"
                 );
                 continue;
@@ -202,6 +214,11 @@ fn exchange(
             ensure!(body.len() as u64 == size, "downloaded object length mismatch");
             store.cache_remote(&object.key, &body)?;
             summary.downloaded += 1;
+            progress.detail(format!(
+                "Remote objects: {} listed, {} downloaded",
+                remote_keys.len(),
+                summary.downloaded
+            ));
         }
         cursor = page.next_cursor;
         if let Some(cursor) = &cursor {
@@ -210,27 +227,136 @@ fn exchange(
             break;
         }
     }
+    progress.phase("Merging revisions");
     summary.sessions_with_alternatives = store.merge_remote()?;
-    for key in store.remote_uploads(&connection.scope)? {
-        if remote_keys.contains(&key) {
-            continue;
-        }
-        let body =
-            store.cached_remote(&key)?.context("remote recovery object is missing locally")?;
-        let path = temporary.path().join("upload.json");
-        std::fs::write(&path, &body)?;
-        ensure!(
-            transport(&Operation::Put {
-                key,
-                input_path: path,
-                size: body.len() as u64,
-                sha256: crate::db::remote_store::digest(&body)
-            })? == Reply::Published,
-            "provider returned an invalid put result"
-        );
-        summary.uploaded += 1;
-    }
+    let uploads: Vec<String> = store
+        .remote_uploads(&connection.scope)?
+        .into_iter()
+        .filter(|key| !remote_keys.contains(key))
+        .collect();
+    progress.phase("Uploading objects");
+    summary.uploaded = upload_objects(store, progress, transport, uploads, temporary.path())?;
     Ok(summary)
+}
+
+struct Upload {
+    key: String,
+    path: PathBuf,
+    size: u64,
+    sha256: String,
+}
+
+fn stage_upload(store: &Store, directory: &Path, index: usize, key: String) -> Result<Upload> {
+    let body = store.cached_remote(&key)?.context("remote recovery object is missing locally")?;
+    let path = directory.join(format!("upload-{index}.json"));
+    std::fs::write(&path, &body)?;
+    let sha256 = crate::db::remote_store::digest(&body);
+    Ok(Upload { key, path, size: body.len() as u64, sha256 })
+}
+
+fn upload_objects(
+    store: &Store,
+    progress: &mut crate::sync_progress::SyncProgress,
+    transport: &(dyn Fn(&Operation) -> Result<Reply> + Sync),
+    uploads: Vec<String>,
+    directory: &Path,
+) -> Result<usize> {
+    let pending = uploads.len();
+    if pending == 0 {
+        return Ok(0);
+    }
+    let workers = UPLOAD_CONCURRENCY.min(pending);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Upload>(workers);
+    let receiver = Mutex::new(receiver);
+    let uploaded = AtomicUsize::new(0);
+    let transferred = AtomicU64::new(0);
+    let aborted = AtomicBool::new(false);
+    let failure = Mutex::new(None);
+    let line = |done: usize, bytes: u64| {
+        format!(
+            "Uploading objects {done}/{pending} ({})",
+            crate::sync_progress::format_bytes(bytes)
+        )
+    };
+
+    std::thread::scope(|scope| -> Result<usize> {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    while let Ok(upload) = receiver.lock().expect("upload queue").recv() {
+                        if aborted.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let published = (|| -> Result<()> {
+                            let reply = transport(&Operation::Put {
+                                key: upload.key,
+                                input_path: upload.path.clone(),
+                                size: upload.size,
+                                sha256: upload.sha256,
+                            })?;
+                            ensure!(
+                                reply == Reply::Published,
+                                "provider returned an invalid put result"
+                            );
+                            std::fs::remove_file(&upload.path)?;
+                            Ok(())
+                        })();
+                        match published {
+                            Ok(()) => {
+                                uploaded.fetch_add(1, Ordering::Relaxed);
+                                transferred.fetch_add(upload.size, Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                aborted.store(true, Ordering::Relaxed);
+                                failure.lock().expect("upload failure").get_or_insert(error);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let mut staging = Ok(());
+        for (index, key) in uploads.into_iter().enumerate() {
+            if aborted.load(Ordering::Relaxed) {
+                break;
+            }
+            match stage_upload(store, directory, index, key) {
+                Ok(upload) => {
+                    if sender.send(upload).is_err() {
+                        break;
+                    }
+                    progress.detail(line(
+                        uploaded.load(Ordering::Relaxed),
+                        transferred.load(Ordering::Relaxed),
+                    ));
+                }
+                Err(error) => {
+                    staging = Err(error);
+                    break;
+                }
+            }
+        }
+        drop(sender);
+
+        while !handles.iter().all(|handle| handle.is_finished()) {
+            progress.detail(line(
+                uploaded.load(Ordering::Relaxed),
+                transferred.load(Ordering::Relaxed),
+            ));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        for handle in handles {
+            handle.join().map_err(|_| anyhow::anyhow!("upload worker panicked"))?;
+        }
+        staging?;
+        if let Some(error) = failure.lock().expect("upload failure").take() {
+            return Err(error);
+        }
+        progress
+            .detail(line(uploaded.load(Ordering::Relaxed), transferred.load(Ordering::Relaxed)));
+        Ok(uploaded.load(Ordering::Relaxed))
+    })
 }
 
 fn connect(
@@ -363,10 +489,13 @@ mod tests {
     }
 
     fn transfer(store: &Store, cloud: &mut BTreeMap<String, Vec<u8>>) -> Result<SyncSummary> {
+        let cloud = Mutex::new(cloud);
         exchange(
             store,
             &Connection { provider: "r2".into(), scope: ProjectScope::Global },
-            &mut |operation| {
+            &mut crate::sync_progress::SyncProgress::disabled(),
+            &|operation| {
+                let mut cloud = cloud.lock().expect("synthetic cloud");
                 Ok(match operation {
                     Operation::List { cursor, .. } => {
                         if cursor.is_none() {
@@ -408,6 +537,40 @@ mod tests {
                 })
             },
         )
+    }
+
+    #[test]
+    fn remote_large_revision_preserves_complete_events_and_recovers_objects() {
+        crate::db::schema::register_sqlite_vec();
+        let a = Store::open_in_memory().unwrap();
+        let b = Store::open_in_memory().unwrap();
+        let id = seed(&a, "large event snapshot", true);
+        let attrs = serde_json::json!({"payload": "x".repeat(64 * 1024 * 1024 + 1)}).to_string();
+        a.conn
+            .execute(
+                "UPDATE session_events SET attrs_json = ?1 WHERE session_id = ?2",
+                rusqlite::params![attrs, id],
+            )
+            .unwrap();
+        let mut cloud = BTreeMap::new();
+        transfer(&a, &mut cloud).unwrap();
+        assert!(cloud.values().any(|body| body.len() > 64 * 1024 * 1024));
+        transfer(&b, &mut cloud).unwrap();
+        let received = b.list_recent_sessions(1).unwrap().pop().unwrap();
+        let actual: String = b
+            .conn
+            .query_row(
+                "SELECT attrs_json FROM session_events WHERE session_id = ?1",
+                [&received.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(actual, attrs);
+        assert_eq!(transfer(&b, &mut cloud).unwrap().uploaded, 0);
+        let key = cloud.iter().max_by_key(|(_, body)| body.len()).unwrap().0.clone();
+        let lost = cloud.remove(&key).unwrap();
+        assert_eq!(transfer(&b, &mut cloud).unwrap().uploaded, 1);
+        assert_eq!(cloud[&key], lost);
     }
 
     #[test]
