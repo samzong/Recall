@@ -283,7 +283,9 @@ fn upload_objects(
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
-                    while let Ok(upload) = receiver.lock().expect("upload queue").recv() {
+                    loop {
+                        let next = receiver.lock().expect("upload queue").recv();
+                        let Ok(upload) = next else { break };
                         if aborted.load(Ordering::Relaxed) {
                             continue;
                         }
