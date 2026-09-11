@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -89,12 +88,9 @@ pub(crate) fn run(passthrough: Vec<OsString>, env: &EnvLookup) -> Result<()> {
     let launch_request = LaunchRequest { harness, provider: None, passthrough };
     let install_env = EnvLookup::real_with(install_overrides(request.install_policy));
     let program = crate::install::ensure(harness, &install_env)?;
-    let runtime = runtime_overrides(harness, &paths.dir)?;
-    prepare_state(&runtime)?;
-    let planning_env = EnvLookup::real_with(planning_overrides(&runtime));
+    let planning_env = EnvLookup::real_with(planning_overrides());
     let mut plan = crate::launch::plan_target(&launch_request, &paths, &planning_env, &target)?;
     plan.program = program;
-    plan.env_set.extend(runtime);
     if let Some(note) = &plan.stderr_note {
         eprintln!("{note}");
     }
@@ -103,7 +99,7 @@ pub(crate) fn run(passthrough: Vec<OsString>, env: &EnvLookup) -> Result<()> {
 
 fn capabilities_json() -> Result<String> {
     serde_json::to_string(&Capabilities {
-        protocol: Protocol { major: 1, minor: 0 },
+        protocol: Protocol { major: 1, minor: 1 },
         version: crate::RELEASE_VERSION,
         harnesses: Harness::ALL.iter().map(|harness| harness.as_str()).collect(),
     })
@@ -166,37 +162,8 @@ fn install_overrides(policy: InstallPolicy) -> HashMap<String, String> {
     )])
 }
 
-fn runtime_overrides(harness: Harness, state_dir: &Path) -> Result<HashMap<String, String>> {
-    let Some((key, suffix)) = (match harness {
-        Harness::Claude => Some(("CLAUDE_CONFIG_DIR", "claude")),
-        Harness::Codex => Some(("CODEX_HOME", "codex")),
-        Harness::OpenCode => Some(("XDG_DATA_HOME", "data")),
-        Harness::Pi => Some(("PI_CODING_AGENT_DIR", "pi-agent")),
-        Harness::Dsh => None,
-        Harness::Kimi => Some(("KIMI_CODE_HOME", "kimi-code")),
-    }) else {
-        return Ok(HashMap::new());
-    };
-    let path = state_dir
-        .join(suffix)
-        .to_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("host state_dir must be UTF-8"))?;
-    Ok(HashMap::from([(key.to_string(), path)]))
-}
-
-fn planning_overrides(runtime: &HashMap<String, String>) -> HashMap<String, String> {
-    let mut environment = runtime.clone();
-    environment.insert("RX_NO_YOLO".to_string(), "1".to_string());
-    environment
-}
-
-fn prepare_state(environment: &HashMap<String, String>) -> Result<()> {
-    for path in environment.values() {
-        fs::create_dir_all(path)
-            .with_context(|| format!("failed to create hosted state {path}"))?;
-    }
-    Ok(())
+fn planning_overrides() -> HashMap<String, String> {
+    HashMap::from([("RX_NO_YOLO".to_string(), "1".to_string())])
 }
 
 fn target(profile: &GatewayProfile, key: String) -> ProviderTarget {
@@ -340,7 +307,7 @@ mod tests {
     #[test]
     fn capabilities_are_stable() {
         let value: serde_json::Value = serde_json::from_str(&capabilities_json().unwrap()).unwrap();
-        assert_eq!(value["protocol"], serde_json::json!({"major": 1, "minor": 0}));
+        assert_eq!(value["protocol"], serde_json::json!({"major": 1, "minor": 1}));
         assert_eq!(
             value["harnesses"],
             serde_json::json!(["claude", "codex", "opencode", "pi", "dsh", "kimi"])
@@ -496,27 +463,21 @@ mod tests {
     }
 
     #[test]
-    fn hosted_environment_scopes_are_harness_specific() {
-        let root = tempfile::tempdir().unwrap();
-        let state = root.path().join("tokener-agent");
-        let cases = [
-            (Harness::Claude, Some(("CLAUDE_CONFIG_DIR", "claude"))),
-            (Harness::Codex, Some(("CODEX_HOME", "codex"))),
-            (Harness::OpenCode, Some(("XDG_DATA_HOME", "data"))),
-            (Harness::Pi, Some(("PI_CODING_AGENT_DIR", "pi-agent"))),
-            (Harness::Dsh, None),
-            (Harness::Kimi, Some(("KIMI_CODE_HOME", "kimi-code"))),
-        ];
-        for (harness, expected) in cases {
-            let environment = runtime_overrides(harness, &state).unwrap();
-            assert_eq!(environment.len(), usize::from(expected.is_some()));
-            if let Some((key, suffix)) = expected {
-                assert_eq!(environment[key], state.join(suffix).to_str().unwrap());
-            }
-            prepare_state(&environment).unwrap();
-            assert!(environment.values().all(|path| Path::new(path).is_dir()));
+    fn hosted_launch_never_redirects_harness_homes() {
+        let planning = planning_overrides();
+        assert_eq!(planning, HashMap::from([("RX_NO_YOLO".to_string(), "1".to_string())]));
+        for key in [
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "XDG_DATA_HOME",
+            "PI_CODING_AGENT_DIR",
+            "DSH_HOME",
+            "KIMI_CODE_HOME",
+        ] {
+            assert!(!planning.contains_key(key));
+            assert!(!install_overrides(InstallPolicy::Prompt).contains_key(key));
+            assert!(!install_overrides(InstallPolicy::Deny).contains_key(key));
         }
-        assert!(!state.join("dsh-home").exists());
     }
 
     #[test]
@@ -529,10 +490,7 @@ mod tests {
             install_overrides(InstallPolicy::Deny),
             HashMap::from([("RX_NO_INSTALL".to_string(), "1".to_string())])
         );
-        let runtime = runtime_overrides(Harness::Codex, Path::new("/tmp/tokener-agent")).unwrap();
-        assert!(!runtime.contains_key("RX_NO_INSTALL"));
-        assert!(!runtime.contains_key("RX_NO_YOLO"));
-        let planning = planning_overrides(&runtime);
+        let planning = planning_overrides();
         assert_eq!(planning["RX_NO_YOLO"], "1");
         assert!(!planning.contains_key("RX_NO_INSTALL"));
     }
