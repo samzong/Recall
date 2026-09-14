@@ -195,16 +195,7 @@ fn ensure_dsh(env: &EnvLookup) -> Result<PathBuf> {
     ensure_pnpm()?;
     let cmd = crate::dsh::npm_install_cmd();
     eprintln!("[rx] {cmd}");
-    run_npm(
-        &[
-            "install",
-            "-g",
-            "--legacy-peer-deps",
-            crate::dsh::CLI_PACKAGE,
-            crate::dsh::PLUGIN_PACKAGE,
-        ],
-        &cmd,
-    )?;
+    run_npm(&["install", "-g", crate::dsh::CLI_PACKAGE, crate::dsh::PLUGIN_PACKAGE], &cmd)?;
     let path = lookup_program("dsh").ok_or_else(|| {
         anyhow::anyhow!(
             "DeepSeek Harness finished installing but dsh was not found. Add npm's global bin to PATH, then retry."

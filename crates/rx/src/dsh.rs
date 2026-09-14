@@ -33,7 +33,7 @@ struct RouteContext<'a> {
 }
 
 pub(crate) fn npm_install_cmd() -> String {
-    format!("npm install -g --legacy-peer-deps {CLI_PACKAGE} {PLUGIN_PACKAGE}")
+    format!("npm install -g {CLI_PACKAGE} {PLUGIN_PACKAGE}")
 }
 
 pub(crate) fn install_hint() -> String {
@@ -374,10 +374,7 @@ mod tests {
     fn install_hint_uses_official_npm_then_profile() {
         assert_eq!(
             install_hint(),
-            format!(
-                "npm install -g --legacy-peer-deps {CLI_PACKAGE} {PLUGIN_PACKAGE}\n  {}",
-                profile_hint()
-            )
+            format!("npm install -g {CLI_PACKAGE} {PLUGIN_PACKAGE}\n  {}", profile_hint())
         );
     }
 
