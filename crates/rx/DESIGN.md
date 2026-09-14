@@ -46,7 +46,7 @@ read `recall.db`.
 | Codex config | launch | Prefer `-c` and environment injection. |
 | OpenCode config | launch | Prefer `OPENCODE_CONFIG_CONTENT`; only warn about native auth conflicts. |
 | Pi `models.json` | shared | Own the selected provider entry; preserve the rest; reject malformed roots. |
-| DSH install and profile | user | Use the user's npm prefix and native `DSH_HOME` (`~/.dsh` by default); routing uses a launch overlay. |
+| DSH install and profile | user | Use the user's npm prefix and native `DSH_HOME` (`~/.dsh` by default); routing uses a per-provider launch overlay under `~/.recall/dsh/<provider>/`. |
 | Kimi `config.toml` | shared | Use rx-prefixed marked entries; preserve collisions and user edits. Launch leases protect active catalog identities. Its required literal credential uses secret mode. |
 | Hosted state | host caller | rx-internal runtime state only (catalog cache); harness homes are never redirected into it; never an installation root. |
 

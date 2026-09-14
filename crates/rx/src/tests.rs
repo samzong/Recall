@@ -1300,13 +1300,18 @@ fn dsh_deepseek_uses_official_adapter_and_clears_pi_ai_routes() {
     assert_eq!(plan.args[0], "--profile");
     assert_eq!(plan.args[1], "dsh-tui");
     assert_eq!(plan.args[2], "--patch");
-    assert_eq!(Path::new(&plan.args[3]), paths.dir.join("dsh").join("launch.cordis.yml"));
+    assert_eq!(
+        Path::new(&plan.args[3]),
+        paths.dir.join("dsh").join("deepseek").join("launch.cordis.yml")
+    );
     assert_eq!(plan.env_set, vec![("DEEPSEEK_API_KEY".to_string(), "sk-ds-test".to_string())]);
-    let patch = fs::read_to_string(paths.dir.join("dsh").join("launch.cordis.yml")).unwrap();
+    let patch =
+        fs::read_to_string(paths.dir.join("dsh").join("deepseek").join("launch.cordis.yml"))
+            .unwrap();
     assert!(patch.contains("id: settings"));
     assert!(!patch.contains("disabled: true"));
     let settings: serde_yaml::Value = serde_yaml::from_str(
-        &fs::read_to_string(paths.dir.join("dsh").join("settings.yaml")).unwrap(),
+        &fs::read_to_string(paths.dir.join("dsh").join("deepseek").join("settings.yaml")).unwrap(),
     )
     .unwrap();
     assert!(settings["llm-pi-ai"]["providers"].as_mapping().unwrap().is_empty());
@@ -1336,7 +1341,7 @@ fn dsh_tokener_injects_provider_catalog() {
     server.join().unwrap();
     assert_eq!(plan.env_set, vec![("TOKENER_API_KEY".to_string(), "sk-tokener".to_string())]);
     let settings: serde_yaml::Value = serde_yaml::from_str(
-        &fs::read_to_string(paths.dir.join("dsh").join("settings.yaml")).unwrap(),
+        &fs::read_to_string(paths.dir.join("dsh").join("tokener").join("settings.yaml")).unwrap(),
     )
     .unwrap();
     let models = settings["llm-pi-ai"]["providers"]["tokener"]["models"].as_sequence().unwrap();
@@ -1348,6 +1353,54 @@ fn dsh_tokener_injects_provider_catalog() {
     assert!(models[1].get("reasoningEfforts").is_none());
     assert_eq!(settings["agent-default-model"]["provider"], "tokener");
     assert!(settings["agent-default-model"].get("model").is_none());
+}
+
+#[test]
+fn dsh_overlays_are_isolated_per_provider() {
+    let (_dir, paths) = temp_paths();
+    let (tokener_url, tokener_server) = serve_openai_models(r#"{"data":[{"id":"kimi-k3"}]}"#);
+    fs::write(
+        &paths.config,
+        format!(
+            "[provider.tokener]\nbase_url = \"{tokener_url}\"\n\n[provider.openrouter]\nmodel = \"openai/gpt-5\"\n"
+        ),
+    )
+    .unwrap();
+    let env = EnvLookup::isolated(HashMap::from([
+        ("TOKENER_API_KEY".to_string(), "sk-tokener".to_string()),
+        ("OPENROUTER_API_KEY".to_string(), "sk-or".to_string()),
+    ]));
+    let launch = |provider: &str| {
+        launch::plan(
+            &LaunchRequest {
+                harness: Harness::Dsh,
+                provider: Some(provider.to_string()),
+                passthrough: Vec::new(),
+            },
+            &paths,
+            &env,
+        )
+        .unwrap()
+    };
+    let tokener_plan = launch("tokener");
+    tokener_server.join().unwrap();
+    let openrouter_plan = launch("openrouter");
+    assert_ne!(tokener_plan.args[3], openrouter_plan.args[3]);
+    let read = |provider: &str| -> serde_yaml::Value {
+        let overlay = paths.dir.join("dsh").join(provider).join("settings.yaml");
+        serde_yaml::from_str(&fs::read_to_string(overlay).unwrap()).unwrap()
+    };
+    let tokener = read("tokener");
+    let openrouter = read("openrouter");
+    assert_eq!(tokener["agent-default-model"]["provider"], "tokener");
+    assert_eq!(tokener["llm-pi-ai"]["providers"]["tokener"]["models"][0]["id"], "kimi-k3");
+    assert!(tokener["llm-pi-ai"]["providers"].get("openrouter").is_none());
+    assert_eq!(openrouter["agent-default-model"]["provider"], "openrouter");
+    assert_eq!(
+        openrouter["llm-pi-ai"]["providers"]["openrouter"]["models"][0]["id"],
+        "openai/gpt-5"
+    );
+    assert!(openrouter["llm-pi-ai"]["providers"].get("tokener").is_none());
 }
 
 #[test]
@@ -1400,7 +1453,7 @@ agent-default-model:
     assert!(patch.contains("id: settings"));
     assert!(patch.contains("id: llm-deepseek"));
     assert!(patch.contains("disabled: true"));
-    let overlay = paths.dir.join("dsh").join("settings.yaml");
+    let overlay = paths.dir.join("dsh").join("tokener").join("settings.yaml");
     let patch: serde_yaml::Value = serde_yaml::from_str(&patch).unwrap();
     assert_eq!(patch[0]["config"]["path"].as_str(), overlay.to_str());
     let settings: serde_yaml::Value =
@@ -1446,7 +1499,7 @@ fn yolo_forces_dsh_preset_over_user_settings() {
     )
     .unwrap();
     server.join().unwrap();
-    let overlay = paths.dir.join("dsh").join("settings.yaml");
+    let overlay = paths.dir.join("dsh").join("tokener").join("settings.yaml");
     let settings: serde_yaml::Value =
         serde_yaml::from_str(&fs::read_to_string(&overlay).unwrap()).unwrap();
     assert_eq!(settings["permission"]["defaultPreset"], "danger-full-access");

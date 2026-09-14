@@ -128,7 +128,7 @@ pub(crate) fn prepare(
     } else {
         load_models(&context, key, model, paths)?
     };
-    let dir = paths.dir.join("dsh");
+    let dir = paths.dir.join("dsh").join(provider_id);
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let settings_path = dir.join("settings.yaml");
     write_settings_overlay(&settings_path, &context, model, &models)?;
