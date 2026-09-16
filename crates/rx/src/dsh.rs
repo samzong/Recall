@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -8,6 +7,7 @@ use serde_yaml::{Mapping, Value};
 
 use crate::catalog::{self, openai_base};
 use crate::config::Paths;
+use crate::file_io;
 use crate::launch::EnvLookup;
 use crate::provider::{ModelProtocol, Provider, ReasoningControl, Setup};
 
@@ -227,44 +227,40 @@ fn load_user_settings(env: &EnvLookup) -> Result<Value> {
 fn llm_pi_ai_section(context: &RouteContext<'_>, models: &[DshModel]) -> Value {
     let mut providers = Mapping::new();
     if !official_deepseek(context.provider_id) && !models.is_empty() {
-        let mut route = Mapping::new();
-        route.insert("apiKeyEnv".into(), Value::String(context.provider.env.clone()));
-        route.insert("api".into(), Value::String(context.protocol.as_str().to_string()));
-        route.insert("baseURL".into(), Value::String(openai_base(context.base_url)));
         let entries = models
             .iter()
             .map(|model| {
-                let mut entry = Mapping::new();
-                entry.insert("id".into(), Value::String(model.id.clone()));
+                let mut entry = Mapping::from_iter([("id".into(), model.id.clone().into())]);
                 if let Some(reasoning) = &model.reasoning {
-                    entry.insert("reasoningEfforts".into(), reasoning_efforts(reasoning));
+                    let efforts = match reasoning {
+                        ReasoningControl::Fixed => Value::Bool(false),
+                        ReasoningControl::Effort { levels } => Value::Mapping(
+                            levels
+                                .iter()
+                                .map(|(level, wire)| {
+                                    (
+                                        level.as_str().into(),
+                                        wire.as_ref()
+                                            .map_or(Value::Null, |wire| wire.clone().into()),
+                                    )
+                                })
+                                .collect(),
+                        ),
+                    };
+                    entry.insert("reasoningEfforts".into(), efforts);
                 }
                 Value::Mapping(entry)
             })
             .collect();
-        route.insert("models".into(), Value::Sequence(entries));
-        providers.insert(Value::String(context.provider_id.to_string()), Value::Mapping(route));
+        let route = Mapping::from_iter([
+            ("apiKeyEnv".into(), context.provider.env.clone().into()),
+            ("api".into(), context.protocol.as_str().into()),
+            ("baseURL".into(), openai_base(context.base_url).into()),
+            ("models".into(), Value::Sequence(entries)),
+        ]);
+        providers.insert(context.provider_id.into(), Value::Mapping(route));
     }
-    let mut section = Mapping::new();
-    section.insert("providers".into(), Value::Mapping(providers));
-    Value::Mapping(section)
-}
-
-fn reasoning_efforts(control: &ReasoningControl) -> Value {
-    match control {
-        ReasoningControl::Fixed => Value::Bool(false),
-        ReasoningControl::Effort { levels } => Value::Mapping(
-            levels
-                .iter()
-                .map(|(level, wire)| {
-                    (
-                        Value::String(level.as_str().to_string()),
-                        wire.as_ref().map_or(Value::Null, |wire| Value::String(wire.clone())),
-                    )
-                })
-                .collect(),
-        ),
-    }
+    Value::Mapping(Mapping::from_iter([("providers".into(), Value::Mapping(providers))]))
 }
 
 fn default_model_section(provider_id: &str, model: Option<&str>) -> Value {
@@ -285,7 +281,7 @@ fn write_launch_patch(path: &Path, settings_path: &Path, official_deepseek: bool
     if !official_deepseek {
         body.push_str("- id: llm-deepseek\n  disabled: true\n");
     }
-    write_bytes_atomic(path, body.as_bytes())
+    file_io::write(path, body.as_bytes())
 }
 
 fn as_mapping(value: &mut Value) -> Result<&mut Mapping> {
@@ -298,23 +294,7 @@ fn as_mapping(value: &mut Value) -> Result<&mut Mapping> {
 fn write_yaml_atomic(path: &Path, document: &Value) -> Result<()> {
     let payload =
         serde_yaml::to_string(document).context("failed to serialize dsh settings overlay")?;
-    write_bytes_atomic(path, payload.as_bytes())
-}
-
-fn write_bytes_atomic(path: &Path, payload: &[u8]) -> Result<()> {
-    let parent = path.parent().context("dsh launch file has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create temporary {}", path.display()))?;
-    temp.write_all(payload)
-        .with_context(|| format!("failed to write temporary {}", path.display()))?;
-    temp.as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync temporary {}", path.display()))?;
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(())
+    file_io::write(path, payload.as_bytes())
 }
 
 fn push_patch(args: &mut Vec<OsString>, patch: Option<&Path>) {

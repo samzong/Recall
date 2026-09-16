@@ -1,11 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+mod store;
+
+pub(crate) use store::write_seed;
+#[cfg(test)]
+pub(crate) use store::write_seed_with_hook;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -17,16 +19,6 @@ use crate::launch::EnvLookup;
 const MIN_CONTEXT: i64 = 100_000;
 const MAX_CONTEXT: i64 = 1_000_000;
 const OPENAI_COMPACT_WINDOW: i64 = 258_000;
-const TOOL_SEARCH_UNSUPPORTED_KEY: &str = "tengu_tool_search_unsupported_models";
-const RX_SEEDED_DENYLIST_KEY: &str = "rxSeededToolSearchDenylist";
-const RX_SEEDED_CATALOG_KEY: &str = "rxSeededCatalog";
-const MODEL_OPTIONS_CACHE_KEY: &str = "additionalModelOptionsCache";
-const MODEL_ACCESS_CACHE_KEY: &str = "modelAccessCache";
-const MODEL_COSTS_CACHE_KEY: &str = "additionalModelCostsCache";
-const COMPACT_WINDOWS_CACHE_KEY: &str = "autoCompactWindowsCache";
-const TOOL_SEARCH_DENYLIST_MARKER_KEY: &str = "toolSearchDenylist";
-const MAX_WRITE_ATTEMPTS: usize = 4;
-
 const BASE_TOOL_SEARCH_DENY: &[&str] = &["claude-3-5-haiku", "claude-3-haiku"];
 
 const SETTINGS_CLEAR_ENV: &[(&str, &str)] = &[
@@ -175,29 +167,17 @@ fn parse_user_catalog(body: &str) -> Result<Vec<UserModel>> {
 }
 
 fn parse_user_model(entry: &Value) -> Option<UserModel> {
-    let id = entry.get("id")?.as_str()?.to_string();
-    let name = entry
-        .get("name")
-        .or_else(|| entry.get("display_name"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let context_length = entry
-        .get("context_length")
-        .or_else(|| entry.get("max_input_tokens"))
-        .and_then(Value::as_i64);
+    let ListedModel { id, name, context_length } = catalog::parse_listed_model(entry)?;
     let canonical_slug = entry.get("canonical_slug").and_then(Value::as_str).map(str::to_string);
-    let pricing = entry.get("pricing").map(|pricing| Pricing {
-        prompt: pricing.get("prompt").and_then(Value::as_str).map(str::to_string),
-        completion: pricing.get("completion").and_then(Value::as_str).map(str::to_string),
-        input_cache_read: pricing
-            .get("input_cache_read")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        input_cache_write: pricing
-            .get("input_cache_write")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        web_search: pricing.get("web_search").and_then(Value::as_str).map(str::to_string),
+    let pricing = entry.get("pricing").map(|pricing| {
+        let field = |key| pricing.get(key).and_then(Value::as_str).map(str::to_string);
+        Pricing {
+            prompt: field("prompt"),
+            completion: field("completion"),
+            input_cache_read: field("input_cache_read"),
+            input_cache_write: field("input_cache_write"),
+            web_search: field("web_search"),
+        }
     });
     Some(UserModel { id, name, context_length, canonical_slug, pricing })
 }
@@ -282,12 +262,7 @@ pub(crate) fn claude_settings_json(base_url: &str, seeded: bool, api_key_env: &s
 }
 
 pub(crate) fn user_passes_settings(passthrough: &[std::ffi::OsString]) -> bool {
-    args::before_double_dash(passthrough).iter().any(|arg| {
-        arg == "--settings"
-            || arg == "--setting-sources"
-            || args::os_prefix(arg, "--settings=")
-            || args::os_prefix(arg, "--setting-sources=")
-    })
+    args::has_flags(passthrough, &["--settings", "--setting-sources"])
 }
 
 fn claude_config_path(env: &EnvLookup) -> PathBuf {
@@ -298,302 +273,6 @@ fn claude_config_path(env: &EnvLookup) -> PathBuf {
             .map(|home| home.join(".claude.json"))
             .unwrap_or_else(|| PathBuf::from(".claude.json"))
     }
-}
-
-pub(crate) fn write_seed(path: &Path, caches: &SeedCaches) -> Result<()> {
-    write_seed_with_hook(path, caches, |_| {})
-}
-
-pub(crate) fn write_seed_with_hook<F>(
-    path: &Path,
-    caches: &SeedCaches,
-    mut after_read: F,
-) -> Result<()>
-where
-    F: FnMut(usize),
-{
-    let parent =
-        path.parent().ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".rx.lock");
-    let lock_path = PathBuf::from(lock_path);
-    // The stable sidecar must outlive each lock holder. Removing it after
-    // unlock could split existing waiters and new writers across two inodes.
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
-    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    for attempt in 0..MAX_WRITE_ATTEMPTS {
-        let (mut document, snapshot) = read_config_document(path)?;
-        after_read(attempt);
-        merge_seed(&mut document, caches);
-        if write_config_document(path, &document, snapshot.as_deref())? {
-            return Ok(());
-        }
-    }
-    bail!("{} changed repeatedly while seeding catalog", path.display())
-}
-
-fn read_config_document(path: &Path) -> Result<(Value, Option<Vec<u8>>)> {
-    match read_config_bytes(path)? {
-        Some(contents) => {
-            let value: Value = serde_json::from_slice(&contents)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-            if !value.is_object() {
-                bail!("{} root is not a JSON object", path.display());
-            }
-            Ok((value, Some(contents)))
-        }
-        None => Ok((json!({}), None)),
-    }
-}
-
-fn read_config_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(contents) => Ok(Some(contents)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-    }
-}
-
-fn merge_seed(document: &mut Value, caches: &SeedCaches) {
-    let object = document.as_object_mut().expect("claude config root is an object");
-    let mut catalog_marker =
-        object.get(RX_SEEDED_CATALOG_KEY).and_then(Value::as_object).cloned().unwrap_or_default();
-    merge_tool_search_denylist(object, caches, &mut catalog_marker);
-    reconcile_array_cache(
-        object,
-        &mut catalog_marker,
-        MODEL_OPTIONS_CACHE_KEY,
-        "value",
-        model_option_values(caches),
-    );
-    reconcile_array_cache(
-        object,
-        &mut catalog_marker,
-        MODEL_ACCESS_CACHE_KEY,
-        "apiName",
-        model_access_values(caches),
-    );
-    reconcile_object_cache(
-        object,
-        &mut catalog_marker,
-        MODEL_COSTS_CACHE_KEY,
-        &caches.additional_model_costs,
-    );
-    merge_compact_windows(object, caches, &mut catalog_marker);
-    catalog_marker.insert("provider_id".to_string(), json!(caches.provider_id));
-    catalog_marker.insert("version".to_string(), json!(1));
-    object.insert(RX_SEEDED_CATALOG_KEY.to_string(), Value::Object(catalog_marker));
-}
-
-fn model_option_values(caches: &SeedCaches) -> Vec<Value> {
-    caches
-        .additional_model_options
-        .iter()
-        .map(|option| {
-            json!({
-                "value": option.value,
-                "label": option.label,
-                "description": option.description,
-            })
-        })
-        .collect()
-}
-
-fn model_access_values(caches: &SeedCaches) -> Vec<Value> {
-    caches
-        .model_access
-        .iter()
-        .map(|access| json!({ "apiName": access.api_name, "entitled": true }))
-        .collect()
-}
-
-fn merge_tool_search_denylist(
-    object: &mut serde_json::Map<String, Value>,
-    caches: &SeedCaches,
-    marker: &mut serde_json::Map<String, Value>,
-) {
-    let previous_marker = marker
-        .get(TOOL_SEARCH_DENYLIST_MARKER_KEY)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_else(|| {
-            string_array(object.get(RX_SEEDED_DENYLIST_KEY))
-                .into_iter()
-                .map(|identity| {
-                    let payload = Value::String(identity.clone());
-                    (identity, owned_marker(&payload))
-                })
-                .collect()
-        });
-    let existing = string_array(
-        object
-            .get("cachedGrowthBookFeatures")
-            .and_then(|value| value.get(TOOL_SEARCH_UNSUPPORTED_KEY)),
-    );
-    let managed: HashSet<_> = previous_marker.keys().cloned().collect();
-    let mut occupied = HashSet::new();
-    let mut reconciled = Vec::new();
-    let mut next_marker = serde_json::Map::new();
-    for identity in existing {
-        if managed.contains(&identity) {
-            continue;
-        }
-        occupied.insert(identity.clone());
-        reconciled.push(identity);
-    }
-
-    let desired = BASE_TOOL_SEARCH_DENY
-        .iter()
-        .map(|identity| (*identity).to_string())
-        .chain(caches.tool_search_denylist.iter().cloned());
-    for identity in desired {
-        if occupied.insert(identity.clone()) {
-            let payload = Value::String(identity.clone());
-            next_marker.insert(identity.clone(), owned_marker(&payload));
-            reconciled.push(identity);
-        }
-    }
-    reconciled.sort();
-    reconciled.dedup();
-
-    if !object.get("cachedGrowthBookFeatures").is_some_and(Value::is_object) {
-        object.insert("cachedGrowthBookFeatures".to_string(), json!({}));
-    }
-    object
-        .get_mut("cachedGrowthBookFeatures")
-        .and_then(Value::as_object_mut)
-        .expect("normalized cachedGrowthBookFeatures to an object")
-        .insert(TOOL_SEARCH_UNSUPPORTED_KEY.to_string(), json!(reconciled));
-    object.insert(
-        "cachedGrowthBookFeaturesAt".to_string(),
-        json!(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()),
-    );
-    let mut legacy_owned = next_marker.keys().cloned().collect::<Vec<_>>();
-    legacy_owned.sort();
-    object.insert(RX_SEEDED_DENYLIST_KEY.to_string(), json!(legacy_owned));
-    marker.insert(TOOL_SEARCH_DENYLIST_MARKER_KEY.to_string(), Value::Object(next_marker));
-}
-
-fn merge_compact_windows(
-    object: &mut serde_json::Map<String, Value>,
-    caches: &SeedCaches,
-    marker: &mut serde_json::Map<String, Value>,
-) {
-    let desired = caches
-        .auto_compact_windows
-        .iter()
-        .map(|(key, value)| (key.clone(), json!(value)))
-        .collect();
-    reconcile_object_cache(object, marker, COMPACT_WINDOWS_CACHE_KEY, &desired);
-}
-
-fn reconcile_array_cache(
-    object: &mut serde_json::Map<String, Value>,
-    marker: &mut serde_json::Map<String, Value>,
-    cache_key: &str,
-    identity_key: &str,
-    desired: Vec<Value>,
-) {
-    let previous_marker =
-        marker.get(cache_key).and_then(Value::as_object).cloned().unwrap_or_default();
-    let existing = object.get(cache_key).and_then(Value::as_array).cloned().unwrap_or_default();
-    let managed: HashSet<_> = previous_marker.keys().cloned().collect();
-    let mut occupied = HashSet::new();
-    let mut reconciled = Vec::new();
-    let mut next_marker = serde_json::Map::new();
-    for entry in existing {
-        let Some(identity) = entry.get(identity_key).and_then(Value::as_str).map(str::to_string)
-        else {
-            reconciled.push(entry);
-            continue;
-        };
-        if managed.contains(&identity) {
-            continue;
-        }
-        occupied.insert(identity);
-        reconciled.push(entry);
-    }
-
-    for entry in desired {
-        let Some(identity) = entry.get(identity_key).and_then(Value::as_str).map(str::to_string)
-        else {
-            continue;
-        };
-        if occupied.insert(identity.clone()) {
-            next_marker.insert(identity, owned_marker(&entry));
-            reconciled.push(entry);
-        }
-    }
-
-    object.insert(cache_key.to_string(), Value::Array(reconciled));
-    marker.insert(cache_key.to_string(), Value::Object(next_marker));
-}
-
-fn reconcile_object_cache(
-    object: &mut serde_json::Map<String, Value>,
-    marker: &mut serde_json::Map<String, Value>,
-    cache_key: &str,
-    desired: &BTreeMap<String, Value>,
-) {
-    let previous_marker =
-        marker.get(cache_key).and_then(Value::as_object).cloned().unwrap_or_default();
-    let mut reconciled =
-        object.get(cache_key).and_then(Value::as_object).cloned().unwrap_or_default();
-    let mut next_marker = serde_json::Map::new();
-    for key in previous_marker.keys() {
-        reconciled.remove(key);
-    }
-
-    for (key, payload) in desired {
-        if !reconciled.contains_key(key) {
-            reconciled.insert(key.clone(), payload.clone());
-            next_marker.insert(key.clone(), owned_marker(payload));
-        }
-    }
-
-    object.insert(cache_key.to_string(), Value::Object(reconciled));
-    marker.insert(cache_key.to_string(), Value::Object(next_marker));
-}
-
-fn owned_marker(payload: &Value) -> Value {
-    json!({ "state": "owned", "payload": payload })
-}
-
-fn string_array(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-fn write_config_document(path: &Path, document: &Value, expected: Option<&[u8]>) -> Result<bool> {
-    let parent =
-        path.parent().ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
-    let contents =
-        serde_json::to_string_pretty(document).context("failed to serialize .claude.json")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
-    temp.write_all(contents.as_bytes())
-        .with_context(|| format!("failed to write temporary file in {}", parent.display()))?;
-    temp.as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync temporary file in {}", parent.display()))?;
-    if read_config_bytes(path)?.as_deref() != expected {
-        return Ok(false);
-    }
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(true)
 }
 
 fn strip_anthropic_prefix(id: &str) -> String {

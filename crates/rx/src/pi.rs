@@ -1,16 +1,15 @@
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 use serde_json::{Value, json};
 
 use crate::args;
 use crate::catalog;
 use crate::catalog::openai_base;
 use crate::config::Paths;
+use crate::file_io;
 use crate::launch::EnvLookup;
 use crate::opencode;
 use crate::provider::{Provider, Setup};
@@ -24,9 +23,6 @@ const PI_ENV_CLEAR: &[&str] = &[
 ];
 
 fn global_agent_dir(env: &EnvLookup) -> Result<PathBuf> {
-    // PI_CODING_AGENT_DIR is authoritative for pi's configuration location
-    // (see src/adapters/pi.rs); providers must land where the launched
-    // process will actually read them.
     if let Some(dir) = env
         .get("PI_CODING_AGENT_DIR")
         .map(|value| value.trim().to_string())
@@ -70,8 +66,6 @@ pub(crate) fn prepare(
         return Ok(());
     }
     let agent_dir = global_agent_dir(env)?;
-    fs::create_dir_all(&agent_dir)
-        .with_context(|| format!("failed to create {}", agent_dir.display()))?;
     merge_provider(&agent_dir.join("models.json"), provider_id, document)
 }
 
@@ -91,31 +85,19 @@ pub(crate) fn args(
     passthrough: &[OsString],
 ) -> Vec<OsString> {
     let mut args = Vec::new();
-    if !user_sets_models_flag(passthrough) {
+    if !args::has_flags(passthrough, &["--models"]) {
         args.push(OsString::from("--models"));
         args.push(OsString::from(format!("{provider_id}/*")));
     }
     if let Some(model) = model.filter(|_| !user_sets_model(passthrough)) {
         args.push(OsString::from("--model"));
         args.push(OsString::from(opencode::prefixed_model(provider_id, model)));
-    } else if !user_sets_provider(passthrough) {
+    } else if !args::has_flags(passthrough, &["--provider"]) {
         args.push(OsString::from("--provider"));
         args.push(OsString::from(provider_id));
     }
     args.extend(passthrough.iter().cloned());
     args
-}
-
-fn user_sets_models_flag(passthrough: &[OsString]) -> bool {
-    args::before_double_dash(passthrough)
-        .iter()
-        .any(|arg| arg == "--models" || args::os_prefix(arg, "--models="))
-}
-
-fn user_sets_provider(passthrough: &[OsString]) -> bool {
-    args::before_double_dash(passthrough)
-        .iter()
-        .any(|arg| arg == "--provider" || args::os_prefix(arg, "--provider="))
 }
 
 fn generated_provider(
@@ -144,7 +126,7 @@ fn generated_provider(
 }
 
 pub(crate) fn merge_provider(models_path: &Path, provider_id: &str, provider: Value) -> Result<()> {
-    let _lock = exclusive_sidecar(models_path)?;
+    let _lock = file_io::lock(&file_io::appended(models_path, ".rx.lock"))?;
     let mut document = if models_path.is_file() {
         let body = fs::read_to_string(models_path)
             .with_context(|| format!("failed to read {}", models_path.display()))?;
@@ -168,41 +150,7 @@ pub(crate) fn merge_provider(models_path: &Path, provider_id: &str, provider: Va
         );
     };
     providers.insert(provider_id.to_string(), provider);
-    write_json_atomic(models_path, &document)
-}
-
-fn exclusive_sidecar(path: &Path) -> Result<fs::File> {
-    let parent = path.parent().context("json file has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".rx.lock");
-    let lock_path = PathBuf::from(lock_path);
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
-    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    Ok(lock)
-}
-
-fn write_json_atomic(path: &Path, document: &Value) -> Result<()> {
-    let parent = path.parent().context("json file has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let payload = serde_json::to_string_pretty(document).context("failed to serialize json")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create temporary {}", path.display()))?;
-    temp.write_all(payload.as_bytes())
-        .with_context(|| format!("failed to write temporary {}", path.display()))?;
-    temp.as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync temporary {}", path.display()))?;
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(())
+    file_io::write(models_path, &serde_json::to_vec_pretty(&document)?)
 }
 
 fn user_sets_model(passthrough: &[OsString]) -> bool {

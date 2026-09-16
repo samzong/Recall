@@ -1,13 +1,12 @@
 use std::cmp::Ordering;
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::args::UpdateCommand;
@@ -105,28 +104,20 @@ pub(crate) fn maybe_before_launch(
         eprintln!("{notice}");
         return Ok(());
     }
-    if state.auto_update {
-        eprintln!("Updating rx to {}...", release.version);
-        install_release(&release)?;
-        relaunch(raw_args)?;
-    } else if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
-        eprintln!("rx {} is available — run `rx update`", release.version);
-    } else {
+    if !state.auto_update {
+        if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
+            eprintln!("rx {} is available — run `rx update`", release.version);
+            return Ok(());
+        }
         match prompt(&release.version)? {
-            PromptChoice::Always => {
-                enable_auto_update(paths)?;
-                eprintln!("Updating rx to {}...", release.version);
-                install_release(&release)?;
-                relaunch(raw_args)?;
-            }
-            PromptChoice::UpdateNow => {
-                eprintln!("Updating rx to {}...", release.version);
-                install_release(&release)?;
-                relaunch(raw_args)?;
-            }
-            PromptChoice::NotNow => {}
+            PromptChoice::Always => enable_auto_update(paths)?,
+            PromptChoice::UpdateNow => {}
+            PromptChoice::NotNow => return Ok(()),
         }
     }
+    eprintln!("Updating rx to {}...", release.version);
+    install_release(&release)?;
+    relaunch(raw_args)?;
     Ok(())
 }
 
@@ -268,9 +259,6 @@ fn replace_executable(source: &Path) -> Result<()> {
     ensure_self_update_allowed(&target)?;
     #[cfg(windows)]
     if target.is_file() {
-        // Windows locks running executables: move the old binary aside so the
-        // staged update can take its place. A leftover backup from a previous
-        // update must go first — Windows rename does not replace destinations.
         let backup = target.with_extension("old.exe");
         if backup.exists() {
             let _ = fs::remove_file(&backup);
@@ -375,21 +363,12 @@ pub(crate) fn version_cmp(left: &str, right: &str) -> Ordering {
             })
             .collect::<Vec<_>>()
     };
-    let left_parts = parse(left);
-    let right_parts = parse(right);
+    let mut left_parts = parse(left);
+    let mut right_parts = parse(right);
     let len = left_parts.len().max(right_parts.len());
-    for index in 0..len {
-        match left_parts
-            .get(index)
-            .copied()
-            .unwrap_or(0)
-            .cmp(&right_parts.get(index).copied().unwrap_or(0))
-        {
-            Ordering::Equal => {}
-            other => return other,
-        }
-    }
-    Ordering::Equal
+    left_parts.resize(len, 0);
+    right_parts.resize(len, 0);
+    left_parts.cmp(&right_parts)
 }
 
 fn state_path(paths: &Paths) -> PathBuf {
@@ -397,7 +376,7 @@ fn state_path(paths: &Paths) -> PathBuf {
 }
 
 fn lock_state(paths: &Paths) -> Result<fs::File> {
-    exclusive_sidecar(&state_path(paths))
+    crate::file_io::lock(&crate::file_io::appended(&state_path(paths), ".rx.lock"))
 }
 
 fn stamp_last_check(paths: &Paths) -> Result<UpdateState> {
@@ -415,23 +394,6 @@ fn enable_auto_update(paths: &Paths) -> Result<()> {
     save_state(paths, &state)
 }
 
-fn exclusive_sidecar(path: &Path) -> Result<fs::File> {
-    let parent = path.parent().context("state file has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".rx.lock");
-    let lock_path = PathBuf::from(lock_path);
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
-    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    Ok(lock)
-}
-
 fn load_state(paths: &Paths) -> Result<UpdateState> {
     let path = state_path(paths);
     if !path.is_file() {
@@ -442,19 +404,8 @@ fn load_state(paths: &Paths) -> Result<UpdateState> {
 }
 
 fn save_state(paths: &Paths, state: &UpdateState) -> Result<()> {
-    let path = state_path(paths);
-    let parent = path.parent().context("state file has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let body = toml::to_string_pretty(state).context("serialize rx-update.toml")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temporary {}", path.display()))?;
-    temp.write_all(body.as_bytes())
-        .with_context(|| format!("write temporary {}", path.display()))?;
-    temp.as_file().sync_all().with_context(|| format!("sync temporary {}", path.display()))?;
-    temp.persist(&path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("replace {}", path.display()))?;
-    Ok(())
+    crate::file_io::write(&state_path(paths), body.as_bytes())
 }
 
 fn should_check(state: &UpdateState) -> bool {

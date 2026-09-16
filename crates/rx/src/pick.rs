@@ -8,7 +8,7 @@ use ratatui::{
     DefaultTerminal, Frame, TerminalOptions, Viewport,
     backend::{Backend, ClearType},
     layout::Position,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
@@ -18,24 +18,7 @@ use crate::args::Harness;
 
 const VIEWPORT_HEIGHT: u16 = 9;
 
-struct Palette {
-    accent: Color,
-    primary: Color,
-    muted: Color,
-}
-
-impl Palette {
-    fn current(env: &EnvLookup) -> Self {
-        if env.get("NO_COLOR").is_some() {
-            return Self { accent: Color::Reset, primary: Color::Reset, muted: Color::Reset };
-        }
-        Self {
-            accent: Color::Rgb(116, 199, 236),
-            primary: Color::Rgb(220, 223, 228),
-            muted: Color::Rgb(111, 115, 122),
-        }
-    }
-}
+use crate::ui::Palette;
 
 #[derive(Clone, Copy)]
 struct Choice {
@@ -163,30 +146,23 @@ fn run(terminal: &mut DefaultTerminal, env: &EnvLookup) -> Result<Option<Harness
 }
 
 fn render(frame: &mut Frame<'_>, app: &App, palette: &Palette) {
-    let mut lines =
-        vec![Line::from(Span::styled("pick a harness", Style::default().fg(palette.accent)))];
+    let mut lines = vec![Line::from(Span::styled("pick a harness", palette.accent))];
     for (index, choice) in CHOICES.iter().enumerate() {
         let selected = index == app.selected;
         let marker = if selected { "→ " } else { "  " };
         lines.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(palette.accent)),
-            Span::styled("[", Style::default().fg(palette.muted)),
-            Span::styled(
-                choice.shortcut.to_string(),
-                Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(palette.muted)),
+            Span::styled(marker, palette.accent),
+            Span::styled("[", palette.muted),
+            Span::styled(choice.shortcut.to_string(), (palette.accent, Modifier::BOLD)),
+            Span::styled("] ", palette.muted),
             Span::styled(
                 format!("{:<10}", choice.harness.as_str()),
                 Style::default().fg(if selected { palette.accent } else { palette.primary }),
             ),
-            Span::styled(format!("rx{}", choice.shortcut), Style::default().fg(palette.muted)),
+            Span::styled(format!("rx{}", choice.shortcut), palette.muted),
         ]));
     }
-    lines.push(Line::from(Span::styled(
-        "↑↓ move  enter launch  esc cancel",
-        Style::default().fg(palette.muted),
-    )));
+    lines.push(Line::from(Span::styled("↑↓ move  enter launch  esc cancel", palette.muted)));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), frame.area());
 }
 

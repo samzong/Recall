@@ -4,6 +4,7 @@ mod claude_catalog;
 mod completions;
 mod config;
 mod dsh;
+mod file_io;
 mod host;
 mod install;
 mod kimi;
@@ -13,6 +14,7 @@ mod pi;
 mod pick;
 mod provider;
 mod providers;
+mod ui;
 mod update;
 
 use std::ffi::OsString;

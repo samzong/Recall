@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+
+use crate::file_io;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
@@ -58,28 +58,24 @@ pub(crate) struct ProviderConfig {
     pub auth: AuthMode,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct KeyFile {
-    #[serde(flatten)]
-    values: BTreeMap<String, String>,
-}
+type KeyFile = BTreeMap<String, String>;
 
 pub(crate) fn load(paths: &Paths) -> Result<Option<RxConfig>> {
-    match fs::read_to_string(&paths.config) {
-        Ok(contents) => {
-            let config: RxConfig = toml::from_str(&contents)
-                .with_context(|| format!("failed to parse {}", paths.config.display()))?;
-            Ok(Some(config))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to read {}", paths.config.display()))
-        }
-    }
+    read_toml(&paths.config)
+}
+
+fn read_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    file_io::read_optional(path)?
+        .map(|contents| {
+            let text = std::str::from_utf8(&contents)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            toml::from_str(text).with_context(|| format!("failed to parse {}", path.display()))
+        })
+        .transpose()
 }
 
 pub(crate) fn stored_key(paths: &Paths, provider: &str) -> Result<Option<String>> {
-    Ok(load_keys(paths)?.values.get(provider).cloned())
+    Ok(load_keys(paths)?.get(provider).cloned())
 }
 
 pub(crate) fn load_or_default(paths: &Paths) -> Result<RxConfig> {
@@ -87,7 +83,7 @@ pub(crate) fn load_or_default(paths: &Paths) -> Result<RxConfig> {
 }
 
 pub(crate) fn stored_providers(paths: &Paths) -> Result<BTreeSet<String>> {
-    Ok(load_keys(paths)?.values.keys().cloned().collect())
+    Ok(load_keys(paths)?.keys().cloned().collect())
 }
 
 pub(crate) fn set_default(paths: &Paths, provider: &str) -> Result<()> {
@@ -112,7 +108,7 @@ pub(crate) fn login(paths: &Paths, provider: &str, key: String) -> Result<()> {
     let mut keys = load_keys(paths)?;
     let entry = config.provider.entry(provider.to_string()).or_default();
     entry.auth = AuthMode::ApiKey;
-    keys.values.insert(provider.to_string(), key);
+    keys.insert(provider.to_string(), key);
     config.default_provider = Some(provider.to_string());
     save_keys(paths, &keys)?;
     save_config(paths, &config)
@@ -123,7 +119,7 @@ pub(crate) fn logout(paths: &Paths, provider: &str) -> Result<bool> {
     let mut config = load_or_default(paths)?;
     crate::provider::resolve(provider, config.provider.get(provider))?;
     let mut keys = load_keys(paths)?;
-    let removed = keys.values.remove(provider).is_some();
+    let removed = keys.remove(provider).is_some();
     if removed {
         if config.default_provider.as_deref() == Some(provider) {
             config.default_provider = None;
@@ -135,30 +131,19 @@ pub(crate) fn logout(paths: &Paths, provider: &str) -> Result<bool> {
 }
 
 fn mutation_lock(paths: &Paths) -> Result<fs::File> {
-    fs::create_dir_all(&paths.dir)
-        .with_context(|| format!("failed to create {}", paths.dir.display()))?;
-    let lock_path = paths.dir.join("rx.lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
-    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    Ok(lock)
+    file_io::lock(&paths.dir.join("rx.lock"))
 }
 
 fn load_keys(paths: &Paths) -> Result<KeyFile> {
-    match fs::read_to_string(&paths.keys) {
-        Ok(contents) if contents.trim().is_empty() => Ok(KeyFile::default()),
-        Ok(contents) => toml::from_str(&contents)
-            .with_context(|| format!("failed to parse {}", paths.keys.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(KeyFile::default()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to read {}", paths.keys.display()))
-        }
+    let Some(contents) = file_io::read_optional(&paths.keys)? else {
+        return Ok(KeyFile::default());
+    };
+    let text = std::str::from_utf8(&contents)
+        .with_context(|| format!("failed to read {}", paths.keys.display()))?;
+    if text.trim().is_empty() {
+        return Ok(KeyFile::default());
     }
+    toml::from_str(text).with_context(|| format!("failed to parse {}", paths.keys.display()))
 }
 
 fn save_config(paths: &Paths, config: &RxConfig) -> Result<()> {
@@ -181,35 +166,14 @@ fn write_file(path: &Path, contents: &str, secret: bool) -> Result<()> {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("failed to chmod {}", parent.display()))?;
     }
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
-    temp.write_all(contents.as_bytes())
-        .with_context(|| format!("failed to write temporary file in {}", parent.display()))?;
-    temp.as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync temporary file in {}", parent.display()))?;
+    let temp = file_io::stage(path, contents.as_bytes())?;
     if secret {
-        set_secret_mode(temp.as_file(), path)?;
+        file_io::secret_mode(temp.as_file(), path)?;
     }
-    let persist_path = path.to_path_buf();
-    temp.persist(&persist_path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", persist_path.display()))?;
+    file_io::persist(temp, path)?;
     if secret {
         set_secret_path_mode(path)?;
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_secret_mode(file: &fs::File, path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to chmod {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_secret_mode(_file: &fs::File, _path: &Path) -> Result<()> {
     Ok(())
 }
 

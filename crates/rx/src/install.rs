@@ -20,39 +20,15 @@ pub(crate) struct InstallSpec {
 }
 
 pub(crate) fn spec(harness: Harness) -> Option<InstallSpec> {
-    Some(match harness {
-        Harness::Claude => InstallSpec {
-            program: "claude",
-            display: "Claude Code",
-            url: "https://claude.ai/install.sh",
-            shell: "bash",
-        },
-        Harness::Codex => InstallSpec {
-            program: "codex",
-            display: "Codex",
-            url: "https://chatgpt.com/codex/install.sh",
-            shell: "sh",
-        },
-        Harness::OpenCode => InstallSpec {
-            program: "opencode",
-            display: "OpenCode",
-            url: "https://opencode.ai/install",
-            shell: "bash",
-        },
-        Harness::Pi => InstallSpec {
-            program: "pi",
-            display: "Pi",
-            url: "https://pi.dev/install.sh",
-            shell: "sh",
-        },
+    let (display, url, shell) = match harness {
+        Harness::Claude => ("Claude Code", "https://claude.ai/install.sh", "bash"),
+        Harness::Codex => ("Codex", "https://chatgpt.com/codex/install.sh", "sh"),
+        Harness::OpenCode => ("OpenCode", "https://opencode.ai/install", "bash"),
+        Harness::Pi => ("Pi", "https://pi.dev/install.sh", "sh"),
         Harness::Dsh => return None,
-        Harness::Kimi => InstallSpec {
-            program: "kimi",
-            display: "Kimi Code",
-            url: "https://code.kimi.com/kimi-code/install.sh",
-            shell: "bash",
-        },
-    })
+        Harness::Kimi => ("Kimi Code", "https://code.kimi.com/kimi-code/install.sh", "bash"),
+    };
+    Some(InstallSpec { program: harness.as_str(), display, url, shell })
 }
 
 pub(crate) fn command_line(spec: &InstallSpec) -> String {
@@ -60,12 +36,12 @@ pub(crate) fn command_line(spec: &InstallSpec) -> String {
 }
 
 pub(crate) fn ensure(harness: Harness, env: &EnvLookup) -> Result<PathBuf> {
-    let Some(spec) = spec(harness) else {
-        return ensure_dsh(env);
-    };
     if !env.is_real() {
         return Ok(PathBuf::from(harness.as_str()));
     }
+    let Some(spec) = spec(harness) else {
+        return ensure_dsh(env);
+    };
     if let Some(path) = lookup(spec.program) {
         return Ok(path);
     }
@@ -95,15 +71,9 @@ pub(crate) fn lookup_with(
     extensions: Option<&OsStr>,
 ) -> Option<PathBuf> {
     let names = executable_names(program, extensions);
-    for dir in std::env::split_paths(path.as_ref()).chain(extra.iter().cloned()) {
-        for name in &names {
-            let candidate = dir.join(name);
-            if is_runnable(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    std::env::split_paths(path.as_ref())
+        .chain(extra.iter().cloned())
+        .find_map(|dir| names.iter().map(|name| dir.join(name)).find(|path| is_runnable(path)))
 }
 
 fn executable_names(program: &str, extensions: Option<&OsStr>) -> Vec<OsString> {
@@ -179,9 +149,6 @@ fn run_official_installer(spec: &InstallSpec) -> Result<()> {
 }
 
 fn ensure_dsh(env: &EnvLookup) -> Result<PathBuf> {
-    if !env.is_real() {
-        return Ok(PathBuf::from("dsh"));
-    }
     if let Some(path) = lookup_program("dsh") {
         if crate::dsh::profile_ready(env) {
             return Ok(path);

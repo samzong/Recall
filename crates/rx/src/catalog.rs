@@ -1,11 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::claude_catalog;
@@ -46,14 +45,6 @@ fn has_version_suffix(url: &str) -> bool {
         };
         !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
     })
-}
-
-fn fetch_get(url: &str, headers: &[(&str, String)]) -> Result<String> {
-    let (status, body) = fetch(url, headers)?;
-    if !(200..300).contains(&status) {
-        bail!("HTTP {status}: {}", truncate(&body, 300));
-    }
-    Ok(body)
 }
 
 pub(crate) fn parse_openai_models(body: &str) -> Result<Vec<ListedModel>> {
@@ -121,13 +112,7 @@ pub(crate) fn load_opencode_models(
     allow_fetch: bool,
 ) -> Result<BTreeMap<String, Value>> {
     ensure(paths, provider_id, base_url, key, allow_fetch)?;
-    let path = artifact_path(paths, provider_id, "opencode.json");
-    if !path.is_file() {
-        return Ok(BTreeMap::new());
-    }
-    let body =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))
+    Ok(read_json(&artifact_path(paths, provider_id, "opencode.json"))?.unwrap_or_default())
 }
 
 pub(crate) fn load_pi_models(
@@ -138,13 +123,7 @@ pub(crate) fn load_pi_models(
     allow_fetch: bool,
 ) -> Result<Vec<Value>> {
     ensure(paths, provider_id, base_url, key, allow_fetch)?;
-    let path = artifact_path(paths, provider_id, "pi.json");
-    if !path.is_file() {
-        return Ok(Vec::new());
-    }
-    let body =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))
+    Ok(read_json(&artifact_path(paths, provider_id, "pi.json"))?.unwrap_or_default())
 }
 
 pub(crate) fn load_listed_models(
@@ -155,14 +134,8 @@ pub(crate) fn load_listed_models(
     allow_fetch: bool,
 ) -> Result<Vec<ListedModel>> {
     ensure(paths, provider_id, base_url, key, allow_fetch)?;
-    let path = artifact_path(paths, provider_id, "json");
-    if !path.is_file() {
-        return Ok(Vec::new());
-    }
-    let body =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let document: Value = serde_json::from_str(&body)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let document: Value =
+        read_json(&artifact_path(paths, provider_id, "json"))?.unwrap_or_default();
     Ok(document
         .get("models")
         .and_then(Value::as_array)
@@ -185,15 +158,7 @@ pub(crate) fn load_claude_seed(
     key: &str,
 ) -> Result<Option<claude_catalog::SeedCaches>> {
     ensure(paths, provider_id, base_url, key, true)?;
-    let path = artifact_path(paths, provider_id, "claude.json");
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let body =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let caches = serde_json::from_str(&body)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    Ok(Some(caches))
+    read_json(&artifact_path(paths, provider_id, "claude.json"))
 }
 
 fn ensure(
@@ -204,10 +169,7 @@ fn ensure(
     allow_fetch: bool,
 ) -> Result<()> {
     let endpoint = openai_base(base_url);
-    if is_fresh(paths, provider_id, &endpoint) {
-        return Ok(());
-    }
-    if !allow_fetch {
+    if !allow_fetch || is_fresh(paths, provider_id, &endpoint) {
         return Ok(());
     }
     match refresh(paths, provider_id, key, &endpoint) {
@@ -222,11 +184,15 @@ fn ensure(
 
 fn refresh(paths: &Paths, provider_id: &str, key: &str, endpoint: &str) -> Result<usize> {
     let url = format!("{endpoint}/models");
-    let body = match fetch_get(&url, &[("Authorization", format!("Bearer {key}"))]) {
+    let body = match fetch(&url, key) {
         Ok(body) => body,
         Err(error) => bail!("{provider_id}: {error:#}"),
     };
-    let models = fill_missing_context(provider_id, &parse_openai_models(&body)?);
+    let mut models = parse_openai_models(&body)?;
+    let fallback = fallback_context(provider_id);
+    for model in &mut models {
+        model.context_length.get_or_insert(fallback);
+    }
     if models.is_empty() {
         bail!("{} returned no models from {endpoint}", provider_id);
     }
@@ -249,8 +215,6 @@ fn write_artifacts(
     models: &[ListedModel],
     body: &str,
 ) -> Result<()> {
-    let dir = catalogs_dir(paths);
-    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let files = [
         (artifact_path(paths, provider_id, "json"), synthesize_codex_catalog(models)),
         (
@@ -278,7 +242,7 @@ fn write_artifacts(
         staged.push((path, temp));
     }
     for (path, temp) in staged {
-        persist_json(temp, &path)?;
+        crate::file_io::persist(temp, &path)?;
     }
     Ok(())
 }
@@ -317,41 +281,28 @@ fn catalog_has_models(path: &Path) -> bool {
     value.get("models").and_then(Value::as_array).is_some_and(|models| !models.is_empty())
 }
 
-fn catalogs_dir(paths: &Paths) -> PathBuf {
-    paths.dir.join("catalogs")
+fn artifact_path(paths: &Paths, provider_id: &str, suffix: &str) -> PathBuf {
+    paths.dir.join("catalogs").join(format!("{provider_id}.{suffix}"))
 }
 
-fn artifact_path(paths: &Paths, provider_id: &str, suffix: &str) -> PathBuf {
-    if suffix == "json" {
-        catalogs_dir(paths).join(format!("{provider_id}.json"))
-    } else {
-        catalogs_dir(paths).join(format!("{provider_id}.{suffix}"))
+fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    if !path.is_file() {
+        return Ok(None);
     }
+    let body =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse {}", path.display()))
+        .map(Some)
 }
 
 fn write_json_atomic(path: &Path, document: &Value) -> Result<()> {
-    persist_json(stage_json(path, document)?, path)
+    crate::file_io::persist(stage_json(path, document)?, path)
 }
 
 fn stage_json(path: &Path, document: &Value) -> Result<tempfile::NamedTempFile> {
-    let parent = path.parent().context("json file has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let payload = serde_json::to_string_pretty(document).context("failed to serialize json")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create temporary {}", path.display()))?;
-    temp.write_all(payload.as_bytes())
-        .with_context(|| format!("failed to write temporary {}", path.display()))?;
-    temp.as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync temporary {}", path.display()))?;
-    Ok(temp)
-}
-
-fn persist_json(temp: tempfile::NamedTempFile, path: &Path) -> Result<()> {
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(())
+    let payload = serde_json::to_vec_pretty(document).context("failed to serialize json")?;
+    crate::file_io::stage(path, &payload)
 }
 
 pub(crate) fn fallback_context(provider_id: &str) -> i64 {
@@ -360,19 +311,7 @@ pub(crate) fn fallback_context(provider_id: &str) -> i64 {
         .unwrap_or(DEFAULT_CONTEXT_WINDOW)
 }
 
-fn fill_missing_context(provider_id: &str, models: &[ListedModel]) -> Vec<ListedModel> {
-    let fallback = fallback_context(provider_id);
-    models
-        .iter()
-        .map(|model| ListedModel {
-            id: model.id.clone(),
-            name: model.name.clone(),
-            context_length: Some(model.context_length.unwrap_or(fallback)),
-        })
-        .collect()
-}
-
-fn parse_listed_model(row: &Value) -> Option<ListedModel> {
+pub(crate) fn parse_listed_model(row: &Value) -> Option<ListedModel> {
     let id = row.get("id")?.as_str()?.to_string();
     let name = row
         .get("name")
@@ -388,23 +327,24 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-fn fetch(url: &str, headers: &[(&str, String)]) -> Result<(u16, String)> {
+fn fetch(url: &str, key: &str) -> Result<String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .http_status_as_error(false)
         .build()
         .into();
-    let mut request = agent.get(url);
-    if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("User-Agent")) {
-        request = request.header("User-Agent", format!("rx/{}", crate::RELEASE_VERSION));
-    }
-    for (name, value) in headers {
-        request = request.header(*name, value);
-    }
-    let mut response = request.call().with_context(|| format!("GET {url}"))?;
+    let mut response = agent
+        .get(url)
+        .header("User-Agent", format!("rx/{}", crate::RELEASE_VERSION))
+        .header("Authorization", format!("Bearer {key}"))
+        .call()
+        .with_context(|| format!("GET {url}"))?;
     let status = response.status().as_u16();
     let body = response.body_mut().read_to_string().context("failed to read response body")?;
-    Ok((status, body))
+    if !(200..300).contains(&status) {
+        bail!("HTTP {status}: {}", truncate(&body, 300));
+    }
+    Ok(body)
 }
 
 fn truncate(value: &str, max: usize) -> String {

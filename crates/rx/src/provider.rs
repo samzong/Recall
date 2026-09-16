@@ -17,14 +17,8 @@ struct Snapshot {
 
 #[derive(Debug, Clone, Deserialize)]
 struct SnapshotProvider {
-    id: String,
-    name: String,
-    endpoint: String,
-    env: String,
-    #[serde(default)]
-    anthropic_base: Option<String>,
-    #[serde(default)]
-    default_context: Option<i64>,
+    #[serde(flatten)]
+    provider: Provider,
     #[serde(default)]
     dsh_protocol: Option<ModelProtocol>,
     #[serde(default)]
@@ -88,13 +82,14 @@ struct ProtocolCapabilities {
     reasoning: Option<ReasoningControl>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Setup {
     OpenRouter,
+    #[default]
     Generated,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct Provider {
     pub id: String,
     pub name: String,
@@ -102,14 +97,19 @@ pub(crate) struct Provider {
     pub anthropic_base: Option<String>,
     pub default_context: Option<i64>,
     pub env: String,
+    #[serde(skip)]
     pub setup: Setup,
+    #[serde(skip)]
     pub default_model: Option<&'static str>,
+    #[serde(skip)]
     pub claude_default_model: Option<&'static str>,
 }
 
 pub(crate) fn catalog() -> &'static [Provider] {
     static CATALOG: OnceLock<Vec<Provider>> = OnceLock::new();
-    CATALOG.get_or_init(|| snapshot().providers.iter().cloned().map(from_snapshot).collect())
+    CATALOG.get_or_init(|| {
+        snapshot().providers.iter().map(|row| from_snapshot(row.provider.clone())).collect()
+    })
 }
 
 pub(crate) fn find(id: &str) -> Option<&'static Provider> {
@@ -122,8 +122,10 @@ pub(crate) fn reasoning_control(
     model_id: &str,
     protocol: ModelProtocol,
 ) -> Option<&'static ReasoningControl> {
-    let provider = snapshot().providers.iter().find(|provider| provider.id == provider_id)?;
-    if crate::catalog::openai_base(&provider.endpoint) != crate::catalog::openai_base(endpoint) {
+    let provider = snapshot().providers.iter().find(|row| row.provider.id == provider_id)?;
+    if crate::catalog::openai_base(&provider.provider.endpoint)
+        != crate::catalog::openai_base(endpoint)
+    {
         return None;
     }
     provider.model_capabilities.get(model_id)?.get(&protocol)?.reasoning.as_ref()
@@ -134,8 +136,8 @@ pub(crate) fn dsh_protocol(provider_id: &str, endpoint: &str) -> ModelProtocol {
         .providers
         .iter()
         .find(|provider| {
-            provider.id == provider_id
-                && crate::catalog::openai_base(&provider.endpoint)
+            provider.provider.id == provider_id
+                && crate::catalog::openai_base(&provider.provider.endpoint)
                     == crate::catalog::openai_base(endpoint)
         })
         .and_then(|provider| provider.dsh_protocol)
@@ -155,10 +157,6 @@ pub(crate) fn resolve(id: &str, entry: Option<&ProviderConfig>) -> Result<Provid
         if let Some(anthropic_base) = entry.and_then(|entry| entry.anthropic_base.as_ref()) {
             provider.anthropic_base = Some(anthropic_base.clone());
         } else if entry.and_then(|entry| entry.base_url.as_ref()).is_some() {
-            // A base_url override points at a different origin, so the bundled
-            // Anthropic endpoint no longer applies. Clear it so claude_base
-            // falls back to the overridden endpoint instead of sending the key
-            // to the original provider.
             provider.anthropic_base = None;
         }
         return Ok(provider);
@@ -238,24 +236,13 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
     bail!("invalid provider name '{id}'; use only letters, numbers, '-' and '_'")
 }
 
-fn from_snapshot(provider: SnapshotProvider) -> Provider {
-    let (setup, default_model, claude_default_model) = match provider.id.as_str() {
-        "openrouter" => {
-            (Setup::OpenRouter, Some("~openai/gpt-latest"), Some("~anthropic/claude-sonnet-latest"))
-        }
-        _ => (Setup::Generated, None, None),
-    };
-    Provider {
-        id: provider.id,
-        name: provider.name,
-        endpoint: provider.endpoint,
-        anthropic_base: provider.anthropic_base,
-        default_context: provider.default_context,
-        env: provider.env,
-        setup,
-        default_model,
-        claude_default_model,
+fn from_snapshot(mut provider: Provider) -> Provider {
+    if provider.id == "openrouter" {
+        provider.setup = Setup::OpenRouter;
+        provider.default_model = Some("~openai/gpt-latest");
+        provider.claude_default_model = Some("~anthropic/claude-sonnet-latest");
     }
+    provider
 }
 
 fn snapshot() -> &'static Snapshot {
