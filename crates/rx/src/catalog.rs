@@ -285,6 +285,28 @@ fn artifact_path(paths: &Paths, provider_id: &str, suffix: &str) -> PathBuf {
     paths.dir.join("catalogs").join(format!("{provider_id}.{suffix}"))
 }
 
+pub(crate) fn purge(provider_id: &str, paths: &Paths) -> Result<crate::residue::Residue> {
+    let dir = paths.dir.join("catalogs");
+    let prefix = format!("{provider_id}.");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(crate::residue::Residue::Absent);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", dir.display()));
+        }
+    };
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("failed to read {}", dir.display()))?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            removed |= crate::file_io::remove(&entry.path())?;
+        }
+    }
+    if removed { Ok(crate::residue::Residue::Removed) } else { Ok(crate::residue::Residue::Absent) }
+}
+
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     if !path.is_file() {
         return Ok(None);

@@ -137,18 +137,31 @@ fn login(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Result<()> 
 
 fn logout(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Result<()> {
     if let Some(state) = select_provider(Action::Logout, paths, env, requested)? {
-        logout_provider(paths, &state)?;
+        logout_provider(paths, env, &state)?;
     }
     Ok(())
 }
 
-fn logout_provider(paths: &Paths, state: &ProviderState) -> Result<()> {
+fn logout_provider(paths: &Paths, env: &EnvLookup, state: &ProviderState) -> Result<()> {
+    let report = crate::residue::purge(&state.provider.id, paths, env);
+    if report.removed() {
+        println!("Cleared rx-owned harness configuration for {}.", state.provider.name);
+    }
+    for note in report.notes() {
+        println!("  {note}");
+    }
+    if report.credential_retained() {
+        println!(
+            "{} is NOT logged out: a copy of the API key is still on disk, so the stored key was kept. Clear the blocker above, then run this logout again.",
+            state.provider.name
+        );
+        return Ok(());
+    }
     let removed = crate::config::logout(paths, &state.provider.id)?;
-    let environment_active = state.environment_active;
     if removed {
         println!("Removed stored API key for {}.", state.provider.name);
     }
-    if environment_active {
+    if state.environment_active {
         println!(
             "{} is still available through ${}. Run this in your shell to remove it:\n  unset {}",
             state.provider.name, state.provider.env, state.provider.env

@@ -10,6 +10,7 @@ use crate::config::Paths;
 use crate::file_io;
 use crate::launch::EnvLookup;
 use crate::provider::{ModelProtocol, Provider, ReasoningControl, Setup};
+use crate::residue::Residue;
 
 pub(crate) const PROFILE: &str = "dsh-tui";
 pub(crate) const CLI_PACKAGE: &str = "@deepseek-ai/dsh";
@@ -135,6 +136,11 @@ pub(crate) fn prepare(
     let patch_path = dir.join("launch.cordis.yml");
     write_launch_patch(&patch_path, &settings_path, official_deepseek(provider_id))?;
     Ok(patch_path)
+}
+
+pub(crate) fn purge(provider_id: &str, paths: &Paths) -> Result<Residue> {
+    let dir = paths.dir.join("dsh").join(provider_id);
+    if file_io::remove_dir(&dir)? { Ok(Residue::Removed) } else { Ok(Residue::Absent) }
 }
 
 fn load_models(

@@ -413,3 +413,65 @@ base_url = "https://provider.test/v1"
     let error = launch::plan(&request(Harness::Pi, None, &[]), &paths, &isolated(&[])).unwrap_err();
     assert!(error.to_string().contains("invalid provider name '../prod'"), "{error}");
 }
+
+#[test]
+fn logout_cascade_clears_the_plaintext_key_kimi_stored_for_the_provider() {
+    let (_dir, paths) = temp_paths();
+    fs::write(&paths.config, "[provider.tokener]\nbase_url = \"http://127.0.0.1:9\"\n").unwrap();
+    config::login(&paths, "tokener", "sk-secret".to_string()).unwrap();
+    let env = isolated(&[]);
+    let plan = launch::plan(
+        &request(Harness::Kimi, Some("tokener"), &["--model", "rx-tokener/kimi-k3"]),
+        &paths,
+        &env,
+    )
+    .unwrap();
+    let kimi_config = paths.dir.join("kimi-code").join("config.toml");
+    assert!(fs::read_to_string(&kimi_config).unwrap().contains("sk-secret"));
+    drop(plan);
+
+    let report = crate::residue::purge("tokener", &paths, &env);
+    assert!(report.removed());
+    assert!(!report.credential_retained());
+    assert!(config::logout(&paths, "tokener").unwrap());
+
+    assert!(!fs::read_to_string(&kimi_config).unwrap().contains("sk-secret"));
+    assert!(!fs::read_to_string(&paths.keys).unwrap().contains("sk-secret"));
+    assert!(!paths.dir.join("catalogs").join("tokener.models.json").exists());
+}
+
+#[test]
+fn logout_keeps_the_stored_key_while_a_kimi_session_holds_the_plaintext_copy() {
+    let (_dir, paths) = temp_paths();
+    fs::write(&paths.config, "[provider.tokener]\nbase_url = \"http://127.0.0.1:9\"\n").unwrap();
+    config::login(&paths, "tokener", "sk-secret".to_string()).unwrap();
+    let env = isolated(&[]);
+    let plan = launch::plan(
+        &request(Harness::Kimi, Some("tokener"), &["--model", "rx-tokener/kimi-k3"]),
+        &paths,
+        &env,
+    )
+    .unwrap();
+    let kimi_config = paths.dir.join("kimi-code").join("config.toml");
+
+    crate::providers::run(
+        crate::args::ProvidersCommand::Logout { provider: Some("tokener".to_string()) },
+        &paths,
+        &env,
+    )
+    .unwrap();
+
+    assert_eq!(config::stored_key(&paths, "tokener").unwrap().as_deref(), Some("sk-secret"));
+    assert!(fs::read_to_string(&kimi_config).unwrap().contains("sk-secret"));
+    drop(plan);
+
+    crate::providers::run(
+        crate::args::ProvidersCommand::Logout { provider: Some("tokener".to_string()) },
+        &paths,
+        &env,
+    )
+    .unwrap();
+
+    assert_eq!(config::stored_key(&paths, "tokener").unwrap(), None);
+    assert!(!fs::read_to_string(&kimi_config).unwrap().contains("sk-secret"));
+}

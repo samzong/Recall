@@ -14,6 +14,7 @@ mod pi;
 mod pick;
 mod provider;
 mod providers;
+mod residue;
 mod ui;
 mod update;
 

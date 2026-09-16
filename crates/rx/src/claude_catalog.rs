@@ -265,6 +265,10 @@ pub(crate) fn user_passes_settings(passthrough: &[std::ffi::OsString]) -> bool {
     args::has_flags(passthrough, &["--settings", "--setting-sources"])
 }
 
+pub(crate) fn purge(provider_id: &str, env: &EnvLookup) -> Result<crate::residue::Residue> {
+    store::purge(&claude_config_path(env), provider_id)
+}
+
 fn claude_config_path(env: &EnvLookup) -> PathBuf {
     if let Some(dir) = env.get("CLAUDE_CONFIG_DIR").filter(|value| !value.trim().is_empty()) {
         PathBuf::from(dir).join(".claude.json")

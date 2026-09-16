@@ -571,3 +571,70 @@ fn live_openrouter_seed_populates_claude_json() {
     let count = entries(&document, "additionalModelOptionsCache").len();
     assert!(count > 100, "expected a large seeded catalog, got {count}");
 }
+
+#[test]
+fn claude_purge_clears_seeded_caches_and_keeps_user_entries() {
+    let (_dir, paths) = temp_paths();
+    let config_dir = tempfile::tempdir().unwrap();
+    let (base_url, server) = serve_openai_models(
+        r#"{"data":[{"id":"claude-sonnet-5","display_name":"Sonnet 5","max_input_tokens":200000}]}"#,
+    );
+    let env = isolated(&[("CLAUDE_CONFIG_DIR", config_dir.path().to_str().unwrap())]);
+    assert_eq!(
+        claude::try_seed_user_catalog(&paths, "openrouter", &base_url, "sk-test", &env),
+        claude::SeedOutcome::Seeded
+    );
+    server.join().unwrap();
+    let config_path = config_dir.path().join(".claude.json");
+    let mut document: Value = read_json(&config_path);
+    document["modelAccessCache"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "apiName": "user-model", "entitled": true }));
+    document["userSetting"] = json!("keep");
+    write_json(&config_path, &document);
+
+    assert_eq!(crate::claude_catalog::purge("lab", &env).unwrap(), crate::residue::Residue::Absent);
+    assert_eq!(
+        crate::claude_catalog::purge("openrouter", &env).unwrap(),
+        crate::residue::Residue::Removed
+    );
+
+    let document: Value = read_json(&config_path);
+    assert!(document.get("rxSeededCatalog").is_none());
+    assert!(document.get("rxSeededToolSearchDenylist").is_none());
+    let access = entries(&document, "modelAccessCache");
+    assert_eq!(access.len(), 1);
+    assert_eq!(access[0]["apiName"], "user-model");
+    assert!(document.get("additionalModelOptionsCache").is_none());
+    assert_eq!(document["userSetting"], "keep");
+}
+
+#[test]
+fn claude_purge_keeps_user_edited_seeded_entries() {
+    let (_dir, paths) = temp_paths();
+    let config_dir = tempfile::tempdir().unwrap();
+    let (base_url, server) = serve_openai_models(
+        r#"{"data":[{"id":"claude-sonnet-5","display_name":"Sonnet 5","max_input_tokens":200000}]}"#,
+    );
+    let env = isolated(&[("CLAUDE_CONFIG_DIR", config_dir.path().to_str().unwrap())]);
+    assert_eq!(
+        claude::try_seed_user_catalog(&paths, "openrouter", &base_url, "sk-test", &env),
+        claude::SeedOutcome::Seeded
+    );
+    server.join().unwrap();
+    let config_path = config_dir.path().join(".claude.json");
+    let mut document: Value = read_json(&config_path);
+    document["modelAccessCache"][0]["entitled"] = json!(false);
+    write_json(&config_path, &document);
+
+    assert_eq!(
+        crate::claude_catalog::purge("openrouter", &env).unwrap(),
+        crate::residue::Residue::Modified(config_path.clone())
+    );
+
+    let document: Value = read_json(&config_path);
+    assert_eq!(document["modelAccessCache"][0]["apiName"], "claude-sonnet-5");
+    assert_eq!(document["modelAccessCache"][0]["entitled"], false);
+    assert!(document.get("rxSeededCatalog").is_none());
+}

@@ -276,3 +276,92 @@ fn legacy_and_unverifiable_leases_fail_closed() {
     assert_eq!(fs::read(&path).unwrap(), before);
     assert_eq!(fs::read(&marker_path).unwrap(), marker_bytes);
 }
+
+#[test]
+fn purge_removes_owned_provider_key_and_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[providers.native]\ntype = \"openai\"\nbase_url = \"https://native.test/v1\"\napi_key = \"native-key\"\n\n[models.\"native/model\"]\nprovider = \"native\"\nmodel = \"native-model\"\nmax_context_size = 100000\n",
+    )
+    .unwrap();
+    let lease =
+        seed(&path, "rx-tokener", "sk-secret", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
+    assert!(fs::read_to_string(&path).unwrap().contains("sk-secret"));
+    drop(lease);
+
+    assert_eq!(purge(&path, "rx-tokener").unwrap(), Residue::Removed);
+
+    let body = fs::read_to_string(&path).unwrap();
+    assert!(!body.contains("sk-secret"), "{body}");
+    assert!(!body.contains("rx-tokener"), "{body}");
+    let config = read_config(&path);
+    assert_eq!(config["providers"]["native"]["api_key"].as_str(), Some("native-key"));
+    assert_eq!(config["models"]["native/model"]["model"].as_str(), Some("native-model"));
+    assert!(!appended_path(&path, ".rx-catalog.json").exists());
+}
+
+#[test]
+fn purge_keeps_user_edited_entries_and_reports_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let lease =
+        seed(&path, "rx-tokener", "sk-secret", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
+    drop(lease);
+    let edited = fs::read_to_string(&path).unwrap().replace("200000", "123456");
+    fs::write(&path, edited).unwrap();
+
+    assert_eq!(purge(&path, "rx-tokener").unwrap(), Residue::Modified(path.clone()));
+
+    let config = read_config(&path);
+    assert_eq!(config["models"]["rx-tokener/glm-5"]["max_context_size"].as_integer(), Some(123456));
+    assert!(config["providers"]["rx-tokener"].is_table());
+}
+
+#[test]
+fn purge_leaves_other_providers_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let first = seed(&path, "rx-tokener", "sk-one", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
+    let _second =
+        seed(&path, "rx-openrouter", "sk-two", &[listed("gpt-6", "GPT 6", 200000)]).unwrap();
+    drop(first);
+
+    assert_eq!(purge(&path, "rx-tokener").unwrap(), Residue::Removed);
+
+    let body = fs::read_to_string(&path).unwrap();
+    assert!(!body.contains("sk-one"), "{body}");
+    assert!(body.contains("sk-two"), "{body}");
+    let config = read_config(&path);
+    assert!(config["models"]["rx-openrouter/gpt-6"].is_table());
+    assert!(config["providers"].get("rx-tokener").is_none());
+}
+
+#[test]
+fn purge_refuses_while_a_launch_holds_the_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let lease =
+        seed(&path, "rx-tokener", "sk-secret", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
+
+    let residue = purge(&path, "rx-tokener").unwrap();
+    assert!(matches!(residue, Residue::Blocked(_)), "{residue:?}");
+    assert!(fs::read_to_string(&path).unwrap().contains("sk-secret"));
+    drop(lease);
+
+    assert_eq!(purge(&path, "rx-tokener").unwrap(), Residue::Removed);
+    assert!(!fs::read_to_string(&path).unwrap().contains("sk-secret"));
+}
+
+#[test]
+fn purge_without_a_marker_reports_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "[providers.native]\napi_key = \"native-key\"\n").unwrap();
+    assert_eq!(purge(&path, "rx-tokener").unwrap(), Residue::Absent);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "[providers.native]\napi_key = \"native-key\"\n"
+    );
+}

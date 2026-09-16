@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::args;
@@ -13,6 +14,9 @@ use crate::file_io;
 use crate::launch::EnvLookup;
 use crate::opencode;
 use crate::provider::{Provider, Setup};
+use crate::residue::Residue;
+
+const MARKER_VERSION: u32 = 1;
 
 const PI_ENV_CLEAR: &[&str] = &[
     "ANTHROPIC_API_KEY",
@@ -127,30 +131,102 @@ fn generated_provider(
 
 pub(crate) fn merge_provider(models_path: &Path, provider_id: &str, provider: Value) -> Result<()> {
     let _lock = file_io::lock(&file_io::appended(models_path, ".rx.lock"))?;
-    let mut document = if models_path.is_file() {
-        let body = fs::read_to_string(models_path)
-            .with_context(|| format!("failed to read {}", models_path.display()))?;
-        serde_json::from_str(&body).with_context(|| {
-            format!("failed to parse {}; fix or remove the file and retry", models_path.display())
-        })?
-    } else {
-        json!({ "providers": {} })
+    let mut document = read_models(models_path)?;
+    let providers = providers_mut(&mut document, models_path)?;
+    providers.insert(provider_id.to_string(), provider.clone());
+    let marker_path = marker_path(models_path);
+    let mut marker = read_marker(&marker_path)?;
+    marker.providers.insert(provider_id.to_string(), provider);
+    file_io::write(models_path, &serde_json::to_vec_pretty(&document)?)?;
+    file_io::write(&marker_path, &serde_json::to_vec_pretty(&marker)?)
+}
+
+pub(crate) fn purge(provider_id: &str, env: &EnvLookup) -> Result<Residue> {
+    let models_path = global_agent_dir(env)?.join("models.json");
+    if !models_path.is_file() {
+        return Ok(Residue::Absent);
+    }
+    let _lock = file_io::lock(&file_io::appended(&models_path, ".rx.lock"))?;
+    let marker_path = marker_path(&models_path);
+    let mut marker = read_marker(&marker_path)?;
+    let Some(owned) = marker.providers.remove(provider_id) else {
+        return Ok(unowned(&models_path, provider_id));
     };
+    let mut document = read_models(&models_path)?;
+    let providers = providers_mut(&mut document, &models_path)?;
+    if providers.get(provider_id) != Some(&owned) {
+        return Ok(Residue::Modified(models_path));
+    }
+    providers.remove(provider_id);
+    if providers.is_empty() {
+        document.as_object_mut().expect("models root is an object").remove("providers");
+    }
+    file_io::write(&models_path, &serde_json::to_vec_pretty(&document)?)?;
+    if marker.providers.is_empty() {
+        file_io::remove(&marker_path)?;
+    } else {
+        file_io::write(&marker_path, &serde_json::to_vec_pretty(&marker)?)?;
+    }
+    Ok(Residue::Removed)
+}
+
+fn unowned(models_path: &Path, provider_id: &str) -> Residue {
+    match read_models(models_path) {
+        Ok(document) if document.pointer(&format!("/providers/{provider_id}")).is_some() => {
+            Residue::Unowned(models_path.to_path_buf())
+        }
+        _ => Residue::Absent,
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct OwnedProviders {
+    version: u32,
+    providers: BTreeMap<String, Value>,
+}
+
+fn marker_path(models_path: &Path) -> PathBuf {
+    file_io::appended(models_path, ".rx-catalog.json")
+}
+
+fn read_marker(path: &Path) -> Result<OwnedProviders> {
+    let Some(contents) = file_io::read_optional(path)? else {
+        return Ok(OwnedProviders { version: MARKER_VERSION, providers: BTreeMap::new() });
+    };
+    let marker: OwnedProviders = serde_json::from_slice(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if marker.version != MARKER_VERSION {
+        bail!("unsupported Pi catalog marker version {}", marker.version);
+    }
+    Ok(marker)
+}
+
+fn read_models(models_path: &Path) -> Result<Value> {
+    let Some(contents) = file_io::read_optional(models_path)? else {
+        return Ok(json!({ "providers": {} }));
+    };
+    serde_json::from_slice(&contents).with_context(|| {
+        format!("failed to parse {}; fix or remove the file and retry", models_path.display())
+    })
+}
+
+fn providers_mut<'a>(
+    document: &'a mut Value,
+    models_path: &Path,
+) -> Result<&'a mut serde_json::Map<String, Value>> {
     let Some(root) = document.as_object_mut() else {
         bail!(
             "{} root is not a JSON object; fix or remove the file and retry",
             models_path.display()
         );
     };
-    let Some(providers) = root.entry("providers").or_insert_with(|| json!({})).as_object_mut()
-    else {
-        bail!(
+    root.entry("providers").or_insert_with(|| json!({})).as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
             "{} providers is not a JSON object; fix or remove the file and retry",
             models_path.display()
-        );
-    };
-    providers.insert(provider_id.to_string(), provider);
-    file_io::write(models_path, &serde_json::to_vec_pretty(&document)?)
+        )
+    })
 }
 
 fn user_sets_model(passthrough: &[OsString]) -> bool {

@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use super::{BASE_TOOL_SEARCH_DENY, SeedCaches};
 use crate::file_io;
+use crate::residue::Residue;
 
 const TOOL_SEARCH_UNSUPPORTED_KEY: &str = "tengu_tool_search_unsupported_models";
 const RX_SEEDED_DENYLIST_KEY: &str = "rxSeededToolSearchDenylist";
@@ -40,6 +41,126 @@ where
         }
     }
     bail!("{} changed repeatedly while seeding catalog", path.display())
+}
+
+pub(crate) fn purge(path: &Path, provider_id: &str) -> Result<Residue> {
+    let _lock = file_io::lock(&file_io::appended(path, ".rx.lock"))?;
+    for _ in 0..MAX_WRITE_ATTEMPTS {
+        let (mut document, snapshot) = read_config_document(path)?;
+        if snapshot.is_none() {
+            return Ok(Residue::Absent);
+        }
+        let object = document.as_object_mut().expect("claude config root is an object");
+        let Some(marker) = object.get(RX_SEEDED_CATALOG_KEY).and_then(Value::as_object).cloned()
+        else {
+            return Ok(Residue::Absent);
+        };
+        if marker.get("provider_id").and_then(Value::as_str) != Some(provider_id) {
+            return Ok(Residue::Absent);
+        }
+        let mut kept = purge_denylist(object, &marker);
+        kept |= purge_array_cache(object, &marker, MODEL_OPTIONS_CACHE_KEY, "value");
+        kept |= purge_array_cache(object, &marker, MODEL_ACCESS_CACHE_KEY, "apiName");
+        kept |= purge_object_cache(object, &marker, MODEL_COSTS_CACHE_KEY);
+        kept |= purge_object_cache(object, &marker, COMPACT_WINDOWS_CACHE_KEY);
+        object.remove(RX_SEEDED_CATALOG_KEY);
+        object.remove(RX_SEEDED_DENYLIST_KEY);
+        if write_config_document(path, &document, snapshot.as_deref())? {
+            return Ok(if kept { Residue::Modified(path.to_path_buf()) } else { Residue::Removed });
+        }
+    }
+    bail!("{} changed repeatedly while clearing catalog", path.display())
+}
+
+fn owned_payloads<'a>(
+    marker: &'a serde_json::Map<String, Value>,
+    cache_key: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    marker.get(cache_key)?.as_object()
+}
+
+fn owns(owned: &serde_json::Map<String, Value>, identity: &str, current: &Value) -> Option<bool> {
+    let payload = owned.get(identity)?.get("payload")?;
+    Some(payload == current)
+}
+
+fn purge_array_cache(
+    object: &mut serde_json::Map<String, Value>,
+    marker: &serde_json::Map<String, Value>,
+    cache_key: &str,
+    identity_key: &str,
+) -> bool {
+    let Some(owned) = owned_payloads(marker, cache_key) else {
+        return false;
+    };
+    let Some(entries) = object.get_mut(cache_key).and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut kept = false;
+    entries.retain(|entry| {
+        let Some(identity) = entry.get(identity_key).and_then(Value::as_str) else {
+            return true;
+        };
+        match owns(owned, identity, entry) {
+            Some(true) => false,
+            Some(false) => {
+                kept = true;
+                true
+            }
+            None => true,
+        }
+    });
+    if entries.is_empty() {
+        object.remove(cache_key);
+    }
+    kept
+}
+
+fn purge_object_cache(
+    object: &mut serde_json::Map<String, Value>,
+    marker: &serde_json::Map<String, Value>,
+    cache_key: &str,
+) -> bool {
+    let Some(owned) = owned_payloads(marker, cache_key) else {
+        return false;
+    };
+    let Some(entries) = object.get_mut(cache_key).and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let mut kept = false;
+    entries.retain(|identity, current| match owns(owned, identity, current) {
+        Some(true) => false,
+        Some(false) => {
+            kept = true;
+            true
+        }
+        None => true,
+    });
+    if entries.is_empty() {
+        object.remove(cache_key);
+    }
+    kept
+}
+
+fn purge_denylist(
+    object: &mut serde_json::Map<String, Value>,
+    marker: &serde_json::Map<String, Value>,
+) -> bool {
+    let Some(owned) = owned_payloads(marker, TOOL_SEARCH_DENYLIST_MARKER_KEY) else {
+        return false;
+    };
+    let Some(entries) = object
+        .get_mut("cachedGrowthBookFeatures")
+        .and_then(Value::as_object_mut)
+        .and_then(|features| features.get_mut(TOOL_SEARCH_UNSUPPORTED_KEY))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    entries.retain(|entry| {
+        entry.as_str().is_none_or(|identity| owns(owned, identity, entry) != Some(true))
+    });
+    false
 }
 
 fn read_config_document(path: &Path) -> Result<(Value, Option<Vec<u8>>)> {

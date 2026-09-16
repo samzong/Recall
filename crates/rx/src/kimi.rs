@@ -79,6 +79,14 @@ pub(crate) fn prepare(
     })
 }
 
+pub(crate) fn purge(
+    provider_id: &str,
+    paths: &Paths,
+    env: &EnvLookup,
+) -> Result<crate::residue::Residue> {
+    store::purge(&kimi_config_path(paths, env)?, &format!("rx-{provider_id}"))
+}
+
 fn kimi_config_path(paths: &Paths, env: &EnvLookup) -> Result<PathBuf> {
     if let Some(home) = env.get("KIMI_CODE_HOME").filter(|value| !value.trim().is_empty()) {
         return Ok(PathBuf::from(home).join("config.toml"));

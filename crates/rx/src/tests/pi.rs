@@ -94,3 +94,61 @@ fn pi_tokener_prepares_native_models() {
     assert_eq!(models["providers"]["tokener"]["apiKey"], "$TOKENER_API_KEY");
     assert_eq!(models["providers"]["tokener"]["models"][0]["id"], "gpt-5.6-sol");
 }
+
+#[test]
+fn pi_purge_removes_only_the_marked_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.json");
+    fs::write(&models_path, r#"{"providers":{"ollama":{"baseUrl":"http://127.0.0.1:11434/v1"}}}"#)
+        .unwrap();
+    let provider = json!({ "baseUrl": "https://api.tokener.dev/v1", "apiKey": "$TOKENER_API_KEY" });
+    crate::pi::merge_provider(&models_path, "tokener", provider).unwrap();
+    let env = isolated(&[("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap())]);
+
+    assert_eq!(crate::pi::purge("tokener", &env).unwrap(), crate::residue::Residue::Removed);
+
+    let document: Value = read_json(&models_path);
+    assert!(document["providers"]["ollama"].is_object());
+    assert!(document["providers"].get("tokener").is_none());
+    assert!(!dir.path().join("models.json.rx-catalog.json").exists());
+}
+
+#[test]
+fn pi_purge_reports_unmarked_and_user_edited_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.json");
+    let env = isolated(&[("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap())]);
+    fs::write(
+        &models_path,
+        r#"{"providers":{"tokener":{"baseUrl":"https://api.tokener.dev/v1"}}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        crate::pi::purge("tokener", &env).unwrap(),
+        crate::residue::Residue::Unowned(models_path.clone())
+    );
+    assert!(read_json::<Value>(&models_path)["providers"]["tokener"].is_object());
+
+    let provider = json!({ "baseUrl": "https://api.tokener.dev/v1", "apiKey": "$TOKENER_API_KEY" });
+    crate::pi::merge_provider(&models_path, "tokener", provider).unwrap();
+    let mut document: Value = read_json(&models_path);
+    document["providers"]["tokener"]["baseUrl"] = json!("https://edited.test/v1");
+    write_json(&models_path, &document);
+
+    assert_eq!(
+        crate::pi::purge("tokener", &env).unwrap(),
+        crate::residue::Residue::Modified(models_path.clone())
+    );
+    assert_eq!(
+        read_json::<Value>(&models_path)["providers"]["tokener"]["baseUrl"],
+        "https://edited.test/v1"
+    );
+}
+
+#[test]
+fn pi_purge_is_absent_without_models_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = isolated(&[("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap())]);
+    assert_eq!(crate::pi::purge("tokener", &env).unwrap(), crate::residue::Residue::Absent);
+}

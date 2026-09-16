@@ -11,6 +11,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use crate::catalog::{self, ListedModel};
 use crate::file_io::{self, appended as appended_path, read_optional as read_bytes};
 use crate::launch::ProviderTarget;
+use crate::residue::Residue;
 
 const MARKER_VERSION: u32 = 1;
 const LEASE_VERSION: u32 = 2;
@@ -112,6 +113,138 @@ pub(super) fn seed_catalog(
         return Ok(lease);
     }
     bail!("{} changed repeatedly while seeding Kimi catalog", config_path.display())
+}
+
+pub(super) fn purge(config_path: &Path, provider_alias: &str) -> Result<Residue> {
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", config_path.display()))?;
+    let _lock = file_io::lock(&appended_path(config_path, ".rx.lock"))?;
+    let marker_path = appended_path(config_path, ".rx-catalog.json");
+    for _ in 0..MAX_WRITE_ATTEMPTS {
+        let snapshot = read_bytes(config_path)?;
+        let mut document = read_document(config_path, snapshot.as_deref())?;
+        let Some(marker) = read_marker(&marker_path)? else {
+            return Ok(Residue::Absent);
+        };
+        let mut retained = BTreeMap::new();
+        let mut targets = Vec::new();
+        let mut leases = Vec::new();
+        let mut blocked = false;
+        match marker {
+            CatalogMarker::Legacy(catalog) => {
+                validate_catalog(&catalog)?;
+                if catalog.provider.alias != provider_alias {
+                    return Ok(Residue::Absent);
+                }
+                targets.push(catalog);
+            }
+            CatalogMarker::Leased { version, catalogs } => {
+                if version != LEASE_VERSION {
+                    bail!("unsupported Kimi catalog marker version {version}");
+                }
+                for (name, catalog) in catalogs {
+                    validate_catalog(&catalog)?;
+                    if name != catalog_lease_name(&catalog)? {
+                        bail!("invalid Kimi catalog lease identity");
+                    }
+                    if catalog.provider.alias != provider_alias {
+                        retained.insert(name, catalog);
+                        continue;
+                    }
+                    if super::lease::is_active(&parent.join(&name))? {
+                        blocked = true;
+                        retained.insert(name, catalog);
+                        continue;
+                    }
+                    leases.push(parent.join(&name));
+                    targets.push(catalog);
+                }
+            }
+        }
+        if targets.is_empty() && !blocked {
+            return Ok(Residue::Absent);
+        }
+        let kept = remove_catalogs(&mut document, &targets)?;
+        let staged_config = stage_secret(config_path, document.to_string().as_bytes())?;
+        let staged_marker = (!retained.is_empty())
+            .then(|| {
+                serde_json::to_vec_pretty(&CatalogMarker::Leased {
+                    version: LEASE_VERSION,
+                    catalogs: retained.clone(),
+                })
+                .context("failed to serialize Kimi marker")
+                .and_then(|marker| stage_secret(&marker_path, &marker))
+            })
+            .transpose()?;
+        if read_bytes(config_path)?.as_deref() != snapshot.as_deref() {
+            continue;
+        }
+        file_io::persist(staged_config, config_path)?;
+        match staged_marker {
+            Some(staged) => file_io::persist(staged, &marker_path)?,
+            None => {
+                file_io::remove(&marker_path)?;
+            }
+        }
+        for lease in leases {
+            file_io::remove(&lease)?;
+        }
+        return Ok(if blocked {
+            Residue::Blocked(format!(
+                "a running Kimi session still uses '{provider_alias}'; close it and rerun this logout to remove the stored key from {}",
+                config_path.display()
+            ))
+        } else if kept {
+            Residue::Modified(config_path.to_path_buf())
+        } else {
+            Residue::Removed
+        });
+    }
+    bail!("{} changed repeatedly while clearing Kimi catalog", config_path.display())
+}
+
+fn remove_catalogs(document: &mut DocumentMut, targets: &[OwnedCatalog]) -> Result<bool> {
+    let mut kept = false;
+    for catalog in targets {
+        if let Some(models) = table_mut(document, "models")? {
+            for (alias, owned) in &catalog.models {
+                match models.get(alias) {
+                    Some(item) if model_matches(item, owned) => {
+                        models.remove(alias);
+                    }
+                    Some(_) => kept = true,
+                    None => {}
+                }
+            }
+            if models.is_empty() {
+                document.remove("models");
+            }
+        }
+        let referenced = table(document, "models")?.is_some_and(|models| {
+            models.iter().any(|(_, item)| {
+                item.as_table().and_then(|table| string_field(table, "provider"))
+                    == Some(&catalog.provider.alias)
+            })
+        });
+        if referenced {
+            kept = true;
+            continue;
+        }
+        if let Some(providers) = table_mut(document, "providers")? {
+            match providers.get(&catalog.provider.alias) {
+                Some(item) if provider_matches(item, &catalog.provider) => {
+                    providers.remove(&catalog.provider.alias);
+                }
+                Some(_) => kept = true,
+                None => {}
+            }
+            if providers.is_empty() {
+                document.remove("providers");
+            }
+        }
+    }
+    Ok(kept)
 }
 
 fn catalog_lease_name(catalog: &OwnedCatalog) -> Result<String> {

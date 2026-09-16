@@ -62,6 +62,22 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     persist(stage(path, bytes)?, path)
 }
 
+pub(crate) fn remove(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+pub(crate) fn remove_dir(path: &Path) -> Result<bool> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
 pub(crate) fn secret_mode(file: &File, path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

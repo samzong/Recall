@@ -45,7 +45,7 @@ read `recall.db`.
 | Claude catalog caches | shared | Marker identity stays rx-owned even if changed or deleted; preserve unmarked entries. |
 | Codex config | launch | Prefer `-c` and environment injection. |
 | OpenCode config | launch | Prefer `OPENCODE_CONFIG_CONTENT`; only warn about native auth conflicts. |
-| Pi `models.json` | shared | Own the selected provider entry; preserve the rest; reject malformed roots. |
+| Pi `models.json` | shared | Own the selected provider entry recorded in the `models.json.rx-catalog.json` marker; preserve the rest; reject malformed roots. |
 | DSH install and profile | user | Use the user's npm prefix and native `DSH_HOME` (`~/.dsh` by default); routing uses a per-provider launch overlay under `~/.recall/dsh/<provider>/`. |
 | Kimi `config.toml` | shared | Use rx-prefixed marked entries; preserve collisions and user edits. Launch leases protect active catalog identities. Its required literal credential uses secret mode. |
 | Hosted state | host caller | rx-internal runtime state only (catalog cache); harness homes are never redirected into it; never an installation root. |
@@ -64,13 +64,32 @@ the entries still match their ownership records. Active identities retain their
 original aliases; conflicting changes fail closed. Missing or malformed lease
 records do not prove that a launch exited. Empty lease files are retained and
 reused, so file growth follows distinct snapshots rather than launch count.
-rx never truncates or deletes lease files and has no automatic cleanup command.
+rx never truncates lease files. Only `rx providers logout` deletes them, and
+only for a catalog it has just purged after an exclusive probe proved it exited.
 
 Before migrating a version 1 Kimi catalog marker, the user must close every
 Kimi session started by an older rx and explicitly confirm migration in a
 terminal. rx never terminates those sessions. Non-interactive launches refuse
 migration, and older rx versions cannot write the migrated marker. Rolling
 back rx must preserve the new marker so older writers continue to fail closed.
+
+## Logout cascade
+
+`rx providers logout <provider>` removes the stored key and every rx-owned
+entry that provider caused rx to persist in a harness config: the Kimi provider
+and model entries plus their marker and exited leases, the Claude catalog caches
+and their markers, the Pi provider entry, the DSH launch overlay, and the
+generated catalog cache.
+
+Removal follows RX-OWN-001: an entry is removed only when a marker records rx as
+its author and the on-disk value still matches the recorded payload. Entries
+without a marker, or edited since rx wrote them, are preserved and reported by
+path so the user decides. Kimi is the only surface holding a literal credential,
+so an active lease there blocks removal. Logout is fail-closed: when any
+credential surface still holds a copy of the key, rx keeps its own stored key
+too, names the blocker, and tells the user to rerun logout. A logout that
+removes the stored key therefore means no rx-written copy of that key is left
+behind.
 
 Hosted order is: select harness, discover or install in the user environment,
 validate route conflicts, execute with the same launch-scoped route injection
