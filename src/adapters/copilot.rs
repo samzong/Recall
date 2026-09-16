@@ -15,12 +15,11 @@ use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
 use crate::adapters::opencode;
 use crate::adapters::paths::resolve_home_dir;
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-    first_timestamp, last_timestamp,
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
+    last_timestamp,
 };
 use crate::types::{
-    CommandEvidenceStatus, FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent,
-    RawUsageEvent, Role,
+    CommandEvidenceStatus, FileEvidence, FileOperation, RawSessionEvent, RawUsageEvent, Role,
 };
 
 pub(crate) struct CopilotAdapter;
@@ -81,11 +80,7 @@ impl SourceAdapter for CopilotAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(sessions_dir) = resolve_copilot_dir()? else {
-            return Ok(Some(SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            }));
+            return Ok(Some(SyncScanResult::default()));
         };
         let result = scan_for_sync_impl(
             &sessions_dir,
@@ -677,13 +672,11 @@ fn copilot_tool_call(
         {
             event.kind = "file_read".to_string();
             event.target = Some(path.to_string());
-            event.files.push(FileEvidence {
-                path: path.to_string(),
-                operation: FileOperation::Read,
-                kind: FileEvidenceKind::Call,
-                cwd: directory.map(str::to_string),
-                target: None,
-            });
+            event.files.push(FileEvidence::call(
+                path.to_string(),
+                FileOperation::Read,
+                directory.map(str::to_string),
+            ));
         }
     } else if name == "bash" {
         event.kind = "command".to_string();
@@ -709,13 +702,11 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn temp_copilot_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -760,25 +751,12 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "copilot-cli".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 
@@ -949,24 +927,8 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "copilot-cli",
-                uuid,
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "copilot-cli",
-                uuid,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
+        seed_empty_event_state(&store, "copilot-cli", uuid, EVENT_PARSER_VERSION, Some(mtime));
+        seed_empty_usage_state(&store, "copilot-cli", uuid, USAGE_PARSER_VERSION, Some(mtime));
 
         let refreshed = scan_for_sync_impl(
             &sessions_dir,
@@ -978,17 +940,7 @@ mod tests {
         .unwrap();
         assert_eq!(refreshed.sessions.len(), 1);
         assert!(refreshed.sessions[0].refresh_session_on_metadata_backfill);
-        store
-            .persist_topology_for_existing_session(
-                "copilot-cli",
-                uuid,
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_metadata_state(&store, "copilot-cli", uuid, METADATA_PARSER_VERSION);
         let result = scan_for_sync_impl(
             &sessions_dir,
             &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
@@ -999,15 +951,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
-        store
-            .persist_session_events_for_existing_session(
-                "copilot-cli",
-                uuid,
-                &[],
-                EVENT_PARSER_VERSION - 1,
-                Some(mtime),
-            )
-            .unwrap();
+        seed_empty_event_state(&store, "copilot-cli", uuid, EVENT_PARSER_VERSION - 1, Some(mtime));
         let stale = scan_for_sync_impl(
             &sessions_dir,
             &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
@@ -1267,27 +1211,9 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "copilot-cli",
-                uuid,
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
+        seed_empty_event_state(&store, "copilot-cli", uuid, EVENT_PARSER_VERSION, Some(mtime));
 
-        store
-            .persist_topology_for_existing_session(
-                "copilot-cli",
-                uuid,
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_metadata_state(&store, "copilot-cli", uuid, METADATA_PARSER_VERSION);
         let skipped = scan_for_sync_impl(
             &sessions_dir,
             &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),

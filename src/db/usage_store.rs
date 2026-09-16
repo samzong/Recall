@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::OptionalExtension;
 
-use super::store::{Store, UsageSessionStateMeta};
+use super::store::{ParserStateMeta, Store};
 use crate::db::search::TimeRange;
 use crate::types::{RawUsageEvent, SessionUsageEventRecord, UsageEventRecord};
 
@@ -25,22 +25,13 @@ impl Store {
     pub(crate) fn usage_state_meta_map(
         &self,
         source: &str,
-    ) -> Result<HashMap<String, UsageSessionStateMeta>> {
-        let mut stmt = self.conn.prepare(
+    ) -> Result<HashMap<String, ParserStateMeta>> {
+        self.parser_state_map(
             "SELECT source_id, parser_version, source_updated_at
              FROM usage_session_state
              WHERE source = ?1 AND session_id IN (SELECT session_id FROM native_bindings)",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![source], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                UsageSessionStateMeta {
-                    parser_version: row.get(1)?,
-                    source_updated_at: row.get(2)?,
-                },
-            ))
-        })?;
-        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
+            source,
+        )
     }
 
     pub(crate) fn persist_usage_events_for_existing_session(
@@ -65,71 +56,16 @@ impl Store {
         };
 
         let tx = self.conn.unchecked_transaction()?;
-        {
-            tx.execute(
-                "DELETE FROM usage_events WHERE session_id = ?1",
-                rusqlite::params![&session_id],
-            )?;
-
-            let created_at = Utc::now().timestamp_millis();
-            let mut stmt = tx.prepare(
-                "INSERT INTO usage_events (
-                    session_id, source, source_id, event_key, event_seq, message_seq,
-                    timestamp, model, provider, input_tokens, output_tokens,
-                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                    token_source, parser_version, source_path, raw_usage_json, created_at
-                 )
-                 VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                    ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
-                 )",
-            )?;
-            for event in usage_events {
-                stmt.execute(rusqlite::params![
-                    &session_id,
-                    source,
-                    source_id,
-                    event.event_key,
-                    event.event_seq,
-                    event.message_seq,
-                    event.timestamp,
-                    event.model,
-                    event.provider,
-                    event.input_tokens,
-                    event.output_tokens,
-                    event.cache_read_tokens,
-                    event.cache_write_tokens,
-                    event.reasoning_tokens,
-                    event.token_source.as_str(),
-                    event.parser_version,
-                    event.source_path,
-                    event.raw_usage_json,
-                    created_at,
-                ])?;
-            }
-
-            tx.execute(
-                "INSERT INTO usage_session_state (
-                    session_id, source, source_id, parser_version,
-                    source_updated_at, event_count, synced_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                    parser_version = excluded.parser_version,
-                    source_updated_at = excluded.source_updated_at,
-                    event_count = excluded.event_count,
-                    synced_at = excluded.synced_at",
-                rusqlite::params![
-                    &session_id,
-                    source,
-                    source_id,
-                    usage_parser_version,
-                    source_updated_at,
-                    usage_events.len() as u32,
-                    Utc::now().timestamp_millis(),
-                ],
-            )?;
-        }
+        replace_usage_events(
+            &tx,
+            &session_id,
+            source,
+            source_id,
+            usage_events,
+            Some(usage_parser_version),
+            source_updated_at,
+            UsageConflict::Reject,
+        )?;
         tx.commit()?;
         Ok(true)
     }
@@ -321,4 +257,112 @@ fn persisted_usage_total(raw_usage_json: Option<&str>) -> Option<i64> {
         .iter()
         .find_map(|key| usage.get(*key).and_then(serde_json::Value::as_i64))
         .filter(|total| *total >= 0)
+}
+
+pub(super) enum UsageConflict {
+    Reject,
+    Update,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn replace_usage_events(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    source: &str,
+    source_id: &str,
+    usage_events: &[RawUsageEvent],
+    usage_parser_version: Option<u32>,
+    source_updated_at: Option<i64>,
+    conflict: UsageConflict,
+) -> Result<()> {
+    {
+        tx.execute(
+            "DELETE FROM usage_events WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        let created_at = Utc::now().timestamp_millis();
+        let conflict = match conflict {
+            UsageConflict::Reject => "",
+            UsageConflict::Update => {
+                "
+             ON CONFLICT(session_id, event_key) DO UPDATE SET
+                event_seq = excluded.event_seq,
+                message_seq = excluded.message_seq,
+                timestamp = excluded.timestamp,
+                model = excluded.model,
+                provider = excluded.provider,
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                cache_read_tokens = excluded.cache_read_tokens,
+                cache_write_tokens = excluded.cache_write_tokens,
+                reasoning_tokens = excluded.reasoning_tokens,
+                token_source = excluded.token_source,
+                parser_version = excluded.parser_version,
+                source_path = excluded.source_path,
+                raw_usage_json = excluded.raw_usage_json"
+            }
+        };
+        let mut stmt = tx.prepare(&format!(
+            "INSERT INTO usage_events (
+                session_id, source, source_id, event_key, event_seq, message_seq,
+                timestamp, model, provider, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                token_source, parser_version, source_path, raw_usage_json, created_at
+             )
+             VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+             ){conflict}",
+        ))?;
+        for event in usage_events {
+            stmt.execute(rusqlite::params![
+                session_id,
+                source,
+                source_id,
+                event.event_key,
+                event.event_seq,
+                event.message_seq,
+                event.timestamp,
+                event.model,
+                event.provider,
+                event.input_tokens,
+                event.output_tokens,
+                event.cache_read_tokens,
+                event.cache_write_tokens,
+                event.reasoning_tokens,
+                event.token_source.as_str(),
+                event.parser_version,
+                event.source_path,
+                event.raw_usage_json,
+                created_at,
+            ])?;
+        }
+    }
+
+    if let Some(parser_version) = usage_parser_version {
+        let synced_at = Utc::now().timestamp_millis();
+        tx.execute(
+            "INSERT INTO usage_session_state (
+                session_id, source, source_id, parser_version,
+                source_updated_at, event_count, synced_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(session_id) DO UPDATE SET
+                parser_version = excluded.parser_version,
+                source_updated_at = excluded.source_updated_at,
+                event_count = excluded.event_count,
+                synced_at = excluded.synced_at",
+            rusqlite::params![
+                session_id,
+                source,
+                source_id,
+                parser_version,
+                source_updated_at,
+                usage_events.len() as u32,
+                synced_at,
+            ],
+        )?;
+    }
+
+    Ok(())
 }

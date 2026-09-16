@@ -755,7 +755,7 @@ fn aggregate_wrapped_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Message, RawUsageEvent, Role, Session, TokenSource};
+    use crate::types::{Message, RawUsageEvent, Role, Session};
     use crate::usage::aggregate_usage_events;
 
     fn event(
@@ -957,25 +957,11 @@ mod tests {
 
     fn make_session(id: &str, source: &str) -> Session {
         Session {
-            id: id.to_string(),
-            source: source.to_string(),
-            source_id: id.to_string(),
-            title: id.to_string(),
-            directory: Some("/tmp/test".to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
+            source: source.into(),
+            directory: Some("/tmp/test".into()),
             started_at: local_ts(2026, 8, 20, 14),
-            updated_at: None,
             message_count: 1,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(id)
         }
     }
 
@@ -987,21 +973,12 @@ mod tests {
         output: i64,
     ) -> RawUsageEvent {
         RawUsageEvent {
-            event_key: key.to_string(),
-            event_seq: 0,
             message_seq: Some(1),
             timestamp,
-            model: model.to_string(),
-            provider: "test".to_string(),
+            model: model.into(),
             input_tokens: input,
             output_tokens: output,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            reasoning_tokens: 0,
-            token_source: TokenSource::Observed,
-            parser_version: 1,
-            source_path: None,
-            raw_usage_json: None,
+            ..crate::types::test_support::usage_event(key)
         }
     }
 

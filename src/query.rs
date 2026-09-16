@@ -78,20 +78,20 @@ pub(crate) fn run_search(
     format: SearchFormat,
 ) -> Result<()> {
     if matches!(format, SearchFormat::Json) {
-        return session::run_session_list(
-            Some(query),
-            source_filter,
-            time_filter,
-            project_filter,
-            repo_filter,
-            None,
-            20,
-            0,
-            false,
-            false,
-            Some(SessionSort::Relevance),
-            SessionListFormat::Json,
-        );
+        return session::run_session_list(&session::SessionListArgs {
+            query: Some(query.into()),
+            source: source_filter.map(str::to_string),
+            time: time_filter.map(str::to_string),
+            project: project_filter.map(str::to_string),
+            repo: repo_filter.map(str::to_string),
+            thread_role: None,
+            limit: 20,
+            offset: 0,
+            all: false,
+            sync: false,
+            sort: Some(SessionSort::Relevance),
+            format: SessionListFormat::Json,
+        });
     }
 
     let time_range = parse_time_range(time_filter)?;
@@ -151,16 +151,18 @@ pub(crate) fn resolve_source_filter(
     source_filter: Option<&str>,
     sources: &[(String, String)],
 ) -> Result<Option<Vec<String>>> {
-    let Some(source) = source_filter else {
-        return Ok(None);
-    };
+    source_filter
+        .map(|source| resolve_source_id(source, sources).map(|source| vec![source]))
+        .transpose()
+}
+
+pub(crate) fn resolve_source_id(source: &str, sources: &[(String, String)]) -> Result<String> {
     let lower = source.to_lowercase();
-    let resolved = sources
+    sources
         .iter()
         .find(|(id, label)| id == &lower || label.to_lowercase() == lower)
         .map(|(id, _)| id.clone())
-        .ok_or_else(|| anyhow::anyhow!("unknown source: {source}"))?;
-    Ok(Some(vec![resolved]))
+        .ok_or_else(|| anyhow::anyhow!("unknown source: {source}"))
 }
 
 pub(crate) fn parse_time_range_arg(value: &str) -> std::result::Result<String, String> {

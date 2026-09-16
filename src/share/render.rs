@@ -288,21 +288,12 @@ fn prepare_structured_tool_timeline(
     let mut public_events = Vec::new();
     let mut text_chars = 0usize;
     let mut truncated = false;
-    let mut group_start = 0usize;
-    while group_start < candidates.len() {
-        let message_seq = candidates[group_start].message_seq;
-        let group_end = candidates[group_start..]
-            .iter()
-            .position(|event| event.message_seq != message_seq)
-            .map_or(candidates.len(), |offset| group_start + offset);
-        if public_events.len() + group_end - group_start > STRUCTURED_EVENT_LIMIT {
+    for candidates in candidates.chunk_by(|left, right| left.message_seq == right.message_seq) {
+        if public_events.len() + candidates.len() > STRUCTURED_EVENT_LIMIT {
             truncated = true;
             break;
         }
-        let group = candidates[group_start..group_end]
-            .iter()
-            .map(|event| public_tool_event(event))
-            .collect::<Vec<_>>();
+        let group = candidates.iter().map(|event| public_tool_event(event)).collect::<Vec<_>>();
         let group_chars = group.iter().map(public_event_text_chars).sum::<usize>();
         if text_chars + group_chars > STRUCTURED_TEXT_CHAR_LIMIT {
             truncated = true;
@@ -310,7 +301,6 @@ fn prepare_structured_tool_timeline(
         }
         text_chars += group_chars;
         public_events.extend(group);
-        group_start = group_end;
     }
     if public_events.is_empty() {
         return None;
@@ -523,12 +513,12 @@ fn render_block_html(out: &mut String, block: RenderBlock, user_index: Option<us
                     }
                     AssistantSegment::LegacyTools(logs) => {
                         out.push_str("<div class=\"tool-run\">");
-                        render_tool_group(out, &logs);
+                        render_tool_group(out, &logs, |out, log| render_log_segment(out, log));
                         out.push_str("</div>");
                     }
                     AssistantSegment::StructuredTools { executions, truncated } => {
                         out.push_str("<div class=\"tool-run\">");
-                        render_structured_tool_group(out, &executions);
+                        render_tool_group(out, &executions, render_structured_execution);
                         if truncated {
                             out.push_str(
                                 "<p class=\"tool-timeline-note\">Tool timeline truncated.</p>",
@@ -553,7 +543,7 @@ fn render_content(out: &mut String, text: &str, suppress_legacy_logs: bool) {
         if pending.is_empty() {
             return;
         }
-        render_tool_group(out, pending);
+        render_tool_group(out, pending, |out, log| render_log_segment(out, log));
         pending.clear();
     };
 
@@ -623,10 +613,17 @@ fn collect_oai_mem_citation(lines: &[&str], start: usize) -> (String, usize) {
 }
 
 fn render_markdown_text(out: &mut String, text: &str) {
-    for fragment in split_markdown_fragments(text.trim()) {
-        match fragment {
-            MarkdownFragment::Markdown(markdown) => render_markdown_blocks(out, &markdown),
-            MarkdownFragment::Preformatted(lines) => render_preformatted_block(out, &lines),
+    let lines: Vec<_> = text.trim().lines().collect();
+    for group in
+        lines.chunk_by(|left, right| is_preformatted_line(left) == is_preformatted_line(right))
+    {
+        if is_preformatted_line(group[0]) {
+            render_preformatted_block(out, group);
+        } else {
+            let markdown = group.join("\n");
+            if !markdown.trim().is_empty() {
+                render_markdown_blocks(out, &markdown);
+            }
         }
     }
 }
@@ -741,42 +738,7 @@ fn is_safe_markdown_link(url: &str) -> bool {
     matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https" | "mailto")
 }
 
-fn split_markdown_fragments(text: &str) -> Vec<MarkdownFragment> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut fragments = Vec::new();
-    let mut index = 0usize;
-    while index < lines.len() {
-        if is_preformatted_line(lines[index]) {
-            let start = index;
-            while index < lines.len() && is_preformatted_line(lines[index]) {
-                index += 1;
-            }
-            fragments.push(MarkdownFragment::Preformatted(
-                lines[start..index].iter().map(|line| (*line).to_string()).collect(),
-            ));
-            continue;
-        }
-        let start = index;
-        while index < lines.len() && !is_preformatted_line(lines[index]) {
-            index += 1;
-        }
-        let markdown = lines[start..index].join("\n");
-        if !markdown.trim().is_empty() {
-            fragments.push(MarkdownFragment::Markdown(markdown));
-        }
-    }
-    if fragments.is_empty() && !text.is_empty() {
-        fragments.push(MarkdownFragment::Markdown(text.to_string()));
-    }
-    fragments
-}
-
-enum MarkdownFragment {
-    Markdown(String),
-    Preformatted(Vec<String>),
-}
-
-fn render_preformatted_block(out: &mut String, lines: &[String]) {
+fn render_preformatted_block(out: &mut String, lines: &[&str]) {
     out.push_str("<pre class=\"preformatted\">");
     for (index, line) in lines.iter().enumerate() {
         if index > 0 {
@@ -818,42 +780,22 @@ fn is_fence_language_tag(line: &str) -> bool {
         && line.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '+')
 }
 
-fn render_tool_group(out: &mut String, logs: &[String]) {
-    if logs.is_empty() {
+fn render_tool_group<T>(out: &mut String, items: &[T], render: impl Fn(&mut String, &T)) {
+    if items.len() == 1 {
+        render(out, &items[0]);
         return;
     }
-    if logs.len() == 1 {
-        render_log_segment(out, &logs[0]);
-        return;
-    }
-    out.push_str("<details class=\"tool-group\"><summary>");
-    out.push_str(CHEVRON_SVG);
-    out.push_str(&escape_html(&format!("{} tool executions", logs.len())));
-    out.push_str("<span class=\"count\">");
-    out.push_str(&logs.len().to_string());
-    out.push_str("</span></summary><div class=\"tool-group-items\">");
-    for log in logs {
-        render_log_segment(out, log);
-    }
-    out.push_str("</div></details>");
-}
-
-fn render_structured_tool_group(out: &mut String, executions: &[StructuredToolExecution]) {
-    if executions.is_empty() {
-        return;
-    }
-    if executions.len() == 1 {
-        render_structured_execution(out, &executions[0]);
+    if items.is_empty() {
         return;
     }
     out.push_str("<details class=\"tool-group\"><summary>");
     out.push_str(CHEVRON_SVG);
-    out.push_str(&escape_html(&format!("{} tool executions", executions.len())));
+    out.push_str(&escape_html(&format!("{} tool executions", items.len())));
     out.push_str("<span class=\"count\">");
-    out.push_str(&executions.len().to_string());
+    out.push_str(&items.len().to_string());
     out.push_str("</span></summary><div class=\"tool-group-items\">");
-    for execution in executions {
-        render_structured_execution(out, execution);
+    for item in items {
+        render(out, item);
     }
     out.push_str("</div></details>");
 }
@@ -1122,6 +1064,7 @@ fn escape_html(input: &str) -> String {
 mod tests {
     use super::super::meta::SessionDisplayMeta;
     use super::*;
+    use crate::share::test_session as session;
     use crate::types::{Message, Role, Session};
 
     fn render_html(session: &Session, messages: &[Message]) -> String {
@@ -1134,30 +1077,6 @@ mod tests {
         events: &[SessionEventRecord],
     ) -> String {
         render_session_html(session, messages, events, &SessionDisplayMeta::default())
-    }
-
-    fn session(source_id: &str) -> Session {
-        Session {
-            id: "local-id".to_string(),
-            source: "codex".to_string(),
-            source_id: source_id.to_string(),
-            title: "Fix <bug>".to_string(),
-            directory: Some("/tmp/project".to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
-            updated_at: None,
-            message_count: 1,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
-        }
     }
 
     fn message(role: Role, content: &str, seq: u32) -> Message {
@@ -1454,16 +1373,8 @@ mod tests {
 
     #[test]
     fn html_renderer_escapes_content() {
-        let html = render_html(
-            &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::User,
-                content: "<script>alert('x')</script>".to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
-        );
+        let html =
+            render_html(&session("s1"), &[message(Role::User, "<script>alert('x')</script>", 0)]);
         assert!(html.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"));
         assert!(!html.contains("<script>alert"));
     }
@@ -1488,13 +1399,7 @@ mod tests {
     fn html_renderer_places_tldr_before_transcript_and_escapes_it() {
         let html = render_session_html_with_tldr(
             &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::User,
-                content: "First question".to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
+            &[message(Role::User, "First question", 0)],
             &[],
             &SessionDisplayMeta::default(),
             Some("**Query:** <script>alert('x')</script>"),
@@ -1513,13 +1418,11 @@ mod tests {
     fn html_renderer_collapses_tool_lines() {
         let html = render_html(
             &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::Assistant,
-                content: "I will inspect it.\n[tool:run_terminal_command_v2]\n[tool_result:run_terminal_command_v2] {\"output\":\"huge\"}\nThe answer is here.".to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
+            &[message(
+                Role::Assistant,
+                "I will inspect it.\n[tool:run_terminal_command_v2]\n[tool_result:run_terminal_command_v2] {\"output\":\"huge\"}\nThe answer is here.",
+                0,
+            )],
         );
         assert!(html.contains("<p>I will inspect it.</p>"));
         assert!(html.contains("2 tool executions"));
@@ -1534,13 +1437,7 @@ mod tests {
     fn html_renderer_uses_reading_layout_and_code_blocks() {
         let html = render_html(
             &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::User,
-                content: "Run this:\n```bash\nnpm test\n```".to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
+            &[message(Role::User, "Run this:\n```bash\nnpm test\n```", 0)],
         );
         assert!(html.contains("--read-width:716px"));
         assert!(html.contains("class=\"site-header\""));
@@ -1553,13 +1450,7 @@ mod tests {
     fn html_renderer_preserves_unlabeled_code_fence_content() {
         let html = render_html(
             &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::User,
-                content: "Example:\n```\nhello\nworld\n```".to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
+            &[message(Role::User, "Example:\n```\nhello\nworld\n```", 0)],
         );
         assert!(html.contains("hello"));
         assert!(html.contains("world"));
@@ -1569,14 +1460,11 @@ mod tests {
     fn html_renderer_dedents_fenced_code_blocks() {
         let html = render_html(
             &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::Assistant,
-                content: "Example:\n```yaml\n     skill:\n       root: skills/mosoo\n```"
-                    .to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
+            &[message(
+                Role::Assistant,
+                "Example:\n```yaml\n     skill:\n       root: skills/mosoo\n```",
+                0,
+            )],
         );
         assert!(
             html.contains(
@@ -1675,13 +1563,7 @@ mod tests {
         let html = render_html(
             &session("s1"),
             &[
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "Final answer.".to_string(),
-                    timestamp: None,
-                    seq: 0,
-                },
+                message(Role::Assistant, "Final answer.", 0),
                 Message {
                     session_id: "local-id".to_string(),
                     role: Role::Assistant,
@@ -1702,27 +1584,9 @@ mod tests {
         let html = render_html(
             &session("s1"),
             &[
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "Answer incoming.".to_string(),
-                    timestamp: None,
-                    seq: 0,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "[Read] {\"path\":\"src/share.rs\"}".to_string(),
-                    timestamp: None,
-                    seq: 1,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "[Glob] {\"glob_pattern\":\"**/*\"}".to_string(),
-                    timestamp: None,
-                    seq: 2,
-                },
+                message(Role::Assistant, "Answer incoming.", 0),
+                message(Role::Assistant, "[Read] {\"path\":\"src/share.rs\"}", 1),
+                message(Role::Assistant, "[Glob] {\"glob_pattern\":\"**/*\"}", 2),
             ],
         );
         assert!(html.contains("<p>Answer incoming.</p>"));
@@ -1740,48 +1604,12 @@ mod tests {
         let html = render_html(
             &session("s1"),
             &[
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::User,
-                    content: "First question".to_string(),
-                    timestamp: None,
-                    seq: 0,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "Working on it.".to_string(),
-                    timestamp: None,
-                    seq: 1,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "[Read] {\"path\":\"src/share.rs\"}".to_string(),
-                    timestamp: None,
-                    seq: 2,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "Here is the answer.".to_string(),
-                    timestamp: None,
-                    seq: 3,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::User,
-                    content: "Second question".to_string(),
-                    timestamp: None,
-                    seq: 4,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "Second answer.".to_string(),
-                    timestamp: None,
-                    seq: 5,
-                },
+                message(Role::User, "First question", 0),
+                message(Role::Assistant, "Working on it.", 1),
+                message(Role::Assistant, "[Read] {\"path\":\"src/share.rs\"}", 2),
+                message(Role::Assistant, "Here is the answer.", 3),
+                message(Role::User, "Second question", 4),
+                message(Role::Assistant, "Second answer.", 5),
             ],
         );
         assert_eq!(html.matches("class=\"turn user\"").count(), 2);
@@ -1803,27 +1631,9 @@ mod tests {
         let html = render_html(
             &session("s1"),
             &[
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::User,
-                    content: "First question".to_string(),
-                    timestamp: None,
-                    seq: 0,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "First answer.".to_string(),
-                    timestamp: None,
-                    seq: 1,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::User,
-                    content: "Second question".to_string(),
-                    timestamp: None,
-                    seq: 2,
-                },
+                message(Role::User, "First question", 0),
+                message(Role::Assistant, "First answer.", 1),
+                message(Role::User, "Second question", 2),
             ],
         );
         assert!(html.contains("class=\"user-toc\""));
@@ -1841,34 +1651,10 @@ mod tests {
         let html = render_html(
             &session("s1"),
             &[
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::User,
-                    content: "Read the config file.".to_string(),
-                    timestamp: None,
-                    seq: 0,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "[Read] {\"path\":\"config.toml\"}".to_string(),
-                    timestamp: None,
-                    seq: 1,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::User,
-                    content: "{\"method\":\"get_file\",\"content\":\"secret body\"}".to_string(),
-                    timestamp: None,
-                    seq: 2,
-                },
-                Message {
-                    session_id: "local-id".to_string(),
-                    role: Role::Assistant,
-                    content: "Here is what the config says.".to_string(),
-                    timestamp: None,
-                    seq: 3,
-                },
+                message(Role::User, "Read the config file.", 0),
+                message(Role::Assistant, "[Read] {\"path\":\"config.toml\"}", 1),
+                message(Role::User, "{\"method\":\"get_file\",\"content\":\"secret body\"}", 2),
+                message(Role::Assistant, "Here is what the config says.", 3),
             ],
         );
         assert_eq!(html.matches("class=\"turn user\"").count(), 1);
@@ -1902,13 +1688,11 @@ mod tests {
     fn html_renderer_wraps_box_drawing_tables_in_preformatted_block() {
         let html = render_html(
             &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::User,
-                content: "Author rejection cases:\n\n┌────────┬──────────────────────────┐\n│ Field  │ Reject when matched      │\n└────────┴──────────────────────────┘".to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
+            &[message(
+                Role::User,
+                "Author rejection cases:\n\n┌────────┬──────────────────────────┐\n│ Field  │ Reject when matched      │\n└────────┴──────────────────────────┘",
+                0,
+            )],
         );
         assert!(html.contains("preformatted"));
         assert!(html.contains("┌────"));
@@ -1921,13 +1705,11 @@ mod tests {
     fn html_renderer_renders_markdown_and_keeps_inline_mentions() {
         let html = render_html(
             &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::User,
-                content: "**Bold title**\n\n### Section\n\n* first item\n* second item\n\nMention `<oai-mem-citation>` in prose.".to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
+            &[message(
+                Role::User,
+                "**Bold title**\n\n### Section\n\n* first item\n* second item\n\nMention `<oai-mem-citation>` in prose.",
+                0,
+            )],
         );
         assert!(html.contains("<strong>Bold title</strong>"));
         assert!(html.contains("<h3>Section</h3>"));

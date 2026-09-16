@@ -73,10 +73,7 @@ impl SourceAdapter for OpenCodeAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "opencode".to_string(),
-            args: vec!["--session".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("opencode", &["--session", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
@@ -104,11 +101,7 @@ impl SourceAdapter for OpenCodeAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_opencode_db()? else {
-            return Ok(Some(SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            }));
+            return Ok(Some(SyncScanResult::default()));
         };
 
         Ok(Some(scan_for_sync_conn(&conn, context, since_ts, include_events)?))
@@ -435,24 +428,10 @@ fn parse_part_events(
                 })
                 .collect::<Vec<_>>();
             vec![RawSessionEvent {
-                command_evidence_status: None,
                 target: files.first().map(|file| file.path.clone()),
                 files,
-                event_seq,
-                timestamp,
-                kind: "file_write".to_string(),
-                actor: "assistant".to_string(),
                 name: Some("patch".to_string()),
-                status: None,
-                message_seq: None,
-                summary: None,
-                source_path: source_path.map(str::to_string),
-                source_event_id: Some(part_id.to_string()),
-                tool_call_id: None,
-                is_meta: None,
-                visibility: None,
-                attrs_json: None,
-                parser_version: EVENT_PARSER_VERSION,
+                ..context(event_seq, part_id.to_string()).event("file_write", "assistant")
             }]
         }
         _ => Vec::new(),
@@ -538,13 +517,11 @@ fn parse_part_events(
                     .and_then(Value::as_str)
                     .filter(|path| !path.trim().is_empty())
             {
-                event.files.push(FileEvidence {
-                    path: path.to_string(),
+                event.files.push(FileEvidence::call(
+                    path.to_string(),
                     operation,
-                    kind: FileEvidenceKind::Call,
-                    cwd: cwd.filter(|_| !options.zcode_tools).map(str::to_string),
-                    target: None,
-                });
+                    cwd.filter(|_| !options.zcode_tools).map(str::to_string),
+                ));
             }
             if event.name.as_deref() == Some("apply_patch")
                 && let Some(patch) =
@@ -831,7 +808,7 @@ pub(crate) fn scan_for_sync_conn_with_options(
                     session.time_updated,
                     include_events,
                 )
-                && crate::adapters::sync_state::metadata_state_is_current(
+                && crate::adapters::sync_state::parser_state_is_current(
                     METADATA_PARSER_VERSION,
                     metadata_state.get(&session.id).copied(),
                     session.time_updated,
@@ -853,8 +830,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::db::store::SessionTopologyWrite;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
+    use crate::db::store::Store;
     use crate::types::Session;
 
     fn make_session(
@@ -864,31 +844,15 @@ mod tests {
         message_count: u32,
     ) -> Session {
         Session {
-            id: id.to_string(),
             source: "opencode".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
             directory: Some("/tmp/project".to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
             started_at: 100,
             updated_at,
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(id)
         }
-    }
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
     }
 
     fn setup_opencode_db() -> (PathBuf, Connection) {
@@ -950,41 +914,15 @@ mod tests {
     }
 
     fn mark_usage_current(store: &Store, source_id: &str, updated_at: Option<i64>) {
-        store
-            .persist_usage_events_for_existing_session(
-                "opencode",
-                source_id,
-                &[],
-                USAGE_PARSER_VERSION,
-                updated_at,
-            )
-            .unwrap();
+        seed_empty_usage_state(store, "opencode", source_id, USAGE_PARSER_VERSION, updated_at);
     }
 
     fn mark_event_current(store: &Store, source_id: &str, updated_at: Option<i64>) {
-        store
-            .persist_session_events_for_existing_session(
-                "opencode",
-                source_id,
-                &[],
-                EVENT_PARSER_VERSION,
-                updated_at,
-            )
-            .unwrap();
+        seed_empty_event_state(store, "opencode", source_id, EVENT_PARSER_VERSION, updated_at);
     }
 
     fn mark_metadata_current(store: &Store, source_id: &str) {
-        store
-            .persist_topology_for_existing_session(
-                "opencode",
-                source_id,
-                &SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_metadata_state(store, "opencode", source_id, METADATA_PARSER_VERSION);
     }
 
     #[test]
@@ -1286,15 +1224,7 @@ mod tests {
             assert!(result.sessions.is_empty());
             assert_eq!(result.stats.skipped_sessions, 1);
 
-            store
-                .persist_session_events_for_existing_session(
-                    source,
-                    "s1",
-                    &[],
-                    EVENT_PARSER_VERSION - 1,
-                    Some(200),
-                )
-                .unwrap();
+            seed_empty_event_state(&store, source, "s1", EVENT_PARSER_VERSION - 1, Some(200));
             let mut result = scan_for_sync_conn(
                 &conn,
                 &AdapterSyncContext::from_store_for_test(&store, source).unwrap(),

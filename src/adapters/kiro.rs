@@ -15,9 +15,7 @@ use crate::adapters::{
     SyncScanStats, first_timestamp, last_timestamp,
 };
 use crate::db::store::SessionPath;
-use crate::types::{
-    CommandEvidenceStatus, FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, Role,
-};
+use crate::types::{CommandEvidenceStatus, FileEvidence, FileOperation, RawSessionEvent, Role};
 
 const EVENT_PARSER_VERSION: u32 = 1;
 const METADATA_PARSER_VERSION: u32 = 1;
@@ -33,10 +31,7 @@ impl SourceAdapter for KiroAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "kiro-cli".to_string(),
-            args: vec!["chat".to_string(), "--resume-id".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("kiro-cli", &["chat", "--resume-id", source_id]))
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
@@ -568,12 +563,8 @@ fn kiro_tool_call(
     event.files = paths
         .into_iter()
         .filter(|(path, _)| !path.trim().is_empty())
-        .map(|(path, operation)| FileEvidence {
-            path: path.to_string(),
-            operation,
-            kind: FileEvidenceKind::Call,
-            cwd: cwd.map(str::to_string),
-            target: None,
+        .map(|(path, operation)| {
+            FileEvidence::call(path.to_string(), operation, cwd.map(str::to_string))
         })
         .collect();
     event.target = event.files.first().map(|file| file.path.clone());

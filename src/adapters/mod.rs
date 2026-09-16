@@ -25,6 +25,7 @@ pub(crate) mod opencode;
 pub(crate) mod openhands;
 pub(crate) mod paths;
 pub(crate) mod pi;
+mod pi_session;
 pub(crate) mod qwen;
 pub(crate) mod roo;
 pub(crate) mod sync_state;
@@ -35,10 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
-use crate::db::store::{
-    EventSessionStateMeta, IndexedSessionMeta, MetadataSessionStateMeta, SessionPath,
-    UsageSessionStateMeta,
-};
+use crate::db::store::{IndexedSessionMeta, ParserStateMeta, SessionPath};
 use crate::types::{ParentLink, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) trait SourceAdapter {
@@ -84,18 +82,18 @@ pub(crate) struct AdapterSyncContext {
     session_meta: HashMap<String, IndexedSessionMeta>,
     session_paths: HashMap<String, SessionPath>,
     imported_ids: HashSet<String>,
-    usage_state: HashMap<String, UsageSessionStateMeta>,
-    event_state: HashMap<String, EventSessionStateMeta>,
-    metadata_state: HashMap<String, MetadataSessionStateMeta>,
+    usage_state: HashMap<String, ParserStateMeta>,
+    event_state: HashMap<String, ParserStateMeta>,
+    metadata_state: HashMap<String, ParserStateMeta>,
 }
 
 pub(crate) struct AdapterSyncContextParts {
     pub(crate) session_meta: HashMap<String, IndexedSessionMeta>,
     pub(crate) session_paths: HashMap<String, SessionPath>,
     pub(crate) imported_ids: HashSet<String>,
-    pub(crate) usage_state: HashMap<String, UsageSessionStateMeta>,
-    pub(crate) event_state: HashMap<String, EventSessionStateMeta>,
-    pub(crate) metadata_state: HashMap<String, MetadataSessionStateMeta>,
+    pub(crate) usage_state: HashMap<String, ParserStateMeta>,
+    pub(crate) event_state: HashMap<String, ParserStateMeta>,
+    pub(crate) metadata_state: HashMap<String, ParserStateMeta>,
 }
 
 impl AdapterSyncContext {
@@ -104,9 +102,9 @@ impl AdapterSyncContext {
         session_meta: HashMap<String, IndexedSessionMeta>,
         session_paths: HashMap<String, SessionPath>,
         imported_ids: HashSet<String>,
-        usage_state: HashMap<String, UsageSessionStateMeta>,
-        event_state: HashMap<String, EventSessionStateMeta>,
-        metadata_state: HashMap<String, MetadataSessionStateMeta>,
+        usage_state: HashMap<String, ParserStateMeta>,
+        event_state: HashMap<String, ParserStateMeta>,
+        metadata_state: HashMap<String, ParserStateMeta>,
     ) -> Self {
         Self {
             source,
@@ -135,15 +133,15 @@ impl AdapterSyncContext {
         !self.session_meta.is_empty()
     }
 
-    pub(crate) fn usage_state(&self) -> &HashMap<String, UsageSessionStateMeta> {
+    pub(crate) fn usage_state(&self) -> &HashMap<String, ParserStateMeta> {
         &self.usage_state
     }
 
-    pub(crate) fn event_state(&self) -> &HashMap<String, EventSessionStateMeta> {
+    pub(crate) fn event_state(&self) -> &HashMap<String, ParserStateMeta> {
         &self.event_state
     }
 
-    pub(crate) fn metadata_state(&self) -> &HashMap<String, MetadataSessionStateMeta> {
+    pub(crate) fn metadata_state(&self) -> &HashMap<String, ParserStateMeta> {
         &self.metadata_state
     }
 
@@ -357,6 +355,13 @@ pub(crate) struct ResumeCommand {
 }
 
 impl ResumeCommand {
+    pub(crate) fn new(program: &str, args: &[&str]) -> Self {
+        Self {
+            program: program.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        }
+    }
+
     pub(crate) fn display(&self) -> String {
         let mut out = self.program.clone();
         for arg in &self.args {
@@ -470,5 +475,70 @@ mod tests {
     fn all_adapters_includes_amp() {
         let ids: Vec<_> = all_adapters().iter().map(|adapter| adapter.id().to_string()).collect();
         assert!(ids.iter().any(|id| id == "amp"), "amp missing from all_adapters()");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::db::store::{SessionTopologyWrite, Store};
+
+    pub(crate) fn store() -> crate::db::store::Store {
+        crate::db::schema::register_sqlite_vec();
+        crate::db::store::Store::open_in_memory().unwrap()
+    }
+
+    pub(crate) fn seed_empty_usage_state(
+        store: &Store,
+        source: &str,
+        source_id: &str,
+        parser_version: u32,
+        updated_at: Option<i64>,
+    ) {
+        store
+            .persist_usage_events_for_existing_session(
+                source,
+                source_id,
+                &[],
+                parser_version,
+                updated_at,
+            )
+            .unwrap();
+    }
+
+    pub(crate) fn seed_empty_event_state(
+        store: &Store,
+        source: &str,
+        source_id: &str,
+        parser_version: u32,
+        updated_at: Option<i64>,
+    ) {
+        store
+            .persist_session_events_for_existing_session(
+                source,
+                source_id,
+                &[],
+                parser_version,
+                updated_at,
+            )
+            .unwrap();
+    }
+
+    pub(crate) fn seed_empty_metadata_state(
+        store: &Store,
+        source: &str,
+        source_id: &str,
+        parser_version: u32,
+    ) {
+        store
+            .persist_topology_for_existing_session(
+                source,
+                source_id,
+                &SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(parser_version),
+                },
+            )
+            .unwrap();
     }
 }

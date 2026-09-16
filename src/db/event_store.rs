@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::OptionalExtension;
 
-use super::store::{EventSessionStateMeta, Store};
+use super::store::{ParserStateMeta, Store};
 use crate::types::{
     CommandEvidenceStatus, EvidenceVisibility, RawSessionEvent, SessionEventRecord,
 };
@@ -13,22 +13,13 @@ impl Store {
     pub(crate) fn event_state_meta_map(
         &self,
         source: &str,
-    ) -> Result<HashMap<String, EventSessionStateMeta>> {
-        let mut stmt = self.conn.prepare(
+    ) -> Result<HashMap<String, ParserStateMeta>> {
+        self.parser_state_map(
             "SELECT source_id, parser_version, source_updated_at
              FROM event_session_state
              WHERE source = ?1 AND session_id IN (SELECT session_id FROM native_bindings)",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![source], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                EventSessionStateMeta {
-                    parser_version: row.get(1)?,
-                    source_updated_at: row.get(2)?,
-                },
-            ))
-        })?;
-        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
+            source,
+        )
     }
 
     pub(crate) fn persist_session_events_for_existing_session(

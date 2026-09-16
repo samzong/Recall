@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::types::{FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent};
+use crate::types::{FileEvidence, FileOperation, RawSessionEvent};
 
 mod command;
 
@@ -17,6 +17,31 @@ pub(crate) struct EventContext {
     pub(crate) parser_version: u32,
 }
 
+impl EventContext {
+    pub(crate) fn event(self, kind: &str, actor: &str) -> RawSessionEvent {
+        RawSessionEvent {
+            command_evidence_status: None,
+            files: Vec::new(),
+            event_seq: self.event_seq,
+            timestamp: self.timestamp,
+            kind: kind.into(),
+            actor: actor.into(),
+            name: None,
+            status: None,
+            target: None,
+            message_seq: self.message_seq,
+            summary: None,
+            source_path: self.source_path,
+            source_event_id: self.source_event_id,
+            tool_call_id: None,
+            is_meta: None,
+            visibility: None,
+            attrs_json: None,
+            parser_version: self.parser_version,
+        }
+    }
+}
+
 pub(crate) fn tool_call_event(
     context: EventContext,
     name: String,
@@ -30,24 +55,11 @@ pub(crate) fn tool_call_event(
         other => format!("[{name}] {other}"),
     });
     RawSessionEvent {
-        command_evidence_status: None,
-        files: Vec::new(),
-        event_seq: context.event_seq,
-        timestamp: context.timestamp,
-        kind: kind.to_string(),
-        actor: "assistant".to_string(),
         name: Some(name),
-        status: None,
         target,
-        message_seq: context.message_seq,
         summary: summary.map(bounded_summary),
-        source_path: context.source_path,
-        source_event_id: context.source_event_id,
-        tool_call_id: None,
-        is_meta: None,
-        visibility: None,
         attrs_json: args.map(|value| value.to_string()),
-        parser_version: context.parser_version,
+        ..context.event(kind, "assistant")
     }
 }
 
@@ -64,24 +76,11 @@ pub(crate) fn tool_call_event_from_text(
         if text.trim().is_empty() { format!("[{name}]") } else { format!("[{name}] {text}") }
     });
     RawSessionEvent {
-        command_evidence_status: None,
-        files: Vec::new(),
-        event_seq: context.event_seq,
-        timestamp: context.timestamp,
-        kind: kind.to_string(),
-        actor: "assistant".to_string(),
         name: Some(name),
-        status: None,
         target,
-        message_seq: context.message_seq,
         summary: summary.map(bounded_summary),
-        source_path: context.source_path,
-        source_event_id: context.source_event_id,
-        tool_call_id: None,
-        is_meta: None,
-        visibility: None,
         attrs_json: parsed.map(|value| value.to_string()),
-        parser_version: context.parser_version,
+        ..context.event(kind, "assistant")
     }
 }
 
@@ -91,24 +90,9 @@ pub(crate) fn tool_result_event(
     summary: Option<String>,
 ) -> RawSessionEvent {
     RawSessionEvent {
-        command_evidence_status: None,
-        files: Vec::new(),
-        event_seq: context.event_seq,
-        timestamp: context.timestamp,
-        kind: "tool_result".to_string(),
-        actor: "tool".to_string(),
         name,
-        status: None,
-        target: None,
-        message_seq: context.message_seq,
         summary: summary.map(bounded_summary),
-        source_path: context.source_path,
-        source_event_id: context.source_event_id,
-        tool_call_id: None,
-        is_meta: None,
-        visibility: None,
-        attrs_json: None,
-        parser_version: context.parser_version,
+        ..context.event("tool_result", "tool")
     }
 }
 
@@ -119,24 +103,10 @@ pub(crate) fn file_write_event(
 ) -> RawSessionEvent {
     let summary = format!("[{name}] {target}");
     RawSessionEvent {
-        command_evidence_status: None,
-        files: Vec::new(),
-        event_seq: context.event_seq,
-        timestamp: context.timestamp,
-        kind: "file_write".to_string(),
-        actor: "assistant".to_string(),
         name: Some(name),
-        status: None,
         target: Some(target),
-        message_seq: context.message_seq,
         summary: Some(bounded_summary(summary)),
-        source_path: context.source_path,
-        source_event_id: context.source_event_id,
-        tool_call_id: None,
-        is_meta: None,
-        visibility: None,
-        attrs_json: None,
-        parser_version: context.parser_version,
+        ..context.event("file_write", "assistant")
     }
 }
 
@@ -178,13 +148,7 @@ pub(crate) fn patch_file_evidence(text: &str) -> Vec<FileEvidence> {
         if let Some((path, operation)) = parsed
             && !path.trim().is_empty()
         {
-            files.push(FileEvidence {
-                path: path.into(),
-                operation,
-                kind: FileEvidenceKind::Call,
-                cwd: None,
-                target: None,
-            });
+            files.push(FileEvidence::call(path.into(), operation, None));
         }
     }
     files

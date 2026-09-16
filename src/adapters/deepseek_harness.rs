@@ -19,7 +19,7 @@ use crate::{
         file_scan::{self, FileScanEntry},
         usage::usage_count,
     },
-    types::{FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, RawUsageEvent, Role},
+    types::{FileEvidence, FileOperation, RawSessionEvent, RawUsageEvent, Role},
 };
 
 const DSH_SESSION_FORMAT_VERSION: i64 = 0;
@@ -383,13 +383,11 @@ fn parse_dsh_session(path: &Path, include_events: bool) -> Result<ParsedDshSessi
                         }
                         .to_string();
                         parsed.target = Some(file_path.to_string());
-                        parsed.files.push(FileEvidence {
-                            path: file_path.to_string(),
+                        parsed.files.push(FileEvidence::call(
+                            file_path.to_string(),
                             operation,
-                            kind: FileEvidenceKind::Call,
-                            cwd: cwd.clone(),
-                            target: None,
-                        });
+                            cwd.clone(),
+                        ));
                     }
                     if name == "bash" {
                         parsed.kind = "command".to_string();
@@ -645,12 +643,16 @@ fn dsh_turn_step(event: &Value) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::FileEvidenceKind;
     use std::fs;
 
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+    };
 
     #[test]
     fn parses_multiframe_zstd_with_encoded_id_and_filters_injected_context() {
@@ -948,15 +950,13 @@ mod tests {
         let mtime = file_scan::stat_mtime_ms(&plain).unwrap();
         store.conn.execute("INSERT INTO sessions (id, source, source_id, title, started_at, updated_at, message_count) VALUES ('stored-id', 'deepseek-harness', 'session/test', 'title', 1000, ?1, 2)", [mtime]).unwrap();
         store.conn.execute_batch("INSERT INTO native_bindings SELECT source, source_id, id, NOT is_import FROM sessions;").unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "deepseek-harness",
-                "session/test",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "deepseek-harness",
+            "session/test",
+            USAGE_PARSER_VERSION,
+            Some(mtime),
+        );
         for (version, metadata_current) in [
             (None, false),
             (Some(EVENT_PARSER_VERSION - 1), false),
@@ -964,28 +964,21 @@ mod tests {
             (Some(EVENT_PARSER_VERSION), true),
         ] {
             if metadata_current {
-                store
-                    .persist_topology_for_existing_session(
-                        "deepseek-harness",
-                        "session/test",
-                        &crate::db::store::SessionTopologyWrite {
-                            thread_role: None,
-                            parents: &[],
-                            parser_version: Some(METADATA_PARSER_VERSION),
-                        },
-                    )
-                    .unwrap();
+                seed_empty_metadata_state(
+                    &store,
+                    "deepseek-harness",
+                    "session/test",
+                    METADATA_PARSER_VERSION,
+                );
             }
             if let Some(version) = version {
-                store
-                    .persist_session_events_for_existing_session(
-                        "deepseek-harness",
-                        "session/test",
-                        &[],
-                        version,
-                        Some(mtime),
-                    )
-                    .unwrap();
+                seed_empty_event_state(
+                    &store,
+                    "deepseek-harness",
+                    "session/test",
+                    version,
+                    Some(mtime),
+                );
             }
             let result = file_scan::run_file_scan_with_options_and_snapshot(
                 &AdapterSyncContext::from_store_for_test(&store, "deepseek-harness").unwrap(),

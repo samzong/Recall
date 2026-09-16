@@ -198,6 +198,12 @@ mod tests {
     use crate::types::{MatchSource, Message, Role, SearchResult, Session};
     use crate::usage::TokenTotals;
 
+    fn test_app() -> App {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default())
+    }
+
     fn numbered_session_result(n: usize) -> SearchResult {
         SearchResult {
             session: Session {
@@ -281,10 +287,7 @@ mod tests {
 
     #[test]
     fn render_result_list_scrolls_selected_row_into_view() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        let mut app = test_app();
         app.results = (1..=6).map(numbered_session_result).collect();
         app.selected_index = 3;
 
@@ -298,31 +301,25 @@ mod tests {
 
     #[test]
     fn render_filter_bar_always_shows_active_project_scope() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        let mut app = test_app();
 
-        app.scope = crate::project_scope::ProjectScope::Repository {
+        app.filters.active.scope = crate::project_scope::ProjectScope::Repository {
             filter: crate::db::search::RepoFilter::Remote("github.com/samzong/Recall".to_string()),
             local_root: None,
         };
         assert!(render_to_text(&app, 80, 10).contains("samzong/Recall"));
 
-        app.scope = crate::project_scope::ProjectScope::Global;
+        app.filters.active.scope = crate::project_scope::ProjectScope::Global;
         assert!(render_to_text(&app, 80, 10).contains("All projects"));
     }
 
     #[test]
     fn render_viewing_shows_subagent_hint_and_picker() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
-        app.viewing_session = Some(numbered_session_result(1).session);
-        app.viewing_children =
+        let mut app = test_app();
+        app.viewing.session = Some(numbered_session_result(1).session);
+        app.viewing.children =
             vec![numbered_session_result(2).session, numbered_session_result(3).session];
-        app.viewing_messages = vec![Message {
+        app.viewing.messages = vec![Message {
             session_id: "session1".to_string(),
             role: Role::User,
             content: "hello".to_string(),
@@ -343,13 +340,10 @@ mod tests {
 
     #[test]
     fn render_subagents_picker_scrolls_selection_into_view() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
-        app.viewing_session = Some(numbered_session_result(1).session);
-        app.viewing_children = (1..=20).map(|n| numbered_session_result(n).session).collect();
-        app.subagent_selected = 19;
+        let mut app = test_app();
+        app.viewing.session = Some(numbered_session_result(1).session);
+        app.viewing.children = (1..=20).map(|n| numbered_session_result(n).session).collect();
+        app.viewing.child_selected = 19;
         app.mode = AppMode::Subagents;
 
         let picker = render_to_text(&app, 80, 12);
@@ -361,10 +355,7 @@ mod tests {
 
     #[test]
     fn render_result_list_keeps_viewport_when_selection_is_visible() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        let mut app = test_app();
         app.results = (1..=6).map(numbered_session_result).collect();
         app.selected_index = 1;
         app.result_scroll_offset = 1;
@@ -378,10 +369,7 @@ mod tests {
 
     #[test]
     fn render_result_list_selected_row_background_fills_interior() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        let mut app = test_app();
         let mut selected = numbered_session_result(1);
         selected.session.title = "--- /tmp/pyrefly_base.txt漢".to_string();
         app.results = vec![selected, numbered_session_result(2)];
@@ -415,10 +403,7 @@ mod tests {
 
     #[test]
     fn render_preview_neutral_content_inherits_terminal_palette() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        let mut app = test_app();
         app.results = vec![numbered_session_result(1)];
         app.preview_messages = vec![Message {
             session_id: "session1".to_string(),
@@ -444,46 +429,30 @@ mod tests {
 
     #[test]
     fn render_viewing_shows_one_line_session_summary_below_title() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        let mut app = test_app();
         app.mode = AppMode::Viewing;
         app.results = vec![SearchResult {
             session: Session {
-                id: "session1".to_string(),
-                source: "codex".to_string(),
-                source_id: "source1".to_string(),
-                title: "Test session".to_string(),
+                title: "Test session".into(),
                 directory: Some("/tmp/repo".to_string()),
-                repo_remote: None,
-                repo_slug: None,
-                repo_name: None,
-                started_at: 0,
                 updated_at: Some(120_000),
-                message_count: 1,
-                entrypoint: None,
-                custom_title: None,
-                summary: None,
                 duration_minutes: Some(2),
-                source_file_path: None,
                 is_import: false,
-                locations: Vec::new(),
-                alternative_versions: 0,
+                ..numbered_session_result(1).session
             },
             match_source: MatchSource::Fts,
             snippet: None,
         }];
-        app.viewing_messages = vec![Message {
+        app.viewing.messages = vec![Message {
             session_id: "session1".to_string(),
             role: Role::User,
             content: "hello".to_string(),
             timestamp: Some(0),
             seq: 0,
         }];
-        app.viewing_sanitized_lines =
+        app.viewing.lines =
             vec![vec![SanitizedLine { text: "hello".to_string(), lower: "hello".to_string() }]];
-        app.viewing_session_summary = Some(ViewingSessionSummary {
+        app.viewing.summary = Some(ViewingSessionSummary {
             user_messages: 2,
             total_messages: 3,
             duration_minutes: Some(2),
@@ -511,44 +480,28 @@ mod tests {
 
     #[test]
     fn render_share_result_popup_shows_share_url() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        let mut app = test_app();
         app.mode = AppMode::ShareResult;
         app.results = vec![SearchResult {
             session: Session {
-                id: "session1".to_string(),
-                source: "codex".to_string(),
-                source_id: "source1".to_string(),
-                title: "Test session".to_string(),
+                title: "Test session".into(),
                 directory: None,
-                repo_remote: None,
-                repo_slug: None,
-                repo_name: None,
-                started_at: 0,
                 updated_at: None,
-                message_count: 1,
-                entrypoint: None,
-                custom_title: None,
-                summary: None,
                 duration_minutes: None,
-                source_file_path: None,
                 is_import: false,
-                locations: Vec::new(),
-                alternative_versions: 0,
+                ..numbered_session_result(1).session
             },
             match_source: MatchSource::Fts,
             snippet: None,
         }];
-        app.viewing_messages = vec![Message {
+        app.viewing.messages = vec![Message {
             session_id: "session1".to_string(),
             role: Role::User,
             content: "hello".to_string(),
             timestamp: None,
             seq: 0,
         }];
-        app.viewing_sanitized_lines =
+        app.viewing.lines =
             vec![vec![SanitizedLine { text: "hello".to_string(), lower: "hello".to_string() }]];
         app.share_popup = Some(SharePopup {
             url: Some("https://recall-share.pages.dev/source1".to_string()),
@@ -576,10 +529,7 @@ mod tests {
 
     #[test]
     fn render_handoff_target_picker_shows_targets() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        let mut app = test_app();
         app.mode = AppMode::HandoffTarget;
         app.handoff_targets = vec![
             crate::handoff::HandoffTarget { id: "codex".into(), label: "Codex".into() },
@@ -590,37 +540,24 @@ mod tests {
         app.handoff_target_selected = 3;
         app.results = vec![SearchResult {
             session: Session {
-                id: "session1".to_string(),
-                source: "codex".to_string(),
-                source_id: "source1".to_string(),
-                title: "Test session".to_string(),
+                title: "Test session".into(),
                 directory: None,
-                repo_remote: None,
-                repo_slug: None,
-                repo_name: None,
-                started_at: 0,
                 updated_at: None,
-                message_count: 1,
-                entrypoint: None,
-                custom_title: None,
-                summary: None,
                 duration_minutes: None,
-                source_file_path: None,
                 is_import: true,
-                locations: Vec::new(),
-                alternative_versions: 0,
+                ..numbered_session_result(1).session
             },
             match_source: MatchSource::Fts,
             snippet: None,
         }];
-        app.viewing_messages = vec![Message {
+        app.viewing.messages = vec![Message {
             session_id: "session1".to_string(),
             role: Role::User,
             content: "hello".to_string(),
             timestamp: None,
             seq: 0,
         }];
-        app.viewing_sanitized_lines =
+        app.viewing.lines =
             vec![vec![SanitizedLine { text: "hello".to_string(), lower: "hello".to_string() }]];
 
         let backend = TestBackend::new(90, 18);
@@ -649,10 +586,7 @@ mod tests {
 
     #[test]
     fn render_handoff_target_picker_fits_short_terminal() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app =
-            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        let mut app = test_app();
         app.mode = AppMode::HandoffTarget;
         app.handoff_targets = (0..17)
             .map(|index| crate::handoff::HandoffTarget {

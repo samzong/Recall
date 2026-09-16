@@ -9,7 +9,7 @@ use crate::db::store::Store;
 use crate::project_scope::ProjectScope;
 use crate::query::{parse_time_range, resolve_source_filter};
 use crate::types::{
-    Message, Role, Session, SessionEventRecord, SessionTopology, SessionUsageEventRecord,
+    Message, Session, SessionEventRecord, SessionTopology, SessionUsageEventRecord,
 };
 
 pub(crate) const RECORD_SCHEMA_VERSION: u32 = 7;
@@ -103,8 +103,8 @@ struct ExportSessionRecord {
     record_type: &'static str,
     session: ExportSession,
     messages: Vec<ExportMessage>,
-    usage_events: Vec<ExportUsageEvent>,
-    events: Vec<ExportEvent>,
+    usage_events: Vec<SessionUsageEventRecord>,
+    events: Vec<SessionEventRecord>,
 }
 
 #[derive(Serialize)]
@@ -134,47 +134,6 @@ struct ExportMessage {
     role: &'static str,
     timestamp: Option<i64>,
     content: String,
-}
-
-#[derive(Serialize)]
-struct ExportUsageEvent {
-    event_key: String,
-    event_seq: u32,
-    message_seq: Option<u32>,
-    timestamp: i64,
-    model: String,
-    provider: String,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_tokens: i64,
-    cache_write_tokens: i64,
-    reasoning_tokens: i64,
-    token_source: String,
-    parser_version: u32,
-    source_path: Option<String>,
-    raw_usage_json: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ExportEvent {
-    command_evidence_status: Option<crate::types::CommandEvidenceStatus>,
-    files: Vec<crate::types::FileEvidence>,
-    event_seq: u32,
-    timestamp: Option<i64>,
-    kind: String,
-    actor: String,
-    name: Option<String>,
-    status: Option<String>,
-    target: Option<String>,
-    message_seq: Option<u32>,
-    summary: Option<String>,
-    source_path: Option<String>,
-    source_event_id: Option<String>,
-    tool_call_id: Option<String>,
-    is_meta: Option<bool>,
-    visibility: Option<crate::types::EvidenceVisibility>,
-    attrs_json: Option<String>,
-    parser_version: u32,
 }
 
 pub(crate) fn write_jsonl<W: Write>(
@@ -295,8 +254,8 @@ fn build_session_record(
         record_type: RECORD_TYPE,
         session: export_session(session, topology),
         messages: messages.into_iter().map(Into::into).collect(),
-        usage_events: usage_events.into_iter().map(Into::into).collect(),
-        events: events.into_iter().map(Into::into).collect(),
+        usage_events,
+        events,
     }
 }
 
@@ -324,57 +283,7 @@ fn export_session(session: Session, topology: SessionTopology) -> ExportSession 
 
 impl From<Message> for ExportMessage {
     fn from(message: Message) -> Self {
-        let role = match message.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-        };
+        let role = message.role.as_str();
         Self { seq: message.seq, role, timestamp: message.timestamp, content: message.content }
-    }
-}
-
-impl From<SessionUsageEventRecord> for ExportUsageEvent {
-    fn from(event: SessionUsageEventRecord) -> Self {
-        Self {
-            event_key: event.event_key,
-            event_seq: event.event_seq,
-            message_seq: event.message_seq,
-            timestamp: event.timestamp,
-            model: event.model,
-            provider: event.provider,
-            input_tokens: event.input_tokens,
-            output_tokens: event.output_tokens,
-            cache_read_tokens: event.cache_read_tokens,
-            cache_write_tokens: event.cache_write_tokens,
-            reasoning_tokens: event.reasoning_tokens,
-            token_source: event.token_source,
-            parser_version: event.parser_version,
-            source_path: event.source_path,
-            raw_usage_json: event.raw_usage_json,
-        }
-    }
-}
-
-impl From<SessionEventRecord> for ExportEvent {
-    fn from(event: SessionEventRecord) -> Self {
-        Self {
-            command_evidence_status: event.command_evidence_status,
-            files: event.files,
-            event_seq: event.event_seq,
-            timestamp: event.timestamp,
-            kind: event.kind,
-            actor: event.actor,
-            name: event.name,
-            status: event.status,
-            target: event.target,
-            message_seq: event.message_seq,
-            summary: event.summary,
-            source_path: event.source_path,
-            source_event_id: event.source_event_id,
-            tool_call_id: event.tool_call_id,
-            is_meta: event.is_meta,
-            visibility: event.visibility,
-            attrs_json: event.attrs_json,
-            parser_version: event.parser_version,
-        }
     }
 }

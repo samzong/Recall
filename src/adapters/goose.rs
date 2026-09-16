@@ -14,8 +14,8 @@ use crate::adapters::{
     SyncScanOutput, SyncScanResult, SyncScanStats, first_timestamp, last_timestamp,
 };
 use crate::types::{
-    FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation, RawSessionEvent,
-    RawUsageEvent, Role, ThreadRole,
+    FileEvidence, FileOperation, ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role,
+    ThreadRole,
 };
 
 const SOURCE: &str = "goose";
@@ -83,15 +83,7 @@ impl SourceAdapter for GooseAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "goose".to_string(),
-            args: vec![
-                "session".to_string(),
-                "--resume".to_string(),
-                "--session-id".to_string(),
-                source_id.to_string(),
-            ],
-        })
+        Some(ResumeCommand::new("goose", &["session", "--resume", "--session-id", source_id]))
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
@@ -209,7 +201,7 @@ fn scan_db(
                         freshness,
                         include_events,
                     )
-                    && crate::adapters::sync_state::metadata_state_is_current(
+                    && crate::adapters::sync_state::parser_state_is_current(
                         METADATA_PARSER_VERSION,
                         metadata_state.and_then(|state| state.get(&row.id).copied()),
                         freshness,
@@ -605,13 +597,11 @@ fn parse_tool_event(
                         if operation == FileOperation::Read { "file_read" } else { "file_write" }
                             .to_string();
                     event.target = Some(path.to_string());
-                    event.files.push(FileEvidence {
-                        path: path.to_string(),
+                    event.files.push(FileEvidence::call(
+                        path.to_string(),
                         operation,
-                        kind: FileEvidenceKind::Call,
-                        cwd: Some(directory.to_string()).filter(|cwd| !cwd.trim().is_empty()),
-                        target: None,
-                    });
+                        Some(directory.to_string()).filter(|cwd| !cwd.trim().is_empty()),
+                    ));
                 } else if name == Some("developer__shell") {
                     event.kind = "command".to_string();
                     event.target = args.get("command").and_then(Value::as_str).map(str::to_string);
@@ -759,36 +749,24 @@ fn col_or_lit(columns: &HashSet<String>, name: &str, lit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
+    use crate::types::FileEvidenceKind;
     use crate::types::Session;
 
     fn make_session(source_id: &str, updated_at: Option<i64>, message_count: u32) -> Session {
         Session {
-            id: format!("local-{source_id}"),
             source: SOURCE.to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
             directory: Some("/repo".to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
             started_at: 100,
             updated_at,
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(&format!("local-{source_id}"))
         }
-    }
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
     }
 
     fn write_empty(path: &Path) {
@@ -1267,35 +1245,9 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_session("s1", Some(200_000), 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                SOURCE,
-                "s1",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                SOURCE,
-                "s1",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                SOURCE,
-                "s1",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, SOURCE, "s1", USAGE_PARSER_VERSION, Some(200_000));
+        seed_empty_event_state(&store, SOURCE, "s1", EVENT_PARSER_VERSION, Some(200_000));
+        seed_empty_metadata_state(&store, SOURCE, "s1", METADATA_PARSER_VERSION);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
         let result = scan_db(
@@ -1307,15 +1259,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.scan.stats.skipped_sessions, 1);
-        store
-            .persist_session_events_for_existing_session(
-                SOURCE,
-                "s1",
-                &[],
-                EVENT_PARSER_VERSION - 1,
-                Some(200_000),
-            )
-            .unwrap();
+        seed_empty_event_state(&store, SOURCE, "s1", EVENT_PARSER_VERSION - 1, Some(200_000));
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
         let stale = scan_db(
             opened,
@@ -1357,35 +1301,9 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_session("s1", Some(200_000), 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                SOURCE,
-                "s1",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                SOURCE,
-                "s1",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                SOURCE,
-                "s1",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, SOURCE, "s1", USAGE_PARSER_VERSION, Some(200_000));
+        seed_empty_event_state(&store, SOURCE, "s1", EVENT_PARSER_VERSION, Some(200_000));
+        seed_empty_metadata_state(&store, SOURCE, "s1", METADATA_PARSER_VERSION);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
         let result = scan_db(

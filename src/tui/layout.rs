@@ -82,6 +82,45 @@ pub(crate) struct MessagePane {
 }
 
 impl MessagePane {
+    pub(crate) fn page(
+        &self,
+        selected: &mut usize,
+        scroll_offset: &mut usize,
+        viewport: usize,
+        up: bool,
+    ) {
+        if viewport == 0 || self.rows.is_empty() || self.total_rows() <= viewport {
+            return;
+        }
+
+        let current = self.scroll_start(*scroll_offset, *selected, viewport);
+        let max_start = self.total_rows().saturating_sub(viewport);
+        let target =
+            if up { current.saturating_sub(viewport) } else { (current + viewport).min(max_start) };
+        let Some(index) = (!up && target == max_start)
+            .then_some(self.rows.len() - 1)
+            .or_else(|| self.index_at(target))
+        else {
+            return;
+        };
+
+        *selected = index;
+        *scroll_offset = self.scroll_start(target, *selected, viewport);
+    }
+    pub(crate) fn message_at(
+        &self,
+        row: u16,
+        area: Rect,
+        offset: usize,
+        selected: usize,
+    ) -> Option<(usize, usize)> {
+        if row < area.y || row >= area.bottom() {
+            return None;
+        }
+        let start = self.scroll_start(offset, selected, area.height as usize);
+        self.index_at(start + usize::from(row - area.y)).map(|index| (index, start))
+    }
+
     pub(crate) fn new(rows: Vec<usize>, focus: Vec<usize>) -> Self {
         debug_assert_eq!(rows.len(), focus.len());
         Self { rows, focus }

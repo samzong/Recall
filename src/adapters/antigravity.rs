@@ -13,10 +13,8 @@ use crate::adapters::events::{
 };
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::paths::resolve_home_dir;
-use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-};
-use crate::types::{FileEvidence, FileEvidenceKind, FileOperation, Role};
+use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
+use crate::types::{FileEvidence, FileOperation, Role};
 
 const EVENT_PARSER_VERSION: u32 = 1;
 
@@ -34,10 +32,7 @@ impl SourceAdapter for AntigravityAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "agy".to_string(),
-            args: vec!["--conversation".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("agy", &["--conversation", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
@@ -73,11 +68,7 @@ impl SourceAdapter for AntigravityAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(cli_dir) = resolve_antigravity_dir()? else {
-            return Ok(Some(SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            }));
+            return Ok(Some(SyncScanResult::default()));
         };
         Ok(Some(scan_for_sync_impl(&cli_dir, context, since_ts, include_events)?))
     }
@@ -299,13 +290,11 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
                             }
                             .to_string();
                             event.target = Some(path.to_string());
-                            event.files.push(FileEvidence {
-                                path: path.to_string(),
+                            event.files.push(FileEvidence::call(
+                                path.to_string(),
                                 operation,
-                                kind: FileEvidenceKind::Call,
-                                cwd: cwd.map(str::to_string),
-                                target: None,
-                            });
+                                cwd.map(str::to_string),
+                            ));
                         }
                     } else if name == "run_command" {
                         event.kind = "command".to_string();
@@ -406,16 +395,12 @@ fn parse_created_at(v: &Value) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::FileEvidenceKind;
     use std::io::Cursor;
 
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{seed_empty_event_state, store as setup_store};
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn temp_antigravity_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -438,25 +423,12 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "antigravity-cli".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 
@@ -618,15 +590,13 @@ mod tests {
         assert_eq!(result.stats.skipped_sessions, 1);
         for version in [None, Some(EVENT_PARSER_VERSION - 1), Some(EVENT_PARSER_VERSION)] {
             if let Some(version) = version {
-                store
-                    .persist_session_events_for_existing_session(
-                        "antigravity-cli",
-                        conversation_id,
-                        &[],
-                        version,
-                        Some(mtime),
-                    )
-                    .unwrap();
+                seed_empty_event_state(
+                    &store,
+                    "antigravity-cli",
+                    conversation_id,
+                    version,
+                    Some(mtime),
+                );
             }
             let result = scan_for_sync_impl(
                 &root,

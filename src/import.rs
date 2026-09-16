@@ -6,8 +6,7 @@ use serde::Deserialize;
 
 use crate::db::store::{SessionTopologyWrite, Store};
 use crate::types::{
-    EvidenceVisibility, Message, ParentLink, RawSessionEvent, RawUsageEvent, Role, Session,
-    TokenSource,
+    Message, ParentLink, RawSessionEvent, RawUsageEvent, Role, Session, TokenSource,
 };
 
 const RECORD_TYPE: &str = "session";
@@ -47,7 +46,7 @@ struct ImportRecord {
     #[serde(default)]
     usage_events: Vec<ImportUsageEvent>,
     #[serde(default)]
-    events: Vec<ImportEvent>,
+    events: Vec<RawSessionEvent>,
 }
 
 #[derive(Deserialize)]
@@ -125,43 +124,6 @@ struct ImportUsageEvent {
     source_path: Option<String>,
     #[serde(default)]
     raw_usage_json: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ImportEvent {
-    #[serde(default)]
-    command_evidence_status: Option<crate::types::CommandEvidenceStatus>,
-    #[serde(default)]
-    files: Vec<crate::types::FileEvidence>,
-    event_seq: u32,
-    #[serde(default)]
-    timestamp: Option<i64>,
-    kind: String,
-    actor: String,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    target: Option<String>,
-    #[serde(default)]
-    message_seq: Option<u32>,
-    #[serde(default)]
-    summary: Option<String>,
-    #[serde(default)]
-    source_path: Option<String>,
-    #[serde(default)]
-    source_event_id: Option<String>,
-    #[serde(default)]
-    tool_call_id: Option<String>,
-    #[serde(default)]
-    is_meta: Option<bool>,
-    #[serde(default)]
-    visibility: Option<EvidenceVisibility>,
-    #[serde(default)]
-    attrs_json: Option<String>,
-    #[serde(default)]
-    parser_version: u32,
 }
 
 pub(crate) fn import_jsonl<R: BufRead>(
@@ -334,31 +296,6 @@ fn decode_record(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let events: Vec<RawSessionEvent> = record
-        .events
-        .into_iter()
-        .map(|e| RawSessionEvent {
-            command_evidence_status: e.command_evidence_status,
-            files: e.files,
-            event_seq: e.event_seq,
-            timestamp: e.timestamp,
-            kind: e.kind,
-            actor: e.actor,
-            name: e.name,
-            status: e.status,
-            target: e.target,
-            message_seq: e.message_seq,
-            summary: e.summary,
-            source_path: e.source_path,
-            source_event_id: e.source_event_id,
-            tool_call_id: e.tool_call_id,
-            is_meta: e.is_meta,
-            visibility: e.visibility,
-            attrs_json: e.attrs_json,
-            parser_version: e.parser_version,
-        })
-        .collect();
-
     let thread_role = s.topology.thread_role.and_then(|role| role.parse().ok());
     let parents: Vec<ParentLink> = s
         .topology
@@ -376,7 +313,7 @@ fn decode_record(
         session,
         messages,
         usage_events,
-        events,
+        events: record.events,
         topology: crate::types::SessionTopology { thread_role, parents },
     })
 }
@@ -388,7 +325,7 @@ mod tests {
     use crate::db::search::TimeRange;
     use crate::export::{ExportIncludes, ExportOptions, write_jsonl};
     use crate::project_scope::ProjectScope;
-    use crate::types::{ParentRelation, ThreadRole};
+    use crate::types::{EvidenceVisibility, ParentRelation, ThreadRole};
 
     fn setup() -> Store {
         schema::register_sqlite_vec();

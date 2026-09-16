@@ -50,10 +50,7 @@ impl SourceAdapter for OpenHandsAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "openhands".to_string(),
-            args: vec!["--resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("openhands", &["--resume", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {

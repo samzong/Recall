@@ -13,12 +13,10 @@ use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::{self, resolve_home_dir};
 use crate::adapters::usage::usage_count;
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-    first_timestamp,
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
 };
 use crate::types::{
-    EvidenceVisibility, FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent,
-    RawUsageEvent, Role,
+    EvidenceVisibility, FileEvidence, FileOperation, RawSessionEvent, RawUsageEvent, Role,
 };
 
 const USAGE_PARSER_VERSION: u32 = 2;
@@ -40,10 +38,7 @@ impl SourceAdapter for QwenAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "qwen".to_string(),
-            args: vec!["--resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("qwen", &["--resume", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
@@ -64,11 +59,7 @@ impl SourceAdapter for QwenAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(runtime_dir) = resolve_qwen_runtime_dir()? else {
-            return Ok(Some(SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            }));
+            return Ok(Some(SyncScanResult::default()));
         };
         Ok(Some(file_scan::run_file_scan_with_options_and_snapshot(
             context,
@@ -398,13 +389,11 @@ fn extract_qwen_events(
                     if operation == FileOperation::Read { "file_read" } else { "file_write" }
                         .to_string();
                 event.target = Some(path.to_string());
-                event.files.push(FileEvidence {
-                    path: path.to_string(),
+                event.files.push(FileEvidence::call(
+                    path.to_string(),
                     operation,
-                    kind: FileEvidenceKind::Call,
-                    cwd: cwd.map(str::to_string),
-                    target: None,
-                });
+                    cwd.map(str::to_string),
+                ));
             } else if name == "run_shell_command" {
                 event.kind = "command".to_string();
                 event.target = args
@@ -566,6 +555,7 @@ fn parse_qwen_session(jsonl: &str, session_id: &str) -> Option<RawSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::test_support::{seed_empty_event_state, seed_empty_usage_state};
     use crate::db::store::Store;
 
     const SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -774,27 +764,23 @@ mod tests {
             )
             .unwrap();
         store.conn.execute_batch("INSERT INTO native_bindings SELECT source, source_id, id, NOT is_import FROM sessions;").unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "qwen-code",
-                SESSION_ID,
-                &[],
-                USAGE_PARSER_VERSION,
-                first.sessions[0].updated_at,
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "qwen-code",
+            SESSION_ID,
+            USAGE_PARSER_VERSION,
+            first.sessions[0].updated_at,
+        );
 
         for previous_version in [None, Some(EVENT_PARSER_VERSION - 1)] {
             if let Some(version) = previous_version {
-                store
-                    .persist_session_events_for_existing_session(
-                        "qwen-code",
-                        SESSION_ID,
-                        &[],
-                        version,
-                        first.sessions[0].updated_at,
-                    )
-                    .unwrap();
+                seed_empty_event_state(
+                    &store,
+                    "qwen-code",
+                    SESSION_ID,
+                    version,
+                    first.sessions[0].updated_at,
+                );
             }
             let backfill = file_scan::run_file_scan_with_options(
                 &AdapterSyncContext::from_store_for_test(&store, "qwen-code").unwrap(),
@@ -810,15 +796,13 @@ mod tests {
             assert_eq!(backfill.sessions.len(), 1);
             assert_eq!(backfill.sessions[0].events.len(), 2);
         }
-        store
-            .persist_session_events_for_existing_session(
-                "qwen-code",
-                SESSION_ID,
-                &[],
-                EVENT_PARSER_VERSION,
-                first.sessions[0].updated_at,
-            )
-            .unwrap();
+        seed_empty_event_state(
+            &store,
+            "qwen-code",
+            SESSION_ID,
+            EVENT_PARSER_VERSION,
+            first.sessions[0].updated_at,
+        );
         let second = file_scan::run_file_scan_with_options(
             &AdapterSyncContext::from_store_for_test(&store, "qwen-code").unwrap(),
             None,

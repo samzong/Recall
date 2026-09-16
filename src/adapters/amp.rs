@@ -36,10 +36,7 @@ impl SourceAdapter for AmpAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "amp".to_string(),
-            args: vec!["threads".to_string(), "continue".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("amp", &["threads", "continue", source_id]))
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
@@ -305,17 +302,11 @@ fn parse_messages(value: Option<&Value>, path: &Path) -> (Vec<RawMessage>, Vec<R
                             .and_then(Value::as_str)
                             .filter(|path| !path.trim().is_empty())
                     {
-                        event.files.push(FileEvidence {
-                            path: path.to_string(),
-                            operation: if name == "Read" {
-                                FileOperation::Read
-                            } else {
-                                FileOperation::Write
-                            },
-                            kind: FileEvidenceKind::Call,
-                            cwd: None,
-                            target: None,
-                        });
+                        event.files.push(FileEvidence::call(
+                            path.to_string(),
+                            if name == "Read" { FileOperation::Read } else { FileOperation::Write },
+                            None,
+                        ));
                     }
                     event
                 }

@@ -14,7 +14,7 @@ use crate::adapters::events::{
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::json_i64;
 use crate::adapters::paths::file_uri_to_path;
-use crate::adapters::sync_state::metadata_state_is_current_for_mtime;
+use crate::adapters::sync_state::parser_state_is_current_for_mtime;
 use crate::adapters::{
     RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter, SyncScanOutput,
     SyncScanResult, first_timestamp,
@@ -122,7 +122,7 @@ fn scan_chat_entries_for_sync(
                 continue;
             };
             let needs_migration = context.session_meta().contains_key(&entry.session_id)
-                && !metadata_state_is_current_for_mtime(
+                && !parser_state_is_current_for_mtime(
                     Some(METADATA_PARSER_VERSION),
                     context.metadata_state().get(&entry.session_id).copied(),
                     mtime_ms,
@@ -849,13 +849,7 @@ fn copilot_tool_files(name: &str, input: Option<&Value>) -> Vec<FileEvidence> {
         .flatten()
         .filter_map(Value::as_str)
         .filter(|path| !path.trim().is_empty())
-        .map(|path| FileEvidence {
-            path: path.to_string(),
-            operation: operation.clone(),
-            kind: FileEvidenceKind::Call,
-            cwd: None,
-            target: None,
-        })
+        .map(|path| FileEvidence::call(path.to_string(), operation.clone(), None))
         .collect()
 }
 
@@ -963,13 +957,8 @@ fn response_text(response: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::store as setup_store;
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn temp_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1326,25 +1315,12 @@ mod tests {
         for source_id in ["other", "unknown"] {
             store
                 .insert_session(&Session {
-                    id: format!("internal-{source_id}"),
                     source: "copilot-chat".to_string(),
                     source_id: source_id.to_string(),
                     title: "existing".to_string(),
-                    directory: None,
-                    repo_remote: None,
-                    repo_slug: None,
-                    repo_name: None,
-                    started_at: 0,
                     updated_at: file_scan::stat_mtime_ms(&dir.join(format!("{source_id}.json"))),
                     message_count: 2,
-                    entrypoint: None,
-                    custom_title: None,
-                    summary: None,
-                    duration_minutes: None,
-                    source_file_path: None,
-                    is_import: false,
-                    locations: Vec::new(),
-                    alternative_versions: 0,
+                    ..crate::types::test_support::session(&format!("internal-{source_id}"))
                 })
                 .unwrap();
         }
@@ -1488,25 +1464,12 @@ mod tests {
         let store = setup_store();
         store
             .insert_session(&Session {
-                id: "internal-sess-1".to_string(),
                 source: "copilot-chat".to_string(),
                 source_id: "sess-1".to_string(),
                 title: "existing".to_string(),
-                directory: None,
-                repo_remote: None,
-                repo_slug: None,
-                repo_name: None,
-                started_at: 0,
                 updated_at: Some(first_mtime),
                 message_count: 2,
-                entrypoint: None,
-                custom_title: None,
-                summary: None,
-                duration_minutes: None,
-                source_file_path: None,
-                is_import: false,
-                locations: Vec::new(),
-                alternative_versions: 0,
+                ..crate::types::test_support::session("internal-sess-1")
             })
             .unwrap();
 

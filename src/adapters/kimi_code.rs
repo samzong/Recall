@@ -17,9 +17,7 @@ use crate::adapters::usage::usage_count;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
 };
-use crate::types::{
-    FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, RawUsageEvent, Role,
-};
+use crate::types::{FileEvidence, FileOperation, RawSessionEvent, RawUsageEvent, Role};
 
 pub(crate) struct KimiCodeAdapter;
 
@@ -43,10 +41,7 @@ impl SourceAdapter for KimiCodeAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "kimi".to_string(),
-            args: vec!["--session".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("kimi", &["--session", source_id]))
     }
 
     fn usage_parser_version(&self) -> Option<u32> {
@@ -446,13 +441,11 @@ fn extract_tool_event(
                 }
                 .to_string();
                 call.target = Some(path.to_string());
-                call.files.push(FileEvidence {
-                    path: path.to_string(),
+                call.files.push(FileEvidence::call(
+                    path.to_string(),
                     operation,
-                    kind: FileEvidenceKind::Call,
-                    cwd: cwd.map(str::to_string),
-                    target: None,
-                });
+                    cwd.map(str::to_string),
+                ));
             } else if name == "Bash" {
                 call.kind = "command".to_string();
                 call.target = args
@@ -568,10 +561,12 @@ pub(crate) fn parse_kimi_session(
 
 #[cfg(test)]
 mod tests {
+    use crate::types::FileEvidenceKind;
     use std::io::Write;
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+    use crate::adapters::test_support::{seed_empty_event_state, seed_empty_usage_state};
     use crate::db::store::Store;
 
     fn fixture_state() -> &'static str {
@@ -887,15 +882,13 @@ mod tests {
             )
             .unwrap();
         store.conn.execute_batch("INSERT INTO native_bindings SELECT source, source_id, id, NOT is_import FROM sessions;").unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "kimi-code",
-                "session_abc",
-                &[],
-                USAGE_PARSER_VERSION - 1,
-                Some(mtime_ms),
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "kimi-code",
+            "session_abc",
+            USAGE_PARSER_VERSION - 1,
+            Some(mtime_ms),
+        );
 
         let backfill = file_scan::run_file_scan_with_options_and_snapshot(
             &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
@@ -911,15 +904,13 @@ mod tests {
         assert!(backfill.sessions[0].events.is_empty());
         assert_eq!(backfill.sessions[0].event_parser_version, None);
 
-        store
-            .persist_usage_events_for_existing_session(
-                "kimi-code",
-                "session_abc",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime_ms),
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "kimi-code",
+            "session_abc",
+            USAGE_PARSER_VERSION,
+            Some(mtime_ms),
+        );
         let usage_only = scan_kimi_dirs_for_sync(
             &[root.path().to_path_buf()],
             &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
@@ -930,15 +921,7 @@ mod tests {
         assert_eq!(usage_only.stats.skipped_sessions, 1);
         for previous_version in [None, Some(EVENT_PARSER_VERSION - 1)] {
             if let Some(version) = previous_version {
-                store
-                    .persist_session_events_for_existing_session(
-                        "kimi-code",
-                        "session_abc",
-                        &[],
-                        version,
-                        Some(mtime_ms),
-                    )
-                    .unwrap();
+                seed_empty_event_state(&store, "kimi-code", "session_abc", version, Some(mtime_ms));
             }
             let events = scan_kimi_dirs_for_sync(
                 &[root.path().to_path_buf()],
@@ -950,15 +933,13 @@ mod tests {
             assert_eq!(events.sessions.len(), 1);
             assert_eq!(events.sessions[0].events.len(), 2);
         }
-        store
-            .persist_session_events_for_existing_session(
-                "kimi-code",
-                "session_abc",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime_ms),
-            )
-            .unwrap();
+        seed_empty_event_state(
+            &store,
+            "kimi-code",
+            "session_abc",
+            EVENT_PARSER_VERSION,
+            Some(mtime_ms),
+        );
         let skipped = file_scan::run_file_scan_with_options_and_snapshot(
             &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),
             None,
@@ -1073,15 +1054,13 @@ mod tests {
             )
             .unwrap();
         store.conn.execute_batch("INSERT INTO native_bindings SELECT source, source_id, id, NOT is_import FROM sessions;").unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "kimi-code",
-                "session_rename",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(wire_mtime),
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "kimi-code",
+            "session_rename",
+            USAGE_PARSER_VERSION,
+            Some(wire_mtime),
+        );
 
         let result = file_scan::run_file_scan_with_options_and_snapshot(
             &AdapterSyncContext::from_store_for_test(&store, "kimi-code").unwrap(),

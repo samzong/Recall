@@ -39,10 +39,7 @@ impl SourceAdapter for ClaudeCodeAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "claude".to_string(),
-            args: vec!["--resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("claude", &["--resume", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
@@ -760,13 +757,11 @@ fn collect_claude_content_events(
                         .and_then(Value::as_str)
                         .filter(|path| !path.trim().is_empty())
                 {
-                    event.files.push(FileEvidence {
-                        path: path.to_string(),
+                    event.files.push(FileEvidence::call(
+                        path.to_string(),
                         operation,
-                        kind: FileEvidenceKind::Call,
-                        cwd: context.cwd.map(str::to_string),
-                        target: None,
-                    });
+                        context.cwd.map(str::to_string),
+                    ));
                 }
                 if event.name.as_deref() == Some("Bash")
                     && let Some(command) = item.pointer("/input/command").and_then(Value::as_str)
@@ -841,24 +836,17 @@ fn collect_claude_meta_event(
         return;
     }
     events_out.push(RawSessionEvent {
-        command_evidence_status: None,
-        files: Vec::new(),
-        event_seq: events_out.len() as u32,
-        timestamp,
-        kind: "message".to_string(),
-        actor: role.as_str().to_string(),
-        name: None,
-        status: None,
-        target: None,
-        message_seq: None,
         summary: Some(events::bounded_summary(summary)),
-        source_path: Some(source_path.to_string()),
-        source_event_id: Some(line_index.to_string()),
-        tool_call_id: None,
         is_meta: Some(true),
-        visibility: None,
-        attrs_json: None,
-        parser_version: EVENT_PARSER_VERSION,
+        ..events::EventContext {
+            event_seq: events_out.len() as u32,
+            timestamp,
+            source_path: Some(source_path.to_string()),
+            source_event_id: Some(line_index.to_string()),
+            message_seq: None,
+            parser_version: EVENT_PARSER_VERSION,
+        }
+        .event("message", role.as_str())
     });
 }
 
@@ -952,13 +940,11 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn temp_claude_root(label: &str) -> PathBuf {
         let root =
@@ -1377,25 +1363,12 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "claude-code".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 
@@ -1721,35 +1694,21 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session("sess-skip", mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "claude-code",
-                "sess-skip",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "claude-code",
-                "sess-skip",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "claude-code",
-                "sess-skip",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "claude-code",
+            "sess-skip",
+            USAGE_PARSER_VERSION,
+            Some(mtime),
+        );
+        seed_empty_event_state(
+            &store,
+            "claude-code",
+            "sess-skip",
+            EVENT_PARSER_VERSION,
+            Some(mtime),
+        );
+        seed_empty_metadata_state(&store, "claude-code", "sess-skip", METADATA_PARSER_VERSION);
 
         let result = scan_for_sync_impl(
             &root,
@@ -1777,35 +1736,21 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session("sess-ai-title", mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "claude-code",
-                "sess-ai-title",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "claude-code",
-                "sess-ai-title",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "claude-code",
-                "sess-ai-title",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(1),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "claude-code",
+            "sess-ai-title",
+            USAGE_PARSER_VERSION,
+            Some(mtime),
+        );
+        seed_empty_event_state(
+            &store,
+            "claude-code",
+            "sess-ai-title",
+            EVENT_PARSER_VERSION,
+            Some(mtime),
+        );
+        seed_empty_metadata_state(&store, "claude-code", "sess-ai-title", 1);
 
         let result = scan_for_sync_impl(
             &root,
@@ -1829,35 +1774,26 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session("sess-event-backfill", mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "claude-code",
-                "sess-event-backfill",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "claude-code",
-                "sess-event-backfill",
-                &[],
-                EVENT_PARSER_VERSION - 1,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "claude-code",
-                "sess-event-backfill",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "claude-code",
+            "sess-event-backfill",
+            USAGE_PARSER_VERSION,
+            Some(mtime),
+        );
+        seed_empty_event_state(
+            &store,
+            "claude-code",
+            "sess-event-backfill",
+            EVENT_PARSER_VERSION - 1,
+            Some(mtime),
+        );
+        seed_empty_metadata_state(
+            &store,
+            "claude-code",
+            "sess-event-backfill",
+            METADATA_PARSER_VERSION,
+        );
 
         let result = scan_for_sync_impl(
             &root,

@@ -68,10 +68,7 @@ impl SourceAdapter for CrushAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "crush".to_string(),
-            args: vec!["--session".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("crush", &["--session", source_id]))
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
@@ -188,7 +185,7 @@ fn scan_projects(
                             Some(updated_at),
                             include_events,
                         )
-                        && crate::adapters::sync_state::metadata_state_is_current(
+                        && crate::adapters::sync_state::parser_state_is_current(
                             METADATA_PARSER_VERSION,
                             metadata_state.and_then(|state| state.get(&row.id).copied()),
                             Some(updated_at),
@@ -430,13 +427,11 @@ fn parse_tool_event(
                     && !path.trim().is_empty()
                 {
                     event.target = Some(path.to_string());
-                    event.files.push(FileEvidence {
-                        path: path.to_string(),
+                    event.files.push(FileEvidence::call(
+                        path.to_string(),
                         operation,
-                        kind: FileEvidenceKind::Call,
-                        cwd: Some(directory.to_string()),
-                        target: None,
-                    });
+                        Some(directory.to_string()),
+                    ));
                 } else if name == "bash" {
                     event.target = input.get("command").and_then(Value::as_str).map(str::to_string);
                     if let Some(command) = event.target.as_deref() {
@@ -526,36 +521,23 @@ fn seconds_to_ms(timestamp: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
     use crate::types::Session;
 
     fn make_session(source_id: &str, updated_at: Option<i64>, message_count: u32) -> Session {
         Session {
-            id: format!("local-{source_id}"),
             source: "crush".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
             directory: Some("/tmp/project".to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
             started_at: 100,
             updated_at,
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(&format!("local-{source_id}"))
         }
-    }
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
     }
 
     fn write_projects(root: &Path, projects: &[(&str, &str)]) -> PathBuf {
@@ -976,35 +958,9 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_session("ses-1", Some(200_000), 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "crush",
-                "ses-1",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "crush",
-                "ses-1",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "crush",
-                "ses-1",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, "crush", "ses-1", USAGE_PARSER_VERSION, Some(200_000));
+        seed_empty_event_state(&store, "crush", "ses-1", EVENT_PARSER_VERSION, Some(200_000));
+        seed_empty_metadata_state(&store, "crush", "ses-1", METADATA_PARSER_VERSION);
 
         let result = scan_projects(
             &[ProjectRef {
@@ -1018,15 +974,7 @@ mod tests {
         .unwrap();
         assert!(result.sessions.is_empty());
         assert_eq!(result.stats.skipped_sessions, 1);
-        store
-            .persist_session_events_for_existing_session(
-                "crush",
-                "ses-1",
-                &[],
-                EVENT_PARSER_VERSION - 1,
-                Some(200_000),
-            )
-            .unwrap();
+        seed_empty_event_state(&store, "crush", "ses-1", EVENT_PARSER_VERSION - 1, Some(200_000));
         let stale = scan_projects(
             &[ProjectRef {
                 path: project.to_string_lossy().into_owned(),
@@ -1076,35 +1024,9 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_session("ses-1", Some(200_000), 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "crush",
-                "ses-1",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "crush",
-                "ses-1",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "crush",
-                "ses-1",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, "crush", "ses-1", USAGE_PARSER_VERSION, Some(200_000));
+        seed_empty_event_state(&store, "crush", "ses-1", EVENT_PARSER_VERSION, Some(200_000));
+        seed_empty_metadata_state(&store, "crush", "ses-1", METADATA_PARSER_VERSION);
 
         let result = scan_projects(
             &[ProjectRef {

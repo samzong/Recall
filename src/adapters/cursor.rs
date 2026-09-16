@@ -89,11 +89,7 @@ impl SourceAdapter for CursorAdapter {
                 &mut transcript_meta,
             )?
         } else {
-            SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            }
+            SyncScanResult::default()
         };
         let mut covered = result
             .sessions
@@ -188,7 +184,7 @@ fn scan_for_sync_conn(
                 source_updated_at,
                 include_events,
             )
-            && crate::adapters::sync_state::metadata_state_is_current(
+            && crate::adapters::sync_state::parser_state_is_current(
                 METADATA_PARSER_VERSION,
                 metadata_state.get(&composer_id).copied(),
                 source_updated_at,
@@ -742,16 +738,14 @@ fn cursor_tool_call(
         event.kind =
             if operation == FileOperation::Read { "file_read" } else { "file_write" }.into();
         event.target = Some(path.into());
-        event.files.push(FileEvidence {
-            path: path.into(),
+        event.files.push(FileEvidence::call(
+            path.into(),
             operation,
-            kind: FileEvidenceKind::Call,
-            cwd: ["cwd", "workingDirectory", "working_directory", "workdir"]
+            ["cwd", "workingDirectory", "working_directory", "workdir"]
                 .iter()
                 .find_map(|key| args.get(key).and_then(Value::as_str))
                 .map(str::to_string),
-            target: None,
-        });
+        ));
     }
     event
 }
@@ -1485,6 +1479,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+    use crate::adapters::test_support::{seed_empty_event_state, seed_empty_usage_state};
     use crate::db::schema;
     use crate::db::store::Store;
     use crate::types::{Session, TokenSource};
@@ -1691,36 +1686,24 @@ mod tests {
         let source_updated_at = 1_700_000_100_000_i64;
         store
             .insert_session(&Session {
-                id: uuid::Uuid::new_v4().to_string(),
                 source: "cursor".to_string(),
                 source_id: composer_id.clone(),
                 title: "Usage review".to_string(),
                 directory: Some("/Users/x/project".to_string()),
-                repo_remote: None,
-                repo_slug: None,
-                repo_name: None,
                 started_at: 1_700_000_000_000,
                 updated_at: Some(source_updated_at),
                 message_count: 1,
                 entrypoint: Some("chat".to_string()),
-                custom_title: None,
-                summary: None,
-                duration_minutes: None,
-                source_file_path: None,
-                is_import: false,
-                locations: Vec::new(),
-                alternative_versions: 0,
+                ..crate::types::test_support::session(&uuid::Uuid::new_v4().to_string())
             })
             .unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "cursor",
-                &composer_id,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(source_updated_at),
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "cursor",
+            &composer_id,
+            USAGE_PARSER_VERSION,
+            Some(source_updated_at),
+        );
         let transcript_paths = HashMap::from([(
             composer_id.clone(),
             AgentTranscriptPath {
@@ -1757,45 +1740,31 @@ mod tests {
         let source_updated_at = 1_700_000_100_000_i64;
         store
             .insert_session(&Session {
-                id: uuid::Uuid::new_v4().to_string(),
                 source: "cursor".to_string(),
                 source_id: composer_id.clone(),
                 title: "Usage review".to_string(),
                 directory: Some("/Users/x/project".to_string()),
-                repo_remote: None,
-                repo_slug: None,
-                repo_name: None,
                 started_at: 1_700_000_000_000,
                 updated_at: Some(source_updated_at),
                 message_count: 1,
                 entrypoint: Some("chat".to_string()),
-                custom_title: None,
-                summary: None,
-                duration_minutes: None,
-                source_file_path: None,
-                is_import: false,
-                locations: Vec::new(),
-                alternative_versions: 0,
+                ..crate::types::test_support::session(&uuid::Uuid::new_v4().to_string())
             })
             .unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "cursor",
-                &composer_id,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(source_updated_at),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "cursor",
-                &composer_id,
-                &[],
-                EVENT_PARSER_VERSION - 1,
-                Some(source_updated_at),
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "cursor",
+            &composer_id,
+            USAGE_PARSER_VERSION,
+            Some(source_updated_at),
+        );
+        seed_empty_event_state(
+            &store,
+            "cursor",
+            &composer_id,
+            EVENT_PARSER_VERSION - 1,
+            Some(source_updated_at),
+        );
 
         let result = scan_for_sync_conn(
             &conn,

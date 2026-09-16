@@ -39,10 +39,7 @@ impl SourceAdapter for GrokAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "grok".to_string(),
-            args: vec!["--resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("grok", &["--resume", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
@@ -75,11 +72,7 @@ impl SourceAdapter for GrokAdapter {
         force: bool,
     ) -> anyhow::Result<Option<SyncScanOutput>> {
         let Some(sessions_dir) = resolve_grok_sessions_dir()? else {
-            let result = SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            };
+            let result = SyncScanResult::default();
             if !context.has_existing_sessions() {
                 return Ok(Some(SyncScanOutput { scan: result, reconcile: None }));
             }
@@ -966,13 +959,11 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn temp_grok_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1001,25 +992,12 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "grok".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 
@@ -1471,15 +1449,7 @@ mod tests {
             "missing usage state must trigger a backfill parse"
         );
 
-        store
-            .persist_usage_events_for_existing_session(
-                "grok",
-                session_id,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, "grok", session_id, USAGE_PARSER_VERSION, Some(mtime));
 
         let result = scan_for_sync_impl(
             &root,
@@ -1502,15 +1472,7 @@ mod tests {
         .unwrap();
         assert_eq!(backfilled.scan.sessions.len(), 1);
         assert_eq!(backfilled.scan.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
-        store
-            .persist_session_events_for_existing_session(
-                "grok",
-                session_id,
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
+        seed_empty_event_state(&store, "grok", session_id, EVENT_PARSER_VERSION, Some(mtime));
         let refreshed = scan_for_sync_impl(
             &root,
             &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
@@ -1521,17 +1483,7 @@ mod tests {
         .unwrap();
         assert_eq!(refreshed.scan.sessions.len(), 1);
         assert!(refreshed.scan.sessions[0].refresh_session_on_metadata_backfill);
-        store
-            .persist_topology_for_existing_session(
-                "grok",
-                session_id,
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_metadata_state(&store, "grok", session_id, METADATA_PARSER_VERSION);
         let unchanged = scan_for_sync_impl(
             &root,
             &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
@@ -1588,15 +1540,7 @@ mod tests {
         .effective_mtime_ms();
         let store = setup_store();
         store.insert_session(&make_existing_session(session_id, mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "grok",
-                session_id,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, "grok", session_id, USAGE_PARSER_VERSION, Some(mtime));
 
         let result = scan_for_sync_impl(
             &root,

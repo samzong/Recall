@@ -114,14 +114,6 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
     );
     for row in rows {
         let source = format!("{} ({})", row.label, row.id);
-        if let Some(error) = row.error {
-            println!(
-                "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}  error: {error}",
-                sessions = "-",
-                messages = "-"
-            );
-            continue;
-        }
         println!(
             "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}  {range}",
             sessions = row.sessions,

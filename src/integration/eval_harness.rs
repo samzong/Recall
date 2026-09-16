@@ -11,25 +11,12 @@ fn setup() -> Store {
 
 fn session(id: &str, source: &str, source_id: &str, title: &str) -> Session {
     Session {
-        id: id.to_string(),
         source: source.to_string(),
         source_id: source_id.to_string(),
         title: title.to_string(),
-        directory: None,
-        repo_remote: None,
-        repo_slug: None,
-        repo_name: None,
         started_at: chrono::Utc::now().timestamp_millis(),
-        updated_at: None,
         message_count: 1,
-        entrypoint: None,
-        custom_title: None,
-        summary: None,
-        duration_minutes: None,
-        source_file_path: None,
-        is_import: false,
-        locations: Vec::new(),
-        alternative_versions: 0,
+        ..crate::types::test_support::session(id)
     }
 }
 

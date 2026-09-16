@@ -15,8 +15,7 @@ use crate::adapters::{
     AdapterSyncContext, RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult,
 };
 use crate::types::{
-    EvidenceVisibility, FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent,
-    RawUsageEvent, Role,
+    EvidenceVisibility, FileEvidence, FileOperation, RawSessionEvent, RawUsageEvent, Role,
 };
 
 pub(crate) struct GeminiAdapter;
@@ -34,10 +33,7 @@ impl SourceAdapter for GeminiAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "gemini".to_string(),
-            args: vec!["--resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("gemini", &["--resume", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
@@ -480,13 +476,7 @@ fn extract_gemini_events(
             event.kind = if operation == FileOperation::Read { "file_read" } else { "file_write" }
                 .to_string();
             event.target = Some(path.to_string());
-            event.files.push(FileEvidence {
-                path: path.to_string(),
-                operation,
-                kind: FileEvidenceKind::Call,
-                cwd: None,
-                target: None,
-            });
+            event.files.push(FileEvidence::call(path.to_string(), operation, None));
         } else if name == "run_shell_command" {
             event.kind = "command".to_string();
             event.target = args
@@ -606,6 +596,9 @@ fn extract_gemini_usage_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+    };
 
     #[test]
     fn parse_gemini_session_extracts_usage_events() {
@@ -680,58 +673,42 @@ mod tests {
             rusqlite::params![session.updated_at],
         ).unwrap();
         store.conn.execute_batch("INSERT INTO native_bindings SELECT source, source_id, id, NOT is_import FROM sessions;").unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "gemini-cli",
-                "abc-123",
-                &[],
-                USAGE_PARSER_VERSION,
-                session.updated_at,
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "gemini-cli",
+            "abc-123",
+            USAGE_PARSER_VERSION,
+            session.updated_at,
+        );
         let context = || AdapterSyncContext::from_store_for_test(&store, "gemini-cli").unwrap();
         let usage_only = scan_gemini_for_sync(dir.path(), &context(), None, false).unwrap();
         assert_eq!(usage_only.stats.skipped_sessions, 1);
         for previous_version in [None, Some(EVENT_PARSER_VERSION - 1)] {
             if let Some(version) = previous_version {
-                store
-                    .persist_session_events_for_existing_session(
-                        "gemini-cli",
-                        "abc-123",
-                        &[],
-                        version,
-                        session.updated_at,
-                    )
-                    .unwrap();
+                seed_empty_event_state(
+                    &store,
+                    "gemini-cli",
+                    "abc-123",
+                    version,
+                    session.updated_at,
+                );
             }
             let backfill = scan_gemini_for_sync(dir.path(), &context(), None, true).unwrap();
             assert_eq!(backfill.sessions.len(), 1);
             assert_eq!(backfill.sessions[0].source_id, "abc-123");
             assert_eq!(backfill.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
         }
-        store
-            .persist_session_events_for_existing_session(
-                "gemini-cli",
-                "abc-123",
-                &[],
-                EVENT_PARSER_VERSION,
-                session.updated_at,
-            )
-            .unwrap();
+        seed_empty_event_state(
+            &store,
+            "gemini-cli",
+            "abc-123",
+            EVENT_PARSER_VERSION,
+            session.updated_at,
+        );
         let refreshed = scan_gemini_for_sync(dir.path(), &context(), None, true).unwrap();
         assert_eq!(refreshed.sessions.len(), 1);
         assert!(refreshed.sessions[0].refresh_session_on_metadata_backfill);
-        store
-            .persist_topology_for_existing_session(
-                "gemini-cli",
-                "abc-123",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_metadata_state(&store, "gemini-cli", "abc-123", METADATA_PARSER_VERSION);
         let skipped = scan_gemini_for_sync(dir.path(), &context(), None, true).unwrap();
         assert_eq!(skipped.stats.skipped_sessions, 1);
     }

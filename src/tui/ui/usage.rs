@@ -17,7 +17,7 @@ use crate::usage::{TokenTotals, UsageReport};
 use super::{format_compact, format_count, truncate_label};
 
 pub(super) fn render_usage_dashboard(f: &mut Frame, app: &App) {
-    match app.usage_tab {
+    match app.usage.tab {
         UsageTab::Tokens => render_tokens_dashboard(f, app),
         UsageTab::Skills => render_skill_audit_dashboard(f, app),
     }
@@ -58,22 +58,22 @@ pub(super) fn render_usage_header(f: &mut Frame, app: &App, area: Rect) {
 
     let control = vec![
         Span::styled(" range ", muted),
-        Span::styled(format!("[{}]", app.usage_time_label()), chip),
+        Span::styled(format!("[{}]", app.usage.time_label()), chip),
         Span::styled(" source ", muted),
         Span::styled(format!("[{}]", app.source_filter_label()), chip),
         Span::styled(" metric ", muted),
-        Span::styled(format!("[{}]", app.usage_tab_label()), chip),
+        Span::styled(format!("[{}]", app.usage.tab_label()), chip),
     ];
 
     let mut lines = vec![Line::from(control)];
 
-    if app.usage_is_loading() {
+    if app.usage.is_loading() {
         lines.push(Line::from(Span::styled(
             " Loading usage data...",
             Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
-    } else if let Some(report) = app.usage_report.as_ref() {
+    } else if let Some(report) = app.usage.report.as_ref() {
         let active_days = report
             .daily
             .iter()
@@ -108,7 +108,7 @@ pub(super) fn render_usage_header(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" top-model ", muted),
             Span::styled(truncate_label(top_model, 32), Style::default().fg(THEME.text)),
         ]));
-    } else if let Some(error) = app.usage_error.as_ref() {
+    } else if let Some(error) = app.usage.error.as_ref() {
         lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(THEME.error))));
         lines.push(Line::from(""));
     } else {
@@ -125,7 +125,7 @@ pub(super) fn render_activity_map(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.success));
 
-    if app.usage_is_loading() {
+    if app.usage.is_loading() {
         f.render_widget(
             Paragraph::new("Loading usage data...")
                 .style(Style::default().fg(THEME.accent))
@@ -135,7 +135,7 @@ pub(super) fn render_activity_map(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let report = app.usage_year_report.as_ref().or(app.usage_report.as_ref());
+    let report = app.usage.year_report.as_ref().or(app.usage.report.as_ref());
     let Some(report) = report else {
         f.render_widget(
             Paragraph::new("No usage events")
@@ -192,7 +192,7 @@ pub(super) fn render_daily_token_chart(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.border_focus));
 
-    if app.usage_is_loading() {
+    if app.usage.is_loading() {
         f.render_widget(
             Paragraph::new("Loading usage data...")
                 .style(Style::default().fg(THEME.accent))
@@ -202,7 +202,7 @@ pub(super) fn render_daily_token_chart(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let Some(report) = app.usage_report.as_ref() else {
+    let Some(report) = app.usage.report.as_ref() else {
         f.render_widget(
             Paragraph::new("No token usage")
                 .style(Style::default().fg(THEME.text_muted))
@@ -215,7 +215,7 @@ pub(super) fn render_daily_token_chart(f: &mut Frame, app: &App, area: Rect) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let label_width = 8usize;
     let plot_width = inner_width.saturating_sub(label_width).max(1);
-    let points = daily_token_points(report, app.usage_time_filter, plot_width);
+    let points = daily_token_points(report, app.usage.time_filter, plot_width);
     let max_tokens = points.iter().map(|(_, value)| *value).max().unwrap_or(0);
     if points.is_empty() || max_tokens == 0 {
         f.render_widget(
@@ -271,7 +271,7 @@ pub(super) fn render_usage_breakdown(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.accent));
 
-    if app.usage_is_loading() {
+    if app.usage.is_loading() {
         f.render_widget(
             Paragraph::new("Loading usage data...")
                 .style(Style::default().fg(THEME.accent))
@@ -281,7 +281,7 @@ pub(super) fn render_usage_breakdown(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let Some(report) = app.usage_report.as_ref() else {
+    let Some(report) = app.usage.report.as_ref() else {
         f.render_widget(
             Paragraph::new("No usage data")
                 .style(Style::default().fg(THEME.text_muted))
@@ -315,7 +315,7 @@ pub(super) fn render_usage_breakdown(f: &mut Frame, app: &App, area: Rect) {
     let model_lines = build_usage_model_lines(app, report, inner_width);
     let visible_height = sections[2].height as usize;
     let max_scroll = model_lines.len().saturating_sub(visible_height);
-    let scroll = app.usage_breakdown_scroll.min(max_scroll as u16) as usize;
+    let scroll = app.usage.breakdown_scroll.min(max_scroll as u16) as usize;
     f.render_widget(Paragraph::new(model_lines).scroll((scroll as u16, 0)), sections[2]);
 }
 
@@ -386,7 +386,7 @@ fn build_usage_model_lines(
 }
 
 pub(super) fn render_usage_status(f: &mut Frame, app: &App, area: Rect) {
-    let line = match app.usage_tab {
+    let line = match app.usage.tab {
         UsageTab::Tokens => Line::from(vec![
             Span::styled("m", Style::default().fg(THEME.accent)),
             Span::styled(" tab  ", Style::default().fg(THEME.text_muted)),
@@ -599,23 +599,23 @@ pub(super) fn render_skill_audit_header(f: &mut Frame, app: &App, area: Rect) {
 
     let control = vec![
         Span::styled(" range ", muted),
-        Span::styled(format!("[{}]", app.usage_time_label()), chip),
+        Span::styled(format!("[{}]", app.usage.time_label()), chip),
         Span::styled(" source ", muted),
         Span::styled(format!("[{}]", app.source_filter_label()), chip),
         Span::styled(" tab ", muted),
-        Span::styled(format!("[{}]", app.usage_tab_label()), chip),
+        Span::styled(format!("[{}]", app.usage.tab_label()), chip),
     ];
 
     let mut lines = vec![Line::from(control)];
 
-    if app.usage_is_loading() {
+    if app.usage.is_loading() {
         lines.push(Line::from(Span::styled(
             " Loading skill audit...",
             Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
         )));
-    } else if let Some(error) = app.skill_audit_error.as_ref() {
+    } else if let Some(error) = app.usage.skill_error.as_ref() {
         lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(THEME.error))));
-    } else if let Some(report) = app.skill_audit_report.as_ref() {
+    } else if let Some(report) = app.usage.skill_report.as_ref() {
         lines.push(Line::from(vec![
             Span::styled(" installed ", muted),
             Span::styled(
@@ -658,7 +658,7 @@ pub(super) fn render_skill_audit_list(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.skill));
 
-    if app.usage_is_loading() {
+    if app.usage.is_loading() {
         f.render_widget(
             Paragraph::new("Loading skill audit...")
                 .style(Style::default().fg(THEME.accent))
@@ -668,7 +668,7 @@ pub(super) fn render_skill_audit_list(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let Some(report) = app.skill_audit_report.as_ref() else {
+    let Some(report) = app.usage.skill_report.as_ref() else {
         f.render_widget(
             Paragraph::new("No skill audit data")
                 .style(Style::default().fg(THEME.text_muted))
@@ -682,7 +682,7 @@ pub(super) fn render_skill_audit_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
     let inner_width = inner.width as usize;
     let (lines, selected_line) =
-        build_skill_audit_lines(report, app.skill_audit_selected, inner_width);
+        build_skill_audit_lines(report, app.usage.skill_selected, inner_width);
     let visible_height = inner.height as usize;
     let max_scroll = lines.len().saturating_sub(visible_height);
     let scroll = selected_line.saturating_sub(visible_height.saturating_sub(1)).min(max_scroll);

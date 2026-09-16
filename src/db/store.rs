@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -74,19 +75,7 @@ pub(crate) enum SessionListSort {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct UsageSessionStateMeta {
-    pub(crate) parser_version: u32,
-    pub(crate) source_updated_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct EventSessionStateMeta {
-    pub(crate) parser_version: u32,
-    pub(crate) source_updated_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MetadataSessionStateMeta {
+pub(crate) struct ParserStateMeta {
     pub(crate) parser_version: u32,
     pub(crate) source_updated_at: Option<i64>,
 }
@@ -108,8 +97,6 @@ impl SessionTopologyWrite<'_> {
 #[derive(Debug, Clone)]
 pub(crate) struct SkillAuditEventRow {
     pub(crate) session_id: String,
-    #[allow(dead_code)] // selected from session_events.source
-    pub(crate) source: String,
     pub(crate) timestamp: Option<i64>,
     pub(crate) name: Option<String>,
     pub(crate) target: Option<String>,
@@ -124,6 +111,21 @@ pub(crate) struct CompactionPlan {
 }
 
 impl Store {
+    pub(super) fn parser_state_map(
+        &self,
+        sql: &str,
+        source: &str,
+    ) -> Result<HashMap<String, ParserStateMeta>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([source], |row| {
+            Ok((
+                row.get(0)?,
+                ParserStateMeta { parser_version: row.get(1)?, source_updated_at: row.get(2)? },
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
     fn pragma_u64(&self, name: &str) -> Result<u64> {
         Ok(self.conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, i64>(0))? as u64)
     }
@@ -152,20 +154,7 @@ impl Store {
     }
 
     pub(crate) fn open() -> Result<Self> {
-        let db_path = Self::default_db_path()?;
-        if let Some(data_dir) = db_path.parent() {
-            std::fs::create_dir_all(data_dir)?;
-        }
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;
-             PRAGMA foreign_keys=ON;",
-        )?;
-        backup_before_remote_migration(&conn, &db_path)?;
-        crate::db::schema::init(&conn)?;
-        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
-        Ok(Store { conn, trigram_message_flag })
+        Self::open_at(&Self::default_db_path()?)
     }
 
     pub(crate) fn open_event_preview_at(path: &Path) -> Result<Self> {
@@ -206,7 +195,6 @@ impl Store {
         Ok(Store { conn, trigram_message_flag })
     }
 
-    #[cfg(test)]
     pub(crate) fn open_at(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -250,25 +238,12 @@ mod exclusion_tests {
 
     fn sess(id: &str, dir: Option<&str>) -> Session {
         Session {
-            id: id.to_string(),
             source: "claude-code".to_string(),
             source_id: format!("src-{id}"),
             title: "t".to_string(),
             directory: dir.map(String::from),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(1),
-            message_count: 0,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(id)
         }
     }
 

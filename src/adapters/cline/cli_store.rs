@@ -18,10 +18,7 @@ use super::{EVENT_PARSER_VERSION, METADATA_PARSER_VERSION};
 pub(super) fn resume_command(source_id: &str) -> Option<ResumeCommand> {
     let sessions_dir = resolve_sessions_dir().ok().flatten()?;
     find_messages_path(&sessions_dir, source_id)?;
-    Some(ResumeCommand {
-        program: "cline".to_string(),
-        args: vec!["--id".to_string(), source_id.to_string()],
-    })
+    Some(ResumeCommand::new("cline", &["--id", source_id]))
 }
 
 pub(super) fn scan_uncovered(covered: &HashSet<String>) -> anyhow::Result<Vec<RawSession>> {
@@ -305,13 +302,11 @@ pub(super) fn append_tool_events(
                             for request in requests {
                                 let path = request.get("path").and_then(Value::as_str);
                                 if let Some(path) = path.filter(|path| !path.trim().is_empty()) {
-                                    event.files.push(FileEvidence {
-                                        path: path.to_string(),
-                                        operation: FileOperation::Read,
-                                        kind: FileEvidenceKind::Call,
-                                        cwd: None,
-                                        target: None,
-                                    });
+                                    event.files.push(FileEvidence::call(
+                                        path.to_string(),
+                                        FileOperation::Read,
+                                        None,
+                                    ));
                                 }
                             }
                         }
@@ -327,13 +322,11 @@ pub(super) fn append_tool_events(
                                     .and_then(Value::as_str)
                                     .filter(|path| !path.trim().is_empty())
                                 {
-                                    event.files.push(FileEvidence {
-                                        path: path.to_string(),
-                                        operation: FileOperation::Write,
-                                        kind: FileEvidenceKind::Call,
-                                        cwd: None,
-                                        target: None,
-                                    });
+                                    event.files.push(FileEvidence::call(
+                                        path.to_string(),
+                                        FileOperation::Write,
+                                        None,
+                                    ));
                                 }
                             }
                         }
@@ -350,13 +343,11 @@ pub(super) fn append_tool_events(
                             .and_then(Value::as_str)
                             .filter(|path| !path.trim().is_empty())
                         {
-                            event.files.push(FileEvidence {
-                                path: path.to_string(),
-                                operation: FileOperation::Write,
-                                kind: FileEvidenceKind::Call,
-                                cwd: None,
-                                target: None,
-                            });
+                            event.files.push(FileEvidence::call(
+                                path.to_string(),
+                                FileOperation::Write,
+                                None,
+                            ));
                         }
                     } else if name == "apply_patch"
                         && let Some(patch) =
@@ -475,13 +466,8 @@ fn read_json(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::store as setup_store;
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn temp_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -552,25 +538,12 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "cline".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count: 1,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 

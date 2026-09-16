@@ -442,7 +442,7 @@ mod tests {
     use crate::share::meta::collect_session_display_meta;
     use crate::share::publish::init_publish_dir;
     use crate::share::render::render_session_html;
-    use crate::types::Session;
+    use crate::share::test_session as session;
 
     #[test]
     fn normalize_share_id_accepts_html_suffix() {
@@ -619,30 +619,6 @@ mod tests {
             project_name: "recall-share-test".to_string(),
             project_domain: "recall-share-test.pages.dev".to_string(),
             publish_dir: publish_dir.to_string_lossy().to_string(),
-        }
-    }
-
-    fn session(source_id: &str) -> Session {
-        Session {
-            id: "local-id".to_string(),
-            source: "codex".to_string(),
-            source_id: source_id.to_string(),
-            title: "Fix <bug>".to_string(),
-            directory: Some("/tmp/project".to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
-            updated_at: None,
-            message_count: 1,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
         }
     }
 }

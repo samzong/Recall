@@ -7,14 +7,13 @@ use rusqlite::OptionalExtension;
 use super::event_store::replace_session_events;
 use super::project_store::apply_scope_filters;
 use super::store::{
-    IndexedSessionMeta, MetadataSessionStateMeta, SESSION_COLUMNS, SessionListSort,
-    SessionTopologyWrite, Store, session_from_row,
+    IndexedSessionMeta, ParserStateMeta, SESSION_COLUMNS, SessionListSort, SessionTopologyWrite,
+    Store, session_from_row,
 };
+use super::topology_store::replace_parent_links_tx;
 use crate::db::search::{ThreadRoleFilter, TimeRange};
 use crate::project_scope::ProjectScope;
-use crate::types::{
-    Message, ParentLink, RawSessionEvent, RawUsageEvent, Role, Session, SessionTopology, ThreadRole,
-};
+use crate::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session};
 
 pub(crate) struct IndexedSourceStats {
     pub(crate) sessions: u64,
@@ -325,149 +324,17 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn persist_topology_for_existing_session(
-        &self,
-        source: &str,
-        source_id: &str,
-        topology: &SessionTopologyWrite<'_>,
-    ) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
-        let session_id: Option<String> = tx
-            .query_row(
-                "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2",
-                rusqlite::params![source, source_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(session_id) = session_id else {
-            return Ok(false);
-        };
-        tx.execute(
-            "UPDATE sessions SET thread_role = ?1, metadata_parser_version = ?2 WHERE id = ?3",
-            rusqlite::params![
-                topology.thread_role.map(|role| role.as_str()),
-                topology.parser_version,
-                session_id,
-            ],
-        )?;
-        replace_parent_links_tx(&tx, &session_id, topology.parents)?;
-        tx.commit()?;
-        Ok(true)
-    }
-
-    pub(crate) fn session_topology(&self, session_id: &str) -> Result<SessionTopology> {
-        let thread_role = self
-            .conn
-            .query_row(
-                "SELECT thread_role FROM sessions WHERE id = ?1",
-                rusqlite::params![session_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten()
-            .and_then(|role| role.parse::<ThreadRole>().ok());
-        let mut stmt = self.conn.prepare(
-            "SELECT relation, parent_source, parent_source_id
-             FROM session_parent_links
-             WHERE session_id = ?1
-             ORDER BY relation, parent_source, parent_source_id",
-        )?;
-        let parents = stmt
-            .query_map(rusqlite::params![session_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter_map(|(relation, source, source_id)| {
-                relation.parse().ok().map(|relation| ParentLink { relation, source, source_id })
-            })
-            .collect();
-        Ok(SessionTopology { thread_role, parents })
-    }
-
-    /// Sessions whose `spawn` parent is the given portable identity — the
-    /// subagents this session directly spawned. `fork`/`resume` links are not
-    /// subagents and are excluded. Uses `idx_session_parent_links_parent`.
-    pub(crate) fn resolve_parent(
-        &self,
-        child_id: &str,
-        parent: &ParentLink,
-    ) -> Result<Option<Session>> {
-        let sync_id: Option<String> = self.conn.query_row(
-            "SELECT parent_sync_id FROM session_parent_links
-             WHERE session_id = ?1 AND relation = ?2 AND parent_source = ?3 AND parent_source_id = ?4",
-            rusqlite::params![child_id, parent.relation.as_str(), parent.source, parent.source_id],
-            |row| row.get(0),
-        ).optional()?.flatten();
-        let parent_id: Option<String> =
-            if let Some(sync_id) = sync_id {
-                self.conn
-                    .query_row(
-                        "SELECT session_id FROM sync_aliases WHERE sync_id = ?1",
-                        [sync_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-            } else {
-                self.conn.query_row(
-                "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2
-                 AND EXISTS(SELECT 1 FROM native_bindings WHERE session_id = ?3)",
-                rusqlite::params![parent.source, parent.source_id, child_id], |row| row.get(0),
-            ).optional()?
-            };
-        parent_id.map(|id| self.get_session_by_id(&id)).transpose().map(Option::flatten)
-    }
-
-    pub(crate) fn child_subagents(&self, parent_id: &str) -> Result<Vec<Session>> {
-        let Some(parent) = self.get_session_by_id(parent_id)? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = self.conn.prepare(
-            "SELECT s.id FROM sessions s JOIN session_parent_links l ON l.session_id = s.id
-             WHERE l.parent_source = ?1 AND l.parent_source_id = ?2 AND l.relation = 'spawn'
-             ORDER BY s.started_at, s.id",
-        )?;
-        let ids = stmt
-            .query_map(rusqlite::params![parent.source, parent.source_id], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let link = ParentLink {
-            relation: crate::types::ParentRelation::Spawn,
-            source: parent.source,
-            source_id: parent.source_id,
-        };
-        let mut children = Vec::new();
-        for id in ids {
-            if self.resolve_parent(&id, &link)?.is_some_and(|resolved| resolved.id == parent_id)
-                && let Some(child) = self.get_session_by_id(&id)?
-            {
-                children.push(child);
-            }
-        }
-        Ok(children)
-    }
-
     pub(crate) fn metadata_state_meta_map(
         &self,
         source: &str,
-    ) -> Result<HashMap<String, MetadataSessionStateMeta>> {
-        let mut stmt = self.conn.prepare(
+    ) -> Result<HashMap<String, ParserStateMeta>> {
+        self.parser_state_map(
             "SELECT source_id, metadata_parser_version, updated_at
              FROM sessions
              WHERE source = ?1 AND metadata_parser_version IS NOT NULL
                AND id IN (SELECT session_id FROM native_bindings)",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![source], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                MetadataSessionStateMeta {
-                    parser_version: row.get(1)?,
-                    source_updated_at: row.get(2)?,
-                },
-            ))
-        })?;
-        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
+            source,
+        )
     }
 
     pub(crate) fn delete_session_data(&self, source: &str, source_id: &str) -> Result<()> {
@@ -558,11 +425,7 @@ impl Store {
                 seq: row.get(3)?,
             })
         })?;
-        let mut messages = Vec::new();
-        for row in rows {
-            messages.push(row?);
-        }
-        Ok(messages)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     pub(crate) fn stats(&self) -> Result<(u64, u64)> {
@@ -771,34 +634,6 @@ impl Store {
     }
 }
 
-fn replace_parent_links_tx(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-    parents: &[ParentLink],
-) -> Result<()> {
-    tx.execute(
-        "DELETE FROM session_parent_links WHERE session_id = ?1",
-        rusqlite::params![session_id],
-    )?;
-    if parents.is_empty() {
-        return Ok(());
-    }
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO session_parent_links
-            (session_id, relation, parent_source, parent_source_id)
-         VALUES (?1, ?2, ?3, ?4)",
-    )?;
-    for parent in parents {
-        stmt.execute(rusqlite::params![
-            session_id,
-            parent.relation.as_str(),
-            parent.source,
-            parent.source_id,
-        ])?;
-    }
-    Ok(())
-}
-
 fn delete_session_data_tx(
     tx: &rusqlite::Transaction<'_>,
     source: &str,
@@ -923,88 +758,16 @@ pub(super) fn persist_session_with_usage_and_events_tx(
 
     insert_messages_tx(tx, messages, trigram_message_flag)?;
 
-    {
-        tx.execute(
-            "DELETE FROM usage_events WHERE session_id = ?1",
-            rusqlite::params![session.id],
-        )?;
-        let created_at = Utc::now().timestamp_millis();
-        let mut stmt = tx.prepare(
-            "INSERT INTO usage_events (
-                session_id, source, source_id, event_key, event_seq, message_seq,
-                timestamp, model, provider, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                token_source, parser_version, source_path, raw_usage_json, created_at
-             )
-             VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
-             )
-             ON CONFLICT(session_id, event_key) DO UPDATE SET
-                event_seq = excluded.event_seq,
-                message_seq = excluded.message_seq,
-                timestamp = excluded.timestamp,
-                model = excluded.model,
-                provider = excluded.provider,
-                input_tokens = excluded.input_tokens,
-                output_tokens = excluded.output_tokens,
-                cache_read_tokens = excluded.cache_read_tokens,
-                cache_write_tokens = excluded.cache_write_tokens,
-                reasoning_tokens = excluded.reasoning_tokens,
-                token_source = excluded.token_source,
-                parser_version = excluded.parser_version,
-                source_path = excluded.source_path,
-                raw_usage_json = excluded.raw_usage_json",
-        )?;
-        for event in usage_events {
-            stmt.execute(rusqlite::params![
-                session.id,
-                session.source,
-                session.source_id,
-                event.event_key,
-                event.event_seq,
-                event.message_seq,
-                event.timestamp,
-                event.model,
-                event.provider,
-                event.input_tokens,
-                event.output_tokens,
-                event.cache_read_tokens,
-                event.cache_write_tokens,
-                event.reasoning_tokens,
-                event.token_source.as_str(),
-                event.parser_version,
-                event.source_path,
-                event.raw_usage_json,
-                created_at,
-            ])?;
-        }
-    }
-
-    if let Some(parser_version) = usage_parser_version {
-        let synced_at = Utc::now().timestamp_millis();
-        tx.execute(
-            "INSERT INTO usage_session_state (
-                session_id, source, source_id, parser_version,
-                source_updated_at, event_count, synced_at
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(session_id) DO UPDATE SET
-                parser_version = excluded.parser_version,
-                source_updated_at = excluded.source_updated_at,
-                event_count = excluded.event_count,
-                synced_at = excluded.synced_at",
-            rusqlite::params![
-                session.id,
-                session.source,
-                session.source_id,
-                parser_version,
-                session.updated_at,
-                usage_events.len() as u32,
-                synced_at,
-            ],
-        )?;
-    }
+    super::usage_store::replace_usage_events(
+        tx,
+        &session.id,
+        &session.source,
+        &session.source_id,
+        usage_events,
+        usage_parser_version,
+        session.updated_at,
+        super::usage_store::UsageConflict::Update,
+    )?;
 
     replace_session_events(
         tx,
@@ -1060,546 +823,28 @@ fn insert_messages_tx(
     messages: &[Message],
     trigram_message_flag: bool,
 ) -> Result<()> {
-    if trigram_message_flag {
-        let mut stmt = tx.prepare(
-            "INSERT INTO messages (
-                session_id, role, content, timestamp, seq, trigram_indexed
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
-        for msg in messages {
-            stmt.execute(rusqlite::params![
-                msg.session_id,
-                msg.role.as_str(),
-                msg.content,
-                msg.timestamp,
-                msg.seq,
-                crate::utils::text_needs_trigram(&msg.content),
-            ])?;
-        }
+    let sql = if trigram_message_flag {
+        "INSERT INTO messages (session_id, role, content, timestamp, seq, trigram_indexed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
     } else {
-        let mut stmt = tx.prepare(
-            "INSERT INTO messages (session_id, role, content, timestamp, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for msg in messages {
-            stmt.execute(rusqlite::params![
-                msg.session_id,
-                msg.role.as_str(),
-                msg.content,
-                msg.timestamp,
-                msg.seq,
-            ])?;
-        }
+        "INSERT INTO messages (session_id, role, content, timestamp, seq)
+         VALUES (?1, ?2, ?3, ?4, ?5)"
+    };
+    let mut stmt = tx.prepare(sql)?;
+    let parameter_count = stmt.parameter_count();
+    for msg in messages {
+        let indexed = trigram_message_flag && crate::utils::text_needs_trigram(&msg.content);
+        let parameters = rusqlite::params![
+            msg.session_id,
+            msg.role.as_str(),
+            msg.content,
+            msg.timestamp,
+            msg.seq,
+            indexed,
+        ];
+        stmt.execute(&parameters[..parameter_count])?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod topology_tests {
-    use super::*;
-    use crate::db::schema;
-    use crate::db::store::SessionListSort;
-    use crate::types::{Message, ParentLink, ParentRelation, Role, Session, ThreadRole};
-
-    fn store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
-
-    fn sess(source_id: &str) -> Session {
-        Session {
-            id: format!("local-{source_id}"),
-            source: "codex".to_string(),
-            source_id: source_id.to_string(),
-            title: "t".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
-            updated_at: Some(10),
-            message_count: 1,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
-        }
-    }
-
-    fn msg(session_id: &str) -> Vec<Message> {
-        vec![Message {
-            session_id: session_id.to_string(),
-            role: Role::User,
-            content: "hello world".to_string(),
-            timestamp: Some(1),
-            seq: 0,
-        }]
-    }
-
-    fn persist(store: &Store, session: &Session, topology: &SessionTopologyWrite<'_>) {
-        store
-            .persist_session_with_usage_and_events_with_topology(
-                session,
-                &msg(&session.id),
-                &[],
-                None,
-                &[],
-                None,
-                topology,
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn native_refresh_and_removal_leave_same_id_replicas_and_sync_identity_intact() {
-        let store = store();
-        let mut native = sess("collision");
-        native.directory = Some("/work/project".into());
-        persist(&store, &native, &SessionTopologyWrite::none());
-        let mut replica = native.clone();
-        replica.id = "remote-copy".into();
-        replica.is_import = true;
-        let tx = store.conn.unchecked_transaction().unwrap();
-        persist_session_with_usage_and_events_tx(
-            &tx,
-            &replica,
-            &msg(&replica.id),
-            &[],
-            Some(1),
-            &[],
-            Some(1),
-            &SessionTopologyWrite::none(),
-            store.trigram_message_flag,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        assert!(store.get_session_by_source_id("codex", "collision").is_err());
-        assert_eq!(store.get_native_session("codex", "collision").unwrap().unwrap().id, native.id);
-        assert_eq!(store.session_meta_map("codex").unwrap().len(), 1);
-        assert!(store.usage_state_meta_map("codex").unwrap().is_empty());
-        assert!(store.event_state_meta_map("codex").unwrap().is_empty());
-        assert_eq!(
-            store
-                .list_indexed_sessions(
-                    None,
-                    TimeRange::All,
-                    &ProjectScope::Directory("/work/project".into()),
-                    None,
-                    None,
-                    0,
-                    SessionListSort::Newest
-                )
-                .unwrap()
-                .len(),
-            1
-        );
-        store
-            .conn
-            .execute("INSERT INTO session_sync(session_id, sync_id, current_revision) VALUES (?1, 'shared-identity', NULL)", [&native.id])
-            .unwrap();
-        let mut host = crate::host::Host {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: "macbook".into(),
-            revision: 1,
-        };
-        host.observe(&store.conn, "codex", "collision").unwrap();
-        native.title = "refreshed".into();
-        store
-            .replace_session_with_usage_and_events_with_topology(
-                "codex",
-                "collision",
-                &native,
-                &msg(&native.id),
-                &[],
-                None,
-                &[],
-                None,
-                &SessionTopologyWrite::none(),
-            )
-            .unwrap();
-        assert_eq!(
-            store.get_session_by_id(&native.id).unwrap().unwrap().locations[0].host.name,
-            "macbook"
-        );
-        assert_eq!(store.get_session_by_id(&replica.id).unwrap().unwrap().title, "t");
-        host.name = "renamed".into();
-        host.revision += 1;
-        host.observe(&store.conn, "codex", "collision").unwrap();
-        assert_eq!(
-            store.get_session_by_id(&native.id).unwrap().unwrap().locations[0].host.name,
-            "renamed"
-        );
-        assert!(store.get_session_by_id(&replica.id).unwrap().unwrap().locations.is_empty());
-        store.delete_session_data("codex", "collision").unwrap();
-        assert!(store.get_native_session("codex", "collision").unwrap().is_none());
-        assert_eq!(store.get_messages(&native.id).unwrap().len(), 1);
-        assert_eq!(store.get_messages(&replica.id).unwrap().len(), 1);
-        assert!(store.session_meta_map("codex").unwrap().is_empty());
-        assert!(store.get_session_by_id(&native.id).unwrap().unwrap().is_import);
-        assert_eq!(
-            store
-                .conn
-                .query_row(
-                    "SELECT sync_id FROM session_sync WHERE session_id = ?1",
-                    [&native.id],
-                    |row| row.get::<_, String>(0)
-                )
-                .unwrap(),
-            "shared-identity"
-        );
-    }
-
-    #[test]
-    fn session_topology_round_trips_role_and_parents() {
-        let store = store();
-        let session = sess("s1");
-        let parents = vec![
-            ParentLink {
-                relation: ParentRelation::Spawn,
-                source: "codex".to_string(),
-                source_id: "p-spawn".to_string(),
-            },
-            ParentLink {
-                relation: ParentRelation::Fork,
-                source: "codex".to_string(),
-                source_id: "p-fork".to_string(),
-            },
-        ];
-        persist(
-            &store,
-            &session,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: &parents,
-                parser_version: Some(1),
-            },
-        );
-
-        let topology = store.session_topology(&session.id).unwrap();
-        assert_eq!(topology.thread_role, Some(ThreadRole::Subagent));
-        assert_eq!(
-            topology.parents,
-            vec![
-                ParentLink {
-                    relation: ParentRelation::Fork,
-                    source: "codex".to_string(),
-                    source_id: "p-fork".to_string(),
-                },
-                ParentLink {
-                    relation: ParentRelation::Spawn,
-                    source: "codex".to_string(),
-                    source_id: "p-spawn".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn metadata_backfill_updates_topology_without_touching_messages() {
-        let store = store();
-        let session = sess("s1");
-        persist(
-            &store,
-            &session,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Primary),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        let embedding_before: i64 = store
-            .conn
-            .query_row(
-                "SELECT units_total FROM session_embedding_state WHERE session_id = ?1",
-                [&session.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-
-        let parents = vec![ParentLink {
-            relation: ParentRelation::Fork,
-            source: "codex".to_string(),
-            source_id: "p1".to_string(),
-        }];
-        let updated = store
-            .persist_topology_for_existing_session(
-                "codex",
-                "s1",
-                &SessionTopologyWrite {
-                    thread_role: Some(ThreadRole::Subagent),
-                    parents: &parents,
-                    parser_version: Some(2),
-                },
-            )
-            .unwrap();
-        assert!(updated);
-
-        let topology = store.session_topology(&session.id).unwrap();
-        assert_eq!(topology.thread_role, Some(ThreadRole::Subagent));
-        assert_eq!(topology.parents, parents);
-
-        assert_eq!(store.get_messages(&session.id).unwrap().len(), 1);
-        let same_id: String = store
-            .conn
-            .query_row(
-                "SELECT id FROM sessions WHERE source = 'codex' AND source_id = 's1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(same_id, session.id);
-        let embedding_after: i64 = store
-            .conn
-            .query_row(
-                "SELECT units_total FROM session_embedding_state WHERE session_id = ?1",
-                [&session.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(embedding_before, embedding_after);
-
-        let meta = store.metadata_state_meta_map("codex").unwrap();
-        assert_eq!(meta.get("s1").map(|m| m.parser_version), Some(2));
-    }
-
-    #[test]
-    fn persist_topology_for_missing_session_reports_false() {
-        let store = store();
-        let updated = store
-            .persist_topology_for_existing_session("codex", "absent", &SessionTopologyWrite::none())
-            .unwrap();
-        assert!(!updated);
-    }
-
-    #[test]
-    fn list_indexed_sessions_filters_by_thread_role() {
-        let store = store();
-        persist(
-            &store,
-            &sess("primary"),
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Primary),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        persist(
-            &store,
-            &sess("subagent"),
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        persist(
-            &store,
-            &sess("unknown"),
-            &SessionTopologyWrite { thread_role: None, parents: &[], parser_version: Some(1) },
-        );
-
-        let ids = |filter| {
-            store
-                .list_indexed_sessions(
-                    None,
-                    TimeRange::All,
-                    &ProjectScope::Global,
-                    Some(filter),
-                    None,
-                    0,
-                    SessionListSort::Newest,
-                )
-                .unwrap()
-                .into_iter()
-                .map(|s| s.source_id)
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(ids(ThreadRoleFilter::Primary), vec!["primary".to_string()]);
-        assert_eq!(ids(ThreadRoleFilter::Subagent), vec!["subagent".to_string()]);
-        assert_eq!(ids(ThreadRoleFilter::Unknown), vec!["unknown".to_string()]);
-    }
-
-    #[test]
-    fn recent_sessions_for_search_scope_hides_only_reachable_subagents() {
-        let store = store();
-        persist(
-            &store,
-            &sess("primary"),
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Primary),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        // Reachable subagent: spawn parent is the indexed "primary" — hidden,
-        // because it can be opened from primary's subagent picker.
-        let spawn_parent = ParentLink {
-            relation: ParentRelation::Spawn,
-            source: "codex".to_string(),
-            source_id: "primary".to_string(),
-        };
-        persist(
-            &store,
-            &sess("child"),
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: std::slice::from_ref(&spawn_parent),
-                parser_version: Some(1),
-            },
-        );
-        // Orphaned subagent: no parent link — must stay visible in the list.
-        persist(
-            &store,
-            &sess("orphan"),
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        persist(
-            &store,
-            &sess("unknown"),
-            &SessionTopologyWrite { thread_role: None, parents: &[], parser_version: Some(1) },
-        );
-
-        let mut ids = store
-            .list_recent_sessions_for_search_scope(
-                None,
-                TimeRange::All,
-                &ProjectScope::Global,
-                None,
-                100,
-            )
-            .unwrap()
-            .into_iter()
-            .map(|s| s.source_id)
-            .collect::<Vec<_>>();
-        ids.sort();
-        assert_eq!(
-            ids,
-            vec!["orphan".to_string(), "primary".to_string(), "unknown".to_string()],
-            "reachable child hidden; orphaned subagent stays visible"
-        );
-    }
-
-    #[test]
-    fn recent_sessions_keeps_subagent_when_parent_is_beyond_result_limit() {
-        let store = store();
-        let spawn = ParentLink {
-            relation: ParentRelation::Spawn,
-            source: "codex".to_string(),
-            source_id: "primary".to_string(),
-        };
-        let mut child = sess("child");
-        child.updated_at = Some(100);
-        persist(
-            &store,
-            &child,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: std::slice::from_ref(&spawn),
-                parser_version: Some(1),
-            },
-        );
-        let mut visible = sess("visible");
-        visible.updated_at = Some(90);
-        persist(
-            &store,
-            &visible,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Primary),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        let mut primary = sess("primary");
-        primary.updated_at = Some(80);
-        persist(
-            &store,
-            &primary,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Primary),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-
-        let ids = store
-            .list_recent_sessions_for_search_scope(
-                None,
-                TimeRange::All,
-                &ProjectScope::Global,
-                None,
-                2,
-            )
-            .unwrap()
-            .into_iter()
-            .map(|session| session.source_id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(ids, vec!["child", "visible"]);
-    }
-
-    #[test]
-    fn recent_sessions_keeps_subagent_when_parent_is_out_of_scope() {
-        let store = store();
-        let now = chrono::Utc::now().timestamp_millis();
-        let mut parent = sess("primary");
-        parent.started_at = now - 3 * 86_400_000;
-        parent.updated_at = Some(parent.started_at);
-        let mut child = sess("child");
-        child.started_at = now;
-        child.updated_at = Some(now);
-        persist(
-            &store,
-            &parent,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Primary),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        let spawn = ParentLink {
-            relation: ParentRelation::Spawn,
-            source: "codex".to_string(),
-            source_id: "primary".to_string(),
-        };
-        persist(
-            &store,
-            &child,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: std::slice::from_ref(&spawn),
-                parser_version: Some(1),
-            },
-        );
-
-        // Under Today, the parent (3 days ago) is filtered out; the child must
-        // stay visible because its picker is unreachable without the parent.
-        let ids: Vec<String> = store
-            .list_recent_sessions_for_search_scope(
-                None,
-                TimeRange::Today,
-                &ProjectScope::Global,
-                None,
-                100,
-            )
-            .unwrap()
-            .into_iter()
-            .map(|s| s.source_id)
-            .collect();
-        assert_eq!(
-            ids,
-            vec!["child".to_string()],
-            "subagent stays visible when its parent is out of the active scope"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1656,25 +901,14 @@ mod search_scope_stats_tests {
         directory: Option<&str>,
     ) -> Session {
         Session {
-            id: id.to_string(),
             source: source.to_string(),
             source_id: format!("raw-{id}"),
             title: id.to_string(),
             directory: directory.map(str::to_string),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
             started_at,
             updated_at: Some(started_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(id)
         }
     }
 

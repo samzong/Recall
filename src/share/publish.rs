@@ -468,7 +468,8 @@ pub(crate) fn validate_project_name(project_name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::share::render::render_session_html;
-    use crate::types::{Message, Role, Session, SessionEventRecord};
+    use crate::share::test_session as session;
+    use crate::types::{Message, Role, SessionEventRecord};
 
     #[test]
     fn share_id_prefers_source_id() {
@@ -613,30 +614,6 @@ mod tests {
         init_publish_dir(legacy.path()).unwrap();
         assert!(legacy.path().join(PUBLISH_DIR_MARKER).is_file());
         init_publish_dir(legacy.path()).unwrap();
-    }
-
-    fn session(source_id: &str) -> Session {
-        Session {
-            id: "local-id".to_string(),
-            source: "codex".to_string(),
-            source_id: source_id.to_string(),
-            title: "Fix <bug>".to_string(),
-            directory: Some("/tmp/project".to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
-            updated_at: None,
-            message_count: 1,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
-        }
     }
 
     fn session_event(event_seq: u32, kind: &str) -> SessionEventRecord {

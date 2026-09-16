@@ -16,7 +16,7 @@ use crate::adapters::usage::usage_count;
 use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
 };
-use crate::types::{FileEvidence, FileEvidenceKind, FileOperation, RawUsageEvent, Role};
+use crate::types::{FileEvidence, FileOperation, RawUsageEvent, Role};
 
 const USAGE_PARSER_VERSION: u32 = 1;
 const EVENT_PARSER_VERSION: u32 = 1;
@@ -37,10 +37,7 @@ impl SourceAdapter for DroidAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "droid".to_string(),
-            args: vec!["--resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("droid", &["--resume", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
@@ -364,13 +361,11 @@ fn parse_droid_jsonl(
                                     }
                                     .to_string();
                                     event.target = Some(path.to_string());
-                                    event.files.push(FileEvidence {
-                                        path: path.to_string(),
+                                    event.files.push(FileEvidence::call(
+                                        path.to_string(),
                                         operation,
-                                        kind: FileEvidenceKind::Call,
-                                        cwd: directory.clone(),
-                                        target: None,
-                                    });
+                                        directory.clone(),
+                                    ));
                                 }
                                 if name == "Execute" {
                                     event.kind = "command".to_string();
@@ -546,7 +541,9 @@ fn parse_droid_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::test_support::{seed_empty_event_state, seed_empty_usage_state};
     use crate::db::store::Store;
+    use crate::types::FileEvidenceKind;
 
     const SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -807,15 +804,13 @@ mod tests {
             )
             .unwrap();
         store.conn.execute_batch("INSERT INTO native_bindings SELECT source, source_id, id, NOT is_import FROM sessions;").unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "droid",
-                SESSION_ID,
-                &[],
-                USAGE_PARSER_VERSION,
-                first.sessions[0].updated_at,
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "droid",
+            SESSION_ID,
+            USAGE_PARSER_VERSION,
+            first.sessions[0].updated_at,
+        );
 
         let second = file_scan::run_file_scan_with_options_and_snapshot(
             &AdapterSyncContext::from_store_for_test(&store, "droid").unwrap(),
@@ -834,15 +829,13 @@ mod tests {
         assert!(second.sessions.is_empty());
         for version in [None, Some(EVENT_PARSER_VERSION - 1), Some(EVENT_PARSER_VERSION)] {
             if let Some(version) = version {
-                store
-                    .persist_session_events_for_existing_session(
-                        "droid",
-                        SESSION_ID,
-                        &[],
-                        version,
-                        first.sessions[0].updated_at,
-                    )
-                    .unwrap();
+                seed_empty_event_state(
+                    &store,
+                    "droid",
+                    SESSION_ID,
+                    version,
+                    first.sessions[0].updated_at,
+                );
             }
             let result = file_scan::run_file_scan_with_options_and_snapshot(
                 &AdapterSyncContext::from_store_for_test(&store, "droid").unwrap(),

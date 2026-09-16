@@ -378,7 +378,6 @@ mod tests {
     fn extract_skill_from_skill_tool_attrs() {
         let mut event = SkillAuditEventRow {
             session_id: "s1".to_string(),
-            source: "codex".to_string(),
             timestamp: Some(1),
             name: Some("Skill".to_string()),
             target: None,
@@ -426,7 +425,6 @@ mod tests {
     fn extract_skill_from_opencode_native_skill_tool() {
         let event = SkillAuditEventRow {
             session_id: "s1".to_string(),
-            source: "opencode".to_string(),
             timestamp: Some(1),
             name: Some("skill".to_string()),
             target: None,
@@ -443,7 +441,6 @@ mod tests {
     fn extract_skill_from_opencode_use_skill_plugin() {
         let event = SkillAuditEventRow {
             session_id: "s1".to_string(),
-            source: "opencode".to_string(),
             timestamp: Some(1),
             name: Some("use_skill".to_string()),
             target: None,
@@ -461,7 +458,6 @@ mod tests {
         let events = [
             SkillAuditEventRow {
                 session_id: "s1".to_string(),
-                source: "codex".to_string(),
                 timestamp: Some(1),
                 name: Some("Skill".to_string()),
                 target: None,
@@ -469,7 +465,6 @@ mod tests {
             },
             SkillAuditEventRow {
                 session_id: "s1".to_string(),
-                source: "codex".to_string(),
                 timestamp: Some(2),
                 name: None,
                 target: Some("/Users/x/.agents/skills/pre-ship/references/a.md".to_string()),
@@ -477,7 +472,6 @@ mod tests {
             },
             SkillAuditEventRow {
                 session_id: "s2".to_string(),
-                source: "codex".to_string(),
                 timestamp: Some(3),
                 name: Some("Skill".to_string()),
                 target: None,

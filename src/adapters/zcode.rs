@@ -4,7 +4,7 @@ use tracing::debug;
 
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::opencode;
-use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats};
+use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
 
 pub(crate) struct ZcodeAdapter;
 
@@ -22,10 +22,7 @@ impl SourceAdapter for ZcodeAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "zcode".to_string(),
-            args: vec!["--resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("zcode", &["--resume", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
@@ -50,11 +47,7 @@ impl SourceAdapter for ZcodeAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_zcode_db()? else {
-            return Ok(Some(SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            }));
+            return Ok(Some(SyncScanResult::default()));
         };
         Ok(Some(opencode::scan_for_sync_conn_with_options(
             &conn,
@@ -89,10 +82,7 @@ fn resolve_zcode_db_path_from(storage_dir: Option<String>, home: PathBuf) -> Opt
 
 #[cfg(target_os = "macos")]
 fn open_zcode_app() -> Option<ResumeCommand> {
-    Some(ResumeCommand {
-        program: "open".to_string(),
-        args: vec!["-a".to_string(), "ZCode".to_string()],
-    })
+    Some(ResumeCommand::new("open", &["-a", "ZCode"]))
 }
 
 #[cfg(not(target_os = "macos"))]

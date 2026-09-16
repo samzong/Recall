@@ -8,4 +8,5 @@ pub(crate) mod semantic_store;
 pub(crate) mod session_store;
 pub(crate) mod skill_audit_store;
 pub(crate) mod store;
+pub(crate) mod topology_store;
 pub(crate) mod usage_store;

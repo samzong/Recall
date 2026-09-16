@@ -34,36 +34,26 @@ pub(crate) fn build_prompt(session: &Session, messages: &[Message]) -> String {
         .iter()
         .rev()
         .find(|message| message.role == Role::User)
-        .map(|message| truncate_chars(&message.content, LAST_USER_CHARS))
+        .map(|message| message.content.chars().take(LAST_USER_CHARS).collect::<String>())
         .filter(|content| !content.is_empty())
         .unwrap_or_else(|| "(none)".to_string());
 
-    let mut prompt = String::new();
-    prompt.push_str("Use Recall session ");
-    prompt.push_str(&session.id);
-    prompt.push_str(" as prior context. This is a handoff, not a native resume.\n");
-    prompt.push_str("Title: ");
-    prompt.push_str(&session.title);
-    prompt.push('\n');
-    prompt.push_str("Source: ");
-    prompt.push_str(&session.source);
-    prompt.push_str(" (");
-    prompt.push_str(&session.source_id);
-    prompt.push_str(")\n");
-    if let Some(directory) = session.directory.as_deref() {
-        prompt.push_str("Directory: ");
-        prompt.push_str(directory);
-        prompt.push('\n');
-    }
-    prompt.push_str("Messages: ");
-    prompt.push_str(&messages.len().to_string());
-    prompt.push('\n');
-    prompt.push_str("Last user request:\n");
-    prompt.push_str(&last_user);
-    prompt.push_str("\n\nLoad evidence with Recall MCP get_session or `recall session show --id ");
-    prompt.push_str(&session.id);
-    prompt.push_str("`.\n");
-    prompt
+    let directory = session
+        .directory
+        .as_deref()
+        .map(|directory| format!("Directory: {directory}\n"))
+        .unwrap_or_default();
+    format!(
+        "Use Recall session {} as prior context. This is a handoff, not a native resume.\n\
+Title: {}\nSource: {} ({})\n{directory}Messages: {}\nLast user request:\n{last_user}\n\n\
+Load evidence with Recall MCP get_session or `recall session show --id {}`.\n",
+        session.id,
+        session.title,
+        session.source,
+        session.source_id,
+        messages.len(),
+        session.id
+    )
 }
 
 pub(crate) fn command_for_target(target: &HandoffTarget, prompt: String) -> Result<ResumeCommand> {
@@ -77,8 +67,9 @@ pub(crate) fn command_for_target(target: &HandoffTarget, prompt: String) -> Resu
 pub(crate) fn target_for(target_id: &str) -> Result<HandoffTarget> {
     let id = target_id.to_ascii_lowercase();
     let supported = supported_targets();
-    supported.into_iter().find(|target| target.id == id).ok_or_else(|| {
-        let names = supported_target_ids().join(", ");
+    supported.iter().find(|target| target.id == id).cloned().ok_or_else(|| {
+        let names =
+            supported.iter().map(|target| target.id.as_str()).collect::<Vec<_>>().join(", ");
         anyhow::anyhow!("unsupported handoff target: {target_id} (supported: {names})")
     })
 }
@@ -96,10 +87,6 @@ fn supported_targets() -> Vec<HandoffTarget> {
         .filter(|adapter| adapter.start_command(String::new()).is_some())
         .map(|adapter| target_from_adapter(adapter.as_ref()))
         .collect()
-}
-
-fn supported_target_ids() -> Vec<String> {
-    supported_targets().into_iter().map(|target| target.id).collect()
 }
 
 fn target_from_adapter(adapter: &dyn adapters::SourceAdapter) -> HandoffTarget {
@@ -123,10 +110,6 @@ fn display_label(id: &str) -> String {
         .join(" ")
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    text.chars().take(max_chars).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,36 +117,18 @@ mod tests {
 
     fn session() -> Session {
         Session {
-            id: "s1".to_string(),
-            source: "grok".to_string(),
-            source_id: "raw1".to_string(),
-            title: "Fix login bug".to_string(),
-            directory: Some("/tmp/project".to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
-            updated_at: None,
+            source: "grok".into(),
+            source_id: "raw1".into(),
+            title: "Fix login bug".into(),
+            directory: Some("/tmp/project".into()),
             message_count: 1,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
             is_import: true,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session("s1")
         }
     }
 
     fn message(role: Role, content: &str, seq: u32) -> Message {
-        Message {
-            session_id: "s1".to_string(),
-            role,
-            content: content.to_string(),
-            timestamp: None,
-            seq,
-        }
+        crate::types::test_support::message("s1", role, content, seq)
     }
 
     fn target(id: &str) -> HandoffTarget {

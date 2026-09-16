@@ -5,10 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use tracing::warn;
 
-use crate::adapters::sync_state::{
-    event_state_is_current_for_mtime, metadata_state_is_current_for_mtime,
-    usage_state_is_current_for_mtime,
-};
+use crate::adapters::sync_state::parser_state_is_current_for_mtime;
 use crate::adapters::{
     AdapterSyncContext, RawSession, SourceObservation, SyncScanResult, SyncScanStats,
 };
@@ -182,17 +179,17 @@ where
 
         if let Some(old) = existing.get(&entry.session_id)
             && old.updated_at == Some(mtime_ms)
-            && usage_state_is_current_for_mtime(
+            && parser_state_is_current_for_mtime(
                 options.usage_parser_version,
                 usage_state.get(&entry.session_id).copied(),
                 mtime_ms,
             )
-            && event_state_is_current_for_mtime(
+            && parser_state_is_current_for_mtime(
                 options.event_parser_version,
                 event_state.get(&entry.session_id).copied(),
                 mtime_ms,
             )
-            && metadata_state_is_current_for_mtime(
+            && parser_state_is_current_for_mtime(
                 options.metadata_parser_version,
                 metadata_state.get(&entry.session_id).copied(),
                 mtime_ms,
@@ -233,14 +230,13 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
     use crate::adapters::{RawMessage, RawSession};
-    use crate::db::{schema, store::Store};
+    use crate::db::store::Store;
     use crate::types::{Role, Session};
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn sync_context(store: &Store) -> AdapterSyncContext {
         AdapterSyncContext::from_store_for_test(store, "test-source").unwrap()
@@ -253,25 +249,12 @@ mod tests {
         message_count: u32,
     ) -> Session {
         Session {
-            id: id.to_string(),
             source: "test-source".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at,
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(id)
         }
     }
 
@@ -482,15 +465,7 @@ mod tests {
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.stats.skipped_sessions, 0);
 
-        store
-            .persist_usage_events_for_existing_session(
-                "test-source",
-                "sess-usage",
-                &[],
-                1,
-                Some(mtime_ms),
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, "test-source", "sess-usage", 1, Some(mtime_ms));
         let entry = FileScanEntry {
             session_id: "sess-usage".to_string(),
             stat_target: path.clone(),
@@ -540,15 +515,7 @@ mod tests {
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.stats.skipped_sessions, 0);
 
-        store
-            .persist_session_events_for_existing_session(
-                "test-source",
-                "sess-event",
-                &[],
-                1,
-                Some(mtime_ms),
-            )
-            .unwrap();
+        seed_empty_event_state(&store, "test-source", "sess-event", 1, Some(mtime_ms));
         let entry = FileScanEntry {
             session_id: "sess-event".to_string(),
             stat_target: path.clone(),
@@ -573,7 +540,6 @@ mod tests {
 
     #[test]
     fn matching_mtime_reparses_until_metadata_state_is_current() {
-        use crate::db::store::SessionTopologyWrite;
         let store = setup_store();
         let path = temp_file_with_mtime("metadata-backfill");
         let mtime_ms = stat_mtime_ms(&path).unwrap();
@@ -601,13 +567,7 @@ mod tests {
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.stats.skipped_sessions, 0);
 
-        store
-            .persist_topology_for_existing_session(
-                "test-source",
-                "sess-meta",
-                &SessionTopologyWrite { thread_role: None, parents: &[], parser_version: Some(1) },
-            )
-            .unwrap();
+        seed_empty_metadata_state(&store, "test-source", "sess-meta", 1);
         let entry = FileScanEntry {
             session_id: "sess-meta".to_string(),
             stat_target: path.clone(),

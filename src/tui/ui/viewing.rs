@@ -20,7 +20,7 @@ use super::{
 /// Compact parent-lineage segment for the viewing header title. Empty when the
 /// session has no recorded parents. Long lists are truncated by the block title.
 fn lineage_suffix(app: &App) -> String {
-    let Some(lineage) = app.viewing_lineage.as_ref() else {
+    let Some(lineage) = app.viewing.lineage.as_ref() else {
         return String::new();
     };
     if lineage.parents.is_empty() {
@@ -43,22 +43,24 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
     let layout = viewing_layout(f.area());
 
     let session_info = app
-        .viewing_session
+        .viewing
+        .session
         .as_ref()
         .map(|s| {
             let dir = s.directory.as_deref().unwrap_or("");
-            let count = app.viewing_messages.len();
-            let pos = app.viewing_selected_msg + 1;
+            let count = app.viewing.messages.len();
+            let pos = app.viewing.selected_msg + 1;
             let role = app
-                .viewing_lineage
+                .viewing
+                .lineage
                 .as_ref()
                 .and_then(|lineage| lineage.role)
                 .map(|role| format!(" [{}]", role.as_str()))
                 .unwrap_or_default();
-            let subs = if app.viewing_children.is_empty() {
+            let subs = if app.viewing.children.is_empty() {
                 String::new()
             } else {
-                format!("  ▾ {} subs", app.viewing_children.len())
+                format!("  ▾ {} subs", app.viewing.children.len())
             };
             let versions = if s.alternative_versions > 0 {
                 format!(" +{} versions", s.alternative_versions)
@@ -81,19 +83,19 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
     f.render_widget(block, layout.content);
 
     let inner_width = layout.messages.width as usize;
-    let pane = app.viewing_pane(inner_width);
+    let pane = app.viewing.pane(inner_width);
     let viewport_start = pane.scroll_start(
-        app.viewing_scroll_offset,
-        app.viewing_selected_msg,
+        app.viewing.scroll_offset,
+        app.viewing.selected_msg,
         layout.messages.height as usize,
     );
     let viewport_end = viewport_start + layout.messages.height as usize;
     let mut visual_row = 0usize;
     let mut lines: Vec<Line> = Vec::new();
-    let needles = app.viewing_search_terms();
+    let needles = app.viewing.search_terms();
 
-    for (i, msg) in app.viewing_messages.iter().enumerate() {
-        let selected = i == app.viewing_selected_msg;
+    for (i, msg) in app.viewing.messages.iter().enumerate() {
+        let selected = i == app.viewing.selected_msg;
         let (prefix, color) = match msg.role {
             Role::User => ("User", THEME.user),
             Role::Assistant => ("Assistant", THEME.assistant),
@@ -119,7 +121,7 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         visual_row += 1;
 
         let empty: Vec<SanitizedLine> = Vec::new();
-        let cached_lines = app.viewing_sanitized_lines.get(i).unwrap_or(&empty);
+        let cached_lines = app.viewing.lines.get(i).unwrap_or(&empty);
         for sl in cached_lines {
             let body_style = Style::default().fg(THEME.text);
             let spans = highlight_spans(&sl.text, &sl.lower, &needles, body_style);
@@ -166,7 +168,7 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled("h", Style::default().fg(THEME.accent)),
         Span::styled(" handoff  ", Style::default().fg(THEME.text_muted)),
     ];
-    if !app.viewing_children.is_empty() {
+    if !app.viewing.children.is_empty() {
         help_spans.push(Span::styled("a", Style::default().fg(THEME.accent)));
         help_spans.push(Span::styled(" subs  ", Style::default().fg(THEME.text_muted)));
     }
@@ -181,7 +183,7 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" back", Style::default().fg(THEME.text_muted)),
     ]);
 
-    let status_line = if let Some(ref input) = app.viewing_search_input {
+    let status_line = if let Some(ref input) = app.viewing.search_input {
         Line::from(vec![
             Span::styled(" /", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
             Span::styled(input.clone(), Style::default().fg(THEME.text)),
@@ -190,19 +192,19 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         Line::from(vec![Span::styled(" Syncing...", Style::default().fg(THEME.info))])
     } else if let Some(ref msg) = app.status_message {
         Line::from(vec![Span::styled(format!(" {msg}"), Style::default().fg(THEME.success))])
-    } else if let Some(ref note) = app.viewing_search_status {
+    } else if let Some(ref note) = app.viewing.search_status {
         Line::from(vec![Span::styled(
-            format!(" {note}: \"{}\"", app.viewing_search_query),
+            format!(" {note}: \"{}\"", app.viewing.search_query),
             Style::default().fg(THEME.error),
         )])
-    } else if !app.viewing_search_query.is_empty() {
-        let matches = app.viewing_match_indices();
+    } else if !app.viewing.search_query.is_empty() {
+        let matches = &app.viewing.matches;
         let total = matches.len();
         let current_pos =
-            matches.iter().position(|&i| i == app.viewing_selected_msg).map(|n| n + 1).unwrap_or(0);
+            matches.iter().position(|&i| i == app.viewing.selected_msg).map(|n| n + 1).unwrap_or(0);
         let mut spans = help_spans.clone();
         spans.push(Span::styled(
-            format!("  [{current_pos}/{total} \"{}\"]", app.viewing_search_query),
+            format!("  [{current_pos}/{total} \"{}\"]", app.viewing.search_query),
             Style::default().fg(THEME.accent),
         ));
         Line::from(spans)
@@ -210,8 +212,8 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         Line::from(help_spans)
     };
 
-    if let Some(ref input) = app.viewing_search_input {
-        let cursor_byte = app.viewing_search_input_cursor.min(input.len());
+    if let Some(ref input) = app.viewing.search_input {
+        let cursor_byte = app.viewing.search_cursor.min(input.len());
         let cursor_x = layout.help.x + 2 + UnicodeWidthStr::width(&input[..cursor_byte]) as u16;
         f.set_cursor_position((cursor_x, layout.help.y));
     }
@@ -225,7 +227,7 @@ pub(super) fn render_viewing_summary(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn viewing_summary_text(app: &App, width: usize) -> String {
-    let Some(summary) = app.viewing_session_summary.as_ref() else {
+    let Some(summary) = app.viewing.summary.as_ref() else {
         return fit_summary_text(vec![" tokens - | time - | user msgs -".to_string()], width);
     };
 

@@ -571,13 +571,11 @@ fn load_ui_records(path: &Path) -> anyhow::Result<(Vec<RawMessage>, Vec<RawSessi
                         .and_then(Value::as_str)
                         .filter(|path| !path.trim().is_empty())
                     {
-                        event.files.push(FileEvidence {
-                            path: path.to_string(),
-                            operation: operation.clone(),
-                            kind: FileEvidenceKind::Call,
-                            cwd: cwd.clone(),
-                            target: None,
-                        });
+                        event.files.push(FileEvidence::call(
+                            path.to_string(),
+                            operation.clone(),
+                            cwd.clone(),
+                        ));
                     }
                 }
                 event.target = event.files.first().map(|file| file.path.clone());
@@ -782,13 +780,10 @@ fn merge_scan_results(into: &mut SyncScanResult, extra: SyncScanResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, store as setup_store,
+    };
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn temp_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -810,25 +805,12 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "cline".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 
@@ -1151,15 +1133,7 @@ mod tests {
         .unwrap();
         assert_eq!(backfill.sessions.len(), 1);
         assert_eq!(backfill.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
-        store
-            .persist_session_events_for_existing_session(
-                "cline",
-                "1765706891317",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
+        seed_empty_event_state(&store, "cline", "1765706891317", EVENT_PARSER_VERSION, Some(mtime));
         let refresh = scan_task_dirs_for_sync(
             std::slice::from_ref(&root),
             &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
@@ -1169,17 +1143,7 @@ mod tests {
         .unwrap();
         assert_eq!(refresh.sessions.len(), 1);
         assert!(refresh.sessions[0].refresh_session_on_metadata_backfill);
-        store
-            .persist_topology_for_existing_session(
-                "cline",
-                "1765706891317",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_metadata_state(&store, "cline", "1765706891317", METADATA_PARSER_VERSION);
         let current = scan_task_dirs_for_sync(
             std::slice::from_ref(&root),
             &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),

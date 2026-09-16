@@ -17,10 +17,7 @@ use super::METADATA_PARSER_VERSION;
 
 pub(super) fn resume_command(source_id: &str) -> Option<ResumeCommand> {
     find_store_db(source_id)?;
-    Some(ResumeCommand {
-        program: "agent".to_string(),
-        args: vec!["--resume".to_string(), source_id.to_string()],
-    })
+    Some(ResumeCommand::new("agent", &["--resume", source_id]))
 }
 
 pub(super) fn scan_uncovered(

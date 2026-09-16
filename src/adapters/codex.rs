@@ -16,8 +16,8 @@ use crate::adapters::invocation_probe::{
 use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
 use crate::adapters::paths::{self, resolve_home_dir};
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-    first_timestamp, last_timestamp,
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
+    last_timestamp,
 };
 use crate::types::{
     FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation, RawSessionEvent,
@@ -39,10 +39,7 @@ impl SourceAdapter for CodexAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "codex".to_string(),
-            args: vec!["resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("codex", &["resume", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
@@ -83,11 +80,7 @@ impl SourceAdapter for CodexAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(codex_dir) = resolve_codex_dir()? else {
-            return Ok(Some(SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            }));
+            return Ok(Some(SyncScanResult::default()));
         };
         let result = scan_for_sync_impl(&codex_dir, context, since_ts, include_events)?;
         Ok(Some(result))
@@ -861,15 +854,7 @@ fn collect_codex_response_item_event(
                         .and_then(Value::as_str),
                 )
                 .filter(|(_, path)| !path.trim().is_empty())
-                .map(|(operation, path)| {
-                    vec![FileEvidence {
-                        path: path.into(),
-                        operation,
-                        kind: FileEvidenceKind::Call,
-                        cwd: None,
-                        target: None,
-                    }]
-                })
+                .map(|(operation, path)| vec![FileEvidence::call(path.into(), operation, None)])
                 .unwrap_or_default()
         };
         let mut event = if matches!(name.as_str(), "apply_patch" | "functions.apply_patch")
@@ -1002,24 +987,17 @@ fn collect_codex_meta_event(
         return;
     }
     events_out.push(RawSessionEvent {
-        command_evidence_status: None,
-        files: Vec::new(),
-        event_seq: events_out.len() as u32,
-        timestamp,
-        kind: "message".to_string(),
-        actor: actor.to_string(),
-        name: None,
-        status: None,
-        target: None,
-        message_seq: None,
         summary: Some(events::bounded_summary(summary)),
-        source_path: Some(source_path.to_string()),
-        source_event_id: Some(line_index.to_string()),
-        tool_call_id: None,
         is_meta: Some(true),
-        visibility: None,
-        attrs_json: None,
-        parser_version: EVENT_PARSER_VERSION,
+        ..events::EventContext {
+            event_seq: events_out.len() as u32,
+            timestamp,
+            source_path: Some(source_path.to_string()),
+            source_event_id: Some(line_index.to_string()),
+            message_seq: None,
+            parser_version: EVENT_PARSER_VERSION,
+        }
+        .event("message", actor)
     });
 }
 
@@ -1366,13 +1344,11 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     #[test]
     fn codex_app_command_opens_thread_deeplink() {
@@ -2276,25 +2252,12 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "codex".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 
@@ -2565,35 +2528,9 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "codex",
-                uuid,
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, "codex", uuid, USAGE_PARSER_VERSION, Some(mtime));
+        seed_empty_event_state(&store, "codex", uuid, EVENT_PARSER_VERSION, Some(mtime));
+        seed_empty_metadata_state(&store, "codex", uuid, METADATA_PARSER_VERSION);
 
         let result = scan_for_sync_impl(
             &root,
@@ -2618,35 +2555,9 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                EVENT_PARSER_VERSION - 1,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "codex",
-                uuid,
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, "codex", uuid, USAGE_PARSER_VERSION, Some(mtime));
+        seed_empty_event_state(&store, "codex", uuid, EVENT_PARSER_VERSION - 1, Some(mtime));
+        seed_empty_metadata_state(&store, "codex", uuid, METADATA_PARSER_VERSION);
 
         let result = scan_for_sync_impl(
             &root,
@@ -2676,15 +2587,7 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, "codex", uuid, USAGE_PARSER_VERSION, Some(mtime));
 
         let result = scan_for_sync_impl(
             &root,

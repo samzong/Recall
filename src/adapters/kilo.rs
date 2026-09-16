@@ -4,7 +4,7 @@ use tracing::debug;
 
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::opencode;
-use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats};
+use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
 
 pub(crate) struct KiloCodeAdapter;
 
@@ -22,10 +22,7 @@ impl SourceAdapter for KiloCodeAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "kilo".to_string(),
-            args: vec!["--session".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("kilo", &["--session", source_id]))
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
@@ -49,11 +46,7 @@ impl SourceAdapter for KiloCodeAdapter {
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_kilo_db()? else {
-            return Ok(Some(SyncScanResult {
-                sessions: vec![],
-                stats: SyncScanStats::default(),
-                observations: Vec::new(),
-            }));
+            return Ok(Some(SyncScanResult::default()));
         };
         Ok(Some(opencode::scan_for_sync_conn(&conn, context, since_ts, include_events)?))
     }
