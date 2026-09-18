@@ -3618,6 +3618,20 @@ name = "recall-probe"
 version = "0.1.0"
 
 [[package]]
+name = "recall-publish"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dirs",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "recall-r2"
 version = "0.1.0"
 dependencies = [
