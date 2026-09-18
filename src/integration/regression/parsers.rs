@@ -127,6 +127,43 @@ fn kimi_parser_aborted_wire_returns_none() {
 }
 
 #[test]
+fn minimax_parser_reads_nested_usage_and_top_level_tool_results() {
+    let transcript = concat!(
+        r#"{"message_id":"msg-user","turn_id":"turn-1","message":{"role":"user","content":[{"type":"text","text":"Add the MiniMax Code adapter"}],"timestamp":1000}}"#,
+        "\n",
+        r#"{"message_id":"msg-assistant","turn_id":"turn-1","message":{"role":"assistant","content":[{"type":"text","text":"Indexing local sessions."},{"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"src/adapters/mod.rs"}}],"api":"anthropic-messages","provider":"minimax","model":"MiniMax-M3","usage":{"input":120,"output":30,"cacheRead":20,"cacheWrite":5},"timestamp":1100,"responseId":"resp-1"}}"#,
+        "\n",
+        r#"{"message_id":"msg-toolresult","turn_id":"turn-1","message":{"role":"toolResult","toolCallId":"call-1","toolName":"read","content":[{"type":"text","text":"contents"}],"isError":false,"timestamp":1200}}"#,
+        "\n",
+    );
+    let session =
+        parse_minimax_transcript("mvs_minimax_test", transcript, None).expect("session parsed");
+
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].role, Role::User);
+    assert_eq!(session.messages[0].content, "Add the MiniMax Code adapter");
+    assert_eq!(session.messages[1].role, Role::Assistant);
+    assert_eq!(session.messages[1].content, "Indexing local sessions.");
+
+    assert_eq!(session.events.len(), 2);
+    assert_eq!(session.events[0].kind, "file_read");
+    assert_eq!(session.events[0].target.as_deref(), Some("src/adapters/mod.rs"));
+    assert_eq!(session.events[0].tool_call_id.as_deref(), Some("call-1"));
+    assert_eq!(session.events[1].kind, "tool_result");
+    assert_eq!(session.events[1].status.as_deref(), Some("success"));
+    assert_eq!(session.events[1].tool_call_id.as_deref(), Some("call-1"));
+
+    assert_eq!(session.usage_events.len(), 1);
+    assert_eq!(session.usage_events[0].event_key, "resp-1");
+    assert_eq!(session.usage_events[0].model, "MiniMax-M3");
+    assert_eq!(session.usage_events[0].provider, "minimax");
+    assert_eq!(session.usage_events[0].input_tokens, 120);
+    assert_eq!(session.usage_events[0].output_tokens, 30);
+    assert_eq!(session.usage_events[0].cache_read_tokens, 20);
+    assert_eq!(session.usage_events[0].cache_write_tokens, 5);
+}
+
+#[test]
 fn kiro_parser_prompt_and_response() {
     let json = r#"{
         "history": [{

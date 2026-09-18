@@ -10,6 +10,7 @@ use crate::adapters::kimi_code::parse_kimi_session;
 use crate::adapters::kiro::{
     parse_kiro_conversation, parse_kiro_v2_session, parse_kiro_v3_session,
 };
+use crate::adapters::minimax_code::parse_minimax_transcript;
 use crate::config::AppConfig;
 use crate::db::schema;
 use crate::db::search::{RepoFilter, SearchEngine, SearchFilters, TimeRange};

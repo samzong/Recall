@@ -20,6 +20,7 @@ pub(crate) mod kilo;
 pub(crate) mod kimi_code;
 pub(crate) mod kiro;
 pub(crate) mod mimo_code;
+pub(crate) mod minimax_code;
 pub(crate) mod omp;
 pub(crate) mod opencode;
 pub(crate) mod openhands;
@@ -398,6 +399,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(kilo::KiloCodeAdapter),
         Box::new(crush::CrushAdapter),
         Box::new(mimo_code::MimoCodeAdapter),
+        Box::new(minimax_code::MinimaxCodeAdapter),
         Box::new(zcode::ZcodeAdapter),
         Box::new(goose::GooseAdapter),
         Box::new(droid::DroidAdapter),
@@ -429,6 +431,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "kilo-code"
             | "crush"
             | "mimo-code"
+            | "minimax-code"
             | "zcode"
             | "goose"
             | "openhands"

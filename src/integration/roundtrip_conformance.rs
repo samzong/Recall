@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::adapters::{RawSession, claude_code, codex, cursor, kimi_code};
+use crate::adapters::{RawSession, claude_code, codex, cursor, kimi_code, minimax_code};
 use crate::db::schema;
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
@@ -347,6 +347,83 @@ fn kimi_composite_files_round_trip() {
 
     assert_roundtrip("kimi-code", || {
         kimi_code::parse_conformance_fixture(root.path())?.context("Kimi fixture was not parsed")
+    });
+}
+
+#[test]
+fn minimax_code_messages_round_trip() {
+    let root = tempfile::tempdir().unwrap();
+    let session_dir = root
+        .path()
+        .join("v2/sessions/2026/09/18/17-11-12-765-session_bXZzXzUwMTc5NDVkMTJhOTQ2ZmY5NzU3NTY2ZWFlYTcyNDBi");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join("manifest.json"),
+        json!({
+            "schemaVersion": 1,
+            "sessionId": "mvs_5017945d12a946ff9757566eaea7240b",
+            "createdAtMs": 1_789_751_472_765_i64,
+            "updatedAtMs": 1_789_751_472_765_i64,
+            "source": "local-runtime",
+            "layout": "v2-final-dated-session"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    write_jsonl(
+        &session_dir.join("messages.jsonl"),
+        &[
+            json!({
+                "message_id": "msg-user-contract",
+                "turn_id": "turn-1",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Add the MiniMax Code adapter"}],
+                    "timestamp": 1_789_751_473_094_i64
+                }
+            }),
+            json!({
+                "message_id": "msg-assistant-contract",
+                "turn_id": "turn-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "internal"},
+                        {"type": "text", "text": "Indexing local sessions."},
+                        {
+                            "type": "toolCall",
+                            "id": "call-minimax-1",
+                            "name": "read",
+                            "arguments": {"path": "src/adapters/mod.rs"}
+                        }
+                    ],
+                    "api": "anthropic-messages",
+                    "provider": "minimax",
+                    "model": "MiniMax-M3",
+                    "usage": {"input": 120, "output": 30, "cacheRead": 20, "cacheWrite": 5},
+                    "stopReason": "tool_use",
+                    "timestamp": 1_789_751_476_000_i64,
+                    "responseId": "resp-minimax-contract"
+                }
+            }),
+            json!({
+                "message_id": "msg-toolresult-contract",
+                "turn_id": "turn-1",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "call-minimax-1",
+                    "toolName": "read",
+                    "content": [{"type": "text", "text": "mod.rs contents"}],
+                    "isError": false,
+                    "timestamp": 1_789_751_476_614_i64
+                }
+            }),
+        ],
+    );
+
+    assert_roundtrip("minimax-code", || {
+        minimax_code::parse_conformance_fixture(root.path())?
+            .context("MiniMax Code fixture was not parsed")
     });
 }
 
