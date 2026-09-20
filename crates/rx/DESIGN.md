@@ -32,7 +32,7 @@ read `recall.db`.
 | RX-OWN-001 | Mutate only explicitly rx-owned identities, preserve unowned data, follow each surface's owned-edit rule, lock, write atomically, and fail closed on malformed input. |
 | RX-SECRET-001 | Never put credentials in argv, logs, or broad-permission files. Persist only when unavoidable and owner-approved. |
 | RX-LIFECYCLE-001 | Install policy, planning controls, and child environment are separate scopes; rx-only controls never reach the child. |
-| RX-HOST-001 | Hosted mode injects the same launch-scoped route as a native rx launch; it never overrides any harness home, and hosted state holds rx-internal runtime state only. |
+| RX-HOST-001 | Hosted mode injects the same launch-scoped route and permissions as a native rx launch; it never overrides any harness home, and hosted state holds rx-internal runtime state only. |
 | RX-CONCURRENCY-001 | Concurrent launches cannot retarget, corrupt, or delete another launch or user edit. |
 | RX-FAIL-001 | Non-interactive runs never install or destructively repair without approval; malformed user config is preserved and reported. |
 
@@ -92,8 +92,9 @@ removes the stored key therefore means no rx-written copy of that key is left
 behind.
 
 Hosted order is: select harness, discover or install in the user environment,
-validate route conflicts, execute with the same launch-scoped route injection
-as a native rx launch. Route checks stop at `--`.
+validate route conflicts, execute with the same launch-scoped injection as a
+native `rx` / `rxc` launch, permission flags included. Route checks stop at
+`--`.
 
 ## Adding a harness
 

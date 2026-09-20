@@ -32,7 +32,6 @@ struct HostRequest {
     harness: Option<String>,
     gateway: GatewayProfile,
     state_dir: PathBuf,
-    permission_policy: PermissionPolicy,
     install_policy: InstallPolicy,
 }
 
@@ -43,12 +42,6 @@ struct GatewayProfile {
     name: String,
     endpoint: String,
     credential_env: String,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PermissionPolicy {
-    Standard,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -88,8 +81,7 @@ pub(crate) fn run(passthrough: Vec<OsString>, env: &EnvLookup) -> Result<()> {
     let launch_request = LaunchRequest { harness, provider: None, passthrough };
     let install_env = EnvLookup::real_with(install_overrides(request.install_policy));
     let program = crate::install::ensure(harness, &install_env)?;
-    let planning_env = EnvLookup::real_with(planning_overrides());
-    let mut plan = crate::launch::plan_target(&launch_request, &paths, &planning_env, &target)?;
+    let mut plan = crate::launch::plan_target(&launch_request, &paths, env, &target)?;
     plan.program = program;
     if let Some(note) = &plan.stderr_note {
         eprintln!("{note}");
@@ -124,7 +116,6 @@ fn parse_request(raw: &str) -> Result<HostRequest> {
     }
     validate_endpoint(&request.gateway.endpoint)?;
     validate_env_name(&request.gateway.credential_env)?;
-    let _ = request.permission_policy;
     Ok(request)
 }
 
@@ -160,10 +151,6 @@ fn install_overrides(policy: InstallPolicy) -> HashMap<String, String> {
         }
         .to_string(),
     )])
-}
-
-fn planning_overrides() -> HashMap<String, String> {
-    HashMap::from([("RX_NO_YOLO".to_string(), "1".to_string())])
 }
 
 fn target(profile: &GatewayProfile, key: String) -> ProviderTarget {

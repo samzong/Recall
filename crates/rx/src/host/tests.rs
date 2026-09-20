@@ -14,7 +14,6 @@ fn request(harness: Option<&str>) -> String {
             "credential_env": "TOKENER_API_KEY"
         },
         "state_dir": std::env::temp_dir().join("tokener-agent"),
-        "permission_policy": "standard",
         "install_policy": "prompt"
     })
     .to_string()
@@ -150,7 +149,6 @@ fn native_arguments_after_double_dash_are_literal() {
 
 #[test]
 fn hosted_controls_are_scoped_and_leave_harness_homes_native() {
-    assert_eq!(planning_overrides(), HashMap::from([("RX_NO_YOLO".to_string(), "1".to_string())]));
     for (policy, value) in [(InstallPolicy::Prompt, "0"), (InstallPolicy::Deny, "1")] {
         assert_eq!(
             install_overrides(policy),

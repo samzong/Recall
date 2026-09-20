@@ -15,7 +15,7 @@ Handshake (no request environment set):
 
 ```
 $ rx host
-{"protocol":{"major":1,"minor":1},"version":"0.6.0","harnesses":["claude","codex","opencode","pi","dsh","kimi"]}
+{"protocol":{"major":1,"minor":1},"version":"0.6.1","harnesses":["claude","codex","opencode","pi","dsh","kimi"]}
 ```
 
 Launch: `rx host -- <native harness args>` with two environment variables:
@@ -34,7 +34,6 @@ Launch: `rx host -- <native harness args>` with two environment variables:
     "credential_env": "TOKENER_API_KEY"
   },
   "state_dir": "/abs/path/owned/by/host",
-  "permission_policy": "standard",
   "install_policy": "prompt"
 }
 ```
@@ -49,8 +48,7 @@ Rules the request must satisfy — rx rejects violations instead of guessing:
   like a native launch. Protocol minor 1 marks this semantic; before it,
   rx scoped harness homes under `state_dir`.
 - `harness` is optional; when omitted, rx shows its interactive picker.
-- `install_policy` is `prompt` or `deny`; `permission_policy` is
-  `standard`.
+- `install_policy` is `prompt` or `deny`.
 - The endpoint must be an HTTP(S) URL; `credential_env` must be a valid
   environment variable name.
 
@@ -64,11 +62,15 @@ What rx guarantees in return:
 - Discovery/installation of the harness binary uses the user-owned harness
   home; hosted state is rx-internal runtime state only, never an
   installation root.
-- Hosted launches use the same launch-scoped injection as native rx
-  launches (flags and child environment). User harness configuration stays
-  visible and is never rewritten beyond marker-owned catalog entries; the
-  gateway route is enforced by injection precedence plus the route guards
-  above.
+- `rx host` plans what `rx` / `rxc` plan. For the same harness, native
+  args and environment, a hosted launch gets the same launch-scoped
+  injection (flags and child environment) as a native one, max-permission
+  injection included; `RX_NO_YOLO` and a user-supplied permission flag
+  disable it exactly as they do natively. The request has no permission
+  knob because the host makes no permission decision. User harness
+  configuration stays visible and is never rewritten beyond marker-owned
+  catalog entries; the gateway route is enforced by injection precedence
+  plus the route guards above.
 - The key is read from the environment and injected into the launch plan;
   it never appears in argv.
 
