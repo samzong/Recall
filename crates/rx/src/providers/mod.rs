@@ -287,11 +287,7 @@ fn provider_states(paths: &Paths, env: &EnvLookup) -> Result<Vec<ProviderState>>
 fn sort_provider_states(states: &mut [ProviderState]) {
     states.sort_by_cached_key(|state| {
         (
-            match state.provider.id.as_str() {
-                "openrouter" => 0,
-                "tokener" => 1,
-                _ => 2,
-            },
+            state.provider.id != "openrouter",
             !state.configured,
             state.provider.name.to_ascii_lowercase(),
             state.provider.id.clone(),

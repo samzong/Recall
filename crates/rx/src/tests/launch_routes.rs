@@ -36,27 +36,24 @@ fn unconfigured_kimi_launches_as_is() {
 #[test]
 fn kimi_explicit_model_seeds_selected_alias_when_catalog_is_unavailable() {
     let (_dir, paths) = temp_paths();
-    fs::write(&paths.config, "[provider.tokener]\nbase_url = \"http://127.0.0.1:9\"\n").unwrap();
-    let env = isolated(&[("TOKENER_API_KEY", "sk-tokener")]);
+    fs::write(&paths.config, fixture_config("http://127.0.0.1:9")).unwrap();
+    let env = isolated(&[("ACME_API_KEY", "sk-fixture")]);
     let plan = launch::plan(
-        &request(Harness::Kimi, Some("tokener"), &["--model", "rx-tokener/kimi-k3", "--plan"]),
+        &request(Harness::Kimi, Some("acme"), &["--model", "rx-acme/kimi-k3", "--plan"]),
         &paths,
         &env,
     )
     .unwrap();
     assert_eq!(plan.program, PathBuf::from("kimi"));
-    assert_eq!(plan.args, os(&["--auto", "--model", "rx-tokener/kimi-k3", "--plan"]));
+    assert_eq!(plan.args, os(&["--auto", "--model", "rx-acme/kimi-k3", "--plan"]));
     assert_eq!(plan.env_set, vec![("KIMI_MODEL_NAME".to_string(), String::new())]);
     let config: toml::Value = toml::from_str(
         &fs::read_to_string(paths.dir.join("kimi-code").join("config.toml")).unwrap(),
     )
     .unwrap();
-    assert_eq!(config["providers"]["rx-tokener"]["type"].as_str(), Some("openai"));
-    assert_eq!(
-        config["providers"]["rx-tokener"]["base_url"].as_str(),
-        Some("http://127.0.0.1:9/v1")
-    );
-    assert_eq!(config["models"]["rx-tokener/kimi-k3"]["model"].as_str(), Some("kimi-k3"));
+    assert_eq!(config["providers"]["rx-acme"]["type"].as_str(), Some("openai"));
+    assert_eq!(config["providers"]["rx-acme"]["base_url"].as_str(), Some("http://127.0.0.1:9/v1"));
+    assert_eq!(config["models"]["rx-acme/kimi-k3"]["model"].as_str(), Some("kimi-k3"));
     assert!(plan.stderr_note.as_deref().unwrap().contains("seeding only the selected model"));
     assert!(plan.stderr_note.as_deref().unwrap().contains("yolo"));
 }
@@ -65,20 +62,20 @@ fn kimi_explicit_model_seeds_selected_alias_when_catalog_is_unavailable() {
 fn kimi_fallback_uses_first_provider_model_and_reports_it() {
     let (_dir, paths) = temp_paths();
     let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"glm-5"},{"id":"kimi-k3"}]}"#);
-    fs::write(&paths.config, format!("[provider.tokener]\nbase_url = \"{base_url}\"\n")).unwrap();
-    let env = isolated(&[("TOKENER_API_KEY", "sk-tokener")]);
+    fs::write(&paths.config, fixture_config(&base_url)).unwrap();
+    let env = isolated(&[("ACME_API_KEY", "sk-fixture")]);
     let plan =
-        launch::plan(&request(Harness::Kimi, Some("tokener"), &["--auto"]), &paths, &env).unwrap();
+        launch::plan(&request(Harness::Kimi, Some("acme"), &["--auto"]), &paths, &env).unwrap();
     server.join().unwrap();
-    assert_eq!(plan.args, os(&["--model", "rx-tokener/glm-5", "--auto"]));
+    assert_eq!(plan.args, os(&["--model", "rx-acme/glm-5", "--auto"]));
     assert_eq!(plan.env_set, vec![("KIMI_MODEL_NAME".to_string(), String::new())]);
     let config: toml::Value = toml::from_str(
         &fs::read_to_string(paths.dir.join("kimi-code").join("config.toml")).unwrap(),
     )
     .unwrap();
     assert_eq!(config["models"].as_table().unwrap().len(), 2);
-    assert_eq!(config["models"]["rx-tokener/glm-5"]["model"].as_str(), Some("glm-5"));
-    assert_eq!(config["models"]["rx-tokener/kimi-k3"]["model"].as_str(), Some("kimi-k3"));
+    assert_eq!(config["models"]["rx-acme/glm-5"]["model"].as_str(), Some("glm-5"));
+    assert_eq!(config["models"]["rx-acme/kimi-k3"]["model"].as_str(), Some("kimi-k3"));
     assert!(plan.stderr_note.as_deref().unwrap().contains("using first provider model 'glm-5'"));
     assert!(!plan.stderr_note.as_deref().unwrap().contains("yolo"));
 }
@@ -86,8 +83,8 @@ fn kimi_fallback_uses_first_provider_model_and_reports_it() {
 #[test]
 fn kimi_skips_yolo_when_prompt_or_hidden_yolo_alias_is_set() {
     let (_dir, paths) = temp_paths();
-    fs::write(&paths.config, "[provider.tokener]\nbase_url = \"http://127.0.0.1:9\"\n").unwrap();
-    let env = isolated(&[("TOKENER_API_KEY", "sk-tokener")]);
+    fs::write(&paths.config, fixture_config("http://127.0.0.1:9")).unwrap();
+    let env = isolated(&[("ACME_API_KEY", "sk-fixture")]);
     for passthrough in [
         &["--model", "kimi-k3", "-p", "hello"].as_slice(),
         &["--model", "kimi-k3", "--prompt", "hello"].as_slice(),
@@ -95,8 +92,7 @@ fn kimi_skips_yolo_when_prompt_or_hidden_yolo_alias_is_set() {
         &["--model", "kimi-k3", "--auto-approve"].as_slice(),
     ] {
         let plan =
-            launch::plan(&request(Harness::Kimi, Some("tokener"), passthrough), &paths, &env)
-                .unwrap();
+            launch::plan(&request(Harness::Kimi, Some("acme"), passthrough), &paths, &env).unwrap();
         assert!(!plan.args.iter().any(|arg| arg == "--auto"), "{:?}", plan.args);
         assert!(!plan.stderr_note.as_deref().is_some_and(|note| note.contains("yolo")));
     }
@@ -202,12 +198,13 @@ fn none_is_reserved_provider_id() {
 }
 
 #[test]
-fn claude_injection_tokener_still_uses_auth_token() {
+fn claude_injection_non_openrouter_still_uses_auth_token() {
     let (_dir, paths) = temp_paths();
-    let env = isolated(&[("TOKENER_API_KEY", "sk-tokener")]);
-    let plan = launch::plan(&request(Harness::Claude, Some("tokener"), &["fix it"]), &paths, &env)
-        .unwrap();
-    assert_env(&plan, &[("ANTHROPIC_AUTH_TOKEN", "sk-tokener"), ("ANTHROPIC_API_KEY", "")]);
+    fs::write(&paths.config, fixture_config("https://provider.test/v1")).unwrap();
+    let env = isolated(&[("ACME_API_KEY", "sk-fixture")]);
+    let plan =
+        launch::plan(&request(Harness::Claude, Some("acme"), &["fix it"]), &paths, &env).unwrap();
+    assert_env(&plan, &[("ANTHROPIC_AUTH_TOKEN", "sk-fixture"), ("ANTHROPIC_API_KEY", "")]);
 }
 
 #[test]
@@ -230,9 +227,8 @@ fn codex_openrouter_overrides_model_and_uses_command_auth() {
 #[test]
 fn codex_injected_values_round_trip_through_toml() {
     let (_dir, paths) = temp_paths();
-    let mut provider = provider::find("tokener").unwrap().clone();
+    let mut provider = fixture_provider("http://127.0.0.1:1/\"quoted\\path");
     provider.name = "Gateway \"Beta\"\nC:\\gateway".to_string();
-    provider.endpoint = "http://127.0.0.1:1/\"quoted\\path".to_string();
     provider.env = "KEY\"'$(exit 9)\\VALUE".to_string();
     let model = "vendor/\"model\\name\nnext";
     let target = launch::ProviderTarget {
@@ -248,7 +244,7 @@ fn codex_injected_values_round_trip_through_toml() {
     )
     .unwrap();
     let config: toml::Value = arg_str(&plan.args[3]).parse().unwrap();
-    let injected = &config["model_providers"]["tokener"];
+    let injected = &config["model_providers"]["acme"];
     assert_eq!(injected["name"].as_str(), Some(provider.name.as_str()));
     assert_eq!(
         injected["base_url"].as_str(),
@@ -276,8 +272,7 @@ fn codex_catalog_override_preserves_the_generated_path() {
     let state_dir = if cfg!(unix) { "quoted\"\\state" } else { "catalog state" };
     let paths = Paths::in_dir(dir.path().join(state_dir));
     let (endpoint, server) = serve_openai_models(r#"{"data":[{"id":"test-model"}]}"#);
-    let mut provider = provider::find("tokener").unwrap().clone();
-    provider.endpoint = endpoint;
+    let provider = fixture_provider(&endpoint);
     let plan = launch::plan_target(
         &request(Harness::Codex, None, &[]),
         &paths,
@@ -290,7 +285,7 @@ fn codex_catalog_override_preserves_the_generated_path() {
         plan.args.iter().find(|arg| arg_str(arg).starts_with("model_catalog_json=")).unwrap();
     let config: toml::Value = arg_str(override_arg).parse().unwrap();
     let catalog = PathBuf::from(config["model_catalog_json"].as_str().unwrap());
-    assert_eq!(catalog, paths.dir.join("catalogs/tokener.json"));
+    assert_eq!(catalog, paths.dir.join("catalogs/acme.json"));
     assert!(catalog.is_file());
 }
 
@@ -452,17 +447,15 @@ fn codex_passthrough_model_flag_wins() {
 }
 
 #[test]
-fn codex_tokener_does_not_invent_a_model() {
+fn codex_provider_without_default_model_does_not_invent_one() {
     let (_dir, paths) = temp_paths();
-    let env = isolated(&[("TOKENER_API_KEY", "sk-tokener")]);
-    let plan = launch::plan(
-        &request(Harness::Codex, Some("tokener"), &["exec", "cargo test"]),
-        &paths,
-        &env,
-    )
-    .unwrap();
-    assert_eq!(plan.args[1], "model_provider=\"tokener\"");
-    assert!(arg_str(&plan.args[3]).contains("base_url=\"https://api.tokener.dev/v1\""));
+    fs::write(&paths.config, fixture_config("https://provider.test/v1")).unwrap();
+    let env = isolated(&[("ACME_API_KEY", "sk-fixture")]);
+    let plan =
+        launch::plan(&request(Harness::Codex, Some("acme"), &["exec", "cargo test"]), &paths, &env)
+            .unwrap();
+    assert_eq!(plan.args[1], "model_provider=\"acme\"");
+    assert!(arg_str(&plan.args[3]).contains("base_url=\"https://provider.test/v1\""));
     assert!(!plan.args.iter().any(|arg| arg_str(arg).starts_with("model=")));
     assert_eq!(
         &plan.args[4..8],
@@ -474,9 +467,10 @@ fn codex_tokener_does_not_invent_a_model() {
 #[test]
 fn isolated_codex_plan_does_not_write_model_catalog_json() {
     let (_dir, paths) = temp_paths();
-    let env = isolated(&[("TOKENER_API_KEY", "sk-tokener")]);
+    fs::write(&paths.config, fixture_config("https://provider.test/v1")).unwrap();
+    let env = isolated(&[("ACME_API_KEY", "sk-fixture")]);
     let plan =
-        launch::plan(&request(Harness::Codex, Some("tokener"), &["exec"]), &paths, &env).unwrap();
+        launch::plan(&request(Harness::Codex, Some("acme"), &["exec"]), &paths, &env).unwrap();
     assert!(!plan.args.iter().any(|arg| arg_str(arg).contains("model_catalog_json")));
     assert!(!paths.dir.join("catalogs").exists());
 }

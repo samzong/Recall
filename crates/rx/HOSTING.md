@@ -30,7 +30,7 @@ Launch: `rx host -- <native harness args>` with two environment variables:
   "gateway": {
     "provider_id": "tokener",
     "name": "Tokener",
-    "endpoint": "https://api.tokener.dev/v1",
+    "endpoint": "https://api.tokener.ai/v1",
     "credential_env": "TOKENER_API_KEY"
   },
   "state_dir": "/abs/path/owned/by/host",

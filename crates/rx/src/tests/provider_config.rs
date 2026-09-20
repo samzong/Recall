@@ -73,6 +73,7 @@ fn bundled_providers_match_the_admission_list() {
     assert_eq!(bundled, admitted);
     assert_eq!(bundled.first().map(String::as_str), Some("openrouter"));
     assert_eq!(bundled.get(1).map(String::as_str), Some("tokener"));
+    assert_eq!(provider::find("tokener").unwrap().endpoint, "https://api.tokener.ai/v1");
     let deepseek = provider::find("deepseek").unwrap();
     assert_eq!(deepseek.endpoint, "https://api.deepseek.com");
     assert_eq!(deepseek.env, "DEEPSEEK_API_KEY");
@@ -161,7 +162,10 @@ base_url = "https://dev.provider.test"
 
     let error = launch::plan(&request(Harness::Codex, None, &[]), &paths, &env).unwrap_err();
 
-    assert!(error.to_string().contains("no API key for provider 'tokener-dev'"), "{error}");
+    assert_eq!(
+        error.to_string(),
+        "no API key for provider 'tokener-dev'; run: rx providers login tokener-dev (or set $RX_PROVIDER_TOKENER_DEV_API_KEY)"
+    );
 }
 
 #[test]
@@ -305,8 +309,9 @@ fn provider_default_selection_does_not_create_auth_config() {
 #[test]
 fn provider_use_argument_sets_default_without_a_terminal() {
     let (_dir, paths) = temp_paths();
+    fs::write(&paths.config, fixture_config("https://provider.test/v1")).unwrap();
     config::login(&paths, "openrouter", "sk-openrouter".to_string()).unwrap();
-    config::login(&paths, "tokener-dev", "sk-dev".to_string()).unwrap();
+    config::login(&paths, "acme", "sk-fixture".to_string()).unwrap();
 
     crate::run_with(os(&["rx", "providers", "use", "openrouter"]), &paths, &isolated(&[])).unwrap();
 
@@ -317,12 +322,12 @@ fn provider_use_argument_sets_default_without_a_terminal() {
 #[test]
 fn provider_logout_argument_removes_key_without_a_terminal() {
     let (_dir, paths) = temp_paths();
-    config::login(&paths, "tokener-dev", "sk-dev".to_string()).unwrap();
+    fs::write(&paths.config, fixture_config("https://provider.test/v1")).unwrap();
+    config::login(&paths, "acme", "sk-fixture".to_string()).unwrap();
 
-    crate::run_with(os(&["rx", "providers", "logout", "tokener-dev"]), &paths, &isolated(&[]))
-        .unwrap();
+    crate::run_with(os(&["rx", "providers", "logout", "acme"]), &paths, &isolated(&[])).unwrap();
 
-    assert!(config::stored_key(&paths, "tokener-dev").unwrap().is_none());
+    assert!(config::stored_key(&paths, "acme").unwrap().is_none());
 }
 
 #[test]
@@ -332,13 +337,13 @@ fn providers_keep_independent_keys_and_behavior() {
     fs::write(
         &paths.config,
         format!(
-            r#"default_provider = "tokener-dev"
+            r#"default_provider = "lab-dev"
 
-[provider.tokener-dev]
+[provider.lab-dev]
 base_url = "{dev_base_url}"
 model = "gpt-dev"
 
-[provider.tokener-prod]
+[provider.lab-prod]
 base_url = "https://prod.provider.test"
 model = "gpt-prod"
 "#
@@ -346,48 +351,47 @@ model = "gpt-prod"
     )
     .unwrap();
 
-    config::login(&paths, "tokener-prod", "sk-prod".to_string()).unwrap();
-    config::login(&paths, "tokener-dev", "sk-dev".to_string()).unwrap();
-    config::set_default(&paths, "tokener-prod").unwrap();
+    config::login(&paths, "lab-prod", "sk-prod".to_string()).unwrap();
+    config::login(&paths, "lab-dev", "sk-dev".to_string()).unwrap();
+    config::set_default(&paths, "lab-prod").unwrap();
 
     let loaded = config::load(&paths).unwrap().unwrap();
-    assert_eq!(loaded.default_provider.as_deref(), Some("tokener-prod"));
-    assert_eq!(loaded.provider["tokener-dev"].base_url.as_deref(), Some(dev_base_url.as_str()));
-    assert_eq!(
-        loaded.provider["tokener-prod"].base_url.as_deref(),
-        Some("https://prod.provider.test")
-    );
+    assert_eq!(loaded.default_provider.as_deref(), Some("lab-prod"));
+    assert_eq!(loaded.provider["lab-dev"].base_url.as_deref(), Some(dev_base_url.as_str()));
+    assert_eq!(loaded.provider["lab-prod"].base_url.as_deref(), Some("https://prod.provider.test"));
 
     let agent_dir = dir.path().join("pi-agent");
     let env = isolated(&[("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())]);
-    let codex =
-        launch::plan(&request(Harness::Codex, Some("tokener-dev"), &[]), &paths, &env).unwrap();
-    assert_eq!(codex.args[1], "model_provider=\"tokener-dev\"");
-    assert!(arg_str(&codex.args[3]).contains("model_providers.tokener-dev="));
+    let codex = launch::plan(&request(Harness::Codex, Some("lab-dev"), &[]), &paths, &env).unwrap();
+    assert_eq!(codex.args[1], "model_provider=\"lab-dev\"");
+    assert!(arg_str(&codex.args[3]).contains("model_providers.lab-dev="));
     assert!(arg_str(&codex.args[3]).contains(&format!("base_url=\"{dev_base_url}/v1\"")));
-    assert_eq!(codex.env_set, vec![("TOKENER_DEV_API_KEY".to_string(), "sk-dev".to_string())]);
+    assert_eq!(
+        codex.env_set,
+        vec![("RX_PROVIDER_LAB_DEV_API_KEY".to_string(), "sk-dev".to_string())]
+    );
 
     let opencode =
-        launch::plan(&request(Harness::OpenCode, Some("tokener-dev"), &[]), &paths, &env).unwrap();
-    assert_eq!(opencode.args, ["--auto", "-m", "tokener-dev/gpt-dev"]);
+        launch::plan(&request(Harness::OpenCode, Some("lab-dev"), &[]), &paths, &env).unwrap();
+    assert_eq!(opencode.args, ["--auto", "-m", "lab-dev/gpt-dev"]);
     let opencode_config = opencode
         .env_set
         .iter()
         .find(|(name, _)| name == "OPENCODE_CONFIG_CONTENT")
         .map(|(_, value)| serde_json::from_str::<Value>(value).unwrap())
         .unwrap();
-    assert!(opencode_config["provider"]["tokener-dev"].is_object());
-    assert!(opencode_config["provider"]["tokener"].is_null());
+    assert!(opencode_config["provider"]["lab-dev"].is_object());
+    assert!(opencode_config["provider"]["lab-prod"].is_null());
 
-    let pi = launch::plan(&request(Harness::Pi, Some("tokener-dev"), &[]), &paths, &env).unwrap();
-    assert_eq!(pi.args, ["--models", "tokener-dev/*", "--model", "tokener-dev/gpt-dev"]);
+    let pi = launch::plan(&request(Harness::Pi, Some("lab-dev"), &[]), &paths, &env).unwrap();
+    assert_eq!(pi.args, ["--models", "lab-dev/*", "--model", "lab-dev/gpt-dev"]);
     let pi_models: Value = read_json(agent_dir.join("models.json"));
-    assert!(pi_models["providers"]["tokener-dev"].is_object());
-    assert!(pi_models["providers"]["tokener"].is_null());
+    assert!(pi_models["providers"]["lab-dev"].is_object());
+    assert!(pi_models["providers"]["lab-prod"].is_null());
     server.join().unwrap();
 
     let claude =
-        launch::plan(&request(Harness::Claude, Some("tokener-prod"), &[]), &paths, &env).unwrap();
+        launch::plan(&request(Harness::Claude, Some("lab-prod"), &[]), &paths, &env).unwrap();
     assert_env(
         &claude,
         &[
@@ -417,11 +421,11 @@ base_url = "https://provider.test/v1"
 #[test]
 fn logout_cascade_clears_the_plaintext_key_kimi_stored_for_the_provider() {
     let (_dir, paths) = temp_paths();
-    fs::write(&paths.config, "[provider.tokener]\nbase_url = \"http://127.0.0.1:9\"\n").unwrap();
-    config::login(&paths, "tokener", "sk-secret".to_string()).unwrap();
+    fs::write(&paths.config, fixture_config("http://127.0.0.1:9")).unwrap();
+    config::login(&paths, "acme", "sk-secret".to_string()).unwrap();
     let env = isolated(&[]);
     let plan = launch::plan(
-        &request(Harness::Kimi, Some("tokener"), &["--model", "rx-tokener/kimi-k3"]),
+        &request(Harness::Kimi, Some("acme"), &["--model", "rx-acme/kimi-k3"]),
         &paths,
         &env,
     )
@@ -430,24 +434,24 @@ fn logout_cascade_clears_the_plaintext_key_kimi_stored_for_the_provider() {
     assert!(fs::read_to_string(&kimi_config).unwrap().contains("sk-secret"));
     drop(plan);
 
-    let report = crate::residue::purge("tokener", &paths, &env);
+    let report = crate::residue::purge("acme", &paths, &env);
     assert!(report.removed());
     assert!(!report.credential_retained());
-    assert!(config::logout(&paths, "tokener").unwrap());
+    assert!(config::logout(&paths, "acme").unwrap());
 
     assert!(!fs::read_to_string(&kimi_config).unwrap().contains("sk-secret"));
     assert!(!fs::read_to_string(&paths.keys).unwrap().contains("sk-secret"));
-    assert!(!paths.dir.join("catalogs").join("tokener.models.json").exists());
+    assert!(!paths.dir.join("catalogs").join("acme.models.json").exists());
 }
 
 #[test]
 fn logout_keeps_the_stored_key_while_a_kimi_session_holds_the_plaintext_copy() {
     let (_dir, paths) = temp_paths();
-    fs::write(&paths.config, "[provider.tokener]\nbase_url = \"http://127.0.0.1:9\"\n").unwrap();
-    config::login(&paths, "tokener", "sk-secret".to_string()).unwrap();
+    fs::write(&paths.config, fixture_config("http://127.0.0.1:9")).unwrap();
+    config::login(&paths, "acme", "sk-secret".to_string()).unwrap();
     let env = isolated(&[]);
     let plan = launch::plan(
-        &request(Harness::Kimi, Some("tokener"), &["--model", "rx-tokener/kimi-k3"]),
+        &request(Harness::Kimi, Some("acme"), &["--model", "rx-acme/kimi-k3"]),
         &paths,
         &env,
     )
@@ -455,23 +459,23 @@ fn logout_keeps_the_stored_key_while_a_kimi_session_holds_the_plaintext_copy() {
     let kimi_config = paths.dir.join("kimi-code").join("config.toml");
 
     crate::providers::run(
-        crate::args::ProvidersCommand::Logout { provider: Some("tokener".to_string()) },
+        crate::args::ProvidersCommand::Logout { provider: Some("acme".to_string()) },
         &paths,
         &env,
     )
     .unwrap();
 
-    assert_eq!(config::stored_key(&paths, "tokener").unwrap().as_deref(), Some("sk-secret"));
+    assert_eq!(config::stored_key(&paths, "acme").unwrap().as_deref(), Some("sk-secret"));
     assert!(fs::read_to_string(&kimi_config).unwrap().contains("sk-secret"));
     drop(plan);
 
     crate::providers::run(
-        crate::args::ProvidersCommand::Logout { provider: Some("tokener".to_string()) },
+        crate::args::ProvidersCommand::Logout { provider: Some("acme".to_string()) },
         &paths,
         &env,
     )
     .unwrap();
 
-    assert_eq!(config::stored_key(&paths, "tokener").unwrap(), None);
+    assert_eq!(config::stored_key(&paths, "acme").unwrap(), None);
     assert!(!fs::read_to_string(&kimi_config).unwrap().contains("sk-secret"));
 }

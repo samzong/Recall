@@ -6,7 +6,7 @@ fn url_helpers_strip_or_add_v1() {
         catalog::anthropic_base("https://openrouter.ai/api/v1/"),
         "https://openrouter.ai/api"
     );
-    assert_eq!(catalog::openai_base("https://api.tokener.dev"), "https://api.tokener.dev/v1");
+    assert_eq!(catalog::openai_base("https://provider.test"), "https://provider.test/v1");
     assert_eq!(
         catalog::openai_base("https://openrouter.ai/api/v1"),
         "https://openrouter.ai/api/v1"
@@ -68,6 +68,7 @@ fn base_url_override_clears_bundled_anthropic_base() {
     let overridden = provider::resolve("deepseek", Some(&override_entry)).unwrap();
     assert_eq!(overridden.endpoint, "https://proxy.example.com/v1");
     assert_eq!(provider::claude_base(&overridden), "https://proxy.example.com");
+    assert_eq!(overridden.env, deepseek.env);
 }
 
 #[test]
@@ -94,8 +95,8 @@ fn openai_data_becomes_codex_model_catalog_json() {
 #[test]
 fn openai_data_without_context_still_seeds_claude_picker() {
     let models = catalog::parse_openai_models(r#"{"data":[{"id":"openai/gpt-5.6-sol"}]}"#).unwrap();
-    let seed = claude::seed_from_listed("tokener", &models);
-    assert_eq!(seed.provider_id, "tokener");
+    let seed = claude::seed_from_listed("lab", &models);
+    assert_eq!(seed.provider_id, "lab");
     assert_eq!(seed.additional_model_options.len(), 1);
     assert_eq!(seed.additional_model_options[0].value, "openai/gpt-5.6-sol");
 }
@@ -117,7 +118,7 @@ fn openai_body_without_context_falls_back_to_listed_claude_seed() {
 fn openai_body_fills_omitted_context_among_models_with_windows() {
     let body = r#"{"data":[{"id":"with-ctx","context_length":200000},{"id":"no-ctx"}]}"#;
     let models = catalog::parse_openai_models(body).unwrap();
-    let seed = claude::seed_from_openai_body("tokener", body, &models);
+    let seed = claude::seed_from_openai_body("lab", body, &models);
     let values = seed
         .additional_model_options
         .iter()
@@ -142,17 +143,17 @@ fn prepare_codex_catalog_writes_processed_provider_file() {
         r#"{"data":[{"id":"gpt-5.6-sol","name":"Sol","context_length":200000}]}"#,
     );
     let path =
-        catalog::prepare_codex_catalog(&paths, "tokener", &base_url, "sk-test").unwrap().unwrap();
+        catalog::prepare_codex_catalog(&paths, "lab", &base_url, "sk-test").unwrap().unwrap();
     server.join().unwrap();
-    assert_eq!(path, paths.dir.join("catalogs/tokener.json"));
+    assert_eq!(path, paths.dir.join("catalogs/lab.json"));
     let document: Value = read_json(&path);
     assert_eq!(document["models"][0]["slug"], "gpt-5.6-sol");
     assert_eq!(document["models"][0]["display_name"], "Sol");
     assert!(document.get("fetched_at").is_none());
-    assert!(paths.dir.join("catalogs/tokener.claude.json").is_file());
-    assert!(paths.dir.join("catalogs/tokener.opencode.json").is_file());
-    assert!(paths.dir.join("catalogs/tokener.pi.json").is_file());
-    assert!(paths.dir.join("catalogs/tokener.meta.json").is_file());
+    assert!(paths.dir.join("catalogs/lab.claude.json").is_file());
+    assert!(paths.dir.join("catalogs/lab.opencode.json").is_file());
+    assert!(paths.dir.join("catalogs/lab.pi.json").is_file());
+    assert!(paths.dir.join("catalogs/lab.meta.json").is_file());
 }
 
 #[test]
@@ -220,11 +221,11 @@ fn catalogs_are_written_per_provider() {
     let (_dir, paths) = temp_paths();
     let (base_url, server) = serve_openai_models_times(r#"{"data":[{"id":"shared-model"}]}"#, 2);
     catalog::prepare_codex_catalog(&paths, "openrouter", &base_url, "sk-or").unwrap().unwrap();
-    catalog::prepare_codex_catalog(&paths, "tokener", &base_url, "sk-tokener").unwrap().unwrap();
+    catalog::prepare_codex_catalog(&paths, "lab", &base_url, "sk-lab").unwrap().unwrap();
     server.join().unwrap();
     assert!(paths.dir.join("catalogs/openrouter.json").is_file());
-    assert!(paths.dir.join("catalogs/tokener.json").is_file());
-    assert_ne!(paths.dir.join("catalogs/openrouter.json"), paths.dir.join("catalogs/tokener.json"));
+    assert!(paths.dir.join("catalogs/lab.json").is_file());
+    assert_ne!(paths.dir.join("catalogs/openrouter.json"), paths.dir.join("catalogs/lab.json"));
 }
 
 #[test]
@@ -244,11 +245,11 @@ fn expired_catalog_is_refetched() {
 fn catalog_endpoint_change_misses_cache() {
     let (_dir, paths) = temp_paths();
     let (first_url, first_server) = serve_openai_models(r#"{"data":[{"id":"first"}]}"#);
-    catalog::prepare_codex_catalog(&paths, "tokener", &first_url, "sk-test").unwrap().unwrap();
+    catalog::prepare_codex_catalog(&paths, "lab", &first_url, "sk-test").unwrap().unwrap();
     first_server.join().unwrap();
     let (second_url, second_server) = serve_openai_models(r#"{"data":[{"id":"second"}]}"#);
     let path =
-        catalog::prepare_codex_catalog(&paths, "tokener", &second_url, "sk-test").unwrap().unwrap();
+        catalog::prepare_codex_catalog(&paths, "lab", &second_url, "sk-test").unwrap().unwrap();
     second_server.join().unwrap();
     let document: Value = read_json(path);
     assert_eq!(document["models"][0]["slug"], "second");
@@ -258,14 +259,13 @@ fn catalog_endpoint_change_misses_cache() {
 fn catalog_refresh_failure_does_not_reuse_other_endpoint() {
     let (_dir, paths) = temp_paths();
     let (first_url, first_server) = serve_openai_models(r#"{"data":[{"id":"first"}]}"#);
-    catalog::prepare_codex_catalog(&paths, "tokener", &first_url, "sk-test").unwrap().unwrap();
+    catalog::prepare_codex_catalog(&paths, "lab", &first_url, "sk-test").unwrap().unwrap();
     first_server.join().unwrap();
     let (error_url, error_server) = serve_openai_error(500);
-    let error =
-        catalog::prepare_codex_catalog(&paths, "tokener", &error_url, "sk-test").unwrap_err();
+    let error = catalog::prepare_codex_catalog(&paths, "lab", &error_url, "sk-test").unwrap_err();
     error_server.join().unwrap();
     assert!(error.to_string().contains("HTTP 500"), "{error:#}");
-    let document: Value = read_json(paths.dir.join("catalogs/tokener.json"));
+    let document: Value = read_json(paths.dir.join("catalogs/lab.json"));
     assert_eq!(document["models"][0]["slug"], "first");
 }
 
@@ -273,13 +273,13 @@ fn catalog_refresh_failure_does_not_reuse_other_endpoint() {
 fn catalog_refresh_failure_reuses_same_endpoint() {
     let (_dir, paths) = temp_paths();
     let (base_url, server) = serve_openai_models_then_error(r#"{"data":[{"id":"first"}]}"#, 500);
-    catalog::prepare_codex_catalog(&paths, "tokener", &base_url, "sk-test").unwrap().unwrap();
-    let meta_path = paths.dir.join("catalogs/tokener.meta.json");
+    catalog::prepare_codex_catalog(&paths, "lab", &base_url, "sk-test").unwrap().unwrap();
+    let meta_path = paths.dir.join("catalogs/lab.meta.json");
     let mut meta: Value = read_json(&meta_path);
     meta["fetched_at"] = json!(0);
     write_json(&meta_path, &meta);
     let path =
-        catalog::prepare_codex_catalog(&paths, "tokener", &base_url, "sk-test").unwrap().unwrap();
+        catalog::prepare_codex_catalog(&paths, "lab", &base_url, "sk-test").unwrap().unwrap();
     server.join().unwrap();
     let document: Value = read_json(path);
     assert_eq!(document["models"][0]["slug"], "first");

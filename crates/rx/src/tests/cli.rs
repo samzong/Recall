@@ -7,7 +7,7 @@ fn launch_syntax_preserves_harness_provider_and_literal_arguments() {
     let cases: &[LaunchCase<'_>] = &[
         (&["/usr/local/bin/rxc", "fix login"], Claude, None, &["fix login"]),
         (&["rxx", "exec", "cargo test"], Codex, None, &["exec", "cargo test"]),
-        (&["rxc", "--provider", "tokener"], Claude, Some("tokener"), &[]),
+        (&["rxc", "--provider", "acme"], Claude, Some("acme"), &[]),
         (
             &["rx", "--provider", "openrouter", "claude", "--resume", "abc"],
             Claude,
@@ -102,13 +102,10 @@ fn invalid_commands_report_the_rejected_argument() {
         (&["rx", "completions", "powershell"], "unknown completions command: powershell"),
         (&["rx", "gemini"], "unknown harness: gemini"),
         (&["rx", "claude", "--provider"], "--provider requires a value"),
-        (
-            &["rx", "providers", "use", "openrouter", "tokener"],
-            "usage: rx providers use [provider]",
-        ),
+        (&["rx", "providers", "use", "openrouter", "acme"], "usage: rx providers use [provider]"),
         (&["rx", "providers", "models", "list"], "unknown providers models command: list"),
         (
-            &["rx", "providers", "models", "update", "openrouter", "tokener"],
+            &["rx", "providers", "models", "update", "openrouter", "acme"],
             "usage: rx providers models update [provider]",
         ),
     ];
@@ -197,7 +194,7 @@ fn providers_commands_parse() {
     assert_eq!(parse_line(&["rx", "providers"]), Command::Providers(Help));
     assert_eq!(parse_line(&["rx", "providers", "list"]), Command::Providers(List));
     assert_eq!(parse_line(&["rx", "providers", "models"]), Command::Providers(ModelsHelp));
-    for provider in [None, Some("tokener-dev")] {
+    for provider in [None, Some("acme")] {
         let selected = provider.map(str::to_string);
         for (command, expected) in [
             ("login", Login { provider: selected.clone() }),

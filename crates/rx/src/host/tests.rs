@@ -8,12 +8,12 @@ fn request(harness: Option<&str>) -> String {
     serde_json::json!({
         "harness": harness,
         "gateway": {
-            "provider_id": "tokener",
-            "name": "Tokener",
-            "endpoint": "https://api.tokener.dev/v1",
-            "credential_env": "TOKENER_API_KEY"
+            "provider_id": "acme",
+            "name": "Acme",
+            "endpoint": "https://gateway.test/v1",
+            "credential_env": "ACME_API_KEY"
         },
-        "state_dir": std::env::temp_dir().join("tokener-agent"),
+        "state_dir": std::env::temp_dir().join("acme-agent"),
         "install_policy": "prompt"
     })
     .to_string()
@@ -47,7 +47,7 @@ fn hosted_request_allows_missing_harness() {
 #[test]
 fn request_rejects_unknown_fields_and_unsafe_profile_values() {
     let mut value: serde_json::Value = serde_json::from_str(&request(None)).unwrap();
-    value["tokener_key"] = serde_json::json!("secret");
+    value["gateway_key"] = serde_json::json!("secret");
     assert!(parse_request(&value.to_string()).is_err());
     let mut value: serde_json::Value = serde_json::from_str(&request(None)).unwrap();
     value["gateway"]["credential_env"] = serde_json::json!("KEY;bad");
@@ -69,20 +69,20 @@ fn route_guards_are_harness_specific() {
         ),
         (
             Harness::OpenCode,
-            vec!["--model", "tokener/model-a", "--fork"],
+            vec!["--model", "acme/model-a", "--fork"],
             vec!["--model", "openai/model-a"],
         ),
         (
             Harness::Pi,
-            vec!["--provider", "tokener", "--model", "model-a", "--resume"],
+            vec!["--provider", "acme", "--model", "model-a", "--resume"],
             vec!["--api-key", "secret"],
         ),
         (Harness::Dsh, vec![], vec!["--patch", "other.yml"]),
     ] {
-        validate_route_args(harness, &os(&allowed), "tokener").unwrap();
-        assert!(validate_route_args(harness, &os(&rejected), "tokener").is_err());
+        validate_route_args(harness, &os(&allowed), "acme").unwrap();
+        assert!(validate_route_args(harness, &os(&rejected), "acme").is_err());
     }
-    validate_route_args(Harness::Kimi, &os(&["--session", "session-id", "--plan"]), "tokener")
+    validate_route_args(Harness::Kimi, &os(&["--session", "session-id", "--plan"]), "acme")
         .unwrap();
 }
 
@@ -114,7 +114,7 @@ fn codex_route_overrides_are_rejected_in_native_config_forms() {
 
 #[test]
 fn model_scopes_follow_the_requested_gateway() {
-    for provider in ["acme", "tokener"] {
+    for provider in ["acme", "beta"] {
         for harness in [Harness::OpenCode, Harness::Pi] {
             for flag in ["-m", "--model"] {
                 for (model, accepted) in
@@ -142,7 +142,7 @@ fn native_arguments_after_double_dash_are_literal() {
     validate_route_args(
         Harness::Claude,
         &os(&["--resume", "session", "--", "--settings", "literal"]),
-        "tokener",
+        "acme",
     )
     .unwrap();
 }

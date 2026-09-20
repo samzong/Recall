@@ -4,8 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 
 fn target(key: &str) -> ProviderTarget {
-    let mut provider = crate::provider::find("tokener").unwrap().clone();
-    provider.endpoint = "https://provider.test".to_string();
+    let provider = crate::tests::fixture_provider("https://provider.test");
     ProviderTarget { provider, key: key.to_string(), model: None }
 }
 
@@ -71,14 +70,14 @@ fn catalog_refresh_preserves_user_config_and_replaces_owned_models() {
     .unwrap();
     seed(
         &path,
-        "rx-tokener",
+        "rx-acme",
         "rx-secret",
         &[listed("model-a", "Model A", 200_000), listed("model-b", "Model B", 300_000)],
     )
     .unwrap();
     seed(
         &path,
-        "rx-tokener",
+        "rx-acme",
         "rx-secret",
         &[listed("model-b", "Model B", 300_000), listed("model-c", "Model C", 400_000)],
     )
@@ -89,9 +88,9 @@ fn catalog_refresh_preserves_user_config_and_replaces_owned_models() {
     assert_eq!(document["default_model"].as_str(), Some("native/model"));
     assert_eq!(document["providers"]["native"]["api_key"].as_str(), Some("native-key"));
     assert!(document["models"].get("native/model").is_some());
-    assert!(document["models"].get("rx-tokener/model-a").is_none());
-    assert!(document["models"].get("rx-tokener/model-b").is_some());
-    assert!(document["models"].get("rx-tokener/model-c").is_some());
+    assert!(document["models"].get("rx-acme/model-a").is_none());
+    assert!(document["models"].get("rx-acme/model-b").is_some());
+    assert!(document["models"].get("rx-acme/model-c").is_some());
     let marker = fs::read_to_string(appended_path(&path, ".rx-catalog.json")).unwrap();
     assert!(!marker.contains("rx-secret"));
     #[cfg(unix)]
@@ -111,14 +110,14 @@ fn modified_owned_model_is_preserved_and_blocks_reclaim() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let models = [listed("model-a", "Model A", 200_000)];
-    seed(&path, "rx-tokener", "rx-secret", &models).unwrap();
+    seed(&path, "rx-acme", "rx-secret", &models).unwrap();
     let mut document = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
-    document["models"]["rx-tokener/model-a"]["model"] = value("user-model");
+    document["models"]["rx-acme/model-a"]["model"] = value("user-model");
     fs::write(&path, document.to_string()).unwrap();
-    let error = seed(&path, "rx-tokener", "rx-secret", &models).unwrap_err();
+    let error = seed(&path, "rx-acme", "rx-secret", &models).unwrap_err();
     assert!(error.to_string().contains("outside rx ownership"), "{error:#}");
     let document = read_config(&path);
-    assert_eq!(document["models"]["rx-tokener/model-a"]["model"].as_str(), Some("user-model"));
+    assert_eq!(document["models"]["rx-acme/model-a"]["model"].as_str(), Some("user-model"));
 }
 
 #[test]
@@ -286,16 +285,15 @@ fn purge_removes_owned_provider_key_and_models() {
         "[providers.native]\ntype = \"openai\"\nbase_url = \"https://native.test/v1\"\napi_key = \"native-key\"\n\n[models.\"native/model\"]\nprovider = \"native\"\nmodel = \"native-model\"\nmax_context_size = 100000\n",
     )
     .unwrap();
-    let lease =
-        seed(&path, "rx-tokener", "sk-secret", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
+    let lease = seed(&path, "rx-acme", "sk-secret", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
     assert!(fs::read_to_string(&path).unwrap().contains("sk-secret"));
     drop(lease);
 
-    assert_eq!(purge(&path, "rx-tokener").unwrap(), Residue::Removed);
+    assert_eq!(purge(&path, "rx-acme").unwrap(), Residue::Removed);
 
     let body = fs::read_to_string(&path).unwrap();
     assert!(!body.contains("sk-secret"), "{body}");
-    assert!(!body.contains("rx-tokener"), "{body}");
+    assert!(!body.contains("rx-acme"), "{body}");
     let config = read_config(&path);
     assert_eq!(config["providers"]["native"]["api_key"].as_str(), Some("native-key"));
     assert_eq!(config["models"]["native/model"]["model"].as_str(), Some("native-model"));
@@ -306,51 +304,49 @@ fn purge_removes_owned_provider_key_and_models() {
 fn purge_keeps_user_edited_entries_and_reports_them() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
-    let lease =
-        seed(&path, "rx-tokener", "sk-secret", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
+    let lease = seed(&path, "rx-acme", "sk-secret", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
     drop(lease);
     let edited = fs::read_to_string(&path).unwrap().replace("200000", "123456");
     fs::write(&path, edited).unwrap();
 
-    assert_eq!(purge(&path, "rx-tokener").unwrap(), Residue::Modified(path.clone()));
+    assert_eq!(purge(&path, "rx-acme").unwrap(), Residue::Modified(path.clone()));
 
     let config = read_config(&path);
-    assert_eq!(config["models"]["rx-tokener/glm-5"]["max_context_size"].as_integer(), Some(123456));
-    assert!(config["providers"]["rx-tokener"].is_table());
+    assert_eq!(config["models"]["rx-acme/glm-5"]["max_context_size"].as_integer(), Some(123456));
+    assert!(config["providers"]["rx-acme"].is_table());
 }
 
 #[test]
 fn purge_leaves_other_providers_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
-    let first = seed(&path, "rx-tokener", "sk-one", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
+    let first = seed(&path, "rx-acme", "sk-one", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
     let _second =
         seed(&path, "rx-openrouter", "sk-two", &[listed("gpt-6", "GPT 6", 200000)]).unwrap();
     drop(first);
 
-    assert_eq!(purge(&path, "rx-tokener").unwrap(), Residue::Removed);
+    assert_eq!(purge(&path, "rx-acme").unwrap(), Residue::Removed);
 
     let body = fs::read_to_string(&path).unwrap();
     assert!(!body.contains("sk-one"), "{body}");
     assert!(body.contains("sk-two"), "{body}");
     let config = read_config(&path);
     assert!(config["models"]["rx-openrouter/gpt-6"].is_table());
-    assert!(config["providers"].get("rx-tokener").is_none());
+    assert!(config["providers"].get("rx-acme").is_none());
 }
 
 #[test]
 fn purge_refuses_while_a_launch_holds_the_catalog() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
-    let lease =
-        seed(&path, "rx-tokener", "sk-secret", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
+    let lease = seed(&path, "rx-acme", "sk-secret", &[listed("glm-5", "GLM 5", 200000)]).unwrap();
 
-    let residue = purge(&path, "rx-tokener").unwrap();
+    let residue = purge(&path, "rx-acme").unwrap();
     assert!(matches!(residue, Residue::Blocked(_)), "{residue:?}");
     assert!(fs::read_to_string(&path).unwrap().contains("sk-secret"));
     drop(lease);
 
-    assert_eq!(purge(&path, "rx-tokener").unwrap(), Residue::Removed);
+    assert_eq!(purge(&path, "rx-acme").unwrap(), Residue::Removed);
     assert!(!fs::read_to_string(&path).unwrap().contains("sk-secret"));
 }
 
@@ -359,7 +355,7 @@ fn purge_without_a_marker_reports_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     fs::write(&path, "[providers.native]\napi_key = \"native-key\"\n").unwrap();
-    assert_eq!(purge(&path, "rx-tokener").unwrap(), Residue::Absent);
+    assert_eq!(purge(&path, "rx-acme").unwrap(), Residue::Absent);
     assert_eq!(
         fs::read_to_string(&path).unwrap(),
         "[providers.native]\napi_key = \"native-key\"\n"

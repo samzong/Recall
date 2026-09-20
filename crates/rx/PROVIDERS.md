@@ -4,11 +4,12 @@
 Admission lives in `crates/rx/data/provider-admission.json`. Running
 `crates/rx/scripts/update-rx-providers` writes `crates/rx/data/providers.json`.
 Both files are committed. Released rx binaries compile `providers.json` in and
-never fetch `models.dev`. The generated list is `openrouter`, then `tokener`,
-then the remaining models.dev IDs, then remaining managed entries. When every
-models.dev model on an admitted provider shares one `limit.context`, that value
-is stored as `default_context` and used if live `GET /v1/models` omits a window.
-OpenAI roots that already end in `/vN` (Z.AI `/paas/v4`) are left as-is.
+never fetch `models.dev`. The generated list is the first admitted models.dev
+ID, then the first managed entry, then the remaining models.dev IDs, then the
+remaining managed entries. When every models.dev model on an admitted provider
+shares one `limit.context`, that value is stored as `default_context` and used
+if live `GET /v1/models` omits a window. OpenAI roots that already end in `/vN`
+(Z.AI `/paas/v4`) are left as-is.
 
 Protocol-scoped model controls live in the admission file's
 `model_capabilities` map and are copied into the bundled snapshot. The key is
@@ -18,10 +19,9 @@ may declare reasoning as `fixed` or list the selectable effort IDs and their
 wire values. Missing data stays unknown and is not inferred from a model name.
 Overriding a bundled provider's endpoint disables its bundled model
 capabilities and falls back to `openai-completions`. A bundled provider may set
-`dsh_protocol` for its verified agent path. Tokener uses `openai-responses`
-because its Chat Completions tool path does not support selectable effort,
-while Responses accepts `reasoning.effort`. Capabilities remain separate per
-protocol.
+`dsh_protocol` for its verified agent path: `openai-responses` when its Chat
+Completions tool path does not support selectable effort while Responses
+accepts `reasoning.effort`. Capabilities remain separate per protocol.
 
 Users manage providers with `rx providers list`, `login [provider]`,
 `logout [provider]`, `use [provider]`, and `models update [provider]`. Passing a

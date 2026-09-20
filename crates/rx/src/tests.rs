@@ -105,6 +105,22 @@ fn request(harness: Harness, provider: Option<&str>, argv: &[&str]) -> LaunchReq
     LaunchRequest { harness, provider: provider.map(str::to_string), passthrough: os(argv) }
 }
 
+fn fixture_config(base_url: &str) -> String {
+    format!("[provider.acme]\nbase_url = \"{base_url}\"\nenv = \"ACME_API_KEY\"\nauth = \"env\"\n")
+}
+
+pub(crate) fn fixture_provider(base_url: &str) -> provider::Provider {
+    provider::resolve(
+        "acme",
+        Some(&config::ProviderConfig {
+            base_url: Some(base_url.to_string()),
+            env: Some("ACME_API_KEY".to_string()),
+            ..config::ProviderConfig::default()
+        }),
+    )
+    .unwrap()
+}
+
 fn isolated(values: &[(&str, &str)]) -> EnvLookup {
     EnvLookup::isolated(
         values.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect(),

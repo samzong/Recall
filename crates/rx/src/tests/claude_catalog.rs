@@ -121,19 +121,19 @@ fn real_claude_plan_uses_seeded_generated_route() {
 #[test]
 fn generated_provider_seeded_plan_uses_auth_token_and_settings() {
     let plan = launch::inject_claude_generated_seeded(
-        &request(Harness::Claude, Some("tokener"), &["fix it"]),
-        "TOKENER_API_KEY",
+        &request(Harness::Claude, Some("acme"), &["fix it"]),
+        "ACME_API_KEY",
         "http://localhost:8080",
-        "sk-tokener",
+        "sk-fixture",
         None,
     );
     assert_eq!(plan.args[0], "--settings");
-    assert!(arg_str(&plan.args[1]).contains("TOKENER_API_KEY"));
+    assert!(arg_str(&plan.args[1]).contains("ACME_API_KEY"));
     assert_eq!(plan.args[2], "fix it");
     assert_env(
         &plan,
         &[
-            ("ANTHROPIC_AUTH_TOKEN", "sk-tokener"),
+            ("ANTHROPIC_AUTH_TOKEN", "sk-fixture"),
             ("ANTHROPIC_API_KEY", ""),
             ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "0"),
         ],
@@ -209,11 +209,11 @@ fn claude_seed_replaces_previous_provider_catalog_without_dropping_unowned_entri
         .push(json!("user-model"));
     write_json(&config_path, &document);
 
-    let tokener = catalog::parse_openai_models(
+    let lab = catalog::parse_openai_models(
         r#"{"data":[{"id":"claude-sonnet-5","name":"Sonnet 5","context_length":200000}]}"#,
     )
     .unwrap();
-    claude::write_seed(&config_path, &claude::seed_from_listed("tokener", &tokener)).unwrap();
+    claude::write_seed(&config_path, &claude::seed_from_listed("lab", &lab)).unwrap();
     let document: Value = read_json(&config_path);
     let values = entries(&document, "additionalModelOptionsCache")
         .iter()
@@ -222,7 +222,7 @@ fn claude_seed_replaces_previous_provider_catalog_without_dropping_unowned_entri
     assert!(!values.contains(&"google/gemini-3.7-flash"));
     assert!(values.contains(&"claude-sonnet-5"));
     assert!(values.contains(&"user-model"));
-    assert_eq!(document["rxSeededCatalog"]["provider_id"], "tokener");
+    assert_eq!(document["rxSeededCatalog"]["provider_id"], "lab");
 
     let access = entries(&document, "modelAccessCache");
     assert!(!access.iter().any(|entry| entry["apiName"] == "google/gemini-3.7-flash"));

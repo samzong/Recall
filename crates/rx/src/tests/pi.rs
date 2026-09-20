@@ -41,21 +41,21 @@ fn pi_selected_credential_survives_route_cleanup() {
 }
 
 #[test]
-fn pi_tokener_merges_provider_into_models_json() {
+fn pi_merges_provider_into_models_json() {
     let dir = tempfile::tempdir().unwrap();
     let models_path = dir.path().join("models.json");
     fs::write(&models_path, r#"{"providers":{"ollama":{"baseUrl":"http://127.0.0.1:11434/v1"}}}"#)
         .unwrap();
     let provider = json!({
-        "baseUrl": "https://api.tokener.dev/v1",
-        "apiKey": "$TOKENER_API_KEY",
+        "baseUrl": "https://provider.test/v1",
+        "apiKey": "$ACME_API_KEY",
         "api": "openai-responses",
         "models": [{ "id": "gpt-5.6-sol" }]
     });
-    crate::pi::merge_provider(&models_path, "tokener", provider).unwrap();
+    crate::pi::merge_provider(&models_path, "acme", provider).unwrap();
     let document: Value = read_json(&models_path);
     assert!(document["providers"]["ollama"].is_object());
-    assert_eq!(document["providers"]["tokener"]["baseUrl"], "https://api.tokener.dev/v1");
+    assert_eq!(document["providers"]["acme"]["baseUrl"], "https://provider.test/v1");
 }
 
 #[test]
@@ -72,27 +72,27 @@ fn pi_merge_provider_refuses_to_reset_corrupt_models_json() {
         r#"{"providers":false}"#,
     ] {
         fs::write(&models_path, body).unwrap();
-        let provider = json!({ "baseUrl": "https://api.tokener.dev/v1" });
-        assert!(crate::pi::merge_provider(&models_path, "tokener", provider).is_err());
+        let provider = json!({ "baseUrl": "https://provider.test/v1" });
+        assert!(crate::pi::merge_provider(&models_path, "acme", provider).is_err());
         assert_eq!(fs::read_to_string(&models_path).unwrap(), body);
     }
 }
 
 #[test]
-fn pi_tokener_prepares_native_models() {
+fn pi_prepares_native_models() {
     let (dir, paths) = temp_paths();
-    let provider = provider::find("tokener").unwrap();
     let (base_url, server) = serve_openai_models(r#"{"data":[{"id":"gpt-5.6-sol"}]}"#);
+    let provider = fixture_provider("https://provider.test/v1");
     let agent_dir = dir.path().join("pi-agent");
     let env = isolated(&[("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())]);
 
-    crate::pi::prepare("tokener", provider, &base_url, "sk-test", &paths, &env).unwrap();
+    crate::pi::prepare("acme", &provider, &base_url, "sk-test", &paths, &env).unwrap();
     server.join().unwrap();
 
     let models: Value = read_json(agent_dir.join("models.json"));
-    assert_eq!(models["providers"]["tokener"]["baseUrl"], format!("{base_url}/v1"));
-    assert_eq!(models["providers"]["tokener"]["apiKey"], "$TOKENER_API_KEY");
-    assert_eq!(models["providers"]["tokener"]["models"][0]["id"], "gpt-5.6-sol");
+    assert_eq!(models["providers"]["acme"]["baseUrl"], format!("{base_url}/v1"));
+    assert_eq!(models["providers"]["acme"]["apiKey"], "$ACME_API_KEY");
+    assert_eq!(models["providers"]["acme"]["models"][0]["id"], "gpt-5.6-sol");
 }
 
 #[test]
@@ -101,15 +101,15 @@ fn pi_purge_removes_only_the_marked_provider() {
     let models_path = dir.path().join("models.json");
     fs::write(&models_path, r#"{"providers":{"ollama":{"baseUrl":"http://127.0.0.1:11434/v1"}}}"#)
         .unwrap();
-    let provider = json!({ "baseUrl": "https://api.tokener.dev/v1", "apiKey": "$TOKENER_API_KEY" });
-    crate::pi::merge_provider(&models_path, "tokener", provider).unwrap();
+    let provider = json!({ "baseUrl": "https://provider.test/v1", "apiKey": "$ACME_API_KEY" });
+    crate::pi::merge_provider(&models_path, "acme", provider).unwrap();
     let env = isolated(&[("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap())]);
 
-    assert_eq!(crate::pi::purge("tokener", &env).unwrap(), crate::residue::Residue::Removed);
+    assert_eq!(crate::pi::purge("acme", &env).unwrap(), crate::residue::Residue::Removed);
 
     let document: Value = read_json(&models_path);
     assert!(document["providers"]["ollama"].is_object());
-    assert!(document["providers"].get("tokener").is_none());
+    assert!(document["providers"].get("acme").is_none());
     assert!(!dir.path().join("models.json.rx-catalog.json").exists());
 }
 
@@ -118,30 +118,27 @@ fn pi_purge_reports_unmarked_and_user_edited_residue() {
     let dir = tempfile::tempdir().unwrap();
     let models_path = dir.path().join("models.json");
     let env = isolated(&[("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap())]);
-    fs::write(
-        &models_path,
-        r#"{"providers":{"tokener":{"baseUrl":"https://api.tokener.dev/v1"}}}"#,
-    )
-    .unwrap();
+    fs::write(&models_path, r#"{"providers":{"acme":{"baseUrl":"https://provider.test/v1"}}}"#)
+        .unwrap();
 
     assert_eq!(
-        crate::pi::purge("tokener", &env).unwrap(),
+        crate::pi::purge("acme", &env).unwrap(),
         crate::residue::Residue::Unowned(models_path.clone())
     );
-    assert!(read_json::<Value>(&models_path)["providers"]["tokener"].is_object());
+    assert!(read_json::<Value>(&models_path)["providers"]["acme"].is_object());
 
-    let provider = json!({ "baseUrl": "https://api.tokener.dev/v1", "apiKey": "$TOKENER_API_KEY" });
-    crate::pi::merge_provider(&models_path, "tokener", provider).unwrap();
+    let provider = json!({ "baseUrl": "https://provider.test/v1", "apiKey": "$ACME_API_KEY" });
+    crate::pi::merge_provider(&models_path, "acme", provider).unwrap();
     let mut document: Value = read_json(&models_path);
-    document["providers"]["tokener"]["baseUrl"] = json!("https://edited.test/v1");
+    document["providers"]["acme"]["baseUrl"] = json!("https://edited.test/v1");
     write_json(&models_path, &document);
 
     assert_eq!(
-        crate::pi::purge("tokener", &env).unwrap(),
+        crate::pi::purge("acme", &env).unwrap(),
         crate::residue::Residue::Modified(models_path.clone())
     );
     assert_eq!(
-        read_json::<Value>(&models_path)["providers"]["tokener"]["baseUrl"],
+        read_json::<Value>(&models_path)["providers"]["acme"]["baseUrl"],
         "https://edited.test/v1"
     );
 }
@@ -150,5 +147,5 @@ fn pi_purge_reports_unmarked_and_user_edited_residue() {
 fn pi_purge_is_absent_without_models_json() {
     let dir = tempfile::tempdir().unwrap();
     let env = isolated(&[("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap())]);
-    assert_eq!(crate::pi::purge("tokener", &env).unwrap(), crate::residue::Residue::Absent);
+    assert_eq!(crate::pi::purge("acme", &env).unwrap(), crate::residue::Residue::Absent);
 }
