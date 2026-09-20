@@ -167,7 +167,9 @@ pub(crate) fn resolve(id: &str, entry: Option<&ProviderConfig>) -> Result<Provid
         );
     };
     let Some(endpoint) = entry.base_url.as_ref() else {
-        bail!("custom provider '{id}' must set base_url to an OpenAI-compatible /v1 endpoint");
+        bail!(
+            "custom provider '{id}' must set base_url to an OpenAI-compatible /v1 endpoint, or pick another with: rx providers use [provider]"
+        );
     };
     Ok(Provider {
         id: id.to_string(),
@@ -180,6 +182,20 @@ pub(crate) fn resolve(id: &str, entry: Option<&ProviderConfig>) -> Result<Provid
         default_model: None,
         claude_default_model: None,
     })
+}
+
+pub(crate) fn orphan(id: &str) -> Provider {
+    Provider {
+        id: id.to_string(),
+        name: id.to_string(),
+        endpoint: String::new(),
+        anthropic_base: None,
+        default_context: None,
+        env: generated_env(id),
+        setup: Setup::Generated,
+        default_model: None,
+        claude_default_model: None,
+    }
 }
 
 pub(crate) fn claude_base(provider: &Provider) -> String {

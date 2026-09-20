@@ -16,6 +16,7 @@ fn state(id: &str, name: &str, configured: bool, default: bool) -> ProviderState
             default_model: None,
             claude_default_model: None,
         },
+        orphaned: false,
         configured,
         stored_key: configured,
         environment_active: false,
@@ -220,4 +221,21 @@ fn list_uses_one_mutually_exclusive_status_marker() {
     let output = render_list(&[&default, &configured]);
     assert!(output.contains("* OpenRouter"));
     assert!(output.contains("• Acme"));
+}
+
+#[test]
+fn list_keeps_a_stored_key_visible_after_its_provider_disappears() {
+    let configured = state("openrouter", "OpenRouter", true, true);
+    let unconfigured = state("acme", "Acme", false, false);
+    let mut orphan = state("retired", "retired", true, false);
+    orphan.provider = crate::provider::orphan("retired");
+    orphan.orphaned = true;
+
+    let output = render_list(&[&configured, &unconfigured, &orphan]);
+
+    assert!(output.contains("retired"), "{output}");
+    assert!(!output.contains("Acme"), "{output}");
+    assert!(!orphan.selectable(Action::Use));
+    assert!(!orphan.selectable(Action::Login));
+    assert!(orphan.selectable(Action::Logout));
 }

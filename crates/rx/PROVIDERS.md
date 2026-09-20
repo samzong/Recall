@@ -31,7 +31,10 @@ launch (`rx --provider none <harness>`) or persistently (`rx providers use none`
 and overrides the implicit OpenRouter default. Custom providers are configured
 with `default_provider` plus `[provider.<id>]` entries in `~/.recall/rx.toml`.
 Stored API keys live in `~/.recall/rx.keys`; `auth = "env"` reads the provider's
-configured environment variable instead.
+configured environment variable instead. A stored key whose provider no longer
+resolves — one dropped from the bundled catalog, or a `[provider.<id>]` entry
+without `base_url` — stays listed under a `!` marker and accepts only `logout`,
+so the key never becomes unreachable.
 
 A provider may enter the bundled provider catalog only after
 `crates/rx/scripts/probe-rx-provider` confirms all of these contracts through

@@ -15,14 +15,15 @@ struct ProviderState {
     stored_key: bool,
     environment_active: bool,
     default: bool,
+    orphaned: bool,
 }
 
 impl ProviderState {
     fn selectable(&self, action: Action) -> bool {
         match action {
-            Action::Login => true,
+            Action::Login => !self.orphaned,
             Action::Logout => self.stored_key || self.configured,
-            Action::Use => self.configured,
+            Action::Use => self.configured && !self.orphaned,
         }
     }
 }
@@ -112,12 +113,12 @@ fn update_models(paths: &Paths, env: &EnvLookup, requested: Option<&str>) -> Res
 
 fn list(paths: &Paths, env: &EnvLookup) -> Result<()> {
     let states = provider_states(paths, env)?;
-    let configured = states.iter().filter(|provider| provider.configured).collect::<Vec<_>>();
-    if configured.is_empty() {
+    let rendered = render_list(&states.iter().collect::<Vec<_>>());
+    if rendered.is_empty() {
         println!("No providers configured. Run: rx providers login");
-        return Ok(());
+    } else {
+        print!("{rendered}");
     }
-    print!("{}", render_list(&configured));
     Ok(())
 }
 
@@ -227,10 +228,9 @@ pub(crate) fn completion_ids(
     let mut ids = provider_states(paths, env)?
         .into_iter()
         .filter(|state| match filter {
-            crate::args::ProviderIdFilter::All => true,
-            crate::args::ProviderIdFilter::Configured | crate::args::ProviderIdFilter::Targets => {
-                state.configured
-            }
+            crate::args::ProviderIdFilter::All => !state.orphaned,
+            crate::args::ProviderIdFilter::Configured => state.configured,
+            crate::args::ProviderIdFilter::Targets => state.configured && !state.orphaned,
         })
         .map(|state| state.provider.id)
         .collect::<Vec<_>>();
@@ -245,6 +245,11 @@ fn provider_index(states: &[ProviderState], id: &str, action: Action) -> Result<
         .iter()
         .position(|state| state.provider.id == id)
         .ok_or_else(|| anyhow::anyhow!("unknown provider: {id}"))?;
+    if states[index].orphaned && action != Action::Logout {
+        bail!(
+            "provider '{id}' is no longer available; only its stored key remains. Run: rx providers logout {id}"
+        );
+    }
     if !states[index].selectable(action) {
         bail!("provider '{id}' is not configured; run: rx providers login {id}");
     }
@@ -277,9 +282,23 @@ fn provider_states(paths: &Paths, env: &EnvLookup) -> Result<Vec<ProviderState>>
                 configured,
                 environment_active,
                 default,
+                orphaned: false,
             }
         })
         .collect::<Vec<_>>();
+    for id in &stored {
+        if states.iter().any(|state| &state.provider.id == id) {
+            continue;
+        }
+        states.push(ProviderState {
+            provider: crate::provider::orphan(id),
+            configured: true,
+            stored_key: true,
+            environment_active: false,
+            default: config.default_provider.as_deref() == Some(id.as_str()),
+            orphaned: true,
+        });
+    }
     sort_provider_states(&mut states);
     Ok(states)
 }
@@ -287,6 +306,7 @@ fn provider_states(paths: &Paths, env: &EnvLookup) -> Result<Vec<ProviderState>>
 fn sort_provider_states(states: &mut [ProviderState]) {
     states.sort_by_cached_key(|state| {
         (
+            state.orphaned,
             state.provider.id != "openrouter",
             !state.configured,
             state.provider.name.to_ascii_lowercase(),
@@ -295,7 +315,12 @@ fn sort_provider_states(states: &mut [ProviderState]) {
     });
 }
 
-fn render_list(providers: &[&ProviderState]) -> String {
+fn render_list(states: &[&ProviderState]) -> String {
+    let providers =
+        states.iter().filter(|state| state.configured || state.orphaned).collect::<Vec<_>>();
+    if providers.is_empty() {
+        return String::new();
+    }
     let name_width = providers
         .iter()
         .map(|state| state.provider.name.chars().count())
@@ -304,11 +329,12 @@ fn render_list(providers: &[&ProviderState]) -> String {
         .max("PROVIDER".len());
     let mut output = format!("  {:<name_width$}  API ENDPOINT\n", "PROVIDER");
     for state in providers {
-        let marker = if state.default { '*' } else { '•' };
-        output.push_str(&format!(
-            "{marker} {:<name_width$}  {}\n",
-            state.provider.name, state.provider.endpoint
-        ));
+        let (marker, detail) = if state.orphaned {
+            ('!', format!("stored key only; run: rx providers logout {}", state.provider.id))
+        } else {
+            (if state.default { '*' } else { '•' }, state.provider.endpoint.clone())
+        };
+        output.push_str(&format!("{marker} {:<name_width$}  {detail}\n", state.provider.name));
     }
     output
 }

@@ -117,7 +117,7 @@ pub(crate) fn login(paths: &Paths, provider: &str, key: String) -> Result<()> {
 pub(crate) fn logout(paths: &Paths, provider: &str) -> Result<bool> {
     let _lock = mutation_lock(paths)?;
     let mut config = load_or_default(paths)?;
-    crate::provider::resolve(provider, config.provider.get(provider))?;
+    crate::provider::validate_id(provider)?;
     let mut keys = load_keys(paths)?;
     let removed = keys.remove(provider).is_some();
     if removed {

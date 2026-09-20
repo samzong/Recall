@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn a_stored_key_outlives_its_provider_and_can_still_be_removed() {
+    let (_dir, paths) = temp_paths();
+    let env = isolated(&[]);
+    fs::write(
+        &paths.config,
+        "default_provider = \"retired\"\n\n[provider.retired]\nauth = \"api_key\"\n",
+    )
+    .unwrap();
+    fs::write(&paths.keys, "retired = \"sk-stranded\"\n").unwrap();
+
+    let configured =
+        crate::providers::completion_ids(&paths, &env, ProviderIdFilter::Configured).unwrap();
+    assert!(configured.contains(&"retired".to_string()), "{configured:?}");
+    let targets =
+        crate::providers::completion_ids(&paths, &env, ProviderIdFilter::Targets).unwrap();
+    assert!(!targets.contains(&"retired".to_string()), "{targets:?}");
+
+    crate::run_with(os(&["rx", "providers", "logout", "retired"]), &paths, &env).unwrap();
+
+    assert_eq!(config::stored_key(&paths, "retired").unwrap(), None);
+    assert_eq!(config::load(&paths).unwrap().unwrap().default_provider, None);
+}
+
+#[test]
 fn completion_ids_list_configured_and_known() {
     let (_dir, paths) = temp_paths();
     let env = isolated(&[]);
