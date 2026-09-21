@@ -314,7 +314,7 @@ impl SyncJob {
 
         let touched = self.stats.touched() - touched_before;
         let elapsed_ms = started.elapsed().as_millis();
-        self.progress.end_source(label, found, touched, elapsed_ms);
+        self.progress.end_source(label, found, touched, scan.unstable_sessions, elapsed_ms);
         self.adapter_runs.push(AdapterRun {
             label: label.to_string(),
             scan,

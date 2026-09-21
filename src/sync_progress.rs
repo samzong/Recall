@@ -4,8 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use tracing_subscriber::fmt::MakeWriter;
+
 const TICK: Duration = Duration::from_millis(500);
 const MIN_REDRAW: Duration = Duration::from_millis(100);
+
+static ACTIVE_LINE: Mutex<Option<Arc<Mutex<Line>>>> = Mutex::new(None);
 
 pub(crate) struct SyncProgress {
     total: usize,
@@ -54,6 +58,9 @@ impl SyncProgress {
                 }
             })
         };
+        if let Ok(mut active) = ACTIVE_LINE.lock() {
+            *active = Some(Arc::clone(&line));
+        }
         Self { total, index: 0, line: Some(line), stop: Some(stop), ticker: Some(ticker) }
     }
 
@@ -77,13 +84,21 @@ impl SyncProgress {
         self.with_line(|line| line.set_transient(text, false));
     }
 
-    pub(crate) fn end_source(&mut self, label: &str, found: usize, touched: u32, elapsed_ms: u128) {
-        if found == 0 && touched == 0 {
+    pub(crate) fn end_source(
+        &mut self,
+        label: &str,
+        found: usize,
+        touched: u32,
+        busy: u32,
+        elapsed_ms: u128,
+    ) {
+        if found == 0 && touched == 0 && busy == 0 {
             self.with_line(Line::clear);
             return;
         }
+        let busy = if busy == 0 { String::new() } else { format!(", {busy} busy") };
         let text = format!(
-            "[{}/{}] {label}: {found} sessions read, {touched} indexed, {}",
+            "[{}/{}] {label}: {found} sessions read, {touched} indexed{busy}, {}",
             self.index,
             self.total,
             format_elapsed(elapsed_ms)
@@ -97,6 +112,12 @@ impl SyncProgress {
 
     pub(crate) fn finish(&mut self) {
         self.with_line(Line::clear);
+        if let Some(line) = &self.line
+            && let Ok(mut active) = ACTIVE_LINE.lock()
+            && active.as_ref().is_some_and(|current| Arc::ptr_eq(current, line))
+        {
+            *active = None;
+        }
         drop(self.stop.take());
         if let Some(ticker) = self.ticker.take() {
             let _ = ticker.join();
@@ -157,6 +178,10 @@ impl Line {
 
     fn clear(&mut self) {
         self.transient = None;
+        self.clear_render();
+    }
+
+    fn clear_render(&mut self) {
         if self.last_width == 0 {
             return;
         }
@@ -164,6 +189,52 @@ impl Line {
         let _ = io::stderr().flush();
         self.last_width = 0;
     }
+}
+
+pub(crate) struct ProgressAwareStderr;
+
+impl<'a> MakeWriter<'a> for ProgressAwareStderr {
+    type Writer = LogRecord;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogRecord { buf: Vec::new() }
+    }
+}
+
+pub(crate) struct LogRecord {
+    buf: Vec<u8>,
+}
+
+impl Write for LogRecord {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for LogRecord {
+    fn drop(&mut self) {
+        let line = ACTIVE_LINE.lock().ok().and_then(|active| active.clone());
+        let held = line.as_ref().and_then(|line| line.try_lock().ok());
+        match held {
+            Some(mut line) => {
+                line.clear_render();
+                write_stderr(&self.buf);
+                line.redraw_transient();
+            }
+            None => write_stderr(&self.buf),
+        }
+    }
+}
+
+fn write_stderr(buf: &[u8]) {
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(buf);
+    let _ = stderr.flush();
 }
 
 pub(crate) fn format_bytes(bytes: u64) -> String {

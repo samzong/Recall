@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tracing::warn;
+use tracing::debug;
 
 use crate::adapters::sync_state::parser_state_is_current_for_mtime;
 use crate::adapters::{
@@ -123,7 +123,7 @@ where
             let raw = parse_fn(entry, mtime_ms)?;
             let stable = snapshot_fn(&revalidate_entry).as_ref() == Some(&before);
             if !stable {
-                warn!(
+                debug!(
                     "skipping unstable {} session {}: source files changed while parsing ({})",
                     context.source(),
                     revalidate_entry.session_id,

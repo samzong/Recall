@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 use crate::adapters::AdapterSyncContext;
@@ -133,7 +133,7 @@ where
         };
         let raw = parse_fn(entry.clone(), snapshot.effective_mtime_ms())?;
         if kimi_session_snapshot(&entry).as_ref() != Some(&snapshot) {
-            warn!(
+            debug!(
                 "skipping unstable Kimi Code session {}: source files changed while parsing ({})",
                 entry.session_id,
                 entry.stat_target.display()

@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::events::{
@@ -195,7 +195,7 @@ where
     let source_id = entry.session_id.clone();
     let parsed = parse_fn(entry, mtime_ms)?;
     if file_scan::file_metadata_snapshot(&path).as_ref() != Some(&before) {
-        warn!(
+        debug!(
             "skipping unstable Copilot Chat session {source_id}: source file changed while parsing ({})",
             path.display()
         );

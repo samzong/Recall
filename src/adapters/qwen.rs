@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::events::{EventContext, tool_call_event, tool_result_event};
@@ -109,7 +109,7 @@ fn scan_qwen_sessions(runtime_dir: &Path) -> anyhow::Result<Vec<RawSession>> {
         let path = entry.stat_target.clone();
         let raw = parse_qwen_session_file(entry, mtime_ms, true)?;
         if file_scan::file_metadata_snapshot(&path).as_ref() != Some(&snapshot) {
-            warn!("skipping unstable Qwen session {}", path.display());
+            debug!("skipping unstable Qwen session {}", path.display());
             continue;
         }
         if let Some(raw) = raw {

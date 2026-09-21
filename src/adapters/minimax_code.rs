@@ -174,7 +174,7 @@ fn parse_stable_sessions(
         let raw =
             parse_minimax_session(entry.clone(), snapshot.effective_mtime_ms(), include_events)?;
         if minimax_session_snapshot(&entry).as_ref() != Some(&snapshot) {
-            warn!(
+            debug!(
                 "skipping unstable MiniMax Code session {}: source files changed while parsing ({})",
                 entry.session_id,
                 entry.stat_target.display()
