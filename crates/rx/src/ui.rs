@@ -33,3 +33,16 @@ impl Palette {
         }
     }
 }
+
+pub(crate) fn truncate(value: &str, width: usize) -> String {
+    match width {
+        0 => String::new(),
+        1 => "…".to_string(),
+        _ if value.chars().count() > width => {
+            let mut truncated = value.chars().take(width - 1).collect::<String>();
+            truncated.push('…');
+            truncated
+        }
+        _ => value.to_string(),
+    }
+}

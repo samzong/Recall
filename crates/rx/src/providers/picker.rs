@@ -13,7 +13,7 @@ use ratatui::{
 };
 
 use super::*;
-use crate::ui::Palette;
+use crate::ui::{Palette, truncate};
 
 const PAGE_SIZE: usize = 8;
 
@@ -437,19 +437,6 @@ fn render_logout_confirmation(frame: &mut Frame, area: Rect, app: &App, palette:
         ]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-}
-
-fn truncate(value: &str, width: usize) -> String {
-    match width {
-        0 => String::new(),
-        1 => "…".to_string(),
-        _ if value.chars().count() > width => {
-            let mut truncated = value.chars().take(width - 1).collect::<String>();
-            truncated.push('…');
-            truncated
-        }
-        _ => value.to_string(),
-    }
 }
 
 #[cfg(test)]

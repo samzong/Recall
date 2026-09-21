@@ -52,7 +52,8 @@ fn run_with(raw_args: Vec<OsString>, paths: &Paths, env: &EnvLookup) -> Result<(
         Command::Completions(command) => completions::run(command, paths, env),
         Command::Host { passthrough } => host::run(passthrough, env),
         Command::PickHarness { provider } => {
-            let Some(harness) = pick::harness(env)? else {
+            let Some((harness, provider)) = pick::harness_with_provider(paths, env, provider)?
+            else {
                 return Ok(());
             };
             launch_request(
@@ -102,7 +103,8 @@ Usage:
   rx completions <bash|zsh|fish>
   rx host [-- native harness args...]
 
-A TTY `rx` with no harness opens a picker. Scripts must pass a harness.
+A TTY `rx` with no harness opens a picker; tab there selects a configured
+provider for that launch only. Scripts must pass a harness.
 
 Environment:
   RX_NO_UPDATE=1     skip launch-time update checks

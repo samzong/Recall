@@ -26,7 +26,9 @@ accepts `reasoning.effort`. Capabilities remain separate per protocol.
 Users manage providers with `rx providers list`, `login [provider]`,
 `logout [provider]`, `use [provider]`, and `models update [provider]`. Passing a
 provider ID skips the picker; `use` persistently selects the default provider. The one-launch form
-`rx --provider <provider> <harness>` overrides it. `none` skips injection for one
+`rx --provider <provider> <harness>` overrides it. The `rx` harness picker offers the
+same one-launch override: `tab` lists the configured providers, and the selection
+applies to that launch without changing `default_provider`. `none` skips injection for one
 launch (`rx --provider none <harness>`) or persistently (`rx providers use none`)
 and overrides the implicit OpenRouter default. Custom providers are configured
 with `default_provider` plus `[provider.<id>]` entries in `~/.recall/rx.toml`.

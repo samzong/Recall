@@ -220,6 +220,27 @@ fn set_default_provider(paths: &Paths, state: &ProviderState) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LaunchChoice {
+    pub id: String,
+    pub name: String,
+    pub endpoint: String,
+    pub default: bool,
+}
+
+pub(crate) fn launch_choices(paths: &Paths, env: &EnvLookup) -> Result<Vec<LaunchChoice>> {
+    Ok(provider_states(paths, env)?
+        .into_iter()
+        .filter(|state| state.selectable(Action::Use))
+        .map(|state| LaunchChoice {
+            id: state.provider.id,
+            name: state.provider.name,
+            endpoint: state.provider.endpoint,
+            default: state.default,
+        })
+        .collect())
+}
+
 pub(crate) fn completion_ids(
     paths: &Paths,
     env: &EnvLookup,

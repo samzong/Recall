@@ -21,7 +21,7 @@ rx dsh web
 rx kimi
 ```
 
-Running `rx` without a harness opens the picker. Arguments after the harness name are passed to that harness.
+Running `rx` without a harness opens the picker; `tab` there picks a configured provider for that launch only, leaving the default unchanged. Arguments after the harness name are passed to that harness.
 For Kimi Code, `rx` seeds the selected provider and its cached models as `rx-<provider>/<model>` aliases in Kimi's native catalog. `--model <id>` selects one of those models. Without it or a provider-level `model` in `rx.toml`, `rx` uses the first cached provider model and reports that choice on stderr. RX-owned entries are refreshed only while their payload remains unchanged; native and user-edited entries are preserved. Kimi requires catalog credentials in its config, so the selected provider key is also stored in Kimi's local `config.toml` with secret-only file permissions.
 
 Concurrent `rx kimi` launches retain their catalog aliases until they exit. A later
