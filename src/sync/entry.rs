@@ -36,6 +36,7 @@ pub(crate) fn run_cli(
                     backfill_events: true,
                     sources,
                     scope,
+                    target_session: None,
                 },
                 store,
                 AppConfig::load()?,
@@ -59,6 +60,7 @@ pub(crate) fn run_cli(
                 backfill_events: false,
                 sources,
                 scope,
+                target_session: None,
             },
             None,
         )?;
@@ -107,6 +109,7 @@ fn usage_sync_options() -> SyncRunOptions {
         backfill_events: false,
         sources: None,
         scope: ProjectScope::Global,
+        target_session: None,
     }
 }
 
@@ -132,6 +135,7 @@ pub(crate) fn run_background_worker(sync_first: bool) -> Result<()> {
             backfill_events: false,
             sources: None,
             scope: ProjectScope::Global,
+            target_session: None,
         })
     })
 }
@@ -150,6 +154,7 @@ pub(crate) fn scan_remote_scope(scope: ProjectScope) -> Result<()> {
             backfill_events: false,
             sources: None,
             scope,
+            target_session: None,
         },
         None,
     )

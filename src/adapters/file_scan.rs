@@ -156,7 +156,11 @@ where
     let mut observations = Vec::new();
     let mut stats = SyncScanStats::default();
 
+    let target = context.target_source_id();
     for entry in entries {
+        if target.is_some_and(|target| target != entry.session_id) {
+            continue;
+        }
         stats.candidates += 1;
         let Some(snapshot) = snapshot_fn(&entry) else {
             stats.rejected_before_parse += 1;
@@ -308,19 +312,28 @@ mod tests {
             directory: None,
         };
 
-        let result = run_file_scan_with_options(
-            &sync_context(&store),
-            None,
-            FileScanOptions::default(),
-            vec![entry],
-            |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
-        )
-        .unwrap();
-
-        assert_eq!(result.sessions.len(), 1);
-        assert!(result.observations.is_empty());
-        assert_eq!(result.sessions[0].source_id, "sess-new");
-        assert_eq!(result.stats.skipped_sessions, 0);
+        for restricted in [false, true] {
+            let context = sync_context(&store);
+            let context = if restricted { context.restricted_to("sess-new") } else { context };
+            let other = FileScanEntry {
+                session_id: "other".to_string(),
+                stat_target: path.join("missing.jsonl"),
+                directory: None,
+            };
+            let result = run_file_scan_with_options(
+                &context,
+                None,
+                FileScanOptions::default(),
+                vec![entry.clone(), other],
+                |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
+            )
+            .unwrap();
+            assert_eq!(result.sessions.len(), 1);
+            assert!(result.observations.is_empty());
+            assert_eq!(result.sessions[0].source_id, "sess-new");
+            assert_eq!(result.stats.skipped_sessions, 0);
+            assert_eq!(result.stats.rejected_before_parse, u32::from(!restricted));
+        }
         let _ = fs::remove_file(&path);
     }
 

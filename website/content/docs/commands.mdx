@@ -15,6 +15,11 @@ Inside a Git checkout `recall sync` syncs that project only. `--project all`
 syncs every project and is what runs index-wide maintenance such as pruning
 sessions whose transcripts were deleted.
 
+To refresh one conversation before handoff, use `recall sync --session <native-session-id> --source codex --format json` (`--source` is required; use the source ID or label).
+This ignores the time window and leaves other sessions untouched. Later session additions require another sync.
+Missing or unreadable sessions and disabled sources fail without changing the index; excluded targets are removed from the index.
+JSON returns `session_id`, `message_count`, and `status` (`created`, `updated`, or `unchanged`).
+
 ## Search
 
 ```bash

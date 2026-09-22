@@ -80,6 +80,7 @@ pub(crate) trait SourceAdapter {
 
 pub(crate) struct AdapterSyncContext {
     source: String,
+    target_source_id: Option<String>,
     session_meta: HashMap<String, IndexedSessionMeta>,
     session_paths: HashMap<String, SessionPath>,
     imported_ids: HashSet<String>,
@@ -109,6 +110,7 @@ impl AdapterSyncContext {
     ) -> Self {
         Self {
             source,
+            target_source_id: None,
             session_meta,
             session_paths,
             imported_ids,
@@ -118,8 +120,23 @@ impl AdapterSyncContext {
         }
     }
 
+    pub(crate) fn restricted_to(mut self, target_source_id: &str) -> Self {
+        self.session_meta.retain(|id, _| id == target_source_id);
+        self.session_paths.retain(|id, _| id == target_source_id);
+        self.imported_ids.retain(|id| id == target_source_id);
+        self.usage_state.retain(|id, _| id == target_source_id);
+        self.event_state.retain(|id, _| id == target_source_id);
+        self.metadata_state.retain(|id, _| id == target_source_id);
+        self.target_source_id = Some(target_source_id.to_string());
+        self
+    }
+
     pub(crate) fn source(&self) -> &str {
         &self.source
+    }
+
+    pub(crate) fn target_source_id(&self) -> Option<&str> {
+        self.target_source_id.as_deref()
     }
 
     pub(crate) fn session_meta(&self) -> &HashMap<String, IndexedSessionMeta> {

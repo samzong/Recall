@@ -42,6 +42,7 @@ fn run_worker(request_rx: Receiver<SyncRequest>, response_tx: Sender<Result<(), 
             backfill_events: false,
             sources: request.sources,
             scope: request.scope,
+            target_session: None,
         })
         .and_then(|_| semantic::ensure_background_worker(false))
         .map_err(|error| format!("{error:#}"));

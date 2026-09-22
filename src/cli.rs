@@ -54,6 +54,21 @@ enum Commands {
     Sync {
         #[arg(
             long,
+            conflicts_with_all = ["backfill_events", "dry_run", "force", "project"],
+            requires = "source",
+            help = "Sync only this native session id"
+        )]
+        session: Option<String>,
+        #[arg(
+            long,
+            value_enum,
+            requires = "session",
+            default_value_t = crate::sync::SessionSyncFormat::Text,
+            help = "Output format for --session"
+        )]
+        format: crate::sync::SessionSyncFormat,
+        #[arg(
+            long,
             help = "Backfill native file evidence without rebuilding existing discussions"
         )]
         backfill_events: bool,
@@ -295,7 +310,12 @@ pub(crate) fn run() -> Result<()> {
 
     match cli.command {
         Some(Commands::Info { format }) => crate::info::run(format)?,
-        Some(Commands::Sync { force, verbose, source, project, backfill_events, dry_run }) => {
+        Some(Commands::Sync { session: Some(session), source, format, .. }) => {
+            crate::sync::run_single_session(source.as_deref(), &session, format)?;
+        }
+        Some(Commands::Sync {
+            force, verbose, source, project, backfill_events, dry_run, ..
+        }) => {
             crate::sync::run_cli(
                 force,
                 verbose,
@@ -303,7 +323,7 @@ pub(crate) fn run() -> Result<()> {
                 project.as_deref(),
                 backfill_events,
                 dry_run,
-            )?
+            )?;
         }
         Some(Commands::BackgroundWorker { sync_first }) => {
             crate::sync::run_background_worker(sync_first)?

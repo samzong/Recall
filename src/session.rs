@@ -104,6 +104,7 @@ pub(crate) fn run_session_list(args: &SessionListArgs) -> Result<()> {
             backfill_events: false,
             sources: resolved_source.clone(),
             scope: scope.clone(),
+            target_session: None,
         })?;
         semantic::ensure_background_worker(false)?;
     }

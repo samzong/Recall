@@ -159,7 +159,10 @@ fn scan_projects(
         let Some(conn) = opencode::open_readonly(&db_path)? else {
             continue;
         };
-        let rows = match load_session_rows(&conn) {
+        let rows = match load_session_rows(
+            &conn,
+            context.and_then(AdapterSyncContext::target_source_id),
+        ) {
             Ok(rows) => rows,
             Err(err) => {
                 warn!("failed to read Crush sessions from {}: {err}", db_path.display());
@@ -228,7 +231,7 @@ fn crush_db_path(project_path: &str, data_dir: &str) -> PathBuf {
     }
 }
 
-fn load_session_rows(conn: &Connection) -> anyhow::Result<Vec<SessionRow>> {
+fn load_session_rows(conn: &Connection, target: Option<&str>) -> anyhow::Result<Vec<SessionRow>> {
     let mut stmt = conn.prepare(
         "SELECT s.id, s.parent_session_id, s.title, s.prompt_tokens, s.completion_tokens,
                 s.created_at,
@@ -239,9 +242,9 @@ fn load_session_rows(conn: &Connection) -> anyhow::Result<Vec<SessionRow>> {
                         s.updated_at
                     )
                 )
-         FROM sessions s",
+         FROM sessions s WHERE (?1 IS NULL OR s.id = ?1)",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([target], |row| {
         Ok(SessionRow {
             id: row.get(0)?,
             parent_session_id: row.get(1)?,
@@ -643,6 +646,28 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn single_session_scan_filters_before_reading_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = setup_crush_db(root.path());
+        for id in ["target", "other"] {
+            conn.execute("INSERT INTO sessions (id, title, created_at, updated_at) VALUES (?1, 'test', 100, 200)", [id]).unwrap();
+            conn.execute("INSERT INTO messages (id, session_id, role, parts, created_at, updated_at) VALUES (?1, ?1, 'user', '[{\"type\":\"text\",\"data\":{\"text\":\"hello\"}}]', 100, 200)", [id]).unwrap();
+        }
+        let projects = [ProjectRef {
+            path: root.path().to_string_lossy().into(),
+            data_dir: root.path().to_string_lossy().into(),
+        }];
+        for (target, count) in [(None, 2), (Some("target"), 1), (Some("missing"), 0)] {
+            let context = AdapterSyncContext::empty_for_test("crush");
+            let context = target.map(|id| context.restricted_to(id));
+            let result = scan_projects(&projects, context.as_ref(), None, true).unwrap();
+            assert_eq!(result.sessions.len(), count);
+            assert_eq!(result.stats.candidates as usize, count);
+            assert!(result.sessions.iter().all(|s| target.is_none_or(|id| s.source_id == id)));
+        }
     }
 
     #[test]

@@ -175,7 +175,8 @@ fn scan_db(
     let metadata_state = incremental_context.map(AdapterSyncContext::metadata_state);
 
     let (live, inventory_issues) = load_all_session_ids(&snapshot, &db_path)?;
-    let rows = load_session_rows(&snapshot)?;
+    let rows =
+        load_session_rows(&snapshot, context.and_then(AdapterSyncContext::target_source_id))?;
     let mut sessions = Vec::new();
     let mut stats = SyncScanStats::default();
 
@@ -252,12 +253,12 @@ fn include_session_type(session_type: &str) -> bool {
     matches!(session_type, "user" | "scheduled" | "acp" | "sub_agent")
 }
 
-fn load_session_rows(conn: &Connection) -> anyhow::Result<Vec<SessionRow>> {
+fn load_session_rows(conn: &Connection, target: Option<&str>) -> anyhow::Result<Vec<SessionRow>> {
     let columns = table_columns(conn, "sessions")?;
     let sql = format!(
         "SELECT id, working_dir, created_at, updated_at, {}, {}, {}, {}, {},
                 (SELECT MAX(created_timestamp) FROM messages WHERE session_id = sessions.id)
-         FROM sessions",
+         FROM sessions WHERE (?1 IS NULL OR id = ?1)",
         col_or_lit(&columns, "name", "''"),
         col_or_lit(&columns, "session_type", "'user'"),
         col_or_null(&columns, "parent_session_id"),
@@ -265,7 +266,7 @@ fn load_session_rows(conn: &Connection) -> anyhow::Result<Vec<SessionRow>> {
         col_or_null(&columns, "model_config_json"),
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([target], |row| {
         Ok(SessionRow {
             id: row.get(0)?,
             working_dir: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -882,6 +883,27 @@ mod tests {
             rusqlite::params![session_id, role, content_json, created_timestamp, metadata_json],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn single_session_scan_filters_before_reading_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sessions.db");
+        let conn = setup_goose_db(&path);
+        for id in ["target", "other"] {
+            insert_session(&conn, &SessionSpec { id, ..SessionSpec::default() });
+            insert_message(&conn, id, "user", r#"[{"type":"text","text":"hello"}]"#, 100, None);
+        }
+        drop(conn);
+        for (target, count) in [(None, 2), (Some("target"), 1), (Some("missing"), 0)] {
+            let context = AdapterSyncContext::empty_for_test(SOURCE);
+            let context = target.map(|id| context.restricted_to(id));
+            let opened = opencode::open_readonly(&path).unwrap().map(|conn| (conn, path.clone()));
+            let result = scan_db(opened, context.as_ref(), None, true, false).unwrap().scan;
+            assert_eq!(result.sessions.len(), count);
+            assert_eq!(result.stats.candidates as usize, count);
+            assert!(result.sessions.iter().all(|s| target.is_none_or(|id| s.source_id == id)));
+        }
     }
 
     #[test]

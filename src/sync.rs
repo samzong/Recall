@@ -1,8 +1,10 @@
 mod entry;
+mod single_session;
 pub(crate) use entry::{
     run_background_worker, run_cli, run_dashboard_sync_job, run_sync_job_inner, run_usage_sync_job,
     run_usage_sync_job_with_progress, scan_remote_scope,
 };
+pub(crate) use single_session::{SessionSyncFormat, run as run_single_session};
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,6 +34,7 @@ pub(crate) struct SyncRunOptions {
     /// child process that inherits the caller's directory, so an inferred
     /// scope would silently shrink global maintenance.
     pub(crate) scope: ProjectScope,
+    pub(crate) target_session: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +186,11 @@ impl SyncJob {
             .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
             .collect();
         config.normalize_sources(&labels);
-        let since_ts = if options.usage_only { None } else { config.sync_window.to_since_cutoff() };
+        let since_ts = if options.usage_only || options.target_session.is_some() {
+            None
+        } else {
+            config.sync_window.to_since_cutoff()
+        };
         let path_excluder = config.build_path_excluder()?;
         let mut job = Self {
             store,
@@ -269,13 +276,15 @@ impl SyncJob {
         let touched_before = self.stats.touched();
         let out_of_scope_before = self.stats.out_of_scope;
 
+        let single_session = self.options.target_session.is_some();
         let mut purged_excluded_ids = HashSet::new();
-        if let Some(matcher) = &self.path_excluder {
+        if !single_session && let Some(matcher) = &self.path_excluder {
             let n = delete_excluded_sessions_for_source(
                 &self.store,
                 source_id,
                 matcher,
                 &self.options.scope,
+                self.options.target_session.as_deref(),
                 &mut purged_excluded_ids,
             )?;
             self.stats.excluded_out += n;
@@ -303,6 +312,7 @@ impl SyncJob {
                 source_id,
                 matcher,
                 &self.options.scope,
+                self.options.target_session.as_deref(),
                 &mut purged_excluded_ids,
             )?;
             self.stats.excluded_out += n;
@@ -310,7 +320,9 @@ impl SyncJob {
         for source_id in &purged_excluded_ids {
             existing.remove(source_id);
         }
-        self.reconcile_source(source_id, label, reconcile, &mut existing)?;
+        if !single_session {
+            self.reconcile_source(source_id, label, reconcile, &mut existing)?;
+        }
 
         let touched = self.stats.touched() - touched_before;
         let elapsed_ms = started.elapsed().as_millis();
@@ -446,6 +458,7 @@ impl SyncJob {
             });
         let scan_result = match scan {
             Ok(scan) => scan,
+            Err(error) if self.options.target_session.is_some() => return Err(error),
             Err(error) => {
                 if self.options.emit {
                     eprintln!("Error scanning {label}: {error}");
@@ -453,6 +466,17 @@ impl SyncJob {
                 return Ok(None);
             }
         };
+        if let Some(target) = &self.options.target_session {
+            anyhow::ensure!(
+                scan_result.scan.stats.candidates > 0,
+                "no {label} session found for {target}"
+            );
+            anyhow::ensure!(
+                !scan_result.scan.sessions.is_empty()
+                    || scan_result.scan.stats.skipped_sessions > 0,
+                "{label} session {target} holds no readable session"
+            );
+        }
         self.stats.skipped += scan_result.scan.stats.skipped_sessions;
         self.stats.filtered_out += scan_result.scan.stats.filtered_sessions;
         if self.options.verbose {
@@ -562,7 +586,7 @@ impl SyncJob {
     }
 
     fn load_adapter_sync_context(&self, source_id: &str) -> Result<adapters::AdapterSyncContext> {
-        Ok(adapters::AdapterSyncContext::new(
+        let context = adapters::AdapterSyncContext::new(
             source_id.to_string(),
             self.store.session_meta_map(source_id)?,
             self.store
@@ -574,7 +598,11 @@ impl SyncJob {
             self.store.usage_state_meta_map(source_id)?,
             self.store.event_state_meta_map(source_id)?,
             self.store.metadata_state_meta_map(source_id)?,
-        ))
+        );
+        Ok(match self.options.target_session.as_deref() {
+            Some(target) => context.restricted_to(target),
+            None => context,
+        })
     }
 
     fn prepare_existing_state(
@@ -619,6 +647,9 @@ impl SyncJob {
         purged_excluded_ids: &mut HashSet<String>,
     ) -> Result<()> {
         let raw_source_id = raw.source_id.clone();
+        if self.options.target_session.as_deref().is_some_and(|target| target != raw_source_id) {
+            return Ok(());
+        }
 
         // Runs before every write and delete below, so a scoped sync can never
         // touch a session outside its scope.
@@ -1163,6 +1194,7 @@ pub(crate) fn persist_raw_session_for_conformance(
             backfill_events: false,
             sources: None,
             scope: ProjectScope::Global,
+            target_session: None,
         },
         store,
         AppConfig::default(),
@@ -1228,10 +1260,14 @@ fn delete_excluded_sessions_for_source(
     source_id: &str,
     matcher: &globset::GlobSet,
     scope: &ProjectScope,
+    target_source_id: Option<&str>,
     deleted: &mut HashSet<String>,
 ) -> Result<u32> {
     let mut count = 0;
     for path in store.session_paths_for_source(source_id)? {
+        if target_source_id.is_some_and(|target| target != path.source_id) {
+            continue;
+        }
         if !scope.matches(SessionScopeFields {
             directory: path.directory.as_deref(),
             repo_remote: path.repo_remote.as_deref(),

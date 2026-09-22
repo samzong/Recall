@@ -149,6 +149,10 @@ fn scan_for_sync_conn(
     let mut observations = Vec::new();
 
     for composer_id in composer_ids {
+        if context.target_source_id().is_some_and(|target| target != composer_id) {
+            continue;
+        }
+        stats.candidates += 1;
         let meta = load_composer_meta(conn, &composer_id, &lookup);
         transcript_meta.insert(composer_id.clone(), meta.clone());
         let source_path_changed = existing.contains_key(&composer_id)
@@ -202,6 +206,7 @@ fn scan_for_sync_conn(
         if let Some(raw) =
             build_raw_session(conn, &composer_id, &meta, transcript_paths, include_events)?
         {
+            stats.parsed += 1;
             sessions.push(raw);
         }
     }
@@ -1576,6 +1581,34 @@ mod tests {
         .unwrap();
 
         conn
+    }
+
+    #[test]
+    fn single_session_scan_filters_before_reading_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = seed_global_db(root.path(), "target", "bubble");
+        conn.execute("INSERT INTO cursorDiskKV SELECT replace(key, 'target', 'other'), replace(value, 'target', 'other') FROM cursorDiskKV", []).unwrap();
+        for (target, count) in [(None, 2), (Some("target"), 1), (Some("missing"), 0)] {
+            let context = AdapterSyncContext::empty_for_test("cursor");
+            let context = target.map_or_else(
+                || AdapterSyncContext::empty_for_test("cursor"),
+                |id| context.restricted_to(id),
+            );
+            let result = scan_for_sync_conn(
+                &conn,
+                &context,
+                None,
+                true,
+                &HashMap::new(),
+                &mut HashMap::new(),
+            )
+            .unwrap();
+            assert_eq!(result.sessions.len(), count);
+            if target.is_some() {
+                assert_eq!(result.stats.candidates as usize, count);
+            }
+            assert!(result.sessions.iter().all(|s| target.is_none_or(|id| s.source_id == id)));
+        }
     }
 
     #[test]

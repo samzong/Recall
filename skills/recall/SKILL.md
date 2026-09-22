@@ -105,6 +105,9 @@ recall session resume --id <session-id> --print-command
 recall session open --id <session-id> --print-command
 ```
 
+Before handoff, refresh a session with `recall sync --session <native-session-id> --source <source-id> --format json`.
+Use the returned `session_id` for subsequent reads; if sync fails, resolve the error before handing off.
+
 ## Share Sessions
 
 An explicit share or refresh request authorizes a real deployment. Use `--dry-run` only for an explicit preview. Before publishing, stop if the selected session contains concrete credentials or private material the user did not authorize sharing.

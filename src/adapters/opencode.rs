@@ -157,17 +157,17 @@ pub(crate) fn scan_with_options(
     include_events: bool,
     options: ScanOptions,
 ) -> anyhow::Result<Vec<RawSession>> {
-    let (sessions, _) = load_session_rows(conn, None)?;
+    let (sessions, _) = load_session_rows(conn, None, None)?;
     scan_session_messages(conn, sessions, include_events, options)
 }
 
 fn load_session_rows(
     conn: &Connection,
     since_ts: Option<i64>,
+    target: Option<&str>,
 ) -> anyhow::Result<(Vec<SessionRow>, u32)> {
-    let mut stmt =
-        conn.prepare("SELECT id, directory, time_created, time_updated, title FROM session")?;
-    let rows = stmt.query_map([], map_session_row)?;
+    let mut stmt = conn.prepare("SELECT id, directory, time_created, time_updated, title FROM session WHERE (?1 IS NULL OR id = ?1)")?;
+    let rows = stmt.query_map([target], map_session_row)?;
     let mut sessions = Vec::new();
     for row in rows {
         match row {
@@ -781,7 +781,8 @@ pub(crate) fn scan_for_sync_conn_with_options(
     include_events: bool,
     options: ScanOptions,
 ) -> anyhow::Result<SyncScanResult> {
-    let (sessions, filtered_sessions) = load_session_rows(conn, since_ts)?;
+    let (sessions, filtered_sessions) =
+        load_session_rows(conn, since_ts, context.target_source_id())?;
     let existing = context.session_meta();
     let usage_state = context.usage_state();
     let event_state = context.event_state();
@@ -792,7 +793,11 @@ pub(crate) fn scan_for_sync_conn_with_options(
         options,
     )?;
 
-    let mut stats = SyncScanStats { filtered_sessions, ..Default::default() };
+    let mut stats = SyncScanStats {
+        candidates: sessions.len() as u32,
+        filtered_sessions,
+        ..Default::default()
+    };
     let mut candidates = Vec::new();
 
     for session in sessions {
@@ -822,6 +827,7 @@ pub(crate) fn scan_for_sync_conn_with_options(
     }
 
     let sessions = scan_session_messages(conn, candidates, include_events, options)?;
+    stats.parsed = sessions.len() as u32;
     Ok(SyncScanResult { sessions, stats, observations: Vec::new() })
 }
 
@@ -923,6 +929,27 @@ mod tests {
 
     fn mark_metadata_current(store: &Store, source_id: &str) {
         seed_empty_metadata_state(store, "opencode", source_id, METADATA_PARSER_VERSION);
+    }
+
+    #[test]
+    fn single_session_scan_filters_before_reading_messages() {
+        let (path, conn) = setup_opencode_db();
+        for id in ["target", "other"] {
+            insert_session_with_message(&conn, id, 2000, 1000, "hello");
+        }
+        for (target, count) in [(None, 2), (Some("target"), 1), (Some("missing"), 0)] {
+            let context = AdapterSyncContext::empty_for_test("opencode");
+            let context = target.map_or_else(
+                || AdapterSyncContext::empty_for_test("opencode"),
+                |id| context.restricted_to(id),
+            );
+            let result = scan_for_sync_conn(&conn, &context, None, true).unwrap();
+            assert_eq!(result.sessions.len(), count);
+            assert_eq!(result.stats.candidates as usize, count);
+            assert!(result.sessions.iter().all(|s| target.is_none_or(|id| s.source_id == id)));
+        }
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1085,7 +1112,7 @@ mod tests {
         insert_session_with_message(&conn, "old", 1_600_000_000, 1_600_000_000, "hello");
 
         let cutoff = 1_700_000_000_000;
-        let (kept, filtered) = load_session_rows(&conn, Some(cutoff)).unwrap();
+        let (kept, filtered) = load_session_rows(&conn, Some(cutoff), None).unwrap();
         assert_eq!(kept.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), vec!["recent"]);
         assert_eq!(filtered, 1);
 
@@ -1429,7 +1456,7 @@ mod tests {
         )
         .unwrap();
 
-        let (sessions, _) = load_session_rows(&conn, None).unwrap();
+        let (sessions, _) = load_session_rows(&conn, None, None).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "good");
         drop(conn);
@@ -1476,7 +1503,7 @@ mod tests {
         )
         .unwrap();
 
-        let (sessions, _) = load_session_rows(&conn, None).unwrap();
+        let (sessions, _) = load_session_rows(&conn, None, None).unwrap();
         let raw = scan_session_messages(&conn, sessions, false, ScanOptions::default()).unwrap();
         let titled = raw.iter().find(|session| session.source_id == "s1").unwrap();
         let blank = raw.iter().find(|session| session.source_id == "s2").unwrap();
@@ -1522,7 +1549,7 @@ mod tests {
         )
         .unwrap();
 
-        let (sessions, _) = load_session_rows(&conn, None).unwrap();
+        let (sessions, _) = load_session_rows(&conn, None, None).unwrap();
         let raw = scan_session_messages(&conn, sessions, true, ScanOptions::default()).unwrap();
 
         assert_eq!(raw.len(), 1);

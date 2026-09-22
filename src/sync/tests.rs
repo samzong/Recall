@@ -95,7 +95,11 @@ impl SourceAdapter for ReconcileAdapter {
         Ok(Some(SyncScanOutput {
             scan: SyncScanResult {
                 sessions: self.scan()?,
-                stats: Default::default(),
+                stats: crate::adapters::SyncScanStats {
+                    candidates: u32::from(self.include_session),
+                    parsed: u32::from(self.include_session),
+                    ..Default::default()
+                },
                 observations: Vec::new(),
             },
             reconcile: Some(self.plan.clone()),
@@ -237,6 +241,18 @@ fn session(id: &str, source: &str, source_id: &str) -> Session {
     }
 }
 
+fn single_session_job(adapters: &[Box<dyn SourceAdapter>], target: &str) -> SyncJob {
+    let mut job = global_job(adapters);
+    job.config.sync_window = crate::config::SyncWindow::Today;
+    SyncJob::new(
+        SyncRunOptions { target_session: Some(target.to_string()), ..job.options },
+        job.store,
+        job.config,
+        adapters,
+    )
+    .unwrap()
+}
+
 fn global_job(adapters: &[Box<dyn SourceAdapter>]) -> SyncJob {
     schema::register_sqlite_vec();
     SyncJob::new(
@@ -248,6 +264,7 @@ fn global_job(adapters: &[Box<dyn SourceAdapter>]) -> SyncJob {
             backfill_events: false,
             sources: None,
             scope: ProjectScope::Global,
+            target_session: None,
         },
         Store::open_in_memory().unwrap(),
         AppConfig::default(),
@@ -716,6 +733,7 @@ fn scoped_job(scope: ProjectScope) -> (SyncJob, Vec<Box<dyn SourceAdapter>>) {
             backfill_events: false,
             sources: None,
             scope,
+            target_session: None,
         },
         Store::open_in_memory().unwrap(),
         AppConfig::default(),
@@ -773,6 +791,7 @@ fn failed_scan_preserves_existing_sessions() {
             backfill_events: false,
             sources: None,
             scope: ProjectScope::Global,
+            target_session: None,
         },
         Store::open_in_memory().unwrap(),
         AppConfig::default(),
@@ -873,6 +892,7 @@ fn skipped_observation_applies_path_exclusion_after_success() {
             backfill_events: false,
             sources: None,
             scope: ProjectScope::Global,
+            target_session: None,
         },
         Store::open_in_memory().unwrap(),
         config,
@@ -1111,6 +1131,7 @@ fn source_path_backfill_runs_after_scope_and_before_time_filter() {
             backfill_events: false,
             sources: None,
             scope: ProjectScope::Global,
+            target_session: None,
         },
         Store::open_in_memory().unwrap(),
         config,
@@ -1135,6 +1156,7 @@ fn source_path_backfill_runs_after_scope_and_before_time_filter() {
             backfill_events: false,
             sources: None,
             scope: ProjectScope::Directory("/repo/root".to_string()),
+            target_session: None,
         },
         Store::open_in_memory().unwrap(),
         AppConfig::default(),
@@ -1174,6 +1196,7 @@ fn delete_excluded_sessions_for_source_uses_persisted_source_file_path() {
         "claude-code",
         &matcher,
         &ProjectScope::Global,
+        None,
         &mut deleted,
     )
     .unwrap();
@@ -1204,6 +1227,7 @@ fn excluded_source_file_path_blocks_fresh_and_force_sync() {
                 backfill_events: false,
                 sources: None,
                 scope: ProjectScope::Global,
+                target_session: None,
             },
             Store::open_in_memory().unwrap(),
             config,
@@ -1233,4 +1257,47 @@ fn source_progress_skips_adapters_without_usage_during_usage_sync() {
     let mut seen = Vec::new();
     job.run_with(&adapters, Some(&mut |label| seen.push(label.to_string()))).unwrap();
     assert!(seen.is_empty());
+}
+
+#[test]
+fn single_session_sync_writes_only_its_target() {
+    let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ReconcileAdapter {
+        plan: ReconcilePlan::CompleteLiveSet(HashSet::from(["new".to_string()])),
+        include_session: true,
+    })];
+    for target in ["new", "kept"] {
+        let mut job = single_session_job(&adapters, target);
+        job.store.insert_session(&session("kept", "test", "kept")).unwrap();
+        job.store.insert_session(&session("existing", "test", "new")).unwrap();
+        job.run_with(&adapters, None).unwrap();
+        let indexed = job.store.session_meta_map("test").unwrap();
+        assert_eq!(indexed["kept"].message_count, 0);
+        assert_eq!(indexed["new"].message_count, u32::from(target == "new"));
+    }
+}
+
+#[test]
+fn single_session_scan_failure_preserves_existing_session() {
+    let temp = tempfile::tempdir().unwrap();
+    for adapter in [
+        Box::new(FailingAdapter) as Box<dyn SourceAdapter>,
+        Box::new(ObservationAdapter {
+            directory: None,
+            include_session: false,
+            failing_path: Some(temp.path().join("missing.jsonl")),
+        }),
+    ] {
+        let adapters = vec![adapter];
+        let mut job = single_session_job(&adapters, "observed");
+        let mut existing = session("retained", "test", "observed");
+        existing.source_file_path =
+            Some(temp.path().join("missing.jsonl").to_string_lossy().into());
+        job.path_excluder = Some(matcher(existing.source_file_path.as_deref().unwrap()));
+        job.store.insert_session(&existing).unwrap();
+        assert!(job.run_with(&adapters, None).is_err());
+        assert_eq!(
+            job.store.get_native_session("test", "observed").unwrap().unwrap().id,
+            "retained"
+        );
+    }
 }

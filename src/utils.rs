@@ -63,6 +63,10 @@ pub(crate) fn acquire_sync_lock() -> anyhow::Result<File> {
     acquire_lock(&recall_lock_path("sync.lock")?)
 }
 
+pub(crate) fn try_acquire_sync_lock() -> anyhow::Result<Option<File>> {
+    try_acquire_lock(&recall_lock_path("sync.lock")?)
+}
+
 fn acquire_lock(path: &Path) -> anyhow::Result<File> {
     let mut file = open_lock_file(path)?;
     file.lock_exclusive()?;
