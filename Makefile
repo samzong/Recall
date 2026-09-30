@@ -123,6 +123,6 @@ clean: ## Remove build artifacts
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*## "; printf "\n$(BOLD)Recall$(RESET) — local-first AI session search\n"} \
-		/^# ── / {n = $$0; gsub(/(^# ── | ─+$$)/, "", n); printf "\n$(BOLD)%s$(RESET)\n", n} \
+		/^# ── / {n = $$0; gsub(/(^# ── | (─)+$$)/, "", n); printf "\n$(BOLD)%s$(RESET)\n", n} \
 		/^[a-zA-Z_-]+:.*## / {printf "  $(CYAN)make %-12s$(RESET) %s\n", $$1, $$2} \
 		END {printf "\n"}' $(MAKEFILE_LIST)
