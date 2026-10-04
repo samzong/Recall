@@ -92,6 +92,7 @@ fn scan_for_sync_impl(
         context,
         since_ts,
         file_scan::FileScanOptions {
+            stream_sessions: true,
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
             ..Default::default()
         },

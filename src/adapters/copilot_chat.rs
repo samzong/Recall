@@ -150,6 +150,7 @@ fn scan_chat_entries_for_sync(
             context,
             if include_events { None } else { since_ts },
             file_scan::FileScanOptions {
+                stream_sessions: true,
                 metadata_parser_version: Some(METADATA_PARSER_VERSION),
                 event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
                 ..Default::default()

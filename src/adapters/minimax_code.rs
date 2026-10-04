@@ -32,6 +32,7 @@ const RUNTIME_DB: &str = "runtime-state.sqlite";
 
 fn minimax_scan_options(include_events: bool) -> file_scan::FileScanOptions {
     file_scan::FileScanOptions {
+        stream_sessions: true,
         usage_parser_version: Some(USAGE_PARSER_VERSION),
         event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
         metadata_parser_version: Some(METADATA_PARSER_VERSION),

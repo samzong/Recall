@@ -243,6 +243,7 @@ fn scan_transcripts_for_sync(
         context,
         since_ts,
         crate::adapters::file_scan::FileScanOptions {
+            stream_sessions: true,
             usage_parser_version: Some(USAGE_PARSER_VERSION),
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
             metadata_parser_version: Some(METADATA_PARSER_VERSION),

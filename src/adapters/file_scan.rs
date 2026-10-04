@@ -15,6 +15,7 @@ pub(crate) struct FileScanOptions {
     pub(crate) usage_parser_version: Option<u32>,
     pub(crate) event_parser_version: Option<u32>,
     pub(crate) metadata_parser_version: Option<u32>,
+    pub(crate) stream_sessions: bool,
 }
 
 #[derive(Clone)]
@@ -213,7 +214,9 @@ where
         }
         if let Some(raw) = raw {
             observations.extend(observation);
-            sessions.push(raw);
+            let raw =
+                if options.stream_sessions { context.stream_session(raw)? } else { Some(raw) };
+            sessions.extend(raw);
         }
     }
 
@@ -242,7 +245,7 @@ mod tests {
     use crate::db::store::Store;
     use crate::types::{Role, Session};
 
-    fn sync_context(store: &Store) -> AdapterSyncContext {
+    fn sync_context(store: &Store) -> AdapterSyncContext<'static> {
         AdapterSyncContext::from_store_for_test(store, "test-source").unwrap()
     }
 
@@ -467,6 +470,7 @@ mod tests {
             &sync_context(&store),
             None,
             FileScanOptions {
+                stream_sessions: false,
                 usage_parser_version: Some(1),
                 event_parser_version: None,
                 metadata_parser_version: None,
@@ -488,6 +492,7 @@ mod tests {
             &sync_context(&store),
             None,
             FileScanOptions {
+                stream_sessions: false,
                 usage_parser_version: Some(1),
                 event_parser_version: None,
                 metadata_parser_version: None,
@@ -517,6 +522,7 @@ mod tests {
             &sync_context(&store),
             None,
             FileScanOptions {
+                stream_sessions: false,
                 usage_parser_version: None,
                 event_parser_version: Some(1),
                 metadata_parser_version: None,
@@ -538,6 +544,7 @@ mod tests {
             &sync_context(&store),
             None,
             FileScanOptions {
+                stream_sessions: false,
                 usage_parser_version: None,
                 event_parser_version: Some(1),
                 metadata_parser_version: None,
@@ -569,6 +576,7 @@ mod tests {
             &sync_context(&store),
             None,
             FileScanOptions {
+                stream_sessions: false,
                 usage_parser_version: None,
                 event_parser_version: None,
                 metadata_parser_version: Some(1),
@@ -590,6 +598,7 @@ mod tests {
             &sync_context(&store),
             None,
             FileScanOptions {
+                stream_sessions: false,
                 usage_parser_version: None,
                 event_parser_version: None,
                 metadata_parser_version: Some(1),

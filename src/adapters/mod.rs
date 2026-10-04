@@ -34,6 +34,7 @@ pub(crate) mod sync_state;
 pub(crate) mod usage;
 pub(crate) mod zcode;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
@@ -79,7 +80,9 @@ pub(crate) trait SourceAdapter {
     }
 }
 
-pub(crate) struct AdapterSyncContext {
+pub(crate) type SessionSink<'a> = dyn FnMut(RawSession) -> anyhow::Result<()> + 'a;
+
+pub(crate) struct AdapterSyncContext<'a> {
     source: String,
     target_source_id: Option<String>,
     session_meta: HashMap<String, IndexedSessionMeta>,
@@ -88,6 +91,7 @@ pub(crate) struct AdapterSyncContext {
     usage_state: HashMap<String, ParserStateMeta>,
     event_state: HashMap<String, ParserStateMeta>,
     metadata_state: HashMap<String, ParserStateMeta>,
+    session_sink: Option<RefCell<&'a mut SessionSink<'a>>>,
 }
 
 pub(crate) struct AdapterSyncContextParts {
@@ -99,7 +103,7 @@ pub(crate) struct AdapterSyncContextParts {
     pub(crate) metadata_state: HashMap<String, ParserStateMeta>,
 }
 
-impl AdapterSyncContext {
+impl<'a> AdapterSyncContext<'a> {
     pub(crate) fn new(
         source: String,
         session_meta: HashMap<String, IndexedSessionMeta>,
@@ -118,6 +122,19 @@ impl AdapterSyncContext {
             usage_state,
             event_state,
             metadata_state,
+            session_sink: None,
+        }
+    }
+
+    pub(crate) fn with_session_sink(mut self, sink: &'a mut SessionSink<'a>) -> Self {
+        self.session_sink = Some(RefCell::new(sink));
+        self
+    }
+
+    pub(crate) fn stream_session(&self, raw: RawSession) -> anyhow::Result<Option<RawSession>> {
+        match &self.session_sink {
+            Some(sink) => (sink.borrow_mut())(raw).map(|()| None),
+            None => Ok(Some(raw)),
         }
     }
 

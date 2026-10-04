@@ -78,6 +78,7 @@ impl SourceAdapter for OpenHandsAdapter {
             context,
             since_ts,
             FileScanOptions {
+                stream_sessions: true,
                 usage_parser_version: None,
                 event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
                 metadata_parser_version: None,

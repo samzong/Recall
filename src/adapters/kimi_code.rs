@@ -26,6 +26,7 @@ const EVENT_PARSER_VERSION: u32 = 1;
 
 fn kimi_scan_options(include_events: bool) -> file_scan::FileScanOptions {
     file_scan::FileScanOptions {
+        stream_sessions: true,
         usage_parser_version: Some(USAGE_PARSER_VERSION),
         event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
         ..Default::default()

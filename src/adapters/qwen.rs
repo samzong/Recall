@@ -65,6 +65,7 @@ impl SourceAdapter for QwenAdapter {
             context,
             since_ts,
             FileScanOptions {
+                stream_sessions: true,
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
                 event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
                 metadata_parser_version: None,
@@ -737,6 +738,7 @@ mod tests {
             &AdapterSyncContext::from_store_for_test(&store, "qwen-code").unwrap(),
             None,
             FileScanOptions {
+                stream_sessions: false,
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
                 event_parser_version: Some(EVENT_PARSER_VERSION),
                 metadata_parser_version: None,
@@ -807,6 +809,7 @@ mod tests {
             &AdapterSyncContext::from_store_for_test(&store, "qwen-code").unwrap(),
             None,
             FileScanOptions {
+                stream_sessions: false,
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
                 event_parser_version: Some(EVENT_PARSER_VERSION),
                 metadata_parser_version: None,

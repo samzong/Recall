@@ -80,6 +80,7 @@ impl SourceAdapter for DeepSeekHarnessAdapter {
             context,
             since_ts,
             file_scan::FileScanOptions {
+                stream_sessions: true,
                 usage_parser_version: Some(USAGE_PARSER_VERSION),
                 event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
                 metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
@@ -984,6 +985,7 @@ mod tests {
                 &AdapterSyncContext::from_store_for_test(&store, "deepseek-harness").unwrap(),
                 None,
                 file_scan::FileScanOptions {
+                    stream_sessions: false,
                     usage_parser_version: Some(USAGE_PARSER_VERSION),
                     event_parser_version: Some(EVENT_PARSER_VERSION),
                     metadata_parser_version: Some(METADATA_PARSER_VERSION),

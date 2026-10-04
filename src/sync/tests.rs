@@ -225,6 +225,74 @@ impl SourceAdapter for StaticAdapter {
     }
 }
 
+struct StreamingAdapter {
+    dir: PathBuf,
+    fail_second: bool,
+}
+
+impl SourceAdapter for StreamingAdapter {
+    fn id(&self) -> &str {
+        "test"
+    }
+
+    fn label(&self) -> &str {
+        "Test"
+    }
+
+    fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
+        anyhow::bail!("full scan is not expected")
+    }
+
+    fn scan_for_sync_output(
+        &self,
+        context: &AdapterSyncContext,
+        since_ts: Option<i64>,
+        _include_events: bool,
+        _force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
+        let entries = ["a", "b"].map(|id| {
+            let stat_target = self.dir.join(id);
+            std::fs::write(&stat_target, id).unwrap();
+            FileScanEntry { session_id: id.to_string(), stat_target, directory: None }
+        });
+        let scan = file_scan::run_file_scan_with_options(
+            context,
+            since_ts,
+            file_scan::FileScanOptions { stream_sessions: true, ..Default::default() },
+            entries,
+            |entry, mtime_ms| {
+                if self.fail_second && entry.session_id == "b" {
+                    anyhow::bail!("injected parse failure");
+                }
+                Ok(Some(RawSession::search_only(
+                    &entry.session_id,
+                    None,
+                    1_000,
+                    Some(mtime_ms),
+                    None,
+                    vec![RawMessage {
+                        role: Role::User,
+                        content: entry.session_id.clone(),
+                        timestamp: Some(mtime_ms),
+                    }],
+                )))
+            },
+        )?;
+        assert!(scan.sessions.is_empty());
+        Ok(Some(SyncScanOutput {
+            scan,
+            reconcile: Some(ReconcilePlan::CompleteLiveSet(HashSet::from([
+                "a".to_string(),
+                "b".to_string(),
+            ]))),
+        }))
+    }
+
+    fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
+        None
+    }
+}
+
 fn matcher(pattern: &str) -> globset::GlobSet {
     let mut builder = globset::GlobSetBuilder::new();
     builder.add(globset::Glob::new(pattern).unwrap());
@@ -806,6 +874,44 @@ fn failed_scan_preserves_existing_sessions() {
 }
 
 #[test]
+fn repo_identity_backfill_waits_for_successful_scan() {
+    let repo = tempfile::tempdir().unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["remote", "add", "origin", "https://github.com/acme/widget.git"][..],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let directory = repo.path().to_str().unwrap().to_string();
+    let repo_slug = |job: &SyncJob| {
+        job.store.session_paths_for_source("test").unwrap().pop().unwrap().repo_slug
+    };
+
+    let failing: Vec<Box<dyn SourceAdapter>> = vec![Box::new(FailingAdapter)];
+    let mut job = global_job(&failing);
+    let mut stored = session("stale", "test", "stale");
+    stored.directory = Some(directory);
+    job.store.insert_session(&stored).unwrap();
+
+    job.run_with(&failing, None).unwrap();
+    assert_eq!(repo_slug(&job), None);
+
+    let succeeding: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ReconcileAdapter {
+        plan: ReconcilePlan::PartialInventory(Vec::new()),
+        include_session: false,
+    })];
+    job.run_with(&succeeding, None).unwrap();
+    assert!(repo_slug(&job).is_some());
+}
+
+#[test]
 fn failed_file_parse_does_not_apply_source_observation() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ObservationAdapter {
@@ -1024,6 +1130,49 @@ fn scoped_sync_cannot_apply_complete_reconcile_plan() {
 
     job.run_with(&adapters, None).unwrap();
 
+    assert!(job.store.session_meta("test", "stale").unwrap().is_some());
+}
+
+#[test]
+fn streamed_sessions_are_indexed_before_reconcile() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters: Vec<Box<dyn SourceAdapter>> =
+        vec![Box::new(StreamingAdapter { dir: dir.path().to_path_buf(), fail_second: false })];
+    let (mut job, _) = scoped_job(ProjectScope::Global);
+    job.store.insert_session(&session("stale", "test", "stale")).unwrap();
+
+    job.run_with(&adapters, None).unwrap();
+
+    assert!(job.store.session_meta("test", "a").unwrap().is_some());
+    assert!(job.store.session_meta("test", "b").unwrap().is_some());
+    assert!(job.store.session_meta("test", "stale").unwrap().is_none());
+}
+
+#[test]
+fn scan_failure_after_streamed_session_skips_reconcile() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters: Vec<Box<dyn SourceAdapter>> =
+        vec![Box::new(StreamingAdapter { dir: dir.path().to_path_buf(), fail_second: true })];
+    let (mut job, _) = scoped_job(ProjectScope::Global);
+    job.store.insert_session(&session("stale", "test", "stale")).unwrap();
+
+    job.run_with(&adapters, None).unwrap();
+
+    assert!(job.store.session_meta("test", "a").unwrap().is_some());
+    assert!(job.store.session_meta("test", "stale").unwrap().is_some());
+    assert_eq!(job.adapter_runs.iter().map(|run| run.touched).collect::<Vec<_>>(), [1]);
+}
+
+#[test]
+fn streamed_session_write_failure_fails_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters: Vec<Box<dyn SourceAdapter>> =
+        vec![Box::new(StreamingAdapter { dir: dir.path().to_path_buf(), fail_second: false })];
+    let (mut job, _) = scoped_job(ProjectScope::Global);
+    job.store.insert_session(&session("stale", "test", "stale")).unwrap();
+    job.store.conn.execute("DROP TABLE messages", []).unwrap();
+
+    assert!(job.run_with(&adapters, None).is_err());
     assert!(job.store.session_meta("test", "stale").unwrap().is_some());
 }
 

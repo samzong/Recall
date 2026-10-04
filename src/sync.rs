@@ -290,8 +290,50 @@ impl SyncJob {
             self.stats.excluded_out += n;
         }
 
-        let context = self.load_adapter_sync_context(source_id)?;
-        let Some(scan_result) = self.scan_sessions(adapter, label, &context)? else {
+        let (mut existing, repo_backfill) =
+            self.resolve_existing_state(self.load_adapter_sync_context(source_id)?);
+        let settings = self.scan_settings(label);
+        let mut streamed = 0;
+        let mut sink_error = None;
+        let scan = {
+            let context = self.load_adapter_sync_context(source_id)?;
+            let mut sink = |raw| {
+                if sink_error.is_some() {
+                    anyhow::bail!("{label} sync stopped after a write failure");
+                }
+                self.progress.indexing(label, streamed, None);
+                match self.process_raw_session(
+                    source_id,
+                    raw,
+                    &mut existing,
+                    &mut purged_excluded_ids,
+                ) {
+                    Ok(()) => {
+                        streamed += 1;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        sink_error = Some(error);
+                        anyhow::bail!("{label} sync stopped after a write failure")
+                    }
+                }
+            };
+            scan_adapter(adapter, &context.with_session_sink(&mut sink), settings)
+        };
+        if let Some(error) = sink_error {
+            return Err(error);
+        }
+        let Some(scan_result) = self.finish_scan(label, scan, streamed)? else {
+            if streamed > 0 {
+                self.record_source_run(
+                    label,
+                    started,
+                    touched_before,
+                    out_of_scope_before,
+                    streamed,
+                    Default::default(),
+                );
+            }
             return Ok(());
         };
         let adapters::SyncScanOutput {
@@ -299,12 +341,12 @@ impl SyncJob {
             reconcile,
         } = scan_result;
 
-        let mut existing = self.prepare_existing_state(source_id, context)?;
-        let found = raw_sessions.len();
-        for (done, raw) in raw_sessions.into_iter().enumerate() {
-            self.progress.indexing(label, done, found);
+        let found = streamed + raw_sessions.len();
+        for (done, raw) in (streamed..).zip(raw_sessions) {
+            self.progress.indexing(label, done, Some(found));
             self.process_raw_session(source_id, raw, &mut existing, &mut purged_excluded_ids)?;
         }
+        self.write_repo_backfill(source_id, repo_backfill, &existing)?;
         self.apply_source_observations(source_id, observations, &mut existing)?;
         if let Some(matcher) = &self.path_excluder {
             let n = delete_excluded_sessions_for_source(
@@ -324,6 +366,20 @@ impl SyncJob {
             self.reconcile_source(source_id, label, reconcile, &mut existing)?;
         }
 
+        self.record_source_run(label, started, touched_before, out_of_scope_before, found, scan);
+        info!("{label} done");
+        Ok(())
+    }
+
+    fn record_source_run(
+        &mut self,
+        label: &str,
+        started: std::time::Instant,
+        touched_before: u32,
+        out_of_scope_before: u32,
+        found: usize,
+        scan: adapters::SyncScanStats,
+    ) {
         let touched = self.stats.touched() - touched_before;
         let elapsed_ms = started.elapsed().as_millis();
         self.progress.end_source(label, found, touched, scan.unstable_sessions, elapsed_ms);
@@ -334,9 +390,6 @@ impl SyncJob {
             touched,
             elapsed_ms,
         });
-
-        info!("{label} done");
-        Ok(())
     }
 
     fn sync_event_backfill_adapter(&mut self, adapter: &dyn adapters::SourceAdapter) -> Result<()> {
@@ -432,30 +485,27 @@ impl SyncJob {
         label: &str,
         context: &adapters::AdapterSyncContext,
     ) -> Result<Option<adapters::SyncScanOutput>> {
+        let scan = scan_adapter(adapter, context, self.scan_settings(label));
+        self.finish_scan(label, scan, 0)
+    }
+
+    fn scan_settings(&self, label: &str) -> ScanSettings {
         if self.options.verbose {
             println!("Scanning {label}...");
         }
-        let include_events = !self.options.usage_only || self.options.backfill_events;
-        let scan = adapter
-            .scan_for_sync_output(context, self.since_ts, include_events, self.options.force)
-            .and_then(|optimized| match optimized {
-                Some(scan) => Ok(scan),
-                None => adapter.scan().map(|sessions| {
-                    let parsed = sessions.len() as u32;
-                    adapters::SyncScanOutput {
-                        scan: adapters::SyncScanResult {
-                            sessions,
-                            stats: adapters::SyncScanStats {
-                                candidates: parsed,
-                                parsed,
-                                ..Default::default()
-                            },
-                            observations: Vec::new(),
-                        },
-                        reconcile: None,
-                    }
-                }),
-            });
+        ScanSettings {
+            since_ts: self.since_ts,
+            include_events: !self.options.usage_only || self.options.backfill_events,
+            force: self.options.force,
+        }
+    }
+
+    fn finish_scan(
+        &mut self,
+        label: &str,
+        scan: Result<adapters::SyncScanOutput>,
+        streamed: usize,
+    ) -> Result<Option<adapters::SyncScanOutput>> {
         let scan_result = match scan {
             Ok(scan) => scan,
             Err(error) if self.options.target_session.is_some() => return Err(error),
@@ -466,21 +516,21 @@ impl SyncJob {
                 return Ok(None);
             }
         };
+        let found = streamed + scan_result.scan.sessions.len();
         if let Some(target) = &self.options.target_session {
             anyhow::ensure!(
                 scan_result.scan.stats.candidates > 0,
                 "no {label} session found for {target}"
             );
             anyhow::ensure!(
-                !scan_result.scan.sessions.is_empty()
-                    || scan_result.scan.stats.skipped_sessions > 0,
+                found > 0 || scan_result.scan.stats.skipped_sessions > 0,
                 "{label} session {target} holds no readable session"
             );
         }
         self.stats.skipped += scan_result.scan.stats.skipped_sessions;
         self.stats.filtered_out += scan_result.scan.stats.filtered_sessions;
         if self.options.verbose {
-            println!("  Found {} sessions", scan_result.scan.sessions.len());
+            println!("  Found {found} sessions");
         }
         Ok(Some(scan_result))
     }
@@ -585,7 +635,10 @@ impl SyncJob {
         }
     }
 
-    fn load_adapter_sync_context(&self, source_id: &str) -> Result<adapters::AdapterSyncContext> {
+    fn load_adapter_sync_context<'a>(
+        &self,
+        source_id: &str,
+    ) -> Result<adapters::AdapterSyncContext<'a>> {
         let context = adapters::AdapterSyncContext::new(
             source_id.to_string(),
             self.store.session_meta_map(source_id)?,
@@ -610,6 +663,34 @@ impl SyncJob {
         source_id: &str,
         context: adapters::AdapterSyncContext,
     ) -> Result<ExistingState> {
+        let (existing, repo_backfill) = self.resolve_existing_state(context);
+        self.write_repo_backfill(source_id, repo_backfill, &existing)?;
+        Ok(existing)
+    }
+
+    fn write_repo_backfill(
+        &self,
+        source_id: &str,
+        repo_backfill: Vec<(String, RepoIdentity)>,
+        existing: &ExistingState,
+    ) -> Result<()> {
+        for (session_id, repo) in repo_backfill {
+            let unchanged = existing.paths.get(&session_id).is_some_and(|path| {
+                path.repo_remote.as_deref() == Some(repo.remote.as_str())
+                    && path.repo_slug.as_deref() == Some(repo.slug.as_str())
+                    && path.repo_name.as_deref() == Some(repo.name.as_str())
+            });
+            if unchanged {
+                self.store.update_session_repo_identity(source_id, &session_id, &repo)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_existing_state(
+        &mut self,
+        context: adapters::AdapterSyncContext,
+    ) -> (ExistingState, Vec<(String, RepoIdentity)>) {
         let adapters::AdapterSyncContextParts {
             session_meta: meta,
             session_paths: mut paths,
@@ -620,23 +701,24 @@ impl SyncJob {
         } = context.into_parts();
         let backfill_identity =
             self.event_backfill.is_none() && matches!(self.options.scope, ProjectScope::Global);
+        let mut repo_backfill = Vec::new();
         for path in paths.values_mut() {
             if backfill_identity
                 && path.directory.is_some()
                 && (path.repo_remote.is_none()
                     || path.repo_slug.is_none()
                     || path.repo_name.is_none())
+                && let Some(repo) = self.repo_cache.resolve(path.directory.as_deref())
             {
-                let repo_identity = self.repo_cache.resolve(path.directory.as_deref());
-                if let Some(repo) = repo_identity.as_ref() {
-                    self.store.update_session_repo_identity(source_id, &path.source_id, repo)?;
-                    path.repo_remote = Some(repo.remote.clone());
-                    path.repo_slug = Some(repo.slug.clone());
-                    path.repo_name = Some(repo.name.clone());
-                }
+                path.repo_remote = Some(repo.remote.clone());
+                path.repo_slug = Some(repo.slug.clone());
+                path.repo_name = Some(repo.name.clone());
+                repo_backfill.push((path.source_id.clone(), repo));
             }
         }
-        Ok(ExistingState { meta, paths, imported_ids, usage_meta, event_meta, metadata_meta })
+        let existing =
+            ExistingState { meta, paths, imported_ids, usage_meta, event_meta, metadata_meta };
+        (existing, repo_backfill)
     }
 
     fn process_raw_session(
@@ -1204,6 +1286,39 @@ pub(crate) fn persist_raw_session_for_conformance(
     let mut existing = job.prepare_existing_state(source, context)?;
     job.process_raw_session(source, raw, &mut existing, &mut HashSet::new())?;
     Ok(job.store)
+}
+
+#[derive(Clone, Copy)]
+struct ScanSettings {
+    since_ts: Option<i64>,
+    include_events: bool,
+    force: bool,
+}
+
+fn scan_adapter(
+    adapter: &dyn adapters::SourceAdapter,
+    context: &adapters::AdapterSyncContext,
+    settings: ScanSettings,
+) -> Result<adapters::SyncScanOutput> {
+    let optimized = adapter.scan_for_sync_output(
+        context,
+        settings.since_ts,
+        settings.include_events,
+        settings.force,
+    )?;
+    if let Some(scan) = optimized {
+        return Ok(scan);
+    }
+    let sessions = adapter.scan()?;
+    let parsed = sessions.len() as u32;
+    Ok(adapters::SyncScanOutput {
+        scan: adapters::SyncScanResult {
+            sessions,
+            stats: adapters::SyncScanStats { candidates: parsed, parsed, ..Default::default() },
+            observations: Vec::new(),
+        },
+        reconcile: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

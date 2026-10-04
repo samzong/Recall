@@ -63,6 +63,7 @@ pub(super) fn scan_for_sync(
         context,
         since_ts,
         FileScanOptions {
+            stream_sessions: false,
             usage_parser_version: Some(usage_parser_version),
             event_parser_version: include_events.then_some(super::EVENT_PARSER_VERSION),
             metadata_parser_version: Some(METADATA_PARSER_VERSION),

@@ -79,8 +79,9 @@ impl SyncProgress {
         self.with_line(|line| line.set_transient(text, true));
     }
 
-    pub(crate) fn indexing(&mut self, label: &str, done: usize, total: usize) {
-        let text = format!("[{}/{}] {label}: indexing {done}/{total}", self.index, self.total);
+    pub(crate) fn indexing(&mut self, label: &str, done: usize, total: Option<usize>) {
+        let total = total.map(|total| format!("/{total}")).unwrap_or_default();
+        let text = format!("[{}/{}] {label}: indexing {done}{total}", self.index, self.total);
         self.with_line(|line| line.set_transient(text, false));
     }
 
