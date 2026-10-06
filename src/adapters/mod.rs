@@ -2,6 +2,7 @@ pub(crate) mod amp;
 pub(crate) mod antigravity;
 pub(crate) mod claude_code;
 pub(crate) mod cline;
+pub(crate) mod codebuddy;
 pub(crate) mod codex;
 pub(crate) mod copilot;
 pub(crate) mod copilot_chat;
@@ -441,6 +442,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(amp::AmpAdapter),
         Box::new(openhands::OpenHandsAdapter),
         Box::new(devin::DevinAdapter),
+        Box::new(codebuddy::CodeBuddyAdapter),
     ]
 }
 
@@ -485,6 +487,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "gemini-cli"
             | "pi"
             | "omp"
+            | "codebuddy"
     )
 }
 
