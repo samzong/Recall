@@ -378,7 +378,7 @@ impl Transcript {
 
     /// Full Codex rollout parse, the `recall sync` hot path.
     pub fn parse_codex(&self, include_events: bool) -> ParsedCounts {
-        let parsed = codex::parse_codex_session_with_options(&self.path, include_events)
+        let parsed = codex::parse_rollout(&self.path, include_events, codex::RolloutDialect::Codex)
             .expect("parse codex rollout")
             .expect("non-empty codex rollout");
         ParsedCounts {

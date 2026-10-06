@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -26,9 +27,24 @@ use crate::types::{
 
 pub(crate) struct CodexAdapter;
 
-const USAGE_PARSER_VERSION: u32 = 6;
+pub(crate) const USAGE_PARSER_VERSION: u32 = 6;
 const EVENT_PARSER_VERSION: u32 = 6;
 const METADATA_PARSER_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RolloutDialect {
+    Codex,
+    Trae,
+}
+
+impl RolloutDialect {
+    fn source(self) -> &'static str {
+        match self {
+            RolloutDialect::Codex => "codex",
+            RolloutDialect::Trae => "trae-cli",
+        }
+    }
+}
 
 impl SourceAdapter for CodexAdapter {
     fn id(&self) -> &str {
@@ -58,19 +74,7 @@ impl SourceAdapter for CodexAdapter {
         let Some(codex_dir) = resolve_codex_dir()? else {
             return Ok(vec![]);
         };
-        let sessions_dir = codex_dir.join("sessions");
-        let archived_dir = codex_dir.join("archived_sessions");
-
-        let mut sessions = Vec::new();
-        for entry in collect_codex_entries(&[&sessions_dir, &archived_dir]) {
-            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
-                continue;
-            };
-            if let Some(raw) = parse_codex_session_for_entry(entry, mtime_ms, true)? {
-                sessions.push(raw);
-            }
-        }
-        Ok(sessions)
+        scan_rollouts(&codex_dir, RolloutDialect::Codex)
     }
 
     fn scan_for_sync(
@@ -282,15 +286,39 @@ fn json_string(input: &str) -> Option<String> {
     None
 }
 
+pub(crate) fn scan_rollouts(
+    root: &Path,
+    dialect: RolloutDialect,
+) -> anyhow::Result<Vec<RawSession>> {
+    let mut sessions = Vec::new();
+    for entry in collect_codex_entries(&[&root.join("sessions"), &root.join("archived_sessions")]) {
+        let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+            continue;
+        };
+        if let Some(raw) = parse_codex_session_for_entry(entry, mtime_ms, true, dialect)? {
+            sessions.push(raw);
+        }
+    }
+    Ok(sessions)
+}
+
 fn scan_for_sync_impl(
     codex_dir: &Path,
     context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
-    let sessions_dir = codex_dir.join("sessions");
-    let archived_dir = codex_dir.join("archived_sessions");
-    let entries = collect_codex_entries(&[&sessions_dir, &archived_dir]);
+    scan_rollouts_for_sync(codex_dir, RolloutDialect::Codex, context, since_ts, include_events)
+}
+
+pub(crate) fn scan_rollouts_for_sync(
+    root: &Path,
+    dialect: RolloutDialect,
+    context: &AdapterSyncContext,
+    since_ts: Option<i64>,
+    include_events: bool,
+) -> anyhow::Result<SyncScanResult> {
+    let entries = collect_codex_entries(&[&root.join("sessions"), &root.join("archived_sessions")]);
     file_scan::run_file_scan_with_options(
         context,
         since_ts,
@@ -302,7 +330,8 @@ fn scan_for_sync_impl(
         },
         entries,
         |entry, mtime_ms| {
-            let Some(session) = parse_codex_session_for_entry(entry, mtime_ms, include_events)?
+            let Some(session) =
+                parse_codex_session_for_entry(entry, mtime_ms, include_events, dialect)?
             else {
                 return Ok(None);
             };
@@ -350,13 +379,18 @@ fn parse_codex_session_for_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
     include_events: bool,
+    dialect: RolloutDialect,
 ) -> anyhow::Result<Option<RawSession>> {
     let source_file_path = entry.stat_target.to_str().map(str::to_string);
-    let mut raw = match parse_codex_session_with_options(&entry.stat_target, include_events) {
+    let mut raw = match parse_rollout(&entry.stat_target, include_events, dialect) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
         Err(e) => {
-            debug!("failed to parse codex session {}: {e}", entry.stat_target.display());
+            debug!(
+                "failed to parse {} session {}: {e}",
+                dialect.source(),
+                entry.stat_target.display()
+            );
             return Ok(None);
         }
     };
@@ -398,14 +432,14 @@ fn codex_thread_role(payload: &Value) -> Option<ThreadRole> {
 }
 
 /// `spawn` ← `parent_thread_id` / `source.subagent.thread_spawn`; `fork` ← `forked_from_id`.
-fn codex_parent_links(payload: &Value) -> Vec<ParentLink> {
+fn codex_parent_links(payload: &Value, source: &str) -> Vec<ParentLink> {
     let mut links = Vec::new();
     let mut push = |relation: ParentRelation, id: &str| {
         let id = id.trim();
         if id.is_empty() {
             return;
         }
-        let link = ParentLink { relation, source: "codex".to_string(), source_id: id.to_string() };
+        let link = ParentLink { relation, source: source.to_string(), source_id: id.to_string() };
         if !links.contains(&link) {
             links.push(link);
         }
@@ -429,12 +463,13 @@ fn codex_parent_links(payload: &Value) -> Vec<ParentLink> {
 
 #[cfg(test)]
 fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
-    parse_codex_session_with_options(path, true)
+    parse_rollout(path, true, RolloutDialect::Codex)
 }
 
-pub(crate) fn parse_codex_session_with_options(
+pub(crate) fn parse_rollout(
     path: &Path,
     include_events: bool,
+    dialect: RolloutDialect,
 ) -> anyhow::Result<Option<RawSession>> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
@@ -456,6 +491,8 @@ pub(crate) fn parse_codex_session_with_options(
     let mut forked_child_inherited_reported_total: Option<i64> = None;
     let mut last_visible_message_seq: Option<u32> = None;
     let mut user_dedup = CodexUserDedup::default();
+    let mut seen_tool_items = HashSet::new();
+    let mut trae_ledger = (dialect == RolloutDialect::Trae).then(TraeMessageLedger::default);
     let source_path = path.to_string_lossy().to_string();
 
     for item in jsonl_indexed(reader.lines()) {
@@ -467,6 +504,11 @@ pub(crate) fn parse_codex_session_with_options(
         let payload_type =
             payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()).unwrap_or("");
         let is_token_count = msg_type == "event_msg" && payload_type == "token_count";
+        if let Some(ledger) = trae_ledger.as_mut()
+            && let Some(turn) = payload.and_then(|p| p.get("turn_id")).and_then(Value::as_str)
+        {
+            ledger.turn = Some(turn.to_string());
+        }
         let event_has_model = payload.and_then(extract_codex_model).is_some()
             || (is_token_count
                 && payload.and_then(|p| p.get("info")).and_then(extract_codex_model).is_some());
@@ -519,7 +561,7 @@ pub(crate) fn parse_codex_session_with_options(
                     meta_topologies.push(CodexMetaTopology {
                         meta_id: meta_id.clone(),
                         thread_role: codex_thread_role(payload),
-                        parent_links: codex_parent_links(payload),
+                        parent_links: codex_parent_links(payload, dialect.source()),
                     });
                     if payload.get("forked_from_id").and_then(|s| s.as_str()).is_some() {
                         forked_child_waiting_for_turn_context = true;
@@ -548,6 +590,53 @@ pub(crate) fn parse_codex_session_with_options(
             "event_msg" => {
                 if let Some(payload) = payload {
                     match payload_type {
+                        "item_completed" if dialect == RolloutDialect::Trae => {
+                            let item = payload.get("item");
+                            let text = item.map(trae_item_text).filter(|text| !text.is_empty());
+                            let ts = parse_timestamp(&v);
+                            match (
+                                item.and_then(|item| item.get("type")).and_then(Value::as_str),
+                                text,
+                            ) {
+                                (Some("UserMessage"), Some(text))
+                                    if admits(&mut trae_ledger, Role::User, &text) =>
+                                {
+                                    last_visible_message_seq = push_codex_user(
+                                        &mut messages,
+                                        &mut user_dedup,
+                                        CodexUserStream::ItemCompleted,
+                                        text,
+                                        ts,
+                                    );
+                                }
+                                (Some("AgentMessage"), Some(text))
+                                    if admits(&mut trae_ledger, Role::Assistant, &text) =>
+                                {
+                                    last_visible_message_seq = push_codex_message(
+                                        &mut messages,
+                                        Role::Assistant,
+                                        text,
+                                        ts,
+                                    );
+                                }
+                                _ => {}
+                            }
+                            if include_events {
+                                collect_codex_file_change(
+                                    payload,
+                                    events::EventContext {
+                                        event_seq: events.len() as u32,
+                                        timestamp: ts,
+                                        source_path: Some(source_path.clone()),
+                                        source_event_id: Some(line_index.to_string()),
+                                        message_seq: last_visible_message_seq,
+                                        parser_version: EVENT_PARSER_VERSION,
+                                    },
+                                    event_cwd.as_deref(),
+                                    &mut events,
+                                );
+                            }
+                        }
                         "item_completed" if include_events => {
                             collect_codex_file_change(
                                 payload,
@@ -604,6 +693,7 @@ pub(crate) fn parse_codex_session_with_options(
                         "user_message" => {
                             if let Some(text) = payload.get("message").and_then(|m| m.as_str())
                                 && !text.is_empty()
+                                && admits(&mut trae_ledger, Role::User, text)
                             {
                                 let ts = parse_timestamp(&v);
                                 last_visible_message_seq = push_codex_user(
@@ -618,6 +708,7 @@ pub(crate) fn parse_codex_session_with_options(
                         "agent_message" => {
                             if let Some(text) = payload.get("message").and_then(|m| m.as_str())
                                 && !text.is_empty()
+                                && admits(&mut trae_ledger, Role::Assistant, text)
                             {
                                 let ts = parse_timestamp(&v);
                                 last_visible_message_seq = push_codex_message(
@@ -637,7 +728,17 @@ pub(crate) fn parse_codex_session_with_options(
                     let timestamp = parse_timestamp(&v);
                     let payload_type = payload.get("type").and_then(|t| t.as_str());
                     let role = payload.get("role").and_then(|r| r.as_str());
-                    if payload_type == Some("message") && role == Some("user") {
+                    if dialect == RolloutDialect::Trae
+                        && payload_type != Some("message")
+                        && trae_tool_item_key(payload)
+                            .is_some_and(|key| !seen_tool_items.insert(key))
+                    {
+                        continue;
+                    }
+                    if dialect == RolloutDialect::Codex
+                        && payload_type == Some("message")
+                        && role == Some("user")
+                    {
                         let text = extract_content_array(payload.get("content"));
                         if !text.is_empty() && !is_codex_injected_context(&text) {
                             last_visible_message_seq = push_codex_user(
@@ -650,7 +751,9 @@ pub(crate) fn parse_codex_session_with_options(
                         }
                     } else if payload_type == Some("message") && role == Some("assistant") {
                         let text = extract_content_array(payload.get("content"));
-                        let message_seq = if text.is_empty() {
+                        let message_seq = if text.is_empty()
+                            || !admits(&mut trae_ledger, Role::Assistant, &text)
+                        {
                             None
                         } else {
                             push_codex_message(&mut messages, Role::Assistant, text, timestamp)
@@ -686,8 +789,12 @@ pub(crate) fn parse_codex_session_with_options(
                             &mut events,
                         );
                     } else if include_events {
+                        let payload = match dialect {
+                            RolloutDialect::Trae => trae_tool_item(payload),
+                            RolloutDialect::Codex => std::borrow::Cow::Borrowed(payload),
+                        };
                         collect_codex_response_item_event(
-                            payload,
+                            &payload,
                             events::EventContext {
                                 event_seq: events.len() as u32,
                                 timestamp,
@@ -699,6 +806,77 @@ pub(crate) fn parse_codex_session_with_options(
                             event_cwd.as_deref(),
                             &mut events,
                         );
+                    }
+                }
+            }
+            "history_mutation" if dialect == RolloutDialect::Trae => {
+                let Some(payload) = payload
+                    .filter(|p| p.get("operation").and_then(Value::as_str) == Some("append"))
+                else {
+                    continue;
+                };
+                let timestamp = parse_timestamp(&v);
+                for completion in payload
+                    .get("display_completions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(item) = completion.get("item").filter(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("UserMessage")
+                    }) else {
+                        continue;
+                    };
+                    let text = trae_item_text(item);
+                    if !text.is_empty() && admits(&mut trae_ledger, Role::User, &text) {
+                        last_visible_message_seq = push_codex_user(
+                            &mut messages,
+                            &mut user_dedup,
+                            CodexUserStream::DisplayCompletion,
+                            text,
+                            timestamp,
+                        );
+                    }
+                }
+                for (item_index, item) in
+                    payload.get("items").and_then(Value::as_array).into_iter().flatten().enumerate()
+                {
+                    match (
+                        item.get("type").and_then(Value::as_str),
+                        item.get("role").and_then(Value::as_str),
+                    ) {
+                        (Some("message"), Some("assistant")) => {
+                            let text = extract_content_array(item.get("content"));
+                            if !text.is_empty() && admits(&mut trae_ledger, Role::Assistant, &text)
+                            {
+                                last_visible_message_seq = push_codex_message(
+                                    &mut messages,
+                                    Role::Assistant,
+                                    text,
+                                    timestamp,
+                                );
+                            }
+                        }
+                        (Some("message"), _) => {}
+                        _ if include_events
+                            && trae_tool_item_key(item)
+                                .is_none_or(|key| seen_tool_items.insert(key)) =>
+                        {
+                            collect_codex_response_item_event(
+                                &trae_tool_item(item),
+                                events::EventContext {
+                                    event_seq: events.len() as u32,
+                                    timestamp,
+                                    source_path: Some(source_path.clone()),
+                                    source_event_id: Some(format!("{line_index}:{item_index}")),
+                                    message_seq: last_visible_message_seq,
+                                    parser_version: EVENT_PARSER_VERSION,
+                                },
+                                event_cwd.as_deref(),
+                                &mut events,
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -882,6 +1060,102 @@ fn collect_codex_response_item_event(
     event.tool_call_id = codex_tool_call_id(payload);
     event.attrs_json = Some(payload.to_string());
     events_out.push(event);
+}
+
+fn trae_item_text(item: &Value) -> String {
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("text" | "Text" | "output_text")
+            )
+        })
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect()
+}
+
+#[derive(Default)]
+struct TraeMessageLedger {
+    turn: Option<String>,
+    seen: HashSet<(bool, String, String)>,
+}
+
+fn admits(ledger: &mut Option<TraeMessageLedger>, role: Role, text: &str) -> bool {
+    let Some(ledger) = ledger else {
+        return true;
+    };
+    let Some(turn) = ledger.turn.clone() else {
+        return true;
+    };
+    ledger.seen.insert((role == Role::User, turn, text.to_string()))
+}
+
+fn trae_tool_item_key(item: &Value) -> Option<(String, String)> {
+    let kind = item.get("type").and_then(Value::as_str)?;
+    let id = codex_tool_call_id(item).or_else(|| {
+        item.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(String::from)
+    })?;
+    Some((kind.to_string(), id))
+}
+
+fn trae_tool_item(item: &Value) -> std::borrow::Cow<'_, Value> {
+    let mut normalized = item.clone();
+    let name = item.get("name").and_then(Value::as_str);
+    if matches!(name, Some("exec" | "shell"))
+        && let Some(Value::Object(mut args)) = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .and_then(|args| serde_json::from_str::<Value>(args).ok())
+        && let Some(command) = args
+            .remove("command")
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|argv| trae_shell_script(argv))
+    {
+        args.insert("cmd".into(), Value::from(command));
+        normalized["name"] = Value::from("exec_command");
+        normalized["arguments"] = Value::from(Value::Object(args).to_string());
+        return std::borrow::Cow::Owned(normalized);
+    }
+    if let Some(blocks) = item.get("output").and_then(Value::as_array) {
+        let text: String = blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("input_text" | "output_text" | "text")
+                )
+            })
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect();
+        normalized["output"] = Value::from(text);
+        return std::borrow::Cow::Owned(normalized);
+    }
+    std::borrow::Cow::Borrowed(item)
+}
+
+fn trae_shell_script(argv: &[Value]) -> Option<String> {
+    let parts: Vec<&str> = argv.iter().map(Value::as_str).collect::<Option<_>>()?;
+    match parts.as_slice() {
+        [.., flag, script] if matches!(*flag, "-c" | "-lc") => Some((*script).to_string()),
+        [] => None,
+        parts => Some(
+            parts
+                .iter()
+                .map(|part| {
+                    if part.is_empty() || part.chars().any(char::is_whitespace) {
+                        format!("'{}'", part.replace('\'', "'\\''"))
+                    } else {
+                        (*part).to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    }
 }
 
 fn codex_tool_call_id(payload: &Value) -> Option<String> {
@@ -1289,6 +1563,8 @@ fn is_codex_injected_context(text: &str) -> bool {
 enum CodexUserStream {
     EventMsg,
     ResponseItem,
+    ItemCompleted,
+    DisplayCompletion,
 }
 
 #[derive(Default)]
@@ -1307,6 +1583,8 @@ fn push_codex_user(
     let stream_bit = match stream {
         CodexUserStream::EventMsg => 1,
         CodexUserStream::ResponseItem => 2,
+        CodexUserStream::ItemCompleted => 4,
+        CodexUserStream::DisplayCompletion => 8,
     };
     if let Some(seq) = dedup.last_seq
         && seq as usize + 1 == messages.len()
@@ -2016,9 +2294,9 @@ mod tests {
         let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2394";
         let path = write_codex_event_only_rollout(&sessions_dir, uuid);
 
-        assert!(parse_codex_session_with_options(&path, false).unwrap().is_none());
+        assert!(parse_rollout(&path, false, RolloutDialect::Codex).unwrap().is_none());
 
-        let raw = parse_codex_session_with_options(&path, true).unwrap().unwrap();
+        let raw = parse_rollout(&path, true, RolloutDialect::Codex).unwrap().unwrap();
         assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
         assert!(raw.events.iter().any(|event| event.kind == "search"));
 

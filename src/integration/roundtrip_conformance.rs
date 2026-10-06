@@ -244,7 +244,7 @@ fn codex_single_file_round_trip() {
     );
 
     assert_roundtrip("codex", || {
-        codex::parse_codex_session_with_options(&path, true)?
+        codex::parse_rollout(&path, true, codex::RolloutDialect::Codex)?
             .context("Codex fixture was not parsed")
     });
 }
