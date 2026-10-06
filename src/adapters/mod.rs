@@ -22,6 +22,7 @@ pub(crate) mod kimi_code;
 pub(crate) mod kiro;
 pub(crate) mod mimo_code;
 pub(crate) mod minimax_code;
+pub(crate) mod muse_code;
 pub(crate) mod omp;
 pub(crate) mod opencode;
 pub(crate) mod openhands;
@@ -441,6 +442,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(amp::AmpAdapter),
         Box::new(openhands::OpenHandsAdapter),
         Box::new(devin::DevinAdapter),
+        Box::new(muse_code::MuseCodeAdapter),
     ]
 }
 
@@ -485,6 +487,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "gemini-cli"
             | "pi"
             | "omp"
+            | "muse-code"
     )
 }
 
