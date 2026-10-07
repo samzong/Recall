@@ -188,13 +188,9 @@ Always run `make check` before pushing. If it passes locally, CI will pass.
 
 ## Benchmarks
 
-Performance is tracked by
-[CodSpeed](https://app.codspeed.io/samzong/Recall) via
-`.github/workflows/codspeed.yml` on pushes and pull requests that touch
-`src/`, `benches/`, `Cargo.toml`, `Cargo.lock`, or the workflow itself,
-using CPU simulation so results do not depend on runner noise. Docs,
-website, skills, and extension-only changes skip the job; force a run
-with `workflow_dispatch`.
+Benchmarks run locally on demand. Timings depend on the machine and its current
+load; use them for local investigation rather than a CI regression gate. No
+benchmark results are uploaded to an external service.
 
 `benches/recall.rs` is a single [divan](https://github.com/nvzqz/divan) target
 grouped by pipeline stage:
@@ -214,8 +210,8 @@ every fixture uses a temporary directory or an in-memory SQLite database, so
 running benchmarks never touches your `recall.db`.
 
 ```bash
-make bench                                   # build + run through the codspeed CLI
-cargo codspeed build --features bench         # build only
+make bench
+cargo bench --features bench --bench recall --no-run
 ```
 
 Add a benchmark by extending `src/bench_api.rs` with the fixture (it can reach

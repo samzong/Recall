@@ -1,17 +1,3 @@
-//! CodSpeed benchmarks for Recall's hot paths.
-//!
-//! The groups follow the pipeline a session goes through: transcripts are
-//! parsed (`parsing`), written to the SQLite index (`indexing`), read back for
-//! search and export (`search`), aggregated for the usage dashboard
-//! (`analytics`) and finally rendered (`rendering`).
-//!
-//! Run locally with:
-//!
-//! ```sh
-//! cargo codspeed build --features bench
-//! cargo codspeed run
-//! ```
-
 use recall::bench_api::{
     BenchStore, IndexWorkload, McpGetSessionWorkload, RenderWorkload, SearchIndex, SyncWorkload,
     Transcript, UsageWorkload, build_embedding_text, normalize_remote_url,
@@ -21,18 +7,6 @@ fn main() {
     divan::main();
 }
 
-/// Under CodSpeed the benchmarked closure runs exactly once between the
-/// instrumentation start and stop, with no warm-up, so first-execution costs
-/// are measured as if they were steady-state work: page faults for a freshly
-/// grown buffer, an allocator that has not yet seen this size class, cold
-/// caches and branch predictors. Those costs vary with the environment rather
-/// than with the code, which is what made `plain_transcript[256]` — a 167 KB
-/// output, past the mmap threshold — swing by 25% between runs of identical
-/// code and produce false regressions.
-///
-/// Running the same work once before the measured region moves those costs out
-/// of it. Every benchmark whose work is side-effect free does this; the numbers
-/// it reports are therefore steady-state, not first-call.
 fn warm_up<T, F: Fn() -> T>(work: &F) {
     divan::black_box(work());
 }
@@ -206,13 +180,6 @@ mod analytics {
         bencher.bench(aggregate);
     }
 
-    /// The instrumented region costs a few microseconds no matter what runs
-    /// inside it. These two helpers take ~80 ns and ~226 ns per call, so a
-    /// single call would report almost pure overhead — which is how a URL parse
-    /// came to be measured at 31.6 us, and why its reported value moved by
-    /// double digits without the code changing. Measure a batch instead, so the
-    /// work dominates. The batch size is part of the benchmark name, so the
-    /// reported figure is never mistaken for a per-call cost.
     const MICRO_BATCH: usize = 4_096;
 
     #[divan::bench(args = [MICRO_BATCH])]

@@ -80,13 +80,11 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# Benchmarks are compiled with the release profile; thin LTO keeps build times
-# reasonable in CI without giving up cross-crate inlining.
 [profile.bench]
 lto = "thin"
 
 [dev-dependencies]
-divan = { version = "5.0.1", package = "codspeed-divan-compat" }
+divan = "0.1.21"
 
 [[bench]]
 name = "recall"

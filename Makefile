@@ -47,9 +47,8 @@ fmt: ## Format code
 
 .PHONY: bench
 
-bench: ## Build and run the CodSpeed benchmarks (needs the codspeed CLI)
-	$(CARGO) codspeed build --features bench
-	codspeed run --mode simulation -- $(CARGO) codspeed run
+bench: ## Run local benchmarks
+	$(CARGO) bench --features bench --bench recall
 
 # ── Documentation ────────────────────────────────────────────────────────────
 
