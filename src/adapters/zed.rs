@@ -769,7 +769,14 @@ mod tests {
             "zed".into(),
             HashMap::from([(
                 "native-thread".into(),
-                IndexedSessionMeta { id: "indexed".into(), updated_at, message_count: 2 },
+                IndexedSessionMeta {
+                    id: "indexed".into(),
+                    directory: None,
+                    custom_title: None,
+                    started_at: 0,
+                    updated_at,
+                    message_count: 2,
+                },
             )]),
             HashMap::new(),
             HashSet::new(),
@@ -966,7 +973,14 @@ mod tests {
             "zed".into(),
             HashMap::from([(
                 "native-thread".into(),
-                IndexedSessionMeta { id: "indexed".into(), updated_at, message_count: 2 },
+                IndexedSessionMeta {
+                    id: "indexed".into(),
+                    directory: None,
+                    custom_title: None,
+                    started_at: 0,
+                    updated_at,
+                    message_count: 2,
+                },
             )]),
             HashMap::new(),
             HashSet::new(),
