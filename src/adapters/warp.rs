@@ -25,7 +25,7 @@ mod proto;
 mod tests;
 
 const METADATA_PARSER_VERSION: u32 = 1;
-const EVENT_PARSER_VERSION: u32 = 2;
+const EVENT_PARSER_VERSION: u32 = 3;
 const USAGE_PARSER_VERSION: u32 = 1;
 
 pub(crate) struct WarpAdapter;
@@ -48,18 +48,23 @@ impl SourceAdapter for WarpAdapter {
     }
 
     fn scan(&self) -> Result<Vec<RawSession>> {
-        Ok(scan_paths(&default_db_paths(), None, true)?.sessions)
+        Ok(scan_paths(&default_db_paths(), None, None, true)?.sessions)
     }
 
     fn scan_for_sync_output(
         &self,
         context: &AdapterSyncContext,
-        _since_ts: Option<i64>,
+        since_ts: Option<i64>,
         include_events: bool,
-        _force: bool,
+        force: bool,
     ) -> Result<Option<SyncScanOutput>> {
         Ok(Some(SyncScanOutput {
-            scan: scan_paths(&default_db_paths(), Some(context), include_events)?,
+            scan: scan_paths(
+                &default_db_paths(),
+                Some(context),
+                if force { None } else { since_ts },
+                include_events,
+            )?,
             reconcile: None,
         }))
     }
@@ -103,13 +108,15 @@ fn default_db_paths() -> Vec<PathBuf> {
 fn scan_paths(
     paths: &[PathBuf],
     context: Option<&AdapterSyncContext>,
+    since_ts: Option<i64>,
     include_events: bool,
 ) -> Result<SyncScanResult> {
     let mut result = SyncScanResult::default();
     let mut seen = HashSet::new();
     for path in paths {
         let mut scan = SyncScanResult::default();
-        let outcome = scan_db_with_seen(Some(path), context, include_events, &mut seen, &mut scan);
+        let outcome =
+            scan_db_with_seen(Some(path), context, since_ts, include_events, &mut seen, &mut scan);
         result.absorb(scan);
         if let Err(error) = outcome {
             if error.is::<SessionWriteError>() {
@@ -147,13 +154,14 @@ fn scan_db(
     include_events: bool,
 ) -> Result<SyncScanResult> {
     let mut result = SyncScanResult::default();
-    scan_db_with_seen(path, context, include_events, &mut HashSet::new(), &mut result)?;
+    scan_db_with_seen(path, context, None, include_events, &mut HashSet::new(), &mut result)?;
     Ok(result)
 }
 
 fn scan_db_with_seen(
     path: Option<&Path>,
     context: Option<&AdapterSyncContext>,
+    since_ts: Option<i64>,
     include_events: bool,
     seen: &mut HashSet<String>,
     result: &mut SyncScanResult,
@@ -165,11 +173,9 @@ fn scan_db_with_seen(
         .context("opening Warp database read-only")?;
     conn.busy_timeout(Duration::from_secs(3))?;
     let snapshot = conn.unchecked_transaction()?;
-    if !has_table(&snapshot, "agent_conversations")? {
+    if !has_table(&snapshot, "agent_conversations")? || !has_table(&snapshot, "agent_tasks")? {
         return Ok(());
     }
-    let has_tasks = has_table(&snapshot, "agent_tasks")?;
-    let has_queries = has_table(&snapshot, "ai_queries")?;
     let mut stmt = snapshot.prepare(
         "SELECT conversation_id, last_modified_at, conversation_data FROM agent_conversations
          WHERE (?1 IS NULL OR conversation_id = ?1) ORDER BY conversation_id",
@@ -180,38 +186,41 @@ fn scan_db_with_seen(
         let parsed = (|| {
             let id: String = row.get(0)?;
             let modified: String = row.get(1)?;
-            parse_conversation(
-                &snapshot,
-                &id,
-                &modified,
-                path,
-                has_tasks,
-                has_queries,
-                include_events,
-            )
+            if let Some(cutoff) = since_ts
+                && before_cutoff(&snapshot, &id, &modified, cutoff)?
+            {
+                result.stats.rejected_before_parse += 1;
+                return Ok(None);
+            }
+            let data: String = row.get(2)?;
+            let Some(mut raw) =
+                parse_conversation(&snapshot, &id, &modified, path, include_events)?
+            else {
+                return Ok(None);
+            };
+            match serde_json::from_str::<Value>(&data) {
+                Ok(data) => {
+                    if let Some(parent) = data
+                        .get("parent_conversation_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|parent| !parent.is_empty())
+                    {
+                        raw.thread_role = Some(ThreadRole::Subagent);
+                        raw.parent_links = vec![ParentLink {
+                            relation: ParentRelation::Spawn,
+                            source: "warp".into(),
+                            source_id: parent.into(),
+                        }];
+                    }
+                }
+                Err(error) => warn!("failed to parse Warp conversation metadata: {error}"),
+            }
+            raw.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+            Ok::<_, anyhow::Error>(Some(raw))
         })();
         match parsed {
-            Ok(Some(mut raw)) => {
-                let data: String = row.get(2)?;
-                match serde_json::from_str::<Value>(&data) {
-                    Ok(data) => {
-                        if let Some(parent) = data
-                            .get("parent_conversation_id")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|parent| !parent.is_empty())
-                        {
-                            raw.thread_role = Some(ThreadRole::Subagent);
-                            raw.parent_links = vec![ParentLink {
-                                relation: ParentRelation::Spawn,
-                                source: "warp".into(),
-                                source_id: parent.into(),
-                            }];
-                        }
-                    }
-                    Err(error) => warn!("failed to parse Warp conversation metadata: {error}"),
-                }
-                raw.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+            Ok(Some(raw)) => {
                 if !seen.insert(raw.source_id.clone()) {
                     result.stats.filtered_sessions += 1;
                     continue;
@@ -229,6 +238,22 @@ fn scan_db_with_seen(
         }
     }
     Ok(())
+}
+
+fn before_cutoff(conn: &Connection, id: &str, modified: &str, cutoff: i64) -> Result<bool> {
+    if parse_timestamp(modified).is_none_or(|timestamp| timestamp >= cutoff) {
+        return Ok(false);
+    }
+    let mut stmt =
+        conn.prepare("SELECT last_modified_at FROM agent_tasks WHERE conversation_id = ?1")?;
+    let mut rows = stmt.query([id])?;
+    while let Some(row) = rows.next()? {
+        let modified: String = row.get(0)?;
+        if parse_timestamp(&modified).is_none_or(|timestamp| timestamp >= cutoff) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn parse_timestamp(text: &str) -> Option<i64> {
@@ -262,44 +287,39 @@ fn parse_conversation(
     id: &str,
     modified: &str,
     path: &Path,
-    has_tasks: bool,
-    has_queries: bool,
     include_events: bool,
 ) -> Result<Option<RawSession>> {
     let mut updated_at = parse_timestamp(modified);
     let mut records = Vec::new();
     let mut title = None;
-    if has_tasks {
-        let mut stmt = conn.prepare(
-            "SELECT task, last_modified_at FROM agent_tasks WHERE conversation_id = ?1 ORDER BY id",
-        )?;
-        let mut rows = stmt.query([id])?;
-        while let Some(row) = rows.next()? {
-            let bytes: Vec<u8> = row.get(0)?;
-            let task =
-                proto::Task::decode(bytes.as_slice()).context("decoding Warp task protobuf")?;
-            let modified: String = row.get(1)?;
-            updated_at = updated_at.max(parse_timestamp(&modified));
-            if task.dependencies.as_ref().is_none_or(|deps| deps.parent_task_id.is_empty())
-                && !task.description.trim().is_empty()
-                && title.is_none()
-            {
-                title = Some(task.description);
-            }
-            let mut ordering_time = task
-                .messages
-                .iter()
-                .find_map(|message| message.timestamp.as_ref().and_then(proto::Timestamp::millis));
-            for (seq, message) in task.messages.into_iter().enumerate() {
-                let key = if message.id.is_empty() {
-                    format!("{}:{seq}", task.id)
-                } else {
-                    message.id.clone()
-                };
-                ordering_time =
-                    message.timestamp.as_ref().and_then(proto::Timestamp::millis).or(ordering_time);
-                records.push((ordering_time, key, task.id.clone(), message));
-            }
+    let mut stmt = conn.prepare(
+        "SELECT task, last_modified_at FROM agent_tasks WHERE conversation_id = ?1 ORDER BY id",
+    )?;
+    let mut rows = stmt.query([id])?;
+    while let Some(row) = rows.next()? {
+        let bytes: Vec<u8> = row.get(0)?;
+        let task = proto::Task::decode(bytes.as_slice()).context("decoding Warp task protobuf")?;
+        let modified: String = row.get(1)?;
+        updated_at = updated_at.max(parse_timestamp(&modified));
+        if task.dependencies.as_ref().is_none_or(|deps| deps.parent_task_id.is_empty())
+            && !task.description.trim().is_empty()
+            && title.is_none()
+        {
+            title = Some(task.description);
+        }
+        let mut ordering_time = task
+            .messages
+            .iter()
+            .find_map(|message| message.timestamp.as_ref().and_then(proto::Timestamp::millis));
+        for (seq, message) in task.messages.into_iter().enumerate() {
+            let key = if message.id.is_empty() {
+                format!("{}:{seq}", task.id)
+            } else {
+                message.id.clone()
+            };
+            ordering_time =
+                message.timestamp.as_ref().and_then(proto::Timestamp::millis).or(ordering_time);
+            records.push((ordering_time, key, task.id.clone(), message));
         }
     }
     records.sort_by_key(|(time, _, _, _)| *time);
@@ -310,15 +330,18 @@ fn parse_conversation(
     let mut usage_events = Vec::new();
     let mut directory = None;
     let mut task_directories = HashMap::new();
-    let mut tool_names = HashMap::new();
-    let shell_commands: HashMap<_, _> = records
+    let tool_calls: HashMap<_, _> = records
         .iter()
         .filter_map(|(_, _, _, message)| message.tool_call.as_ref())
         .filter(|call| !call.tool_call_id.is_empty())
-        .filter_map(|call| {
-            call.run_shell_command
-                .as_ref()
-                .map(|shell| (call.tool_call_id.clone(), shell.command.clone()))
+        .map(|call| {
+            (
+                call.tool_call_id.clone(),
+                (
+                    call_name(call).to_string(),
+                    call.run_shell_command.as_ref().map(|shell| shell.command.clone()),
+                ),
+            )
         })
         .collect();
     let mut started_at = None;
@@ -371,11 +394,11 @@ fn parse_conversation(
             };
             if let Some(call) = message.tool_call {
                 let event = call_event(&call, context, active_cwd);
-                tool_names.insert(call.tool_call_id, event.name.clone());
                 session_events.push(event);
             } else if let Some(result) = message.tool_call_result {
-                let name = tool_names.get(&result.tool_call_id).cloned().flatten();
-                let command = shell_commands.get(&result.tool_call_id).map(String::as_str);
+                let call = tool_calls.get(&result.tool_call_id);
+                let name = call.map(|(name, _)| name.clone());
+                let command = call.and_then(|(_, command)| command.as_deref());
                 session_events.push(result_event(&result, context, name, command, active_cwd));
             }
         }
@@ -383,36 +406,6 @@ fn parse_conversation(
             && let Some(timestamp) = timestamp
         {
             parse_usage(&metadata, &key, timestamp, &source_path, &mut usage_events)?;
-        }
-    }
-    if !has_tasks && has_queries {
-        let mut stmt = conn.prepare(
-            "SELECT input, working_directory, start_ts FROM ai_queries
-             WHERE conversation_id = ?1 ORDER BY start_ts, id",
-        )?;
-        let mut rows = stmt.query([id])?;
-        while let Some(row) = rows.next()? {
-            let input: Option<String> = row.get(0)?;
-            let pwd: Option<String> = row.get(1)?;
-            let time: String = row.get(2)?;
-            let timestamp = parse_timestamp(&time);
-            started_at = started_at.or(timestamp);
-            updated_at = updated_at.max(timestamp);
-            directory = directory.or(pwd.filter(|pwd| !pwd.trim().is_empty()));
-            if let Some(input) = input {
-                let input: Vec<Value> = serde_json::from_str(&input)?;
-                for item in input {
-                    if let Some(text) = item.pointer("/Query/text").and_then(Value::as_str)
-                        && !text.trim().is_empty()
-                    {
-                        messages.push(RawMessage {
-                            role: Role::User,
-                            content: text.into(),
-                            timestamp,
-                        });
-                    }
-                }
-            }
         }
     }
     if messages.is_empty() && session_events.is_empty() && usage_events.is_empty() {
@@ -430,18 +423,28 @@ fn parse_conversation(
     Ok(Some(raw))
 }
 
+fn call_name(call: &proto::ToolCall) -> &str {
+    if call.run_shell_command.is_some() {
+        "run_shell_command"
+    } else if call.read_files.is_some() {
+        "read_files"
+    } else if call.apply_file_diffs.is_some() {
+        "apply_file_diffs"
+    } else {
+        call.other.as_ref().map(proto::OtherTool::name).unwrap_or("unknown")
+    }
+}
+
 fn call_event(call: &proto::ToolCall, context: EventContext, cwd: Option<&str>) -> RawSessionEvent {
     let mut files = Vec::new();
-    let (name, args) = if let Some(shell) = &call.run_shell_command {
-        ("run_shell_command", Some(json!({"command": shell.command})))
+    let name = call_name(call);
+    let args = if let Some(shell) = &call.run_shell_command {
+        Some(json!({"command": shell.command}))
     } else if let Some(read) = &call.read_files {
         files.extend(read.files.iter().filter(|file| !file.name.trim().is_empty()).map(|file| {
             FileEvidence::call(file.name.clone(), FileOperation::Read, cwd.map(str::to_string))
         }));
-        (
-            "read_files",
-            Some(json!({"paths": read.files.iter().map(|file| &file.name).collect::<Vec<_>>()})),
-        )
+        Some(json!({"paths": read.files.iter().map(|file| &file.name).collect::<Vec<_>>()}))
     } else if let Some(diff) = &call.apply_file_diffs {
         for (paths, operation) in [
             (&diff.diffs, FileOperation::Write),
@@ -474,14 +477,11 @@ fn call_event(call: &proto::ToolCall, context: EventContext, cwd: Option<&str>) 
                 ));
             }
         }
-        (
-            "apply_file_diffs",
-            Some(
-                json!({"summary": diff.summary, "paths": files.iter().map(|file| &file.path).collect::<Vec<_>>()}),
-            ),
+        Some(
+            json!({"summary": diff.summary, "paths": files.iter().map(|file| &file.path).collect::<Vec<_>>()}),
         )
     } else {
-        (call.other.as_ref().map(proto::OtherTool::name).unwrap_or("unknown"), None)
+        None
     };
     let mut event = events::tool_call_event(context, name.into(), args.as_ref());
     event.tool_call_id = Some(call.tool_call_id.clone()).filter(|id| !id.is_empty());

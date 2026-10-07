@@ -191,7 +191,7 @@ fn restricted_streaming_scan_and_usage_only_scan_obey_the_core_contract() {
 }
 
 #[test]
-fn legacy_queries_do_not_replace_missing_tasks_in_a_modern_database() {
+fn taskless_conversations_do_not_emit_user_only_sessions() {
     let (_dir, path, conn) = database();
     conn.execute_batch("CREATE TABLE ai_queries (id INTEGER PRIMARY KEY, conversation_id TEXT, input TEXT, working_directory TEXT, start_ts TEXT);
         INSERT INTO agent_conversations (conversation_id, conversation_data) VALUES ('legacy', '{}');").unwrap();
@@ -343,7 +343,7 @@ fn multiple_database_scan_streams_unique_conversations_across_channels() {
         Ok(())
     };
     let context = AdapterSyncContext::empty_for_test("warp").with_session_sink(&mut sink);
-    let scan = scan_paths(&[path, other_path], Some(&context), true).unwrap();
+    let scan = scan_paths(&[path, other_path], Some(&context), None, true).unwrap();
     assert_eq!(scan.stats.candidates, 3);
     assert_eq!(scan.stats.parsed, 2);
     assert_eq!(scan.stats.filtered_sessions, 1);
@@ -364,21 +364,6 @@ fn invalid_parent_metadata_does_not_discard_task_content() {
         assert_eq!(raw.messages.len(), 3);
         assert!(raw.parent_links.is_empty());
     }
-}
-
-#[test]
-fn legacy_queries_are_read_only_when_the_task_table_is_absent() {
-    let (_dir, path, conn) = database();
-    conn.execute_batch("DROP TABLE agent_tasks;
-        CREATE TABLE ai_queries (id INTEGER PRIMARY KEY, conversation_id TEXT, input TEXT, working_directory TEXT, start_ts TEXT);").unwrap();
-    let input = r#"[{"Context":{"text":"hidden context"}},{"Query":{"text":"Legacy prompt"}}]"#;
-    conn.execute("INSERT INTO ai_queries (conversation_id, input, working_directory, start_ts) VALUES ('conversation-1', ?1, '/tmp/legacy', '2026-09-30 15:00:00')", [input]).unwrap();
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
-    assert_eq!(raw.messages.len(), 1);
-    assert_eq!(raw.messages[0].content, "Legacy prompt");
-    assert_eq!(raw.directory.as_deref(), Some("/tmp/legacy"));
-    assert!(raw.events.is_empty());
-    assert!(raw.usage_events.is_empty());
 }
 
 #[test]
@@ -436,7 +421,7 @@ fn unreadable_database_does_not_block_another_database() {
     let (_dir, path, _conn) = database();
     let bad = path.with_file_name("bad.sqlite");
     std::fs::write(&bad, b"not a database").unwrap();
-    let scan = scan_paths(&[bad, path], None, true).unwrap();
+    let scan = scan_paths(&[bad, path], None, None, true).unwrap();
     assert_eq!(scan.sessions.len(), 1);
     assert_eq!(scan.stats.parsed, 1);
     assert_eq!(scan.sessions[0].source_id, "conversation-1");
@@ -451,33 +436,85 @@ fn database_error_isolation_does_not_hide_session_write_failures() {
         Err(anyhow::anyhow!("index write failed"))
     };
     let context = AdapterSyncContext::empty_for_test("warp").with_session_sink(&mut sink);
-    let error = scan_paths(&[path.clone(), path], Some(&context), true).err().unwrap();
+    let error = scan_paths(&[path.clone(), path], Some(&context), None, true).err().unwrap();
     assert!(error.is::<SessionWriteError>());
     drop(context);
     assert_eq!(writes, 1);
 }
 
 #[test]
-fn partial_database_read_retains_streamed_stats_and_scans_the_next_database() {
+fn invalid_utf8_metadata_skips_only_its_conversation() {
     let (_dir, path, conn) = database();
-    conn.execute("INSERT INTO agent_conversations (conversation_id, conversation_data) VALUES ('z-bad', x'ff')", []).unwrap();
-    conn.execute("INSERT INTO agent_tasks (conversation_id, task_id, task) VALUES ('z-bad', 'bad-metadata-task', ?1)", [TASK]).unwrap();
-    let (_other_dir, other_path, conn) = database();
-    conn.execute_batch("INSERT INTO agent_conversations (conversation_id, conversation_data, last_modified_at) SELECT 'other', conversation_data, last_modified_at FROM agent_conversations;
-        UPDATE agent_tasks SET conversation_id = 'other';
-        DELETE FROM agent_conversations WHERE conversation_id = 'conversation-1';").unwrap();
-    let mut streamed = Vec::new();
-    let mut sink = |raw: RawSession| {
-        streamed.push(raw);
-        Ok(())
-    };
-    let context = AdapterSyncContext::empty_for_test("warp").with_session_sink(&mut sink);
-    let scan = scan_paths(&[path, other_path], Some(&context), true).unwrap();
-    assert_eq!(scan.stats.parsed, 2);
+    conn.execute_batch("INSERT INTO agent_conversations (conversation_id, conversation_data) VALUES ('a-bad', x'ff'), ('z-good', '{}');").unwrap();
+    for id in ["a-bad", "z-good"] {
+        conn.execute(
+            "INSERT INTO agent_tasks (conversation_id, task_id, task) VALUES (?1, ?1, ?2)",
+            params![id, TASK],
+        )
+        .unwrap();
+    }
+    let scan = scan_db(Some(&path), None, true).unwrap();
     assert_eq!(scan.stats.candidates, 3);
-    drop(context);
+    assert_eq!(scan.stats.parsed, 2);
     assert_eq!(
-        streamed.iter().map(|raw| raw.source_id.as_str()).collect::<Vec<_>>(),
-        ["conversation-1", "other"]
+        scan.sessions.iter().map(|raw| raw.source_id.as_str()).collect::<Vec<_>>(),
+        ["conversation-1", "z-good"]
     );
+    conn.execute_batch("UPDATE agent_conversations SET conversation_data = CAST(x'ff' AS TEXT) WHERE conversation_id = 'a-bad';").unwrap();
+    assert_eq!(scan_db(Some(&path), None, true).unwrap().sessions.len(), 2);
+}
+
+#[test]
+fn cutoff_rejects_old_tasks_before_decoding_and_keeps_recent_task_updates() {
+    let (_dir, path, conn) = database();
+    let cutoff = 1790784009250;
+    conn.execute_batch("UPDATE agent_tasks SET task = x'ff', last_modified_at = '2026-09-29 00:00:00';
+        UPDATE agent_conversations SET last_modified_at = '2026-09-29 00:00:00';
+        INSERT INTO agent_conversations (conversation_id, conversation_data, last_modified_at) VALUES ('recent-task', '{}', '2026-09-29 00:00:00'), ('recent-conversation', '{}', '2026-09-30T18:00:09.250+02:00'), ('unknown-time', '{}', 'unknown');").unwrap();
+    for (id, modified) in [
+        ("recent-task", "2026-09-30T18:00:09.250+02:00"),
+        ("recent-conversation", "2026-09-29 00:00:00"),
+        ("unknown-time", "unknown"),
+    ] {
+        conn.execute("INSERT INTO agent_tasks (conversation_id, task_id, task, last_modified_at) VALUES (?1, ?1, ?2, ?3)", params![id, TASK, modified]).unwrap();
+    }
+    let scan = scan_paths(&[path], None, Some(cutoff), true).unwrap();
+    assert_eq!(scan.stats.candidates, 4);
+    assert_eq!(scan.stats.rejected_before_parse, 1);
+    assert_eq!(scan.stats.parsed, 3);
+    assert_eq!(
+        scan.sessions.iter().map(|raw| raw.source_id.as_str()).collect::<Vec<_>>(),
+        ["recent-conversation", "recent-task", "unknown-time"]
+    );
+}
+
+#[test]
+fn interleaved_result_names_do_not_depend_on_call_timestamp_order() {
+    let (_dir, path, conn) = database();
+    let mut task = proto::Task::decode(TASK).unwrap();
+    let results: Vec<_> = task
+        .messages
+        .iter()
+        .filter(|message| message.tool_call_result.is_some())
+        .cloned()
+        .map(|mut message| {
+            message.timestamp = Some(proto::Timestamp { seconds: 1790784001, nanos: 0 });
+            message
+        })
+        .collect();
+    task.messages.retain(|message| message.tool_call_result.is_none());
+    write_task(&conn, &task);
+    let child = proto::Task { id: "results-task".into(), messages: results, ..Default::default() };
+    conn.execute("INSERT INTO agent_tasks (conversation_id, task_id, task) VALUES ('conversation-1', 'results-task', ?1)", [child.encode_to_vec()]).unwrap();
+    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    for (id, name) in
+        [("read-1", "read_files"), ("shell-1", "run_shell_command"), ("edit-1", "apply_file_diffs")]
+    {
+        let result = raw
+            .events
+            .iter()
+            .find(|event| event.kind == "tool_result" && event.tool_call_id.as_deref() == Some(id))
+            .unwrap();
+        assert_eq!(result.name.as_deref(), Some(name));
+    }
 }
