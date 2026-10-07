@@ -59,7 +59,4 @@ compute total tokens:
 The application-created snapshot has the same adapter-read column types as
 `schema.sql`, with an additional `summary` column in `agent_conversations`.
 Real CLI verification used the macOS Application Support Stable fallback path
-inside a sandbox HOME. Direct read-only access to the native group-container
-database from the verification terminal failed under macOS access controls;
-Recall warned and returned successfully. No privacy settings or Warp application
-state were changed by the verifier.
+inside a sandbox HOME.

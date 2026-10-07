@@ -297,9 +297,6 @@ fn forked_tasks_preserve_message_based_usage_keys_and_parent_links() {
     let (_dir, path, conn) = database();
     let mut fork = proto::Task::decode(TASK).unwrap();
     fork.id = "fork-task".into();
-    for message in &mut fork.messages {
-        message.task_id = fork.id.clone();
-    }
     conn.execute(
         "INSERT INTO agent_conversations (conversation_id, conversation_data) VALUES ('fork', ?1)",
         [r#"{"parent_conversation_id":"conversation-1"}"#],

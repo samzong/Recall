@@ -28,10 +28,6 @@ pub(super) struct Message {
     pub(super) tool_call: Option<ToolCall>,
     #[prost(message, optional, tag = "5")]
     pub(super) tool_call_result: Option<ToolCallResult>,
-    #[prost(string, tag = "11")]
-    pub(super) task_id: String,
-    #[prost(string, tag = "13")]
-    pub(super) request_id: String,
     #[prost(message, optional, tag = "14")]
     pub(super) timestamp: Option<Timestamp>,
     #[prost(message, optional, tag = "30")]
@@ -58,16 +54,12 @@ pub(super) struct UserQuery {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub(super) struct UserQueryOrigin {
-    #[prost(oneof = "QueryOrigin", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "QueryOrigin", tags = "3, 4, 5, 6, 8")]
     pub(super) variant: Option<QueryOrigin>,
 }
 
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub(super) enum QueryOrigin {
-    #[prost(bytes, tag = "1")]
-    WarpClient(Vec<u8>),
-    #[prost(bytes, tag = "2")]
-    ExternalPlatform(Vec<u8>),
     #[prost(bytes, tag = "3")]
     ParentAgent(Vec<u8>),
     #[prost(bytes, tag = "4")]
@@ -76,8 +68,6 @@ pub(super) enum QueryOrigin {
     Schedule(Vec<u8>),
     #[prost(bytes, tag = "6")]
     Automation(Vec<u8>),
-    #[prost(bytes, tag = "7")]
-    PublicApi(Vec<u8>),
     #[prost(bytes, tag = "8")]
     ServerSynthesized(Vec<u8>),
 }
@@ -304,8 +294,6 @@ pub(super) struct ShellResult {
     pub(super) exit_code: Option<i32>,
     #[prost(string, tag = "3")]
     pub(super) command: String,
-    #[prost(bytes = "vec", optional, tag = "4")]
-    pub(super) long_running: Option<Vec<u8>>,
     #[prost(message, optional, tag = "5")]
     pub(super) command_finished: Option<ShellFinished>,
     #[prost(bytes = "vec", optional, tag = "6")]
@@ -320,12 +308,6 @@ pub(super) struct ShellFinished {
     pub(super) output: String,
     #[prost(int32, tag = "2")]
     pub(super) exit_code: i32,
-    #[prost(string, tag = "3")]
-    pub(super) command_id: String,
-    #[prost(message, optional, tag = "4")]
-    pub(super) start_ts: Option<Timestamp>,
-    #[prost(message, optional, tag = "5")]
-    pub(super) finish_ts: Option<Timestamp>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
