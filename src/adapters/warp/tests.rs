@@ -37,7 +37,7 @@ fn write_task(conn: &Connection, task: &proto::Task) {
 fn official_wire_fixture_yields_messages_tools_and_observed_usage() {
     let (_dir, path, conn) = database();
     let before = std::fs::read(&path).unwrap();
-    let scan = scan_db(Some(&path), None, true).unwrap();
+    let scan = scan_db(&path, None, true).unwrap();
     assert_eq!(scan.sessions.len(), 1);
     assert_eq!(scan.stats.candidates, 1);
     assert_eq!(scan.stats.parsed, 1);
@@ -93,10 +93,10 @@ fn live_wal_snapshot_excludes_uncommitted_changes_and_sees_committed_changes() {
     let mut task = proto::Task::decode(TASK).unwrap();
     task.messages[0].user_query.as_mut().unwrap().query = "Updated prompt".into();
     write_task(&conn, &task);
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     assert!(raw.messages[0].content.starts_with("Read input.txt"));
     conn.execute_batch("COMMIT;").unwrap();
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     assert_eq!(raw.messages[0].content, "Updated prompt");
 }
 
@@ -121,7 +121,7 @@ fn interleaved_subtasks_do_not_replace_the_root_tasks_tool_directory() {
         ..Default::default()
     };
     conn.execute("INSERT INTO agent_tasks (conversation_id, task_id, task) VALUES ('conversation-1', 'child-task', ?1)", [child.encode_to_vec()]).unwrap();
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     assert_eq!(raw.directory.as_deref(), Some("/tmp/recall-warp-project"));
     assert_eq!(raw.events[0].files[0].cwd.as_deref(), Some("/tmp/recall-warp-project"));
 }
@@ -131,7 +131,7 @@ fn corrupt_task_skips_its_conversation_without_losing_other_conversations() {
     let (_dir, path, conn) = database();
     conn.execute_batch("INSERT INTO agent_conversations (conversation_id, conversation_data) VALUES ('bad', '{}');
         INSERT INTO agent_tasks (conversation_id, task_id, task) VALUES ('bad', 'bad-task', x'ff');").unwrap();
-    let scan = scan_db(Some(&path), None, true).unwrap();
+    let scan = scan_db(&path, None, true).unwrap();
     assert_eq!(scan.stats.candidates, 2);
     assert_eq!(scan.sessions.len(), 1);
     assert_eq!(scan.sessions[0].source_id, "conversation-1");
@@ -147,7 +147,7 @@ fn aggregate_stats_and_absent_token_counts_do_not_invent_usage_or_tool_calls() {
         message.tool_call_result = None;
     }
     write_task(&conn, &task);
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     assert_eq!(raw.messages.len(), 3);
     assert!(raw.events.is_empty());
     assert!(raw.usage_events.is_empty());
@@ -161,7 +161,7 @@ fn missing_timestamps_preserve_message_order_and_duplicates_are_not_reindexed() 
     let duplicate = task.messages[0].clone();
     task.messages.push(duplicate);
     write_task(&conn, &task);
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     assert_eq!(raw.messages.len(), 3);
     assert_eq!(raw.messages[0].role, Role::User);
     assert_eq!(raw.messages[1].content, "I will inspect the file first.");
@@ -181,7 +181,7 @@ fn restricted_streaming_scan_and_usage_only_scan_obey_the_core_contract() {
     let context = AdapterSyncContext::empty_for_test("warp")
         .restricted_to("conversation-1")
         .with_session_sink(&mut sink);
-    let scan = scan_db(Some(&path), Some(&context), false).unwrap();
+    let scan = scan_db(&path, Some(&context), false).unwrap();
     assert_eq!(scan.stats.candidates, 1);
     assert!(scan.sessions.is_empty());
     drop(context);
@@ -200,7 +200,7 @@ fn taskless_conversations_do_not_emit_user_only_sessions() {
     for id in ["legacy", "conversation-1"] {
         conn.execute("INSERT INTO ai_queries (conversation_id, input, working_directory, start_ts) VALUES (?1, ?2, '/tmp/legacy', '2026-09-30 15:00:00')", params![id, input]).unwrap();
     }
-    let scan = scan_db(Some(&path), None, true).unwrap();
+    let scan = scan_db(&path, None, true).unwrap();
     assert_eq!(scan.sessions.len(), 1);
     assert_eq!(scan.sessions[0].messages.len(), 3);
     assert_eq!(scan.sessions[0].source_id, "conversation-1");
@@ -216,7 +216,7 @@ fn shell_results_keep_executed_commands_and_failure_status() {
     shell.command = "mv input.txt changed.txt".into();
     shell.command_finished.as_mut().unwrap().exit_code = 1;
     write_task(&conn, &task);
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     let result = &raw.events[3];
     assert_eq!(result.status.as_deref(), Some("error"));
     assert_eq!(result.target.as_deref(), Some("mv input.txt changed.txt"));
@@ -261,11 +261,11 @@ fn file_delete_move_and_opaque_tool_variants_preserve_source_evidence() {
 fn missing_sources_are_empty_and_not_created() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.sqlite");
-    assert!(scan_db(Some(&missing), None, true).unwrap().sessions.is_empty());
+    assert!(scan_db(&missing, None, true).unwrap().sessions.is_empty());
     assert!(!missing.exists());
     let path = dir.path().join("empty.sqlite");
     let _conn = Connection::open(&path).unwrap();
-    assert!(scan_db(Some(&path), None, true).unwrap().sessions.is_empty());
+    assert!(scan_db(&path, None, true).unwrap().sessions.is_empty());
 }
 
 #[test]
@@ -284,7 +284,7 @@ fn official_origin_fixture_excludes_agent_and_automated_prompts() {
         proto::Task::decode(include_bytes!("../../../tests/fixtures/warp/origins.bin").as_slice())
             .unwrap();
     write_task(&conn, &task);
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     assert_eq!(
         raw.messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
         ["origin-legacy", "origin-client", "origin-external", "origin-api", "origin-unknown"]
@@ -307,7 +307,7 @@ fn forked_tasks_preserve_message_based_usage_keys_and_parent_links() {
         [fork.encode_to_vec()],
     )
     .unwrap();
-    let scan = scan_db(Some(&path), None, true).unwrap();
+    let scan = scan_db(&path, None, true).unwrap();
     let root = &scan.sessions[0];
     let child = &scan.sessions[1];
     assert_eq!(root.usage_events[0].event_key, child.usage_events[0].event_key);
@@ -358,7 +358,7 @@ fn invalid_parent_metadata_does_not_discard_task_content() {
     let (_dir, path, conn) = database();
     for data in [r#"{"parent_conversation_id":"  "}"#, "malformed"] {
         conn.execute("UPDATE agent_conversations SET conversation_data = ?1", [data]).unwrap();
-        let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+        let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
         assert_eq!(raw.messages.len(), 3);
         assert!(raw.parent_links.is_empty());
     }
@@ -379,7 +379,7 @@ fn unchanged_shell_results_do_not_repeat_call_file_evidence() {
         .unwrap()
         .command = "mv a.txt b.txt".into();
     write_task(&conn, &task);
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     assert_eq!(
         raw.events[2]
             .files
@@ -394,7 +394,7 @@ fn unchanged_shell_results_do_not_repeat_call_file_evidence() {
     assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
     task.messages[5].timestamp = Some(proto::Timestamp { seconds: 1790784001, nanos: 0 });
     write_task(&conn, &task);
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     assert_eq!(
         raw.events
             .iter()
@@ -405,7 +405,7 @@ fn unchanged_shell_results_do_not_repeat_call_file_evidence() {
     );
     task.messages[4].tool_call = None;
     write_task(&conn, &task);
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     let result = raw
         .events
         .iter()
@@ -451,7 +451,7 @@ fn invalid_utf8_metadata_skips_only_its_conversation() {
         )
         .unwrap();
     }
-    let scan = scan_db(Some(&path), None, true).unwrap();
+    let scan = scan_db(&path, None, true).unwrap();
     assert_eq!(scan.stats.candidates, 3);
     assert_eq!(scan.stats.parsed, 2);
     assert_eq!(
@@ -459,7 +459,7 @@ fn invalid_utf8_metadata_skips_only_its_conversation() {
         ["conversation-1", "z-good"]
     );
     conn.execute_batch("UPDATE agent_conversations SET conversation_data = CAST(x'ff' AS TEXT) WHERE conversation_id = 'a-bad';").unwrap();
-    assert_eq!(scan_db(Some(&path), None, true).unwrap().sessions.len(), 2);
+    assert_eq!(scan_db(&path, None, true).unwrap().sessions.len(), 2);
 }
 
 #[test]
@@ -504,7 +504,7 @@ fn interleaved_result_names_do_not_depend_on_call_timestamp_order() {
     write_task(&conn, &task);
     let child = proto::Task { id: "results-task".into(), messages: results, ..Default::default() };
     conn.execute("INSERT INTO agent_tasks (conversation_id, task_id, task) VALUES ('conversation-1', 'results-task', ?1)", [child.encode_to_vec()]).unwrap();
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     for (id, name) in
         [("read-1", "read_files"), ("shell-1", "run_shell_command"), ("edit-1", "apply_file_diffs")]
     {
@@ -523,7 +523,7 @@ fn real_probe_preserves_native_messages_events_and_missing_usage() {
     conn.execute_batch("UPDATE agent_conversations SET conversation_data = '{}', last_modified_at = '2026-10-07 15:42:09';
         UPDATE agent_tasks SET last_modified_at = '2026-10-07 15:42:09';").unwrap();
     conn.execute("UPDATE agent_tasks SET task = ?1", [PROBE]).unwrap();
-    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
     assert_eq!(raw.custom_title.as_deref(), Some("Count Lines And Append Text In File"));
     assert_eq!(raw.directory.as_deref(), Some("/tmp/recall-warp-probe"));
     assert_eq!(raw.started_at, 1791387715621);

@@ -114,11 +114,9 @@ fn scan_paths(
     let mut result = SyncScanResult::default();
     let mut seen = HashSet::new();
     for path in paths {
-        let mut scan = SyncScanResult::default();
-        let outcome =
-            scan_db_with_seen(Some(path), context, since_ts, include_events, &mut seen, &mut scan);
-        result.absorb(scan);
-        if let Err(error) = outcome {
+        if let Err(error) =
+            scan_db_with_seen(path, context, since_ts, include_events, &mut seen, &mut result)
+        {
             if error.is::<SessionWriteError>() {
                 return Err(error);
             }
@@ -149,7 +147,7 @@ fn has_table(conn: &Connection, name: &str) -> Result<bool> {
 
 #[cfg(test)]
 fn scan_db(
-    path: Option<&Path>,
+    path: &Path,
     context: Option<&AdapterSyncContext>,
     include_events: bool,
 ) -> Result<SyncScanResult> {
@@ -159,16 +157,16 @@ fn scan_db(
 }
 
 fn scan_db_with_seen(
-    path: Option<&Path>,
+    path: &Path,
     context: Option<&AdapterSyncContext>,
     since_ts: Option<i64>,
     include_events: bool,
     seen: &mut HashSet<String>,
     result: &mut SyncScanResult,
 ) -> Result<()> {
-    let Some(path) = path.filter(|path| path.is_file()) else {
+    if !path.is_file() {
         return Ok(());
-    };
+    }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .context("opening Warp database read-only")?;
     conn.busy_timeout(Duration::from_secs(3))?;
@@ -275,13 +273,6 @@ impl proto::Timestamp {
     }
 }
 
-fn cwd(context: Option<&proto::InputContext>) -> Option<String> {
-    context
-        .and_then(|context| context.directory.as_ref())
-        .map(|directory| directory.pwd.clone())
-        .filter(|pwd| !pwd.trim().is_empty())
-}
-
 fn parse_conversation(
     conn: &Connection,
     id: &str,
@@ -354,7 +345,11 @@ fn parse_conversation(
             message.user_query.as_ref().and_then(|query| query.context.as_ref()).or_else(|| {
                 message.tool_call_result.as_ref().and_then(|result| result.context.as_ref())
             });
-        if let Some(pwd) = cwd(context) {
+        if let Some(pwd) = context
+            .and_then(|context| context.directory.as_ref())
+            .map(|directory| directory.pwd.clone())
+            .filter(|pwd| !pwd.trim().is_empty())
+        {
             directory = directory.or_else(|| Some(pwd.clone()));
             task_directories.insert(task_id.clone(), pwd);
         }
