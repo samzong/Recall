@@ -54,7 +54,7 @@ impl SourceAdapter for QoderAdapter {
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let mut sessions = Vec::new();
-        let QoderEntries { entries, parent_ids } = collect_entries(&config_dirs()?);
+        let QoderEntries { entries, parent_ids } = collect_entries(&config_dirs());
         for entry in entries {
             let Some(before) = snapshot(&entry) else { continue };
             let raw = parse_entry(
@@ -76,7 +76,7 @@ impl SourceAdapter for QoderAdapter {
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let QoderEntries { entries, parent_ids } = collect_entries(&config_dirs()?);
+        let QoderEntries { entries, parent_ids } = collect_entries(&config_dirs());
         Ok(Some(file_scan::run_file_scan_with_options_and_snapshot(
             context,
             since_ts,
@@ -100,18 +100,26 @@ fn native_command(id: &str) -> (&str, &str) {
     id.strip_prefix("cn:").map_or(("qodercli", id), |id| ("qoderclicn", id))
 }
 
-fn config_dirs() -> anyhow::Result<Vec<(PathBuf, &'static str)>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    Ok([
-        (paths::env_path_dir("QODER_CONFIG_DIR").unwrap_or_else(|| home.join(".qoder")), ""),
-        (
-            paths::env_path_dir("QODERCN_CONFIG_DIR").unwrap_or_else(|| home.join(".qoder-cn")),
-            "cn:",
-        ),
+fn config_dirs() -> Vec<(PathBuf, &'static str)> {
+    resolve_config_dirs(
+        paths::env_path_dir("QODER_CONFIG_DIR"),
+        paths::env_path_dir("QODERCN_CONFIG_DIR"),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+fn resolve_config_dirs(
+    qoder: Option<PathBuf>,
+    qoder_cn: Option<PathBuf>,
+    home: Option<&Path>,
+) -> Vec<(PathBuf, &'static str)> {
+    [
+        (qoder.or_else(|| home.map(|home| home.join(".qoder"))), ""),
+        (qoder_cn.or_else(|| home.map(|home| home.join(".qoder-cn"))), "cn:"),
     ]
     .into_iter()
-    .filter(|(dir, _)| dir.is_dir())
-    .collect())
+    .filter_map(|(dir, prefix)| dir.filter(|dir| dir.is_dir()).map(|dir| (dir, prefix)))
+    .collect()
 }
 
 fn collect_entries(dirs: &[(PathBuf, &str)]) -> QoderEntries {
@@ -535,6 +543,25 @@ mod tests {
     fn write_records(entry: &FileScanEntry, records: &[Value]) {
         fs::write(&entry.stat_target, records.iter().map(|r| format!("{r}\n")).collect::<String>())
             .unwrap();
+    }
+
+    #[test]
+    fn resolves_explicit_config_dirs_without_home() {
+        let root = tempfile::tempdir().unwrap();
+        let qoder = root.path().join("custom-qoder");
+        let qoder_cn = root.path().join("custom-qoder-cn");
+        fs::create_dir_all(&qoder).unwrap();
+        fs::create_dir_all(&qoder_cn).unwrap();
+        assert_eq!(
+            resolve_config_dirs(Some(qoder.clone()), Some(qoder_cn.clone()), None),
+            [(qoder.clone(), ""), (qoder_cn.clone(), "cn:")]
+        );
+        assert_eq!(resolve_config_dirs(Some(qoder), None, None).len(), 1);
+        assert_eq!(resolve_config_dirs(None, Some(qoder_cn), None).len(), 1);
+        assert!(resolve_config_dirs(None, None, None).is_empty());
+        let default = root.path().join(".qoder");
+        fs::create_dir_all(&default).unwrap();
+        assert_eq!(resolve_config_dirs(None, None, Some(root.path())), [(default, "")]);
     }
 
     #[test]
