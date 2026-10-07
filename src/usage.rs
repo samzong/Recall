@@ -86,6 +86,7 @@ pub(crate) struct UsageDedup {
     codex_seen: HashSet<String>,
     claude_seen: HashSet<String>,
     warp_seen: HashSet<String>,
+    qoder_seen: HashSet<String>,
 }
 
 impl UsageDedup {
@@ -112,6 +113,12 @@ impl UsageDedup {
         }
         if event.source == "warp" {
             return self.warp_seen.insert(event.event_key.clone());
+        }
+        if event.source == "qoder"
+            && event.event_key.starts_with("assistant:")
+            && !event.event_key.starts_with("assistant:line:")
+        {
+            return self.qoder_seen.insert(event.event_key.clone());
         }
         true
     }
@@ -379,5 +386,41 @@ mod tests {
         let report = aggregate_usage_events(&[first, duplicate, next, category]);
         assert_eq!(report.summary.events, 3);
         assert_eq!(report.summary.tokens.total_tokens, 42);
+    }
+
+    #[test]
+    fn aggregate_usage_dedupes_qoder_forked_messages() {
+        let mut events = Vec::new();
+        for (index, (input, output)) in [(120, 20), (170, 15), (190, 12)].into_iter().enumerate() {
+            let mut original =
+                event("qoder", "parent", &format!("assistant:msg-{index}"), index as i64);
+            original.input_tokens = input;
+            original.output_tokens = output;
+            original.cache_read_tokens = 0;
+            original.reasoning_tokens = 0;
+            original.token_source = "observed".to_string();
+            let mut forked = original.clone();
+            forked.session_id = "fork".to_string();
+            forked.source_id = "fork".to_string();
+            events.extend([original, forked]);
+        }
+        let report = aggregate_usage_events(&events);
+        assert_eq!(report.summary.events, 3);
+        assert_eq!(report.summary.tokens.input_tokens, 480);
+        assert_eq!(report.summary.tokens.output_tokens, 47);
+        assert_eq!(report.summary.tokens.total_tokens, 527);
+    }
+
+    #[test]
+    fn aggregate_usage_keeps_qoder_line_keys_and_other_sources_separate() {
+        let events = [
+            event("qoder", "parent", "assistant:line:2", 1),
+            event("qoder", "fork", "assistant:line:2", 1),
+            event("claude-code", "claude", "assistant:msg-1", 1),
+            event("qoder", "parent", "assistant:msg-1", 1),
+        ];
+        let report = aggregate_usage_events(&events);
+        assert_eq!(report.summary.events, 4);
+        assert_eq!(report.summary.tokens.total_tokens, 56);
     }
 }
