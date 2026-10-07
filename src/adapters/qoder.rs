@@ -533,16 +533,99 @@ mod tests {
     const FIXTURE: &str = include_str!("../../tests/fixtures/qoder/cli.jsonl");
 
     fn fixture(root: &Path) -> FileScanEntry {
+        transcript_fixture(root, SESSION, FIXTURE)
+    }
+
+    fn transcript_fixture(root: &Path, session_id: &str, transcript: &str) -> FileScanEntry {
         let path =
-            root.join("projects/-tmp-qoder-fixture-project").join(format!("{SESSION}.jsonl"));
+            root.join("projects/-tmp-qoder-fixture-project").join(format!("{session_id}.jsonl"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, FIXTURE).unwrap();
-        FileScanEntry { session_id: SESSION.to_string(), stat_target: path, directory: None }
+        fs::write(&path, transcript).unwrap();
+        FileScanEntry { session_id: session_id.to_string(), stat_target: path, directory: None }
     }
 
     fn write_records(entry: &FileScanEntry, records: &[Value]) {
         fs::write(&entry.stat_target, records.iter().map(|r| format!("{r}\n")).collect::<String>())
             .unwrap();
+    }
+
+    #[test]
+    fn parses_authenticated_main_and_resumed_session_without_hidden_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let entry = transcript_fixture(
+            root.path(),
+            "22222222-2222-4222-8222-222222222222",
+            include_str!("../../tests/fixtures/qoder/real-main.jsonl"),
+        );
+        let raw = parse_transcript(&entry, 1791387600000, true, None).unwrap().unwrap();
+        assert_eq!(raw.directory.as_deref(), Some("/tmp/qoder-real-fixture-project"));
+        assert_eq!(raw.custom_title.as_deref(), Some("Recall probe main"));
+        assert_eq!(raw.started_at, 1791387384288);
+        assert_eq!(raw.messages.len(), 6);
+        assert_eq!(raw.messages[0].role, Role::User);
+        assert_eq!(raw.messages[3].content, "The final line count is 3.");
+        assert_eq!(raw.messages[4].role, Role::User);
+        assert_eq!(raw.messages[5].role, Role::Assistant);
+        assert_eq!(raw.messages[5].content, "gamma");
+        assert_eq!(raw.messages[5].timestamp, Some(1791387524399));
+        assert!(raw.parent_links.is_empty());
+        assert!(raw.usage_events.is_empty());
+        assert_eq!(raw.events.len(), 10);
+        let calls: Vec<_> = raw.events.iter().filter(|event| event.kind != "tool_result").collect();
+        let results: Vec<_> =
+            raw.events.iter().filter(|event| event.kind == "tool_result").collect();
+        assert_eq!(
+            calls.iter().map(|event| event.name.as_deref()).collect::<Vec<_>>(),
+            [Some("Read"), Some("Bash"), Some("Edit"), Some("Bash"), Some("Bash")]
+        );
+        assert_eq!(calls[0].files[0].operation, FileOperation::Read);
+        assert_eq!(calls[2].files[0].operation, FileOperation::Write);
+        for call in [calls[0], calls[2]] {
+            assert_eq!(call.target.as_deref(), Some("/tmp/qoder-real-fixture-project/sample.txt"));
+            assert_eq!(call.files[0].cwd.as_deref(), Some("/tmp/qoder-real-fixture-project"));
+        }
+        assert_eq!(results.len(), calls.len());
+        for (call, result) in calls.iter().zip(results) {
+            assert!(call.timestamp.is_some());
+            assert_eq!(result.tool_call_id, call.tool_call_id);
+            assert_eq!(result.name, call.name);
+            assert_eq!(result.status, None);
+            assert_eq!(result.visibility, None);
+        }
+    }
+
+    #[test]
+    fn parses_authenticated_fork_with_copied_history_and_parent_link() {
+        let root = tempfile::tempdir().unwrap();
+        let main = transcript_fixture(
+            root.path(),
+            "22222222-2222-4222-8222-222222222222",
+            include_str!("../../tests/fixtures/qoder/real-main.jsonl"),
+        );
+        let fork = transcript_fixture(
+            root.path(),
+            "33333333-3333-4333-8333-333333333333",
+            include_str!("../../tests/fixtures/qoder/real-fork.jsonl"),
+        );
+        let main = parse_transcript(&main, 1791387600000, true, None).unwrap().unwrap();
+        let fork = parse_transcript(&fork, 1791387600000, true, None).unwrap().unwrap();
+        assert_eq!(fork.messages.len(), 8);
+        for (original, copied) in main.messages.iter().zip(&fork.messages) {
+            assert_eq!(copied.role, original.role);
+            assert_eq!(copied.content, original.content);
+            assert_eq!(copied.timestamp, original.timestamp);
+        }
+        assert_eq!(fork.custom_title.as_deref(), Some("Recall probe fork"));
+        assert_eq!(fork.parent_links.len(), 1);
+        assert_eq!(fork.parent_links[0].source_id, main.source_id);
+        assert_eq!(fork.parent_links[0].relation, ParentRelation::Fork);
+        assert_eq!(fork.messages[6].content, "Without using tools, answer FORK_OK only.");
+        assert_eq!(fork.messages[7].content, "The final line count in sample.txt is 3.");
+        assert_eq!(fork.messages[7].timestamp, Some(1791387585678));
+        assert_eq!(fork.directory, main.directory);
+        assert_eq!(fork.started_at, main.started_at);
+        assert_eq!(fork.events.len(), main.events.len());
+        assert!(fork.usage_events.is_empty());
     }
 
     #[test]

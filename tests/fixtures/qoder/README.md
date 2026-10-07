@@ -1,4 +1,29 @@
-# Qoder CLI parser fixture
+# Qoder CLI parser fixtures
+
+`real-main.jsonl` and `real-fork.jsonl` were captured from authenticated Qoder
+CLI 1.1.65 on macOS 27.0.1 arm64 on 2026-10-07, using Qwen3.8-Flash in an
+isolated HOME and a temporary project containing only `sample.txt`.
+Three short tasks read the file, ran `wc -l sample.txt`, appended `gamma`,
+resumed the main session to ask which line was appended, and forked the session.
+The file changed from `alpha` / `beta` to `alpha` / `beta` / `gamma`.
+
+The main transcript contains six visible messages and five tool calls with five
+results. Resume returned `gamma`. The fork copies those messages and tools,
+adds two visible messages, and records `forkedFrom` pointing to the main session.
+The fork request asked for `FORK_OK`; the actual assistant instead answered
+`The final line count in sample.txt is 3.`. Both the request and actual answer
+are preserved. Native-provider input, output, cache-read, and cache-write counts
+were all zero; these real fixtures must not generate usage events.
+
+Sanitization keeps probe messages, tool payloads/results, timestamps, inline
+titles, ancestry, and zero token counters. Session IDs, record UUIDs, model
+response IDs, and tool-call IDs are replaced consistently; project paths become
+`/tmp/qoder-real-fixture-project`. Reasoning text is redacted. Runtime
+configuration, file-history snapshots, account and billing metadata, request
+identifiers, and other unrelated records are omitted. No credentials or original
+login conversation are included. The parser tests exercise the sanitized real
+envelopes, copied fork history, resume messages, tool result linkage, and hidden
+usage behavior.
 
 `cli.jsonl` is synthetic, not captured from an authenticated Qoder session.
 It contains no credentials or private conversation data.
@@ -22,7 +47,7 @@ then the latest message cwd; directory-priority tests follow these records.
 No `-session.json` or `fork_from` writer exists in this bundle; only transcript
 metadata is supported.
 
-Installation on macOS succeeded, but print mode, model discovery, and the
-interactive startup all required vendor authentication. Qoder itself recognized this synthetic transcript through `--list-sessions`.
-No vendor account was registered or used. Replace or supplement this fixture with a sanitized real
-session once authorized credentials are available.
+Positive token values, cache splitting, compaction/rewind behavior, subagent
+names, and worktree/relocation priority remain synthetic or bundle-derived
+regression coverage. The authenticated real captures do not establish those
+numeric or runtime behaviors, China-edition behavior, or IDE storage formats.
