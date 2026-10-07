@@ -25,11 +25,6 @@ const METADATA_PARSER_VERSION: u32 = 3;
 
 pub(crate) struct QoderAdapter;
 
-struct QoderEntries {
-    entries: Vec<FileScanEntry>,
-    parent_ids: HashMap<String, String>,
-}
-
 impl SourceAdapter for QoderAdapter {
     fn id(&self) -> &str {
         "qoder"
@@ -54,15 +49,9 @@ impl SourceAdapter for QoderAdapter {
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
         let mut sessions = Vec::new();
-        let QoderEntries { entries, parent_ids } = collect_entries(&config_dirs());
-        for entry in entries {
+        for entry in collect_entries(&config_dirs()) {
             let Some(before) = snapshot(&entry) else { continue };
-            let raw = parse_entry(
-                entry.clone(),
-                before.effective_mtime_ms(),
-                true,
-                parent_ids.get(&entry.session_id).map(String::as_str),
-            )?;
+            let raw = parse_entry(entry.clone(), before.effective_mtime_ms(), true)?;
             if snapshot(&entry).as_ref() == Some(&before) {
                 sessions.extend(raw);
             }
@@ -76,7 +65,6 @@ impl SourceAdapter for QoderAdapter {
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let QoderEntries { entries, parent_ids } = collect_entries(&config_dirs());
         Ok(Some(file_scan::run_file_scan_with_options_and_snapshot(
             context,
             since_ts,
@@ -86,12 +74,9 @@ impl SourceAdapter for QoderAdapter {
                 event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
                 metadata_parser_version: Some(METADATA_PARSER_VERSION),
             },
-            entries,
+            collect_entries(&config_dirs()),
             snapshot,
-            |entry, mtime| {
-                let parent = parent_ids.get(&entry.session_id).map(String::as_str);
-                parse_entry(entry, mtime, include_events, parent)
-            },
+            |entry, mtime| parse_entry(entry, mtime, include_events),
         )?))
     }
 }
@@ -122,9 +107,8 @@ fn resolve_config_dirs(
     .collect()
 }
 
-fn collect_entries(dirs: &[(PathBuf, &str)]) -> QoderEntries {
+fn collect_entries(dirs: &[(PathBuf, &str)]) -> Vec<FileScanEntry> {
     let mut entries = Vec::new();
-    let mut parent_ids = HashMap::new();
     for (dir, prefix) in dirs {
         let Ok(projects) = fs::read_dir(dir.join("projects")) else { continue };
         for project in projects.flatten() {
@@ -149,10 +133,8 @@ fn collect_entries(dirs: &[(PathBuf, &str)]) -> QoderEntries {
                     for file in subagents.flatten() {
                         let path = file.path();
                         if let Some(id) = transcript_id(&path, true) {
-                            let session_id = format!("{prefix}{parent}:{id}");
-                            parent_ids.insert(session_id.clone(), format!("{prefix}{parent}"));
                             entries.push(FileScanEntry {
-                                session_id,
+                                session_id: format!("{prefix}{parent}:{id}"),
                                 stat_target: path,
                                 directory: None,
                             });
@@ -165,7 +147,7 @@ fn collect_entries(dirs: &[(PathBuf, &str)]) -> QoderEntries {
     entries.sort_by(|a, b| a.stat_target.cmp(&b.stat_target));
     let mut claimed = HashSet::new();
     entries.retain(|entry| claimed.insert(entry.session_id.clone()));
-    QoderEntries { entries, parent_ids }
+    entries
 }
 
 fn valid_id(id: &str) -> bool {
@@ -191,9 +173,8 @@ fn parse_entry(
     entry: FileScanEntry,
     mtime: i64,
     include_events: bool,
-    parent_id: Option<&str>,
 ) -> anyhow::Result<Option<RawSession>> {
-    match parse_transcript(&entry, mtime, include_events, parent_id) {
+    match parse_transcript(&entry, mtime, include_events) {
         Ok(session) => Ok(session),
         Err(error) => {
             warn!("failed to parse {}: {error}", entry.stat_target.display());
@@ -206,9 +187,13 @@ fn parse_transcript(
     entry: &FileScanEntry,
     mtime: i64,
     include_events: bool,
-    parent_id: Option<&str>,
 ) -> anyhow::Result<Option<RawSession>> {
     let path = &entry.stat_target;
+    let (prefix, local_id) = entry
+        .session_id
+        .strip_prefix("cn:")
+        .map_or(("", entry.session_id.as_str()), |id| ("cn:", id));
+    let parent_id = local_id.split_once(':').map(|(parent, _)| format!("{prefix}{parent}"));
     let subagent = parent_id.is_some();
     let source_path = path.to_string_lossy().to_string();
     let mut directory = None;
@@ -222,7 +207,6 @@ fn parse_transcript(
     let mut events = Vec::new();
     let mut usage = Vec::<RawUsageEvent>::new();
     let mut usage_index = HashMap::<String, usize>::new();
-    let mut seen = HashSet::new();
     let mut calls = HashMap::new();
     let mut parents = HashMap::new();
     let mut event_uuids = Vec::new();
@@ -272,7 +256,7 @@ fn parse_transcript(
         }
         let uuid = nonempty(record.get("uuid"));
         if let Some(id) = &uuid {
-            if !seen.insert(id.clone()) {
+            if parents.contains_key(id) {
                 continue;
             }
             parents.insert(
@@ -322,7 +306,6 @@ fn parse_transcript(
                 usage.push(event);
             }
         }
-        let event_cwd = nonempty(record.get("cwd")).or_else(|| directory.clone());
         if include_events
             && !hidden
             && let Some(items) = content.and_then(Value::as_array)
@@ -352,27 +335,22 @@ fn parse_transcript(
                             calls.insert(id.clone(), name.clone());
                         }
                         let operation = match name.as_str() {
-                            "Read" => Some(FileOperation::Read),
+                            "Read" => Some((FileOperation::Read, "file_read")),
                             "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
-                                Some(FileOperation::Write)
+                                Some((FileOperation::Write, "file_write"))
                             }
                             _ => None,
                         };
-                        if let Some(operation) = operation
+                        if let Some((operation, kind)) = operation
                             && let Some(file) = nonempty(item.pointer("/input/file_path"))
                                 .or_else(|| nonempty(item.pointer("/input/notebook_path")))
                         {
                             event.target = Some(file.clone());
-                            event.kind = if operation == FileOperation::Read {
-                                "file_read"
-                            } else {
-                                "file_write"
-                            }
-                            .to_string();
+                            event.kind = kind.to_string();
                             event.files.push(FileEvidence::call(
                                 file,
                                 operation,
-                                event_cwd.clone(),
+                                directory.clone(),
                             ));
                         }
                         if matches!(name.as_str(), "Bash" | "PowerShell")
@@ -380,7 +358,7 @@ fn parse_transcript(
                                 item.pointer("/input/command").and_then(Value::as_str)
                         {
                             let (files, status) = if name == "Bash" {
-                                events::shell_file_evidence(command, event_cwd.as_deref())
+                                events::shell_file_evidence(command, directory.as_deref())
                             } else {
                                 (Vec::new(), CommandEvidenceStatus::Unsupported)
                             };
@@ -416,19 +394,15 @@ fn parse_transcript(
     }
     if rewound {
         let mut active = HashSet::new();
-        let mut complete = true;
-        while let Some(id) = active_leaf {
-            if !active.insert(id.clone()) {
-                complete = false;
-                break;
+        let complete = loop {
+            let Some(id) = active_leaf else { break !active.is_empty() };
+            let Some(parent) = parents.get(&id) else { break false };
+            if !active.insert(id) {
+                break false;
             }
-            let Some(parent) = parents.get(&id) else {
-                complete = false;
-                break;
-            };
             active_leaf = parent.clone();
-        }
-        if complete && !active.is_empty() {
+        };
+        if complete {
             for (event, uuid) in events.iter_mut().zip(event_uuids) {
                 if uuid.is_some_and(|id| !active.contains(&id)) {
                     event.visibility = Some(EvidenceVisibility::Inactive);
@@ -455,10 +429,9 @@ fn parse_transcript(
         session.parent_links.push(ParentLink {
             relation: ParentRelation::Spawn,
             source: "qoder".to_string(),
-            source_id: parent.to_string(),
+            source_id: parent,
         });
     } else if let Some(parent) = fork_parent {
-        let prefix = if entry.session_id.starts_with("cn:") { "cn:" } else { "" };
         session.parent_links.push(ParentLink {
             relation: ParentRelation::Fork,
             source: "qoder".to_string(),
@@ -557,7 +530,7 @@ mod tests {
             "22222222-2222-4222-8222-222222222222",
             include_str!("../../tests/fixtures/qoder/real-main.jsonl"),
         );
-        let raw = parse_transcript(&entry, 1791387600000, true, None).unwrap().unwrap();
+        let raw = parse_transcript(&entry, 1791387600000, true).unwrap().unwrap();
         assert_eq!(raw.directory.as_deref(), Some("/tmp/qoder-real-fixture-project"));
         assert_eq!(raw.custom_title.as_deref(), Some("Recall probe main"));
         assert_eq!(raw.started_at, 1791387384288);
@@ -607,8 +580,8 @@ mod tests {
             "33333333-3333-4333-8333-333333333333",
             include_str!("../../tests/fixtures/qoder/real-fork.jsonl"),
         );
-        let main = parse_transcript(&main, 1791387600000, true, None).unwrap().unwrap();
-        let fork = parse_transcript(&fork, 1791387600000, true, None).unwrap().unwrap();
+        let main = parse_transcript(&main, 1791387600000, true).unwrap().unwrap();
+        let fork = parse_transcript(&fork, 1791387600000, true).unwrap().unwrap();
         assert_eq!(fork.messages.len(), 8);
         for (original, copied) in main.messages.iter().zip(&fork.messages) {
             assert_eq!(copied.role, original.role);
@@ -651,7 +624,7 @@ mod tests {
     fn parses_cli_envelope_messages_timestamps_and_tools() {
         let root = tempfile::tempdir().unwrap();
         let entry = fixture(root.path());
-        let raw = parse_transcript(&entry, 1791370810000, true, None).unwrap().unwrap();
+        let raw = parse_transcript(&entry, 1791370810000, true).unwrap().unwrap();
         assert_eq!(raw.directory.as_deref(), Some("/tmp/qoder-fixture-project"));
         assert_eq!(raw.started_at, 1791370800000);
         assert_eq!(raw.updated_at, Some(1791370810000));
@@ -674,7 +647,7 @@ mod tests {
         assert_eq!(raw.usage_events.len(), 3);
         assert_eq!(raw.usage_events.iter().map(|u| u.input_tokens).sum::<i64>(), 480);
         assert!(raw.usage_events.iter().all(|u| u.provider == "unknown"));
-        let without_events = parse_transcript(&entry, 1791370810000, false, None).unwrap().unwrap();
+        let without_events = parse_transcript(&entry, 1791370810000, false).unwrap().unwrap();
         assert!(without_events.events.is_empty());
         assert_eq!(without_events.event_parser_version, None);
         assert_eq!(without_events.messages.len(), raw.messages.len());
@@ -697,7 +670,7 @@ mod tests {
                 json!({"type":"token-stats", "promptTokenCount":4000,"timestamp":1791370800000i64}),
             ],
         );
-        let raw = parse_transcript(&entry, 10, true, None).unwrap().unwrap();
+        let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
         assert_eq!(
             raw.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
             ["describe file", "done"]
@@ -713,7 +686,7 @@ mod tests {
         let first = json!({"type":"assistant","uuid":"one", "message":{"id":"response", "model":"fixture", "content":[{"type":"tool_use","name":"Read","id":"call","input":{"file_path":"sample.txt"}}]}});
         let last = json!({"type":"assistant","uuid":"two", "message":{"id":"response", "model":"fixture", "content":[{"type":"text","text":"done"}], "usage":{"input_tokens":80,"output_tokens":12}}});
         write_records(&entry, &[first.clone(), first, last.clone(), last]);
-        let raw = parse_transcript(&entry, 10, true, None).unwrap().unwrap();
+        let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
         assert_eq!(raw.messages.len(), 1);
         assert_eq!(raw.events.len(), 1);
         assert_eq!(raw.usage_events.len(), 1);
@@ -733,18 +706,10 @@ mod tests {
         fs::create_dir_all(child.parent().unwrap()).unwrap();
         fs::write(&child, r#"{"type":"user","isSidechain":true,"sessionId":"11111111-1111-4111-8111-111111111111","message":{"content":"inspect file"}}"#).unwrap();
         fs::write(entry.stat_target.parent().unwrap().join("agent-orphan.jsonl"), FIXTURE).unwrap();
-        let QoderEntries { entries, parent_ids } =
-            collect_entries(&[(root.path().to_path_buf(), "cn:")]);
+        let entries = collect_entries(&[(root.path().to_path_buf(), "cn:")]);
         assert_eq!(entries.len(), 2);
         let child = entries.iter().find(|e| e.session_id.contains(":agent-")).unwrap();
-        let raw = parse_transcript(
-            child,
-            10,
-            true,
-            parent_ids.get(&child.session_id).map(String::as_str),
-        )
-        .unwrap()
-        .unwrap();
+        let raw = parse_transcript(child, 10, true).unwrap().unwrap();
         assert_eq!(raw.messages[0].content, "inspect file");
         assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));
         assert_eq!(raw.parent_links[0].source_id, format!("cn:{SESSION}"));
@@ -767,18 +732,10 @@ mod tests {
         ] {
             fs::write(children.join(format!("{name}.jsonl")), r#"{"type":"user","isSidechain":true,"message":{"content":"plugin subagent result"}}"#).unwrap();
         }
-        let QoderEntries { entries, parent_ids } =
-            collect_entries(&[(root.path().to_path_buf(), "cn:")]);
+        let entries = collect_entries(&[(root.path().to_path_buf(), "cn:")]);
         assert_eq!(entries.len(), 4);
         for child in entries.iter().filter(|entry| entry.session_id.contains(":agent-")) {
-            let raw = parse_transcript(
-                child,
-                10,
-                true,
-                parent_ids.get(&child.session_id).map(String::as_str),
-            )
-            .unwrap()
-            .unwrap();
+            let raw = parse_transcript(child, 10, true).unwrap().unwrap();
             assert_eq!(raw.messages[0].content, "plugin subagent result");
             assert_eq!(raw.parent_links[0].source_id, format!("cn:{SESSION}"));
             assert_eq!(raw.parent_links[0].relation, ParentRelation::Spawn);
@@ -796,26 +753,26 @@ mod tests {
         ];
         write_records(&entry, &records);
         assert_eq!(
-            parse_transcript(&entry, 10, true, None).unwrap().unwrap().directory.as_deref(),
+            parse_transcript(&entry, 10, true).unwrap().unwrap().directory.as_deref(),
             Some("/tmp/latest")
         );
         records
             .push(json!({"type":"relocated","sessionId":SESSION,"relocatedCwd":"/tmp/relocated"}));
         write_records(&entry, &records);
         assert_eq!(
-            parse_transcript(&entry, 10, true, None).unwrap().unwrap().directory.as_deref(),
+            parse_transcript(&entry, 10, true).unwrap().unwrap().directory.as_deref(),
             Some("/tmp/relocated")
         );
         records.push(json!({"type":"worktree-state","sessionId":SESSION,"worktreeSession":{"worktreeCwd":"/tmp/worktree/subdir","worktreePath":"/tmp/worktree","originalCwd":"/tmp/restored"}}));
         write_records(&entry, &records);
         assert_eq!(
-            parse_transcript(&entry, 10, true, None).unwrap().unwrap().directory.as_deref(),
+            parse_transcript(&entry, 10, true).unwrap().unwrap().directory.as_deref(),
             Some("/tmp/worktree/subdir")
         );
         records.push(json!({"type":"worktree-state","sessionId":SESSION,"worktreeSession":null}));
         write_records(&entry, &records);
         assert_eq!(
-            parse_transcript(&entry, 10, true, None).unwrap().unwrap().directory.as_deref(),
+            parse_transcript(&entry, 10, true).unwrap().unwrap().directory.as_deref(),
             Some("/tmp/restored")
         );
     }
@@ -831,7 +788,7 @@ mod tests {
         write_records(&entry, &records);
         for prefix in ["", "cn:"] {
             entry.session_id = format!("{prefix}{SESSION}");
-            let raw = parse_transcript(&entry, 10, true, None).unwrap().unwrap();
+            let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
             assert_eq!(raw.parent_links.len(), 1);
             assert_eq!(raw.parent_links[0].source_id, format!("{prefix}parent"));
             assert_eq!(raw.parent_links[0].relation, ParentRelation::Fork);
@@ -844,9 +801,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let entry = fixture(root.path());
         fs::write(&entry.stat_target, format!("invalid\n{FIXTURE}\n{{partial")).unwrap();
-        let raw = parse_transcript(&entry, 10, true, None).unwrap().unwrap();
+        let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
         assert_eq!(raw.messages.len(), 3);
-        assert!(collect_entries(&[(root.path().join("missing"), "")]).entries.is_empty());
+        assert!(collect_entries(&[(root.path().join("missing"), "")]).is_empty());
     }
 
     #[test]
@@ -857,7 +814,7 @@ mod tests {
             FIXTURE.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         records.push(json!({"type":"active-leaf","sessionId":SESSION,"leafUuid":"u1","explicit":true,"rewound":true,"timestamp":1791370806000i64}));
         write_records(&entry, &records);
-        let raw = parse_transcript(&entry, 10, true, None).unwrap().unwrap();
+        let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
         assert_eq!(raw.messages.len(), 3);
         assert!(raw.events.iter().all(|e| e.visibility == Some(EvidenceVisibility::Inactive)));
     }
@@ -894,7 +851,7 @@ mod tests {
                 json!({"type":"active-leaf","leafUuid":"u2","rewound":true}),
             ],
         );
-        let raw = parse_transcript(&entry, 10, true, None).unwrap().unwrap();
+        let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
         assert_eq!(raw.events.len(), 2);
         assert_eq!(raw.events[0].visibility, None);
         assert_eq!(raw.events[1].visibility, Some(EvidenceVisibility::Inactive));
@@ -911,7 +868,7 @@ mod tests {
                 {"type":"tool_use","name":"NotebookEdit","id":"notebook","input":{"notebook_path":"sample.ipynb","new_source":"print(1)"}}
             ]}})],
         );
-        let raw = parse_transcript(&entry, 10, true, None).unwrap().unwrap();
+        let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
         assert_eq!(raw.events[0].kind, "command");
         assert_eq!(raw.events[0].target.as_deref(), Some("Get-Content sample.txt"));
         assert_eq!(raw.events[0].command_evidence_status, Some(CommandEvidenceStatus::Unsupported));
@@ -932,7 +889,7 @@ mod tests {
                 json!({"type":"assistant","cwd":"/tmp/new","message":{"content":[{"type":"tool_use","name":"Read","id":"read","input":{"file_path":"sample.txt"}}]}}),
             ],
         );
-        let raw = parse_transcript(&entry, 10, true, None).unwrap().unwrap();
+        let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
         assert_eq!(raw.directory.as_deref(), Some("/tmp/new"));
         assert_eq!(raw.events[0].files[0].cwd.as_deref(), Some("/tmp/new"));
     }

@@ -90,35 +90,33 @@ pub(crate) struct UsageDedup {
 
 impl UsageDedup {
     pub(crate) fn accept(&mut self, event: &UsageEventRecord) -> bool {
-        match event.source.as_str() {
-            "codex" => {
-                let key = format!(
-                    "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
-                    event.timestamp,
-                    event.provider,
-                    event.model,
-                    event.input_tokens,
-                    event.output_tokens,
-                    event.cache_read_tokens,
-                    event.cache_write_tokens,
-                    event.reasoning_tokens
-                );
-                self.codex_seen.insert(key)
-            }
-            "claude-code"
-                if event.event_key.starts_with("assistant:")
-                    && !event.event_key.contains(":line:") =>
-            {
-                self.claude_seen.insert(event.event_key.clone())
-            }
-            "qoder"
-                if event.event_key.starts_with("assistant:")
-                    && !event.event_key.starts_with("assistant:line:") =>
-            {
-                self.qoder_seen.insert(event.event_key.clone())
-            }
-            _ => true,
+        if event.source == "codex" {
+            let key = format!(
+                "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
+                event.timestamp,
+                event.provider,
+                event.model,
+                event.input_tokens,
+                event.output_tokens,
+                event.cache_read_tokens,
+                event.cache_write_tokens,
+                event.reasoning_tokens
+            );
+            return self.codex_seen.insert(key);
         }
+        if event.source == "claude-code"
+            && event.event_key.starts_with("assistant:")
+            && !event.event_key.contains(":line:")
+        {
+            return self.claude_seen.insert(event.event_key.clone());
+        }
+        if event.source == "qoder"
+            && event.event_key.starts_with("assistant:")
+            && !event.event_key.starts_with("assistant:line:")
+        {
+            return self.qoder_seen.insert(event.event_key.clone());
+        }
+        true
     }
 }
 
