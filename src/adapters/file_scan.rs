@@ -29,11 +29,17 @@ pub(crate) struct FileScanEntry {
 pub(crate) struct FileScanSnapshot<T> {
     effective_mtime_ms: i64,
     fingerprint: T,
+    requires_parse: bool,
 }
 
 impl<T> FileScanSnapshot<T> {
     pub(crate) fn new(effective_mtime_ms: i64, fingerprint: T) -> Self {
-        Self { effective_mtime_ms, fingerprint }
+        Self { effective_mtime_ms, fingerprint, requires_parse: false }
+    }
+
+    pub(crate) fn requiring_parse(mut self, requires_parse: bool) -> Self {
+        self.requires_parse = requires_parse;
+        self
     }
 
     pub(crate) fn effective_mtime_ms(&self) -> i64 {
@@ -183,6 +189,7 @@ where
         }
 
         if let Some(old) = existing.get(&entry.session_id)
+            && !snapshot.requires_parse
             && old.updated_at == Some(mtime_ms)
             && parser_state_is_current_for_mtime(
                 options.usage_parser_version,
