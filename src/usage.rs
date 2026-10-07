@@ -85,6 +85,7 @@ impl TokenTotals {
 pub(crate) struct UsageDedup {
     codex_seen: HashSet<String>,
     claude_seen: HashSet<String>,
+    warp_seen: HashSet<String>,
 }
 
 impl UsageDedup {
@@ -108,6 +109,9 @@ impl UsageDedup {
             && !event.event_key.contains(":line:")
         {
             return self.claude_seen.insert(event.event_key.clone());
+        }
+        if event.source == "warp" {
+            return self.warp_seen.insert(event.event_key.clone());
         }
         true
     }
@@ -360,5 +364,20 @@ mod tests {
 
         assert_eq!(report.summary.events, 1);
         assert_eq!(report.summary.tokens.total_tokens, 14);
+    }
+
+    #[test]
+    fn aggregate_usage_dedupes_warp_events_across_forked_sessions() {
+        let first =
+            event("warp", "session-a", r#"["msg-1","primary_agent","warp","test-model"]"#, 1);
+        let mut duplicate = first.clone();
+        duplicate.session_id = "session-b".into();
+        let mut next = first.clone();
+        next.event_key = r#"["msg-2","primary_agent","warp","test-model"]"#.into();
+        let mut category = first.clone();
+        category.event_key = r#"["msg-1","subagent","warp","test-model"]"#.into();
+        let report = aggregate_usage_events(&[first, duplicate, next, category]);
+        assert_eq!(report.summary.events, 3);
+        assert_eq!(report.summary.tokens.total_tokens, 42);
     }
 }

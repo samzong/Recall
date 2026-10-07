@@ -1,0 +1,182 @@
+id: "task-root"
+description: "Warp fixture task"
+messages {
+  id: "user-1"
+  user_query {
+    query: "Read input.txt, run wc -l input.txt, and update output.txt."
+    context {
+      directory {
+        pwd: "/tmp/recall-warp-project"
+      }
+    }
+  }
+  timestamp {
+    seconds: 1790784000
+    nanos: 125000000
+  }
+}
+messages {
+  id: "reply-1"
+  agent_output {
+    text: "I will inspect the file first."
+  }
+  timestamp {
+    seconds: 1790784001
+    nanos: 125000000
+  }
+}
+messages {
+  id: "read-call"
+  tool_call {
+    tool_call_id: "read-1"
+    read_files {
+      files {
+        name: "input.txt"
+      }
+    }
+  }
+  timestamp {
+    seconds: 1790784002
+    nanos: 125000000
+  }
+}
+messages {
+  id: "read-result"
+  tool_call_result {
+    tool_call_id: "read-1"
+    read_files {
+      text_files_success {
+      }
+    }
+    context {
+      directory {
+        pwd: "/tmp/recall-warp-project"
+      }
+    }
+  }
+  timestamp {
+    seconds: 1790784003
+    nanos: 125000000
+  }
+}
+messages {
+  id: "shell-call"
+  tool_call {
+    tool_call_id: "shell-1"
+    run_shell_command {
+      command: "wc -l input.txt"
+    }
+  }
+  timestamp {
+    seconds: 1790784004
+    nanos: 125000000
+  }
+}
+messages {
+  id: "shell-result"
+  tool_call_result {
+    tool_call_id: "shell-1"
+    run_shell_command {
+      command: "wc -l input.txt"
+      command_finished {
+        output: "2 input.txt\n"
+        exit_code: 0
+      }
+    }
+  }
+  timestamp {
+    seconds: 1790784005
+    nanos: 125000000
+  }
+}
+messages {
+  id: "edit-call"
+  tool_call {
+    tool_call_id: "edit-1"
+    apply_file_diffs {
+      summary: "Update the output"
+      diffs {
+        file_path: "output.txt"
+        search: "before"
+        replace: "after"
+      }
+    }
+  }
+  timestamp {
+    seconds: 1790784006
+    nanos: 125000000
+  }
+}
+messages {
+  id: "edit-result"
+  tool_call_result {
+    tool_call_id: "edit-1"
+    apply_file_diffs {
+      success {
+      }
+    }
+  }
+  timestamp {
+    seconds: 1790784007
+    nanos: 125000000
+  }
+}
+messages {
+  id: "reply-2"
+  agent_output {
+    text: "Read the file, counted two lines, and updated output.txt."
+  }
+  timestamp {
+    seconds: 1790784008
+    nanos: 125000000
+  }
+}
+messages {
+  id: "system-1"
+  system_query {
+    auto_code_diff {
+      query: "Injected background instruction"
+    }
+  }
+  timestamp {
+    seconds: 1790784001
+    nanos: 125000000
+  }
+}
+messages {
+  id: "debug-1"
+  timestamp {
+    seconds: 1790784001
+    nanos: 125000000
+  }
+  debug_output {
+    text: "Internal trace"
+  }
+}
+messages {
+  id: "usage-1"
+  timestamp {
+    seconds: 1790784008
+    nanos: 125000000
+  }
+  request_metadata {
+    charges {
+      usage_by_category {
+        key: "primary_agent"
+        value {
+          direct_api_inference_usage {
+            key: "test-model"
+            value {
+              token_count {
+                input: 11
+                output: 7
+                input_cache_read: 3
+                input_cache_write: 2
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

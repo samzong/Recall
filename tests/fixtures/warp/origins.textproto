@@ -1,0 +1,12 @@
+id: "origin-task"
+description: "Origin fixture"
+messages { id: "origin-legacy" user_query { query: "origin-legacy"  } timestamp { seconds: 1790784020 } }
+messages { id: "origin-client" user_query { query: "origin-client" origin { warp_client {} } } timestamp { seconds: 1790784021 } }
+messages { id: "origin-external" user_query { query: "origin-external" origin { external_platform {} } } timestamp { seconds: 1790784022 } }
+messages { id: "origin-parent" user_query { query: "origin-parent" origin { parent_agent {} } } timestamp { seconds: 1790784023 } }
+messages { id: "origin-wake" user_query { query: "origin-wake" origin { agent_message_wake {} } } timestamp { seconds: 1790784024 } }
+messages { id: "origin-scheduled" user_query { query: "origin-scheduled" origin { schedule {} } } timestamp { seconds: 1790784025 } }
+messages { id: "origin-automated" user_query { query: "origin-automated" origin { automation {} } } timestamp { seconds: 1790784026 } }
+messages { id: "origin-api" user_query { query: "origin-api" origin { public_api {} } } timestamp { seconds: 1790784027 } }
+messages { id: "origin-synthesized" user_query { query: "origin-synthesized" origin { server_synthesized {} } } timestamp { seconds: 1790784028 } }
+messages { id: "origin-unknown" user_query { query: "origin-unknown" origin {} } timestamp { seconds: 1790784029 } }
