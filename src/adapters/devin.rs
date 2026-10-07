@@ -5,17 +5,19 @@ use rusqlite::Connection;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::adapters::events::{self, EventContext};
 use crate::adapters::json_util::{json_i64, rfc3339_ms};
 use crate::adapters::{
     AdapterSyncContext, RawMessage, RawSession, RawUsageEvent, ResumeCommand, SourceAdapter,
     SyncScanResult, SyncScanStats,
 };
 use crate::adapters::{opencode, paths, sync_state};
-use crate::types::Role;
+use crate::types::{FileEvidence, FileOperation, RawSessionEvent, Role};
 
 pub(crate) struct DevinAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 3;
+const EVENT_PARSER_VERSION: u32 = 1;
 
 struct SessionRow {
     id: String,
@@ -57,19 +59,19 @@ impl SourceAdapter for DevinAdapter {
         let Some((conn, db_path)) = open_sessions_db()? else {
             return Ok(vec![]);
         };
-        Ok(scan_db(&conn, &db_path, None, None)?.sessions)
+        Ok(scan_db(&conn, &db_path, None, None, true)?.sessions)
     }
 
     fn scan_for_sync(
         &self,
         context: &AdapterSyncContext,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some((conn, db_path)) = open_sessions_db()? else {
             return Ok(Some(SyncScanResult::default()));
         };
-        Ok(Some(scan_db(&conn, &db_path, Some(context), since_ts)?))
+        Ok(Some(scan_db(&conn, &db_path, Some(context), since_ts, include_events)?))
     }
 }
 
@@ -97,6 +99,7 @@ fn scan_db(
     db_path: &Path,
     context: Option<&AdapterSyncContext>,
     since_ts: Option<i64>,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let mut stats = SyncScanStats::default();
     let mut sessions = Vec::new();
@@ -114,11 +117,11 @@ fn scan_db(
             stats.filtered_sessions += 1;
             continue;
         }
-        if context.is_some_and(|context| session_is_current(context, &row)) {
+        if context.is_some_and(|context| session_is_current(context, &row, include_events)) {
             stats.skipped_sessions += 1;
             continue;
         }
-        match scan_session(conn, &row, db_path) {
+        match scan_session(conn, &row, db_path, include_events) {
             Ok(Some(raw)) => {
                 stats.parsed += 1;
                 sessions.push(raw);
@@ -130,14 +133,21 @@ fn scan_db(
     Ok(SyncScanResult { sessions, stats, observations: Vec::new() })
 }
 
-fn session_is_current(context: &AdapterSyncContext, row: &SessionRow) -> bool {
+fn session_is_current(
+    context: &AdapterSyncContext,
+    row: &SessionRow,
+    include_events: bool,
+) -> bool {
     let updated_at = Some(row.updated_at);
     context.session_meta().get(&row.id).is_some_and(|old| {
         old.updated_at == updated_at
-            && sync_state::parser_state_is_current(
+            && sync_state::session_state_is_current(
                 USAGE_PARSER_VERSION,
+                EVENT_PARSER_VERSION,
                 context.usage_state().get(&row.id).copied(),
+                context.event_state().get(&row.id).copied(),
                 updated_at,
+                include_events,
             )
     })
 }
@@ -204,6 +214,7 @@ fn scan_session(
     conn: &Connection,
     session: &SessionRow,
     db_path: &Path,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let nodes = load_nodes(conn, &session.id)?;
     let mut roots: HashMap<i64, i64> = HashMap::with_capacity(nodes.len());
@@ -222,42 +233,35 @@ fn scan_session(
 
     let source_path = db_path.to_str().map(str::to_string);
     let mut messages = Vec::new();
+    let mut events = Vec::new();
+    let mut tool_names = HashMap::new();
     let mut seen_ids: HashSet<&str> = HashSet::new();
+    let mut seen_event_ids: HashSet<&str> = HashSet::new();
     for node in &nodes {
-        if !conversation_roots.contains(&roots[&node.node_id]) {
-            continue;
-        }
         let message_id = node.message.get("message_id").and_then(Value::as_str).unwrap_or_default();
-        if !seen_ids.insert(message_id) {
-            continue;
+        let in_conversation = conversation_roots.contains(&roots[&node.node_id]);
+        if in_conversation
+            && seen_ids.insert(message_id)
+            && let Some(message) = conversation_message(node)
+        {
+            messages.push(message);
         }
-        let timestamp = Some(node_timestamp_ms(node));
-        match node.message.get("role").and_then(Value::as_str) {
-            Some("user") if is_real_user_input(&node.message) => {
-                let content = user_text(&node.message);
-                if content.trim().is_empty() {
-                    continue;
-                }
-                messages.push(RawMessage { role: Role::User, content, timestamp });
-            }
-            Some("assistant") => {
-                let content =
-                    node.message.get("content").and_then(Value::as_str).unwrap_or_default();
-                if content.trim().is_empty() {
-                    continue;
-                }
-                messages.push(RawMessage {
-                    role: Role::Assistant,
-                    content: content.to_string(),
-                    timestamp,
-                });
-            }
-            _ => {}
+        if include_events && seen_event_ids.insert(message_id) {
+            let message_seq = in_conversation
+                .then(|| messages.len().checked_sub(1).map(|seq| seq as u32))
+                .flatten();
+            let mut context = NodeEventContext {
+                session,
+                source_path: source_path.as_deref(),
+                message_seq,
+                tool_names: &mut tool_names,
+            };
+            push_node_events(&mut events, &mut context, node, message_id);
         }
     }
 
     let usage_events = session_usage(&nodes, session, source_path.as_deref());
-    if messages.is_empty() && usage_events.is_empty() {
+    if messages.is_empty() && usage_events.is_empty() && events.is_empty() {
         return Ok(None);
     }
 
@@ -284,7 +288,144 @@ fn scan_session(
         },
         _ => None,
     };
-    Ok(Some(raw))
+    Ok(Some(if include_events { raw.with_events(events, EVENT_PARSER_VERSION) } else { raw }))
+}
+
+fn conversation_message(node: &MessageNode) -> Option<RawMessage> {
+    let timestamp = Some(node_timestamp_ms(node));
+    match node.message.get("role").and_then(Value::as_str) {
+        Some("user") if is_real_user_input(&node.message) => {
+            let content = user_text(&node.message);
+            (!content.trim().is_empty()).then_some(RawMessage {
+                role: Role::User,
+                content,
+                timestamp,
+            })
+        }
+        Some("assistant") => {
+            let content = node.message.get("content").and_then(Value::as_str).unwrap_or_default();
+            (!content.trim().is_empty()).then(|| RawMessage {
+                role: Role::Assistant,
+                content: content.to_string(),
+                timestamp,
+            })
+        }
+        _ => None,
+    }
+}
+
+struct NodeEventContext<'a> {
+    session: &'a SessionRow,
+    source_path: Option<&'a str>,
+    message_seq: Option<u32>,
+    tool_names: &'a mut HashMap<String, String>,
+}
+
+impl NodeEventContext<'_> {
+    fn event_context(
+        &self,
+        events: &[RawSessionEvent],
+        node: &MessageNode,
+        source_event_id: String,
+    ) -> EventContext {
+        EventContext {
+            event_seq: events.len() as u32,
+            timestamp: Some(node_timestamp_ms(node)),
+            source_path: self.source_path.map(str::to_string),
+            source_event_id: Some(source_event_id),
+            message_seq: self.message_seq,
+            parser_version: EVENT_PARSER_VERSION,
+        }
+    }
+}
+
+fn push_node_events(
+    events: &mut Vec<RawSessionEvent>,
+    context: &mut NodeEventContext<'_>,
+    node: &MessageNode,
+    message_id: &str,
+) {
+    match node.message.get("role").and_then(Value::as_str) {
+        Some("assistant") => {
+            let Some(calls) = node.message.get("tool_calls").and_then(Value::as_array) else {
+                return;
+            };
+            for (index, call) in calls.iter().enumerate() {
+                let Some(name) = non_empty_str(call.get("name")) else { continue };
+                let event_context =
+                    context.event_context(events, node, format!("{message_id}:{index}"));
+                let event = tool_call_event(event_context, name, call, context);
+                events.push(event);
+            }
+        }
+        Some("tool") => {
+            let tool_call_id = non_empty_str(node.message.get("tool_call_id"));
+            let event_context = context.event_context(events, node, message_id.to_string());
+            let mut event = events::tool_result_event(
+                event_context,
+                tool_call_id.as_ref().and_then(|id| context.tool_names.get(id)).cloned(),
+                node.message.get("content").and_then(Value::as_str).map(str::to_string),
+            );
+            event.tool_call_id = tool_call_id;
+            event.status = node
+                .message
+                .pointer("/metadata/extensions/chisel~1tool_result_meta/success")
+                .and_then(Value::as_bool)
+                .map(|success| if success { "success" } else { "error" }.to_string());
+            events.push(event);
+        }
+        _ => {}
+    }
+}
+
+fn tool_call_event(
+    event_context: EventContext,
+    name: String,
+    call: &Value,
+    context: &mut NodeEventContext<'_>,
+) -> RawSessionEvent {
+    let args = call.get("arguments");
+    let mut event = events::tool_call_event(event_context, name.clone(), args);
+    event.tool_call_id = non_empty_str(call.get("id"));
+    if let Some(id) = &event.tool_call_id {
+        context.tool_names.insert(id.clone(), name.clone());
+    }
+    let directory = Some(context.session.working_directory.clone());
+    event.kind = match name.as_str() {
+        "read" => "file_read",
+        "edit" | "write" => "file_write",
+        "exec" => "command",
+        "grep" | "find_file_by_name" | "web_search" => "search",
+        _ => "tool_call",
+    }
+    .to_string();
+    let operation = match name.as_str() {
+        "read" => Some(FileOperation::Read),
+        "edit" | "write" => Some(FileOperation::Write),
+        _ => None,
+    };
+    if let Some(operation) = operation
+        && let Some(path) = non_empty_str(args.and_then(|args| args.get("file_path")))
+    {
+        event.target = Some(path.clone());
+        event.files.push(FileEvidence::call(path, operation, directory.clone()));
+    }
+    if name == "exec"
+        && let Some(command) = args.and_then(|args| args.get("command")).and_then(Value::as_str)
+    {
+        let cwd = non_empty_str(args.and_then(|args| args.get("workdir")))
+            .filter(|cwd| Path::new(cwd).is_absolute())
+            .or(directory);
+        let (files, status) = events::shell_file_evidence(command, cwd.as_deref());
+        event.target = Some(command.to_string());
+        event.files = files;
+        event.command_evidence_status = Some(status);
+    }
+    event
+}
+
+fn non_empty_str(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty()).map(str::to_string)
 }
 
 fn node_timestamp_ms(node: &MessageNode) -> i64 {
@@ -392,7 +533,9 @@ fn session_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::test_support::{seed_empty_usage_state, store as setup_store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_usage_state, store as setup_store,
+    };
     use crate::types::Session;
     use rusqlite::params;
 
@@ -523,7 +666,7 @@ mod tests {
         insert_node(&conn, "s1", 13, Some(12), &user_message("u2", "second question"), 1103);
         insert_node(&conn, "s1", 14, Some(13), &assistant_message("a4", "reply two", None), 1104);
 
-        let result = scan_db(&conn, &db_path, None, None).unwrap();
+        let result = scan_db(&conn, &db_path, None, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(
             contents(&result.sessions[0]),
@@ -588,7 +731,7 @@ mod tests {
             1201,
         );
 
-        let result = scan_db(&conn, &db_path, None, None).unwrap();
+        let result = scan_db(&conn, &db_path, None, None, true).unwrap();
         let raw = &result.sessions[0];
         assert_eq!(contents(raw), [("user", "real question"), ("assistant", "main answer")]);
         assert_eq!(raw.usage_events.len(), 3);
@@ -618,7 +761,7 @@ mod tests {
         insert_node(&conn, "s1", 3, Some(2), &linked, 1002);
         insert_node(&conn, "s1", 4, Some(3), &assistant_message("a2", "done", None), 1003);
 
-        let result = scan_db(&conn, &db_path, None, None).unwrap();
+        let result = scan_db(&conn, &db_path, None, None, true).unwrap();
         assert_eq!(
             contents(&result.sessions[0]),
             [
@@ -679,7 +822,7 @@ mod tests {
             1103,
         );
 
-        let result = scan_db(&conn, &db_path, None, None).unwrap();
+        let result = scan_db(&conn, &db_path, None, None, true).unwrap();
         let events = &result.sessions[0].usage_events;
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_key, "a1");
@@ -717,7 +860,7 @@ mod tests {
             );
         }
 
-        let result = scan_db(&conn, &db_path, None, None).unwrap();
+        let result = scan_db(&conn, &db_path, None, None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         let raw = &result.sessions[0];
         assert_eq!(raw.source_id, "s1");
@@ -736,7 +879,7 @@ mod tests {
         insert_node(&conn, "s1", 1, None, &user_message("u1", "hi"), 1000);
         insert_node(&conn, "s1", 2, Some(1), &assistant_message("a1", "hey", None), 1001);
 
-        let first = scan_db(&conn, &db_path, None, None).unwrap();
+        let first = scan_db(&conn, &db_path, None, None, true).unwrap();
         assert_eq!(first.sessions.len(), 1);
         let updated_at = first.sessions[0].updated_at.unwrap();
 
@@ -756,10 +899,150 @@ mod tests {
         seed_empty_usage_state(&store, "devin", "s1", USAGE_PARSER_VERSION, Some(updated_at));
 
         let context = AdapterSyncContext::from_store_for_test(&store, "devin").unwrap();
-        let second = scan_db(&conn, &db_path, Some(&context), None).unwrap();
+        let usage_only = scan_db(&conn, &db_path, Some(&context), None, false).unwrap();
+        assert!(usage_only.sessions.is_empty());
+        let backfill = scan_db(&conn, &db_path, Some(&context), None, true).unwrap();
+        assert_eq!(backfill.sessions.len(), 1);
+        assert_eq!(backfill.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
+
+        seed_empty_event_state(&store, "devin", "s1", EVENT_PARSER_VERSION, Some(updated_at));
+        let context = AdapterSyncContext::from_store_for_test(&store, "devin").unwrap();
+        let second = scan_db(&conn, &db_path, Some(&context), None, true).unwrap();
         assert!(second.sessions.is_empty());
         assert_eq!(second.stats.candidates, 1);
         assert_eq!(second.stats.skipped_sessions, 1);
+    }
+
+    fn tool_call_message(id: &str, calls: Value) -> Value {
+        let mut message = assistant_message(id, "", None);
+        message["tool_calls"] = calls;
+        message
+    }
+
+    fn tool_result_message(id: &str, call_id: &str, content: &str, success: bool) -> Value {
+        serde_json::json!({
+            "message_id": id,
+            "role": "tool",
+            "content": content,
+            "tool_call_id": call_id,
+            "metadata": {
+                "created_at": "2026-09-24T08:00:06Z",
+                "extensions": {"chisel/tool_result_meta": {"success": success}},
+            },
+        })
+    }
+
+    #[test]
+    fn tool_calls_and_results_become_session_events() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = setup_db(root.path());
+        let conn = Connection::open(&db_path).unwrap();
+        insert_session(&conn, "s1", 0);
+        insert_node(&conn, "s1", 1, None, &user_message("u1", "count lines"), 1000);
+        let first_calls = tool_call_message(
+            "a1",
+            serde_json::json!([
+                {"id": "c-read", "name": "read", "arguments": {"file_path": "/repo/sample.txt"}},
+                {"id": "c-exec", "name": "exec",
+                 "arguments": {"command": "mv draft.txt final.txt", "workdir": "/repo/sub"}},
+            ]),
+        );
+        insert_node(&conn, "s1", 2, Some(1), &first_calls, 1001);
+        insert_node(&conn, "s1", 3, Some(2), &first_calls, 1001);
+        insert_node(
+            &conn,
+            "s1",
+            4,
+            Some(3),
+            &tool_result_message("r1", "c-read", "alpha", true),
+            1002,
+        );
+        insert_node(
+            &conn,
+            "s1",
+            5,
+            Some(4),
+            &tool_result_message("r2", "c-exec", "Exit code: 1", false),
+            1002,
+        );
+        insert_node(
+            &conn,
+            "s1",
+            6,
+            Some(5),
+            &tool_call_message(
+                "a2",
+                serde_json::json!([
+                    {"id": "c-edit", "name": "edit",
+                     "arguments": {"file_path": "/repo/sample.txt", "old_string": "a", "new_string": "b"}},
+                    {"id": "c-kill", "name": "kill_shell", "arguments": {"shell_id": "abc"}},
+                ]),
+            ),
+            1003,
+        );
+        insert_node(&conn, "s1", 7, Some(6), &assistant_message("a3", "done", None), 1004);
+        let mut handoff = user_message("h1", "subagent brief");
+        handoff["metadata"]["extensions"] = serde_json::json!({"subagent/handoff": true});
+        insert_node(&conn, "s1", 20, None, &handoff, 1100);
+        insert_node(
+            &conn,
+            "s1",
+            21,
+            Some(20),
+            &tool_call_message(
+                "a4",
+                serde_json::json!([{"id": "c-write", "name": "write",
+                    "arguments": {"file_path": "notes.md", "content": "x"}}]),
+            ),
+            1101,
+        );
+
+        let result = scan_db(&conn, &db_path, None, None, true).unwrap();
+        let raw = &result.sessions[0];
+        assert_eq!(contents(raw), [("user", "count lines"), ("assistant", "done")]);
+        assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
+        let summary: Vec<_> = raw
+            .events
+            .iter()
+            .map(|e| (e.kind.as_str(), e.name.as_deref(), e.tool_call_id.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("file_read", Some("read"), Some("c-read")),
+                ("command", Some("exec"), Some("c-exec")),
+                ("tool_result", Some("read"), Some("c-read")),
+                ("tool_result", Some("exec"), Some("c-exec")),
+                ("file_write", Some("edit"), Some("c-edit")),
+                ("tool_call", Some("kill_shell"), Some("c-kill")),
+                ("file_write", Some("write"), Some("c-write")),
+            ]
+        );
+        let seqs: Vec<_> = raw.events.iter().map(|e| e.event_seq).collect();
+        assert_eq!(seqs, [0, 1, 2, 3, 4, 5, 6]);
+        let read = &raw.events[0];
+        assert_eq!(read.target.as_deref(), Some("/repo/sample.txt"));
+        assert_eq!(read.files[0].operation, FileOperation::Read);
+        assert_eq!(read.message_seq, Some(0));
+        assert_eq!(read.timestamp, Some(1_790_236_805_000));
+        assert_eq!(read.source_event_id.as_deref(), Some("a1:0"));
+        let exec = &raw.events[1];
+        assert_eq!(exec.target.as_deref(), Some("mv draft.txt final.txt"));
+        assert_eq!(exec.files[0].path, "draft.txt");
+        assert_eq!(exec.files[0].cwd.as_deref(), Some("/repo/sub"));
+        assert_eq!(raw.events[2].status.as_deref(), Some("success"));
+        assert_eq!(raw.events[3].status.as_deref(), Some("error"));
+        assert_eq!(raw.events[4].files[0].operation, FileOperation::Write);
+        let subagent_write = &raw.events[6];
+        assert_eq!(subagent_write.message_seq, None);
+        assert_eq!(subagent_write.files[0].path, "notes.md");
+        assert_eq!(subagent_write.files[0].cwd.as_deref(), Some("/repo"));
+
+        let without_events = scan_db(&conn, &db_path, None, None, false).unwrap();
+        let raw = &without_events.sessions[0];
+        assert!(raw.events.is_empty());
+        assert_eq!(raw.event_parser_version, None);
+        assert_eq!(raw.messages.len(), 2);
     }
 
     #[test]
@@ -772,7 +1055,7 @@ mod tests {
             insert_node(&conn, id, 1, None, &user_message(&format!("u-{id}"), "hi"), 1000);
         }
         let context = AdapterSyncContext::empty_for_test("devin").restricted_to("s1");
-        let result = scan_db(&conn, &db_path, Some(&context), None).unwrap();
+        let result = scan_db(&conn, &db_path, Some(&context), None, true).unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "s1");
         assert_eq!(result.stats.candidates, 1);

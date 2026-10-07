@@ -508,6 +508,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "junie"
             | "zed"
             | "warp"
+            | "devin"
     )
 }
 
