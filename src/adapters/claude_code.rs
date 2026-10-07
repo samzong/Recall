@@ -473,6 +473,7 @@ fn parse_claude_session_file(
         thread_role,
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
+        refresh_session_metadata: false,
         refresh_session_on_metadata_backfill: true,
     }))
 }

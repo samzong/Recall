@@ -926,6 +926,7 @@ pub(crate) fn parse_rollout(
         thread_role,
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
+        refresh_session_metadata: false,
         refresh_session_on_metadata_backfill: false,
     }))
 }

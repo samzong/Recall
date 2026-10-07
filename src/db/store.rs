@@ -63,6 +63,9 @@ pub(crate) struct SessionPath {
 #[derive(Debug, Clone)]
 pub(crate) struct IndexedSessionMeta {
     pub(crate) id: String,
+    pub(crate) directory: Option<String>,
+    pub(crate) custom_title: Option<String>,
+    pub(crate) started_at: i64,
     pub(crate) updated_at: Option<i64>,
     pub(crate) message_count: u32,
 }
