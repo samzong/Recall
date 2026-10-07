@@ -36,6 +36,7 @@ pub(crate) mod sync_state;
 pub(crate) mod trae_cli;
 pub(crate) mod usage;
 pub(crate) mod zcode;
+pub(crate) mod zed;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -447,6 +448,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(muse_code::MuseCodeAdapter),
         Box::new(codebuddy::CodeBuddyAdapter),
         Box::new(trae_cli::TraeCliAdapter),
+        Box::new(zed::ZedAdapter),
     ]
 }
 
@@ -494,6 +496,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "muse-code"
             | "codebuddy"
             | "trae-cli"
+            | "zed"
     )
 }
 
