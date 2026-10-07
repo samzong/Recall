@@ -4,14 +4,8 @@
 ## [0.6.3](https://github.com/samzong/Recall/compare/v0.6.2...v0.6.3) (2026-10-07)
 
 
-### ⚠ BREAKING CHANGES
-
-* **rx:** drop tokener-dev and move tokener to api.tokener.ai ([#267](https://github.com/samzong/Recall/issues/267))
-
-
 ### Features
 
-* **rx:** pick a provider for one launch from the harness picker ([#269](https://github.com/samzong/Recall/issues/269))
 * **sync:** refresh a single native session ([#270](https://github.com/samzong/Recall/issues/270))
 * **adapters:** add Devin CLI session adapter ([#271](https://github.com/samzong/Recall/issues/271))
 * **adapters:** add Muse Code session adapter ([#275](https://github.com/samzong/Recall/issues/275))
