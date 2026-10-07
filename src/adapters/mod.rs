@@ -18,6 +18,7 @@ pub(crate) mod goose;
 pub(crate) mod grok;
 pub(crate) mod invocation_probe;
 pub(crate) mod json_util;
+pub(crate) mod junie;
 pub(crate) mod kilo;
 pub(crate) mod kimi_code;
 pub(crate) mod kiro;
@@ -37,6 +38,7 @@ pub(crate) mod sync_state;
 pub(crate) mod trae_cli;
 pub(crate) mod usage;
 pub(crate) mod zcode;
+pub(crate) mod zed;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -249,6 +251,7 @@ pub(crate) struct RawSession {
     pub(crate) parent_links: Vec<ParentLink>,
     pub(crate) metadata_parser_version: Option<u32>,
     pub(crate) refresh_session_on_metadata_backfill: bool,
+    pub(crate) refresh_session_metadata: bool,
 }
 
 impl RawSession {
@@ -279,6 +282,7 @@ impl RawSession {
             parent_links: Vec::new(),
             metadata_parser_version: None,
             refresh_session_on_metadata_backfill: false,
+            refresh_session_metadata: false,
         }
     }
 
@@ -449,6 +453,8 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(muse_code::MuseCodeAdapter),
         Box::new(codebuddy::CodeBuddyAdapter),
         Box::new(trae_cli::TraeCliAdapter),
+        Box::new(junie::JunieAdapter),
+        Box::new(zed::ZedAdapter),
     ]
 }
 
@@ -497,6 +503,8 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "muse-code"
             | "codebuddy"
             | "trae-cli"
+            | "junie"
+            | "zed"
     )
 }
 

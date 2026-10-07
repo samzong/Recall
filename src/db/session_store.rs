@@ -43,7 +43,7 @@ impl Store {
         source: &str,
     ) -> Result<HashMap<String, IndexedSessionMeta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT source_id, id, updated_at, message_count FROM sessions
+            "SELECT source_id, id, updated_at, message_count, directory, custom_title, started_at FROM sessions
              WHERE source = ?1 AND id IN (SELECT session_id FROM native_bindings)",
         )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| {
@@ -53,6 +53,9 @@ impl Store {
                     id: row.get(1)?,
                     updated_at: row.get(2)?,
                     message_count: row.get(3)?,
+                    directory: row.get(4)?,
+                    custom_title: row.get(5)?,
+                    started_at: row.get(6)?,
                 },
             ))
         })?;

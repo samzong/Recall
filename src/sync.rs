@@ -128,6 +128,9 @@ impl ExistingState {
             session.source_id.clone(),
             IndexedSessionMeta {
                 id: session.id.clone(),
+                directory: session.directory.clone(),
+                custom_title: session.custom_title.clone(),
+                started_at: session.started_at,
                 updated_at: session.updated_at,
                 message_count: session.message_count,
             },
@@ -865,7 +868,8 @@ impl SyncJob {
                 let metadata_changed = existing.paths.get(&raw_source_id).is_some_and(|old| {
                     raw_session_metadata_changed(&raw, repo_identity.as_ref(), old)
                 });
-                let content_changed = old.message_count != msg_count
+                let content_changed = raw.refresh_session_metadata
+                    || old.message_count != msg_count
                     || metadata_changed
                     || (raw.updated_at.is_some() && raw.updated_at != old.updated_at)
                     || (raw.refresh_session_on_metadata_backfill && metadata_backfill_needed);
