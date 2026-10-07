@@ -30,6 +30,7 @@ pub(crate) mod openhands;
 pub(crate) mod paths;
 pub(crate) mod pi;
 mod pi_session;
+pub(crate) mod qoder;
 pub(crate) mod qwen;
 pub(crate) mod roo;
 pub(crate) mod sync_state;
@@ -434,6 +435,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(deepseek_harness::DeepSeekHarnessAdapter),
         Box::new(kimi_code::KimiCodeAdapter),
         Box::new(qwen::QwenAdapter),
+        Box::new(qoder::QoderAdapter),
         Box::new(kilo::KiloCodeAdapter),
         Box::new(crush::CrushAdapter),
         Box::new(mimo_code::MimoCodeAdapter),
@@ -488,6 +490,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "cline"
             | "roo"
             | "qwen-code"
+            | "qoder"
             | "gemini-cli"
             | "pi"
             | "omp"

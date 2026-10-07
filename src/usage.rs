@@ -85,31 +85,40 @@ impl TokenTotals {
 pub(crate) struct UsageDedup {
     codex_seen: HashSet<String>,
     claude_seen: HashSet<String>,
+    qoder_seen: HashSet<String>,
 }
 
 impl UsageDedup {
     pub(crate) fn accept(&mut self, event: &UsageEventRecord) -> bool {
-        if event.source == "codex" {
-            let key = format!(
-                "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
-                event.timestamp,
-                event.provider,
-                event.model,
-                event.input_tokens,
-                event.output_tokens,
-                event.cache_read_tokens,
-                event.cache_write_tokens,
-                event.reasoning_tokens
-            );
-            return self.codex_seen.insert(key);
+        match event.source.as_str() {
+            "codex" => {
+                let key = format!(
+                    "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
+                    event.timestamp,
+                    event.provider,
+                    event.model,
+                    event.input_tokens,
+                    event.output_tokens,
+                    event.cache_read_tokens,
+                    event.cache_write_tokens,
+                    event.reasoning_tokens
+                );
+                self.codex_seen.insert(key)
+            }
+            "claude-code"
+                if event.event_key.starts_with("assistant:")
+                    && !event.event_key.contains(":line:") =>
+            {
+                self.claude_seen.insert(event.event_key.clone())
+            }
+            "qoder"
+                if event.event_key.starts_with("assistant:")
+                    && !event.event_key.starts_with("assistant:line:") =>
+            {
+                self.qoder_seen.insert(event.event_key.clone())
+            }
+            _ => true,
         }
-        if event.source == "claude-code"
-            && event.event_key.starts_with("assistant:")
-            && !event.event_key.contains(":line:")
-        {
-            return self.claude_seen.insert(event.event_key.clone());
-        }
-        true
     }
 }
 
@@ -360,5 +369,41 @@ mod tests {
 
         assert_eq!(report.summary.events, 1);
         assert_eq!(report.summary.tokens.total_tokens, 14);
+    }
+
+    #[test]
+    fn aggregate_usage_dedupes_qoder_forked_messages() {
+        let mut events = Vec::new();
+        for (index, (input, output)) in [(120, 20), (170, 15), (190, 12)].into_iter().enumerate() {
+            let mut original =
+                event("qoder", "parent", &format!("assistant:msg-{index}"), index as i64);
+            original.input_tokens = input;
+            original.output_tokens = output;
+            original.cache_read_tokens = 0;
+            original.reasoning_tokens = 0;
+            original.token_source = "observed".to_string();
+            let mut forked = original.clone();
+            forked.session_id = "fork".to_string();
+            forked.source_id = "fork".to_string();
+            events.extend([original, forked]);
+        }
+        let report = aggregate_usage_events(&events);
+        assert_eq!(report.summary.events, 3);
+        assert_eq!(report.summary.tokens.input_tokens, 480);
+        assert_eq!(report.summary.tokens.output_tokens, 47);
+        assert_eq!(report.summary.tokens.total_tokens, 527);
+    }
+
+    #[test]
+    fn aggregate_usage_keeps_qoder_line_keys_and_other_sources_separate() {
+        let events = [
+            event("qoder", "parent", "assistant:line:2", 1),
+            event("qoder", "fork", "assistant:line:2", 1),
+            event("claude-code", "claude", "assistant:msg-1", 1),
+            event("qoder", "parent", "assistant:msg-1", 1),
+        ];
+        let report = aggregate_usage_events(&events);
+        assert_eq!(report.summary.events, 4);
+        assert_eq!(report.summary.tokens.total_tokens, 56);
     }
 }
