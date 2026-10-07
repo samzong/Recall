@@ -1,6 +1,34 @@
 # Warp fixtures
 
-These are synthetic fixtures, not transcripts from an authenticated Warp session.
+`probe.textproto` and `probe.bin` are sanitized derivatives of a real local
+conversation produced on 2026-10-07 with Warp 0.2026.09.30.08.29.01 and Grok 4.7
+(`grok-4-7-low`). The user requested reading `sample.txt`, running `wc -l`, and
+appending `gamma` in `/tmp/recall-warp-probe`. The terminal output changed from
+two lines to three, and the final file contained `alpha`, `beta`, and `gamma`.
+
+The user exported a consistent SQLite snapshot using `.backup` from Warp's own
+terminal. Only the probe task was decoded using the official protocol revision
+linked below. Message, task, request, and call IDs were replaced with fixture
+aliases. Only allowlisted prompt/reply text, title, temporary-project paths,
+commands, shell output/exit codes, timestamps, model markers, tool variants,
+and query-origin markers were retained. Account/user identifiers, server data,
+conversation tokens, credentials, project rules, reasoning text, attachments,
+and result contexts were omitted. Read-success and ignored server/reasoning
+payloads retain their original variants with empty bodies. The sanitized task
+was serialized with libprotoc 36.1; it is not an unmodified original blob.
+
+This task contains one user message, one assistant message, four calls (including
+a server call), and three results. It has no `RequestMetadata`, so Recall emits
+no usage events. The source does not record a parent conversation. Both shell
+commands and their successful results are preserved. The shared command-evidence
+parser does not support `wc` or ordinary output redirection, so this conversation
+has read-call file evidence but no inferred shell file evidence.
+
+The snapshot contained three conversations and two tasks. The other conversations
+were checked only for indexing status and are absent from these fixtures. The
+snapshot and temporary private indexes were deleted after verification.
+
+`task.*`, `origins.*`, and `schema.sql` remain synthetic fixtures.
 
 `schema.sql` is a minimal synthetic schema based on the upstream migration that
 introduced `agent_conversations` and `agent_tasks`. It retains the column types
@@ -28,9 +56,10 @@ The input/output/cache token fields are separate counts; Warp adds all four to
 compute total tokens:
 [usage accounting](https://github.com/warpdotdev/warp/blob/d807d987652361ea970287748fe4f2ea002766cc/crates/persistence/src/model.rs).
 
-The installed Warp 0.2026.09.30.08.29.01 could not finish launching on the test
-machine. Its embedded `CREATE TABLE agent_conversations` and `CREATE TABLE
-agent_tasks` migration statements were inspected and match these read column
-types. No local database was created by the app, and no locally produced agent
-session was available. This fixture is not an installed database dump or a real
-conversation.
+The application-created snapshot has the same adapter-read column types as
+`schema.sql`, with an additional `summary` column in `agent_conversations`.
+Real CLI verification used the macOS Application Support Stable fallback path
+inside a sandbox HOME. Direct read-only access to the native group-container
+database from the verification terminal failed under macOS access controls;
+Recall warned and returned successfully. No privacy settings or Warp application
+state were changed by the verifier.

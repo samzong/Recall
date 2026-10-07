@@ -1,0 +1,233 @@
+id: "probe-task"
+description: "Count Lines And Append Text In File"
+messages {
+  id: "probe-message-1"
+  tool_call {
+    tool_call_id: "probe-call-1"
+    server {
+    }
+  }
+  task_id: "probe-task"
+  request_id: "probe-request-7"
+  timestamp {
+    seconds: 1791387715
+    nanos: 621700231
+  }
+}
+messages {
+  id: "probe-message-2"
+  server_event {
+  }
+  task_id: "probe-task"
+  request_id: "probe-request-7"
+  timestamp {
+    seconds: 1791387715
+    nanos: 621858212
+  }
+}
+messages {
+  id: "probe-message-3"
+  user_query {
+    query: "Read sample.txt, run wc -l sample.txt, then append a line gamma to sample.txt."
+    context {
+      directory {
+        pwd: "/tmp/recall-warp-probe"
+      }
+    }
+    origin {
+      warp_client {
+      }
+    }
+  }
+  task_id: "probe-task"
+  request_id: "probe-request-7"
+  timestamp {
+    seconds: 1791387715
+    nanos: 621858462
+  }
+}
+messages {
+  id: "probe-message-4"
+  task_id: "probe-task"
+  request_id: "probe-request-7"
+  timestamp {
+    seconds: 1791387715
+    nanos: 925981716
+  }
+  model_used {
+    model_id: "grok-4-7-low"
+    model_display_name: "grok 4.7 (low)"
+  }
+}
+messages {
+  id: "probe-message-5"
+  task_id: "probe-task"
+  request_id: "probe-request-7"
+  timestamp {
+    seconds: 1791387718
+    nanos: 848277004
+  }
+  agent_reasoning {
+  }
+}
+messages {
+  id: "probe-message-6"
+  tool_call {
+    tool_call_id: "probe-call-6"
+    read_files {
+      files {
+        name: "/tmp/recall-warp-probe/sample.txt"
+      }
+    }
+  }
+  task_id: "probe-task"
+  request_id: "probe-request-7"
+  timestamp {
+    seconds: 1791387719
+    nanos: 101163736
+  }
+}
+messages {
+  id: "probe-message-7"
+  tool_call {
+    tool_call_id: "probe-call-7"
+    run_shell_command {
+      command: "wc -l sample.txt"
+    }
+  }
+  task_id: "probe-task"
+  request_id: "probe-request-7"
+  timestamp {
+    seconds: 1791387719
+    nanos: 485032097
+  }
+}
+messages {
+  id: "probe-message-8"
+  tool_call_result {
+    tool_call_id: "probe-call-6"
+    read_files {
+      any_files_success {
+      }
+    }
+  }
+  task_id: "probe-task"
+  request_id: "probe-request-12"
+  timestamp {
+    seconds: 1791387724
+    nanos: 117393728
+  }
+}
+messages {
+  id: "probe-message-9"
+  tool_call_result {
+    tool_call_id: "probe-call-7"
+    run_shell_command {
+      command: "wc -l sample.txt"
+      command_finished {
+        output: "       2 sample.txt"
+        exit_code: 0
+      }
+    }
+  }
+  task_id: "probe-task"
+  request_id: "probe-request-12"
+  timestamp {
+    seconds: 1791387724
+    nanos: 117394068
+  }
+}
+messages {
+  id: "probe-message-10"
+  task_id: "probe-task"
+  request_id: "probe-request-12"
+  timestamp {
+    seconds: 1791387724
+    nanos: 143662590
+  }
+  model_used {
+    model_id: "grok-4-7-low"
+    model_display_name: "grok 4.7 (low)"
+  }
+}
+messages {
+  id: "probe-message-11"
+  task_id: "probe-task"
+  request_id: "probe-request-12"
+  timestamp {
+    seconds: 1791387726
+    nanos: 591794340
+  }
+  agent_reasoning {
+  }
+}
+messages {
+  id: "probe-message-12"
+  tool_call {
+    tool_call_id: "probe-call-12"
+    run_shell_command {
+      command: "printf \'%s\\n\' gamma >> sample.txt && wc -l sample.txt && cat sample.txt"
+    }
+  }
+  task_id: "probe-task"
+  request_id: "probe-request-12"
+  timestamp {
+    seconds: 1791387726
+    nanos: 592288021
+  }
+}
+messages {
+  id: "probe-message-13"
+  tool_call_result {
+    tool_call_id: "probe-call-12"
+    run_shell_command {
+      command: "printf \'%s\\n\' gamma >> sample.txt && wc -l sample.txt && cat sample.txt"
+      command_finished {
+        output: "       3 sample.txt\nalpha\nbeta\ngamma"
+        exit_code: 0
+      }
+    }
+  }
+  task_id: "probe-task"
+  request_id: "probe-request-16"
+  timestamp {
+    seconds: 1791387727
+    nanos: 111655149
+  }
+}
+messages {
+  id: "probe-message-14"
+  task_id: "probe-task"
+  request_id: "probe-request-16"
+  timestamp {
+    seconds: 1791387727
+    nanos: 141474958
+  }
+  model_used {
+    model_id: "grok-4-7-low"
+    model_display_name: "grok 4.7 (low)"
+  }
+}
+messages {
+  id: "probe-message-15"
+  task_id: "probe-task"
+  request_id: "probe-request-16"
+  timestamp {
+    seconds: 1791387728
+    nanos: 192166887
+  }
+  agent_reasoning {
+  }
+}
+messages {
+  id: "probe-message-16"
+  agent_output {
+    text: "`sample.txt` 原先是 `alpha`、`beta` 两行（末尾有换行），`wc -l` 是 2。\n\n已追加一行 `gamma`。现在是 3 行：\n\n```\nalpha\nbeta\ngamma\n```"
+  }
+  task_id: "probe-task"
+  request_id: "probe-request-16"
+  timestamp {
+    seconds: 1791387728
+    nanos: 192474877
+  }
+}

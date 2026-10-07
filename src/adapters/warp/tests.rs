@@ -2,6 +2,7 @@ use super::*;
 use rusqlite::params;
 
 const TASK: &[u8] = include_bytes!("../../../tests/fixtures/warp/task.bin");
+const PROBE: &[u8] = include_bytes!("../../../tests/fixtures/warp/probe.bin");
 const SCHEMA: &str = include_str!("../../../tests/fixtures/warp/schema.sql");
 
 fn database() -> (tempfile::TempDir, PathBuf, Connection) {
@@ -517,4 +518,64 @@ fn interleaved_result_names_do_not_depend_on_call_timestamp_order() {
             .unwrap();
         assert_eq!(result.name.as_deref(), Some(name));
     }
+}
+
+#[test]
+fn real_probe_preserves_native_messages_events_and_missing_usage() {
+    let (_dir, path, conn) = database();
+    conn.execute_batch("UPDATE agent_conversations SET conversation_data = '{}', last_modified_at = '2026-10-07 15:42:09';
+        UPDATE agent_tasks SET last_modified_at = '2026-10-07 15:42:09';").unwrap();
+    conn.execute("UPDATE agent_tasks SET task = ?1", [PROBE]).unwrap();
+    let raw = scan_db(Some(&path), None, true).unwrap().sessions.remove(0);
+    assert_eq!(raw.custom_title.as_deref(), Some("Count Lines And Append Text In File"));
+    assert_eq!(raw.directory.as_deref(), Some("/tmp/recall-warp-probe"));
+    assert_eq!(raw.started_at, 1791387715621);
+    assert_eq!(raw.updated_at, Some(1791387729000));
+    assert_eq!(raw.messages.len(), 2);
+    assert_eq!(raw.messages[0].role, Role::User);
+    assert_eq!(
+        raw.messages[0].content,
+        "Read sample.txt, run wc -l sample.txt, then append a line gamma to sample.txt."
+    );
+    assert_eq!(raw.messages[0].timestamp, Some(1791387715621));
+    assert_eq!(raw.messages[1].role, Role::Assistant);
+    assert!(raw.messages[1].content.contains("alpha\nbeta\ngamma"));
+    assert_eq!(raw.messages[1].timestamp, Some(1791387728192));
+    assert_eq!(raw.events.len(), 7);
+    let read = raw.events.iter().find(|event| event.kind == "file_read").unwrap();
+    assert_eq!(read.timestamp, Some(1791387719101));
+    assert_eq!(read.files.len(), 1);
+    assert_eq!(read.files[0].path, "/tmp/recall-warp-probe/sample.txt");
+    assert_eq!(read.files[0].operation, FileOperation::Read);
+    assert_eq!(read.files[0].cwd.as_deref(), raw.directory.as_deref());
+    let read_result = raw
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_result" && event.name.as_deref() == Some("read_files"))
+        .unwrap();
+    assert_eq!(read_result.status.as_deref(), Some("success"));
+    let commands: Vec<_> = raw.events.iter().filter(|event| event.kind == "command").collect();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].target.as_deref(), Some("wc -l sample.txt"));
+    assert!(commands[1].target.as_ref().unwrap().contains("gamma >> sample.txt"));
+    let shell_results: Vec<_> = raw
+        .events
+        .iter()
+        .filter(|event| {
+            event.kind == "tool_result" && event.name.as_deref() == Some("run_shell_command")
+        })
+        .collect();
+    assert_eq!(shell_results.len(), 2);
+    assert!(shell_results[0].summary.as_ref().unwrap().contains("2 sample.txt"));
+    assert!(
+        shell_results[1].summary.as_ref().unwrap().contains("3 sample.txt\nalpha\nbeta\ngamma")
+    );
+    for result in shell_results {
+        assert_eq!(result.status.as_deref(), Some("success"));
+        assert_eq!(result.attrs_json.as_deref(), Some(r#"{"exit_code":0}"#));
+        assert!(result.files.is_empty());
+    }
+    assert!(raw.usage_events.is_empty());
+    assert!(raw.thread_role.is_none());
+    assert!(raw.parent_links.is_empty());
 }
