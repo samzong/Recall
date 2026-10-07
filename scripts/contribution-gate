@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+	echo "usage: contribution-gate assign <issue> <login> | pr <number>" >&2
+	exit 2
+}
+
+repo="${GH_REPO:?GH_REPO must be owner/name}"
+
+assign() {
+	local issue="$1" login="$2" state assignees
+	read -r state assignees < <(gh api "repos/$repo/issues/$issue" \
+		--jq '[.state, (.assignees | length)] | @tsv')
+	if [ "$state" != "open" ]; then
+		echo "Issue #$issue is $state; not assigning."
+		return
+	fi
+	if [ "$assignees" -gt 0 ]; then
+		echo "Issue #$issue is already assigned; not assigning $login."
+		return
+	fi
+	gh issue edit "$issue" --repo "$repo" --add-assignee "$login"
+}
+
+check_pr() {
+	local pr="$1" failures=() pull author
+
+	pull=$(gh api "repos/$repo/pulls/$pr")
+	author=$(jq -r '.user.login' <<<"$pull")
+
+	if [ "$(jq -r '.user.type' <<<"$pull")" = "Bot" ]; then
+		failures+=("Pull requests opened by bot accounts are not accepted; a human must open the pull request.")
+	elif jq -e '.author_association | IN("OWNER", "MEMBER", "COLLABORATOR")' <<<"$pull" >/dev/null; then
+		echo "Author $author is a maintainer; contribution rules do not apply."
+		return
+	fi
+
+	local linked
+	linked=$(gh api graphql -F owner="${repo%%/*}" -F name="${repo#*/}" -F pr="$pr" -f query='
+		query($owner: String!, $name: String!, $pr: Int!) {
+			repository(owner: $owner, name: $name) {
+				pullRequest(number: $pr) {
+					closingIssuesReferences(first: 20) {
+						nodes { number repository { nameWithOwner } assignees(first: 20) { nodes { login } } }
+					}
+				}
+			}
+		}' --jq "[.data.repository.pullRequest.closingIssuesReferences.nodes[]
+			| select(.repository.nameWithOwner == \"$repo\")]")
+	if [ "$(jq 'length' <<<"$linked")" -eq 0 ]; then
+		failures+=("Link the issue this pull request resolves with \`Closes #<issue>\` in the description.")
+	elif ! jq -e --arg a "$author" 'any(.[]; any(.assignees.nodes[]; .login == $a))' <<<"$linked" >/dev/null; then
+		failures+=("A linked issue must be assigned to $author. Comment \`/assign\` on an unassigned issue first.")
+	fi
+
+	if [ "$(jq '.commits' <<<"$pull")" -gt 250 ]; then
+		failures+=("Pull requests with more than 250 commits cannot be checked; squash or split them.")
+	fi
+
+	local commit_failures
+	commit_failures=$(gh api --paginate "repos/$repo/pulls/$pr/commits" | jq -rs --arg a "$author" '
+		add[]
+		| .sha[0:7] as $sha
+		| "Signed-off-by: \(.commit.author.name) <\(.commit.author.email)>" as $own
+		| [.commit.message | split("\n")[] | rtrimstr("\r") | select(startswith("Signed-off-by:"))] as $signoffs
+		| if .author == null then
+			"Commit \($sha): author email \(.commit.author.email) is not linked to a GitHub account."
+		  elif .author.type == "Bot" then
+			"Commit \($sha): authored by bot account \(.author.login)."
+		  elif .author.login != $a then
+			"Commit \($sha): authored by \(.author.login), not the pull request author \($a)."
+		  elif ($signoffs | length) == 0 then
+			"Commit \($sha): missing `\($own)`; commit with `git commit -s`."
+		  elif any($signoffs[]; . != $own) then
+			"Commit \($sha): every Signed-off-by must be the commit author, `\($own)`."
+		  else empty end')
+	while IFS= read -r line; do
+		[ -n "$line" ] && failures+=("$line")
+	done <<<"$commit_failures"
+
+	if ! jq -r '.body // ""' <<<"$pull" | awk '
+		!level && /^#+[[:space:]]*[Tt]est [Ee]vidence[[:space:]:#]*$/ { match($0, /^#+/); level = RLENGTH; next }
+		level && match($0, /^#+[[:space:]]/) { if (RLENGTH - 1 <= level) exit; next }
+		level && /[^[:space:]]/ { found = 1; exit }
+		END { exit !found }'; then
+		failures+=("Add a \`## Test evidence\` section describing what you ran against real data and what you observed.")
+	fi
+
+	if [ "${#failures[@]}" -eq 0 ]; then
+		echo "Pull request #$pr meets the contribution rules."
+		return
+	fi
+	for failure in "${failures[@]}"; do
+		echo "::error::$failure"
+	done
+	echo "See the Contributing section of AGENTS.md." >&2
+	exit 1
+}
+
+case "${1:-}" in
+assign) [ $# -eq 3 ] || usage; assign "$2" "$3" ;;
+pr) [ $# -eq 2 ] || usage; check_pr "$2" ;;
+*) usage ;;
+esac

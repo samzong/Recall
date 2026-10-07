@@ -7,6 +7,28 @@ Read the nested `AGENTS.md` before changing `src/adapters/`, `src/db/`,
 `src/tui/`, `extensions/`, or `website/`.
 `CLAUDE.md` links to this file; edit this file once.
 
+## Contributing
+
+Repository owners, members, and collaborators are exempt. Everyone else,
+including agents acting for a contributor, follows these rules;
+`.github/workflows/contribution-gate.yml` checks them on every pull request.
+
+- Work only on an open issue assigned to you. Check `assignees` in
+  `gh issue view <issue>`; to claim an unassigned issue, comment `/assign`
+  and confirm you then appear in `assignees`. An assignment with no linked
+  pull request after 15 days may be released.
+- Every pull request resolves an issue assigned to its author: put
+  `Closes #<issue>` in the description.
+- A human opens the pull request and authors every commit, signing off with
+  `git commit -s` using an email linked to their GitHub account. Bot or agent
+  accounts must not open the pull request, author commits, or sign off.
+- The description has a `## Test evidence` section: the tool and version, OS,
+  what you ran against real data or a real installation, the Recall output you
+  observed, and what you could not verify. Tests and `make check` alone do not
+  count.
+- When the check fails, fix the cause, then edit the description or push to
+  run it again.
+
 ## Build and verify
 
 - `make check` is required before push and is the CI gate: dependency audit,

@@ -1,0 +1,69 @@
+name: Contribution gate
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  assign:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      !github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      startsWith(github.event.comment.body, '/assign')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: assign-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/contribution-gate
+          sparse-checkout-cone-mode: false
+      - name: Assign the commenter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE: ${{ github.event.issue.number }}
+          LOGIN: ${{ github.event.comment.user.login }}
+        run: |
+          if [ "$(printf '%s\n' "$COMMENT_BODY" | tr -d '\r' | awk 'NR == 1 { print $1 }')" != "/assign" ]; then
+            echo "Comment does not start with /assign; nothing to do."
+            exit 0
+          fi
+          scripts/contribution-gate assign "$ISSUE" "$LOGIN"
+
+  pull-request:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: contribution-gate-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/contribution-gate
+          sparse-checkout-cone-mode: false
+      - name: Check contribution rules
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: scripts/contribution-gate pr "$PR"
