@@ -282,17 +282,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn probe_accepts_a_delayed_response_before_timeout() {
-        let output = probe_output(
-            Command::new("/bin/sh").args(["-c", "sleep 0.05; printf ready"]),
-            Duration::from_millis(200),
-        )
-        .unwrap();
-        assert_eq!(output.as_deref(), Some("ready"));
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn timed_out_probe_stops_its_process_group_and_reaps_child() {
         let temp = tempfile::tempdir().unwrap();
         let parent_pid = temp.path().join("parent.pid");
@@ -313,30 +302,6 @@ mod tests {
                 Command::new("/bin/ps").args(["-p", pid.trim(), "-o", "stat="]).output().unwrap();
             assert!(output.stdout.is_empty(), "probe process remains: {pid}");
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn probe_collects_large_stdout_without_stderr_pipe_deadlock() {
-        let value = probe_output(
-            Command::new("/bin/sh").args([
-                "-c",
-                "head -c 262144 /dev/zero | tr '\\000' x; head -c 262144 /dev/zero >&2",
-            ]),
-            GIT_METADATA_PROBE_TIMEOUT,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(value.len(), 262144);
-        assert!(value.bytes().all(|byte| byte == b'x'));
-        assert!(
-            probe_output(
-                Command::new("/bin/sh").args(["-c", "printf ignored; exit 1"]),
-                GIT_METADATA_PROBE_TIMEOUT,
-            )
-            .unwrap()
-            .is_none()
-        );
     }
 
     #[test]

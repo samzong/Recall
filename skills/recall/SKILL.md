@@ -20,20 +20,11 @@ If neither MCP nor the installed CLI is available, stop and offer `brew install 
 
 ## Scheduled Sync
 
-Run `recall sync schedule install` or `uninstall` only when the user explicitly
-requests installing, changing, or removing the schedule. Do not install or
-remove it as a convenience during ordinary sync work. Run `status` only when
-the user asks to inspect the schedule. The macOS LaunchAgent runs the installed
-binary's `sync --project all` immediately after install, then at the requested
-interval. macOS may ask for access to multiple folders in sequence (Documents,
-Downloads, Desktop, or other volumes); the user must click Allow within
-60 seconds for each prompt while Recall is running. If the first sync fails,
-rerun `recall sync schedule install` when the user requests a retry; include
-`--interval` again to retain a custom interval. When loaded, `status` shows
-launchd's last exit code. A Git metadata probe timeout stops the whole sync
-after 60 seconds; once process
-cleanup completes, the sync releases its lock. Log modification times do not
-prove a sync succeeded.
+- `recall sync schedule install --interval 30m`
+- `recall sync schedule status`
+- `recall sync schedule uninstall`
+
+Run install or uninstall only when the user explicitly requests a schedule change; run status only when the user asks to inspect it.
 
 ## Find Sessions
 

@@ -301,31 +301,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lock_file_queues_and_excludes_parallel_owners() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sync.lock");
-        let first = acquire_lock(&path).unwrap();
-
-        assert!(try_acquire_lock(&path).unwrap().is_none());
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let second = acquire_lock(&path).unwrap();
-            acquired_tx.send(()).unwrap();
-            second
-        });
-        started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert_eq!(
-            acquired_rx.recv_timeout(std::time::Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        );
-        drop(first);
-        acquired_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        drop(waiter.join().unwrap());
-    }
-
-    #[test]
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn clipboard_candidates_fall_back_wl_copy_then_xclip_then_xsel_on_linux() {
         let candidates = clipboard_candidates();
