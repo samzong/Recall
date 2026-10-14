@@ -1,6 +1,10 @@
 use std::collections::HashMap;
+use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
 
 use crate::types::FileTarget;
 
@@ -19,72 +23,95 @@ pub(crate) struct RepoIdentityCache {
 }
 
 impl RepoIdentityCache {
-    pub(crate) fn resolve_file(&mut self, path: &str, cwd: Option<&str>) -> Option<FileTarget> {
+    pub(crate) fn resolve_file(
+        &mut self,
+        path: &str,
+        cwd: Option<&str>,
+    ) -> Result<Option<FileTarget>> {
         if path.trim().is_empty() || path.contains('\0') || path.starts_with('~') {
-            return None;
+            return Ok(None);
         }
         if cfg!(not(windows))
             && (path.starts_with("\\\\")
                 || (path.as_bytes().get(1) == Some(&b':')
                     && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)))
         {
-            return None;
+            return Ok(None);
         }
         let path = Path::new(path);
         let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
             if path.has_root() {
-                return None;
+                return Ok(None);
             }
-            let cwd = Path::new(cwd?);
+            let Some(cwd) = cwd else { return Ok(None) };
+            let cwd = Path::new(cwd);
             if !cwd.is_absolute() {
-                return None;
+                return Ok(None);
             }
             cwd.join(path)
         };
-        let absolute = normalize_file_path(&absolute)?;
-        let parent = absolute.parent()?.ancestors().find(|dir| dir.is_dir())?;
-        let root = self
-            .file_roots
-            .entry(parent.to_path_buf())
-            .or_insert_with(|| git_toplevel(parent.to_str()?))
-            .clone();
-        let identity = root.as_deref().and_then(|root| self.resolve_toplevel(root));
+        let Some(absolute) = normalize_file_path(&absolute) else { return Ok(None) };
+        let Some(parent) =
+            absolute.parent().and_then(|parent| parent.ancestors().find(|dir| dir.is_dir()))
+        else {
+            return Ok(None);
+        };
+        let root = match self.file_roots.get(parent) {
+            Some(root) => root.clone(),
+            None => {
+                let root = match parent.to_str() {
+                    Some(parent) => git_toplevel(parent)?,
+                    None => None,
+                };
+                self.file_roots.insert(parent.to_path_buf(), root.clone());
+                root
+            }
+        };
+        let identity =
+            root.as_deref().map(|root| self.resolve_toplevel(root)).transpose()?.flatten();
         let relative = root
             .as_deref()
             .and_then(|root| absolute.strip_prefix(root).ok())
             .and_then(Path::to_str)
             .map(str::to_string);
-        Some(FileTarget {
-            absolute_path: absolute.to_str()?.to_string(),
+        let Some(absolute_path) = absolute.to_str() else { return Ok(None) };
+        Ok(Some(FileTarget {
+            absolute_path: absolute_path.to_string(),
             repo_root: root,
             repo_relative_path: relative,
             repo_remote: identity.map(|repo| repo.remote),
-        })
+        }))
     }
 
-    pub(crate) fn resolve(&mut self, directory: Option<&str>) -> Option<RepoIdentity> {
-        let directory = directory?.trim();
+    pub(crate) fn resolve(&mut self, directory: Option<&str>) -> Result<Option<RepoIdentity>> {
+        let Some(directory) = directory else { return Ok(None) };
+        let directory = directory.trim();
         if directory.is_empty() {
-            return None;
+            return Ok(None);
         }
         if let Some(identity) = self.by_directory.get(directory) {
-            return identity.clone();
+            return Ok(identity.clone());
         }
 
-        let Some(toplevel) = git_toplevel(directory) else {
+        let Some(toplevel) = git_toplevel(directory)? else {
             self.by_directory.insert(directory.to_string(), None);
-            return None;
+            return Ok(None);
         };
 
-        let identity = self.resolve_toplevel(&toplevel);
+        let identity = self.resolve_toplevel(&toplevel)?;
         self.by_directory.insert(directory.to_string(), identity.clone());
-        identity
+        Ok(identity)
     }
 
-    fn resolve_toplevel(&mut self, toplevel: &str) -> Option<RepoIdentity> {
-        self.by_toplevel.entry(toplevel.into()).or_insert_with(|| origin_identity(toplevel)).clone()
+    fn resolve_toplevel(&mut self, toplevel: &str) -> Result<Option<RepoIdentity>> {
+        if let Some(identity) = self.by_toplevel.get(toplevel) {
+            return Ok(identity.clone());
+        }
+        let identity = origin_identity(toplevel)?;
+        self.by_toplevel.insert(toplevel.to_string(), identity.clone());
+        Ok(identity)
     }
 }
 
@@ -105,13 +132,15 @@ fn normalize_file_path(path: &Path) -> Option<PathBuf> {
     Some(result)
 }
 
-pub(crate) fn git_toplevel(directory: &str) -> Option<String> {
+pub(crate) fn git_toplevel(directory: &str) -> Result<Option<String>> {
     git_output(["-C", directory, "rev-parse", "--show-toplevel"])
+        .with_context(|| format!("cannot probe Git repository root for directory {directory:?}"))
 }
 
-pub(crate) fn origin_identity(toplevel: &str) -> Option<RepoIdentity> {
-    git_output(["-C", toplevel, "remote", "get-url", "origin"])
-        .and_then(|url| normalize_remote_url(&url))
+pub(crate) fn origin_identity(toplevel: &str) -> Result<Option<RepoIdentity>> {
+    Ok(git_output(["-C", toplevel, "remote", "get-url", "origin"])
+        .with_context(|| format!("cannot probe Git origin for directory {toplevel:?}"))?
+        .and_then(|url| normalize_remote_url(&url)))
 }
 
 /// Parses any Git remote form into a host-qualified identity:
@@ -181,20 +210,134 @@ fn host_looks_like_host(host: &str) -> bool {
     host.contains('.') || host.eq_ignore_ascii_case("localhost")
 }
 
-fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
+pub(crate) const GIT_METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn git_output<const N: usize>(args: [&str; N]) -> Result<Option<String>> {
+    probe_output(Command::new("git").args(args), GIT_METADATA_PROBE_TIMEOUT)
+}
+
+fn stop_probe(child: &mut Child) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
-    let value = String::from_utf8(output.stdout).ok()?;
+    let killed = child.kill();
+    let reaped = child.wait();
+    reaped.context("failed to reap Git metadata probe")?;
+    killed.context("failed to stop Git metadata probe")
+}
+
+fn probe_output(command: &mut Command, timeout: Duration) -> Result<Option<String>> {
+    let mut output = tempfile::tempfile().context("cannot capture Git metadata probe output")?;
+    command.stdin(Stdio::null()).stdout(output.try_clone()?).stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let started = Instant::now();
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return Ok(None),
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) => {
+                stop_probe(&mut child)?;
+                anyhow::bail!(
+                    "Git metadata probe timed out after {}s; it may be blocked by folder permissions or a stalled Git process. The operation was stopped; this is not evidence of index corruption. Check folder permissions, operating system privacy controls, and whether Git responds in the reported directory, then retry. Read commands can use `--project all` to bypass automatic project inference.",
+                    timeout.as_secs()
+                );
+            }
+            Err(error) => {
+                stop_probe(&mut child)?;
+                return Err(error).context("cannot wait for Git metadata probe");
+            }
+        }
+    };
+    if !status.success() {
+        return Ok(None);
+    }
+    output.rewind()?;
+    let mut bytes = Vec::new();
+    output.read_to_end(&mut bytes)?;
+    let Ok(value) = String::from_utf8(bytes) else { return Ok(None) };
     let value = value.trim();
-    if value.is_empty() { None } else { Some(value.to_string()) }
+    Ok(if value.is_empty() { None } else { Some(value.to_string()) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_accepts_a_delayed_response_before_timeout() {
+        let output = probe_output(
+            Command::new("/bin/sh").args(["-c", "sleep 0.05; printf ready"]),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert_eq!(output.as_deref(), Some("ready"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_probe_stops_its_process_group_and_reaps_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_pid = temp.path().join("parent.pid");
+        let child_pid = temp.path().join("child.pid");
+        let started = Instant::now();
+        let result = probe_output(
+            Command::new("/bin/sh")
+                .args(["-c", "echo $$ > \"$1\"; sleep 30 & echo $! > \"$2\"; wait", "probe"])
+                .arg(&parent_pid)
+                .arg(&child_pid),
+            Duration::from_millis(200),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        for path in [parent_pid, child_pid] {
+            let pid = fs::read_to_string(path).unwrap();
+            let output =
+                Command::new("/bin/ps").args(["-p", pid.trim(), "-o", "stat="]).output().unwrap();
+            assert!(output.stdout.is_empty(), "probe process remains: {pid}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_collects_large_stdout_without_stderr_pipe_deadlock() {
+        let value = probe_output(
+            Command::new("/bin/sh").args([
+                "-c",
+                "head -c 262144 /dev/zero | tr '\\000' x; head -c 262144 /dev/zero >&2",
+            ]),
+            GIT_METADATA_PROBE_TIMEOUT,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(value.len(), 262144);
+        assert!(value.bytes().all(|byte| byte == b'x'));
+        assert!(
+            probe_output(
+                Command::new("/bin/sh").args(["-c", "printf ignored; exit 1"]),
+                GIT_METADATA_PROBE_TIMEOUT,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
 
     #[test]
     fn normalizes_github_remote_urls() {
@@ -253,7 +396,7 @@ mod tests {
             .unwrap();
 
         let mut cache = RepoIdentityCache::default();
-        let identity = cache.resolve(root.to_str()).unwrap();
+        let identity = cache.resolve(root.to_str()).unwrap().unwrap();
         assert_eq!(identity.remote, "github.com/samzong/Recall");
         assert_eq!(identity.slug, "samzong/Recall");
         assert_eq!(identity.name, "Recall");
@@ -266,7 +409,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("recall-non-git-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let mut cache = RepoIdentityCache::default();
-        assert_eq!(cache.resolve(root.to_str()), None);
+        assert_eq!(cache.resolve(root.to_str()).unwrap(), None);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -279,6 +422,7 @@ mod tests {
             .unwrap();
         let target = RepoIdentityCache::default()
             .resolve_file("link/../file.rs", temp.path().to_str())
+            .unwrap()
             .unwrap();
         assert_eq!(
             Path::new(&target.absolute_path),

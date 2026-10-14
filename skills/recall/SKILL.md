@@ -18,6 +18,23 @@ If neither MCP nor the installed CLI is available, stop and offer `brew install 
 - `all` covers every indexed project.
 - The CLI derives an omitted `--project` from its working directory. Recall MCP treats an omitted `project` as global, so pass the current project unless the user explicitly requests all projects.
 
+## Scheduled Sync
+
+Run `recall sync schedule install` or `uninstall` only when the user explicitly
+requests installing, changing, or removing the schedule. Do not install or
+remove it as a convenience during ordinary sync work. Run `status` only when
+the user asks to inspect the schedule. The macOS LaunchAgent runs the installed
+binary's `sync --project all` immediately after install, then at the requested
+interval. macOS may ask for access to multiple folders in sequence (Documents,
+Downloads, Desktop, or other volumes); the user must click Allow within
+60 seconds for each prompt while Recall is running. If the first sync fails,
+rerun `recall sync schedule install` when the user requests a retry; include
+`--interval` again to retain a custom interval. When loaded, `status` shows
+launchd's last exit code. A Git metadata probe timeout stops the whole sync
+after 60 seconds; once process
+cleanup completes, the sync releases its lock. Log modification times do not
+prove a sync succeeded.
+
 ## Find Sessions
 
 For a specific historical question, use MCP `search_messages` with keywords and the current project. Each match includes `session_id`, `seq`, `role`, and an excerpt around the match. Add `session_id` to search within a known session. This is full-text matching, not semantic search; use `search_sessions` for broader session discovery and `list_recent_sessions` when there is no query.

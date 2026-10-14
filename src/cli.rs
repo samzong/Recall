@@ -50,8 +50,13 @@ enum Commands {
         #[command(subcommand)]
         command: session::SessionCommands,
     },
-    #[command(about = "Scan configured AI coding session sources")]
+    #[command(
+        about = "Scan configured AI coding session sources",
+        args_conflicts_with_subcommands = true
+    )]
     Sync {
+        #[command(subcommand)]
+        command: Option<crate::schedule::SyncCommands>,
         #[arg(
             long,
             conflicts_with_all = ["backfill_events", "dry_run", "force", "project"],
@@ -310,6 +315,12 @@ pub(crate) fn run() -> Result<()> {
 
     match cli.command {
         Some(Commands::Info { format }) => crate::info::run(format)?,
+        Some(Commands::Sync {
+            command: Some(crate::schedule::SyncCommands::Schedule { command }),
+            ..
+        }) => {
+            crate::schedule::run(command)?;
+        }
         Some(Commands::Sync { session: Some(session), source, format, .. }) => {
             crate::sync::run_single_session(source.as_deref(), &session, format)?;
         }

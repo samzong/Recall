@@ -118,9 +118,10 @@ impl Store {
                 scope: self.resolve_project_selector(project)?,
                 inferred: false,
             }),
-            None => {
-                Ok(ScopeResolution { scope: crate::project_scope::auto_scope(), inferred: true })
-            }
+            None => Ok(ScopeResolution {
+                scope: crate::project_scope::try_auto_scope()?,
+                inferred: true,
+            }),
         }
     }
 

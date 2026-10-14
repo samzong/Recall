@@ -145,27 +145,34 @@ pub(crate) fn classify_selector(value: &str) -> SelectorForm {
     }
 }
 
-pub(crate) fn auto_scope_for_dir(dir: &Path) -> ProjectScope {
+pub(crate) fn auto_scope_for_dir(dir: &Path) -> anyhow::Result<ProjectScope> {
     let Some(dir) = dir.to_str() else {
-        return ProjectScope::Global;
+        return Ok(ProjectScope::Global);
     };
-    let Some(toplevel) = git_toplevel(dir) else {
-        return ProjectScope::Global;
+    let Some(toplevel) = git_toplevel(dir)? else {
+        return Ok(ProjectScope::Global);
     };
-    match origin_identity(&toplevel) {
+    Ok(match origin_identity(&toplevel)? {
         Some(identity) => ProjectScope::Repository {
             filter: RepoFilter::Remote(identity.remote),
             local_root: Some(toplevel),
         },
         None => ProjectScope::Directory(toplevel),
+    })
+}
+
+pub(crate) fn try_auto_scope() -> anyhow::Result<ProjectScope> {
+    match std::env::current_dir() {
+        Ok(dir) => auto_scope_for_dir(&dir),
+        Err(_) => Ok(ProjectScope::Global),
     }
 }
 
 pub(crate) fn auto_scope() -> ProjectScope {
-    match std::env::current_dir() {
-        Ok(dir) => auto_scope_for_dir(&dir),
-        Err(_) => ProjectScope::Global,
-    }
+    try_auto_scope().unwrap_or_else(|error| {
+        eprintln!("Cannot infer project scope: {error}");
+        ProjectScope::Global
+    })
 }
 
 fn looks_like_path(value: &str) -> bool {
@@ -235,7 +242,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         git_init(&root, Some("git@github.com:samzong/Recall.git"));
 
-        let scope = auto_scope_for_dir(&nested);
+        let scope = auto_scope_for_dir(&nested).unwrap();
 
         let root_name = root.file_name().unwrap().to_str().unwrap().to_string();
         match scope {
@@ -254,7 +261,7 @@ mod tests {
         let root = temp_dir("recall-scope-noorigin");
         git_init(&root, None);
 
-        let scope = auto_scope_for_dir(&root);
+        let scope = auto_scope_for_dir(&root).unwrap();
 
         match scope {
             ProjectScope::Directory(directory) => {
@@ -270,7 +277,7 @@ mod tests {
     fn auto_scope_is_global_outside_git() {
         let root = temp_dir("recall-scope-nongit");
 
-        assert_eq!(auto_scope_for_dir(&root), ProjectScope::Global);
+        assert_eq!(auto_scope_for_dir(&root).unwrap(), ProjectScope::Global);
 
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -252,6 +252,7 @@ fn sync_resolves_cross_repository_files_and_keeps_native_paths() {
     if alternate.is_dir() {
         let resolved = crate::repo_identity::RepoIdentityCache::default()
             .resolve_file("src/deleted.rs", alternate.to_str())
+            .unwrap()
             .unwrap();
         assert_eq!(&resolved, file);
     }

@@ -597,11 +597,69 @@ pruning sessions whose source transcript disappeared, and backfilling repo
 identity for sessions indexed before it was resolvable. Deleting sessions that
 match `excluded_paths` still runs, restricted to the current scope.
 
+### Scheduled Sync (macOS)
+
+Install, inspect, or remove a user-level LaunchAgent:
+
+```bash
+recall sync schedule install --interval 30m
+recall sync schedule status
+recall sync schedule uninstall
+```
+
+The default interval is 30 minutes. Intervals are integers with `s`, `m`, or
+`h` units, from 60 through 2147483647 seconds. The LaunchAgent runs the
+absolute path of the installed Recall binary with `sync --project all`; it uses
+the same blocking `sync.lock` as other syncs and exits after each run. Its label
+is `io.github.samzong.recall.sync`, and its plist is
+`~/Library/LaunchAgents/io.github.samzong.recall.sync.plist`.
+
+Install starts the first sync immediately, then launchd triggers subsequent syncs
+at the configured interval in the logged-in GUI session while the Mac is awake.
+If a sync is still running at a trigger, that interval is skipped; sleep does not guarantee
+a fresh sync every 30 minutes. When loaded, `status` shows launchd's last exit
+code: zero indicates the last completed run succeeded, while a nonzero code indicates
+failure. It also shows log modification times, which do not prove a sync
+succeeded. Logs are kept at
+`~/Library/Logs/recall/sync.stdout.log` and
+`~/Library/Logs/recall/sync.stderr.log`; uninstall retains them. Reinstall after
+moving or deleting the Recall binary, or to replace and reload the schedule.
+Linux and Windows report `not supported yet on <os>`.
+
+macOS may ask the scheduled Recall binary for access to multiple protected
+folders in sequence, including Documents, Downloads, Desktop, or other volumes.
+Terminal permissions do not grant the LaunchAgent that access. Click Allow
+within 60 seconds for each prompt while the permission request still belongs
+to a running process. If the first sync fails, rerun
+`recall sync schedule install` to start it again; include `--interval` again
+to retain a custom interval. Check `recall sync schedule status` for the last
+exit code.
+While the scheduled sync holds its index lock, manual syncs wait and report the
+lock owner's PID. A stalled Git metadata probe requests termination after 60
+seconds; once cleanup completes, that sync fails and releases the lock. The first
+probe timeout stops the entire sync; it does not continue waiting on other
+directories.
+`recall sync schedule uninstall` requests that launchd stop the scheduled job.
+
+The 60-second Git metadata timeout also applies to manual syncs and read
+commands that infer a project from the current directory, including `search`,
+`session list`, and `export`. Timeout errors identify the probed directory;
+they do not mean the index is corrupt or the repository has no identity.
+Existing repository identities are retained. Earlier successful writes in the
+same sync are not rolled back. Check folder permissions, operating system
+privacy controls, and whether Git responds in the reported directory, then
+retry. Read commands can use `--project all` to bypass automatic project
+inference; this does not bypass probes performed by a sync.
+
+Probe cleanup kills the process and waits for it to exit. That wait has no
+separate deadline: uninterruptible kernel I/O, such as a stalled hard-mounted
+NFS share, can still delay cleanup and lock release. The timeout does not bound
+the entire sync or direct filesystem operations.
+
 ## Backward Compatibility
 
-- Existing commands keep working: `recall search`, `recall export`,
-  `recall import`, `recall usage`, `recall share init`, and the TUI remain
-  unchanged.
+- Existing command names and flags remain available: `recall search`,
+  `recall export`, `recall import`, `recall usage`, `recall share init`, and the TUI.
 - Existing `recall export` remains the bulk export command.
 - Existing TUI shortcuts keep using the same internal session operations.
 - Export record schema is `v7`: event records retain `files` and nullable

@@ -294,7 +294,7 @@ impl SyncJob {
         }
 
         let (mut existing, repo_backfill) =
-            self.resolve_existing_state(self.load_adapter_sync_context(source_id)?);
+            self.resolve_existing_state(self.load_adapter_sync_context(source_id)?)?;
         let settings = self.scan_settings(label);
         let mut streamed = 0;
         let mut sink_error = None;
@@ -414,20 +414,20 @@ impl SyncJob {
             return Ok(());
         }
         let context = self.load_adapter_sync_context(source)?;
-        let paths = context
-            .session_paths()
-            .filter(|path| {
-                path_matches_scope(&self.options.scope, path, &mut self.repo_cache)
-                    && !self.path_excluder.as_ref().is_some_and(|matcher| {
-                        paths_match_excluded(
-                            path.directory.as_deref(),
-                            path.source_file_path.as_deref(),
-                            matcher,
-                        )
-                    })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        for path in context.session_paths() {
+            if path_matches_scope(&self.options.scope, path, &mut self.repo_cache)?
+                && !self.path_excluder.as_ref().is_some_and(|matcher| {
+                    paths_match_excluded(
+                        path.directory.as_deref(),
+                        path.source_file_path.as_deref(),
+                        matcher,
+                    )
+                })
+            {
+                paths.push(path.clone());
+            }
+        }
         let scan = self.scan_sessions(adapter, adapter.label(), &context)?;
         let Some(scan) = scan else {
             self.event_backfill.as_mut().unwrap().unavailable.push(source.to_string());
@@ -548,7 +548,7 @@ impl SyncJob {
             let Some(stored) = existing.paths.get_mut(&observation.source_id) else {
                 continue;
             };
-            if !path_matches_scope(&self.options.scope, stored, &mut self.repo_cache) {
+            if !path_matches_scope(&self.options.scope, stored, &mut self.repo_cache)? {
                 continue;
             }
             if let Some(source_file_path) = observation.source_file_path.as_deref()
@@ -666,7 +666,7 @@ impl SyncJob {
         source_id: &str,
         context: adapters::AdapterSyncContext,
     ) -> Result<ExistingState> {
-        let (existing, repo_backfill) = self.resolve_existing_state(context);
+        let (existing, repo_backfill) = self.resolve_existing_state(context)?;
         self.write_repo_backfill(source_id, repo_backfill, &existing)?;
         Ok(existing)
     }
@@ -693,7 +693,7 @@ impl SyncJob {
     fn resolve_existing_state(
         &mut self,
         context: adapters::AdapterSyncContext,
-    ) -> (ExistingState, Vec<(String, RepoIdentity)>) {
+    ) -> Result<(ExistingState, Vec<(String, RepoIdentity)>)> {
         let adapters::AdapterSyncContextParts {
             session_meta: meta,
             session_paths: mut paths,
@@ -711,7 +711,7 @@ impl SyncJob {
                 && (path.repo_remote.is_none()
                     || path.repo_slug.is_none()
                     || path.repo_name.is_none())
-                && let Some(repo) = self.repo_cache.resolve(path.directory.as_deref())
+                && let Some(repo) = self.repo_cache.resolve(path.directory.as_deref())?
             {
                 path.repo_remote = Some(repo.remote.clone());
                 path.repo_slug = Some(repo.slug.clone());
@@ -721,7 +721,7 @@ impl SyncJob {
         }
         let existing =
             ExistingState { meta, paths, imported_ids, usage_meta, event_meta, metadata_meta };
-        (existing, repo_backfill)
+        Ok((existing, repo_backfill))
     }
 
     fn process_raw_session(
@@ -736,9 +736,7 @@ impl SyncJob {
             return Ok(());
         }
 
-        // Runs before every write and delete below, so a scoped sync can never
-        // touch a session outside its scope.
-        let repo_identity = self.repo_cache.resolve(raw.directory.as_deref());
+        let repo_identity = self.repo_cache.resolve(raw.directory.as_deref())?;
         if !self
             .options
             .scope
@@ -790,7 +788,7 @@ impl SyncJob {
 
         for event in &mut raw.events {
             for file in &mut event.files {
-                file.target = self.repo_cache.resolve_file(&file.path, file.cwd.as_deref());
+                file.target = self.repo_cache.resolve_file(&file.path, file.cwd.as_deref())?;
             }
         }
 
@@ -1414,9 +1412,9 @@ fn path_matches_scope(
     scope: &ProjectScope,
     path: &SessionPath,
     cache: &mut RepoIdentityCache,
-) -> bool {
-    let repo = cache.resolve(path.directory.as_deref());
-    scope.matches(SessionScopeFields {
+) -> Result<bool> {
+    let repo = cache.resolve(path.directory.as_deref())?;
+    Ok(scope.matches(SessionScopeFields {
         directory: path.directory.as_deref(),
         repo_remote: path
             .repo_remote
@@ -1430,7 +1428,7 @@ fn path_matches_scope(
             .repo_name
             .as_deref()
             .or_else(|| repo.as_ref().map(|repo| repo.name.as_str())),
-    })
+    }))
 }
 
 fn paths_match_excluded(

@@ -69,7 +69,20 @@ pub(crate) fn try_acquire_sync_lock() -> anyhow::Result<Option<File>> {
 
 fn acquire_lock(path: &Path) -> anyhow::Result<File> {
     let mut file = open_lock_file(path)?;
-    file.lock_exclusive()?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            let owner =
+                std::fs::read_to_string(path).ok().and_then(|pid| pid.trim().parse::<u32>().ok());
+            if let Some(pid) = owner {
+                eprintln!("Waiting for another Recall sync (pid {pid})");
+            } else {
+                eprintln!("Waiting for another Recall sync");
+            }
+            file.lock_exclusive()?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     write_lock_owner(&mut file)?;
     Ok(file)
 }
@@ -288,13 +301,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lock_file_excludes_parallel_owner() {
+    fn lock_file_queues_and_excludes_parallel_owners() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sync.lock");
         let first = acquire_lock(&path).unwrap();
 
         assert!(try_acquire_lock(&path).unwrap().is_none());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let second = acquire_lock(&path).unwrap();
+            acquired_tx.send(()).unwrap();
+            second
+        });
+        started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            acquired_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
         drop(first);
+        acquired_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        drop(waiter.join().unwrap());
     }
 
     #[test]

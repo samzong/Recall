@@ -6,6 +6,64 @@ use crate::session;
 use clap::{CommandFactory, Parser};
 
 #[test]
+fn sync_schedule_preserves_manual_sync_and_excludes_mixed_arguments() {
+    use crate::schedule::{ScheduleCommands, SyncCommands};
+
+    let cli = Cli::try_parse_from(["recall", "sync", "schedule", "install"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Sync {
+            command: Some(SyncCommands::Schedule {
+                command: ScheduleCommands::Install { interval: 1800 }
+            }),
+            ..
+        })
+    ));
+    let cli =
+        Cli::try_parse_from(["recall", "sync", "schedule", "install", "--interval", "2m"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Sync {
+            command: Some(SyncCommands::Schedule {
+                command: ScheduleCommands::Install { interval: 120 }
+            }),
+            ..
+        })
+    ));
+    for action in ["status", "uninstall"] {
+        assert!(Cli::try_parse_from(["recall", "sync", "schedule", action]).is_ok());
+    }
+    for args in [
+        vec!["recall", "sync"],
+        vec!["recall", "sync", "--project", "all"],
+        vec!["recall", "sync", "--session", "native-id", "--source", "codex", "--format", "json"],
+        vec!["recall", "sync", "--source", "codex", "--force", "--verbose"],
+        vec!["recall", "sync", "--backfill-events", "--dry-run", "--project", "all"],
+    ] {
+        assert!(matches!(
+            Cli::try_parse_from(args).unwrap().command,
+            Some(Commands::Sync { command: None, .. })
+        ));
+    }
+    for args in [
+        vec!["recall", "sync", "--project", "all", "schedule", "install"],
+        vec![
+            "recall",
+            "sync",
+            "--session",
+            "native-id",
+            "--source",
+            "codex",
+            "schedule",
+            "install",
+        ],
+        vec!["recall", "sync", "schedule", "status", "--force"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+}
+
+#[test]
 fn export_accepts_default_jsonl_without_format_flag() {
     let cli = Cli::try_parse_from([
         "recall",

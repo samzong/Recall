@@ -19,6 +19,7 @@ pub(crate) mod project_scope;
 pub(crate) mod query;
 pub(crate) mod remote;
 pub(crate) mod repo_identity;
+pub(crate) mod schedule;
 pub(crate) mod semantic;
 pub(crate) mod session;
 pub(crate) mod session_action;

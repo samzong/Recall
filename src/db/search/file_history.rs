@@ -42,8 +42,8 @@ impl SearchEngine<'_> {
                 let directory = directory
                     .to_str()
                     .ok_or_else(|| anyhow::anyhow!("invalid target directory"))?;
-                let root = git_toplevel(directory).unwrap_or_else(|| directory.to_string());
-                let remote = origin_identity(&root).map(|identity| identity.remote);
+                let root = git_toplevel(directory)?.unwrap_or_else(|| directory.to_string());
+                let remote = origin_identity(&root)?.map(|identity| identity.remote);
                 (remote, Some(root))
             }
             SelectorForm::Repository(identity) => (Some(identity.remote), None),
@@ -73,7 +73,7 @@ impl SearchEngine<'_> {
         };
         let mut absolute_path = None;
         let relative = if std::path::Path::new(path).is_absolute() || root.is_some() {
-            let resolved = RepoIdentityCache::default().resolve_file(path, root.as_deref());
+            let resolved = RepoIdentityCache::default().resolve_file(path, root.as_deref())?;
             if let Some(file) = resolved.filter(|file| {
                 remote.as_deref().is_some_and(|remote| file.repo_remote.as_deref() == Some(remote))
                     || root.as_deref().is_some_and(|root| {
