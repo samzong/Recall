@@ -1,6 +1,41 @@
 # Changelog
 
 
+## [0.6.4](https://github.com/samzong/Recall/compare/v0.6.3...v0.6.4) (2026-10-23)
+
+
+### Features
+
+* **adapters:** add JetBrains Junie session adapter ([#303](https://github.com/samzong/Recall/issues/303))
+* **adapters:** add Zed agent thread adapter ([#304](https://github.com/samzong/Recall/issues/304))
+* **adapters:** add Qoder session adapter ([#305](https://github.com/samzong/Recall/issues/305))
+* **adapters:** add Warp agent conversation adapter ([#306](https://github.com/samzong/Recall/issues/306))
+* **adapters:** record Devin tool calls as session events ([#308](https://github.com/samzong/Recall/issues/308))
+* **sync:** add macos launchd sync scheduling ([#309](https://github.com/samzong/Recall/issues/309))
+* **remote:** add launchd sync scheduling ([#315](https://github.com/samzong/Recall/issues/315))
+
+
+### Fixes
+
+* **deps:** restore dependency audit with zip 9 ([#314](https://github.com/samzong/Recall/issues/314))
+* **opencode:** import parent links and read 2.1.0 session storage ([#317](https://github.com/samzong/Recall/issues/317))
+
+
+### Performance
+
+* **remote:** download remote objects concurrently ([#321](https://github.com/samzong/Recall/issues/321))
+
+
+### Refactors
+
+* **schedule:** always render launchd environment variables ([#319](https://github.com/samzong/Recall/issues/319))
+
+
+### Documentation
+
+* **changelog:** drop rx entries from the v0.6.3 notes ([#278](https://github.com/samzong/Recall/issues/278))
+
+
 ## [0.6.3](https://github.com/samzong/Recall/compare/v0.6.2...v0.6.3) (2026-10-07)
 
 
