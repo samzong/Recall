@@ -30,10 +30,24 @@ pub(crate) enum RemoteCommands {
     },
     #[command(about = "Disconnect while retaining local sessions and remote objects")]
     Disconnect,
-    #[command(about = "Scan the saved scope and exchange indexed sessions")]
+    #[command(
+        about = "Scan the saved scope and exchange indexed sessions",
+        args_conflicts_with_subcommands = true
+    )]
     Sync {
+        #[command(subcommand)]
+        command: Option<RemoteSyncCommands>,
         #[arg(long, value_enum, default_value_t = crate::info::InfoFormat::Text)]
         format: crate::info::InfoFormat,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RemoteSyncCommands {
+    #[command(about = "Manage scheduled remote sync (macOS only)")]
+    Schedule {
+        #[command(subcommand)]
+        command: crate::schedule::ScheduleCommands,
     },
 }
 
@@ -119,7 +133,10 @@ pub(crate) fn run(command: RemoteCommands) -> Result<()> {
             eprintln!("Remote disconnected. Indexed sessions and remote objects were retained.");
             Ok(())
         }
-        RemoteCommands::Sync { format } => synchronize(format),
+        RemoteCommands::Sync {
+            command: Some(RemoteSyncCommands::Schedule { command }), ..
+        } => crate::schedule::run(command, crate::schedule::Job::RemoteSync),
+        RemoteCommands::Sync { command: None, format } => synchronize(format),
     }
 }
 

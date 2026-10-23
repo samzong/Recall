@@ -319,7 +319,7 @@ pub(crate) fn run() -> Result<()> {
             command: Some(crate::schedule::SyncCommands::Schedule { command }),
             ..
         }) => {
-            crate::schedule::run(command)?;
+            crate::schedule::run(command, crate::schedule::Job::LocalSync)?;
         }
         Some(Commands::Sync { session: Some(session), source, format, .. }) => {
             crate::sync::run_single_session(source.as_deref(), &session, format)?;

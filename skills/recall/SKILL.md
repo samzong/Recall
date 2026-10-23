@@ -23,8 +23,19 @@ If neither MCP nor the installed CLI is available, stop and offer `brew install 
 - `recall sync schedule install --interval 30m`
 - `recall sync schedule status`
 - `recall sync schedule uninstall`
+- `recall remote sync schedule install --interval 30m`
+- `recall remote sync schedule status`
+- `recall remote sync schedule uninstall`
 
 Run install or uninstall only when the user explicitly requests a schedule change; run status only when the user asks to inspect it.
+
+Local and remote schedules are independent macOS LaunchAgents. The remote
+schedule runs `recall remote sync` against the saved scope. Connect the remote
+before installing its schedule. A disconnected scheduled run fails with exit
+code 1. Use status to find its last exit code and stderr log path.
+Install starts the first run immediately. Uninstall retains logs and the connection.
+The remote schedule preserves HOME and configured AWS credential/configuration
+file paths. It does not copy credential values or load shell profiles.
 
 ## Find Sessions
 

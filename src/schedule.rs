@@ -12,7 +12,7 @@ pub(crate) enum SyncCommands {
 
 #[derive(Subcommand)]
 pub(crate) enum ScheduleCommands {
-    #[command(about = "Install or reload a user LaunchAgent for recall sync --project all")]
+    #[command(about = "Install or reload a user LaunchAgent for this sync command")]
     Install {
         #[arg(long, default_value = "30m", value_parser = parse_interval, help = "Sync interval: integer seconds (s), minutes (m), or hours (h); minimum 60s")]
         interval: u32,
@@ -21,6 +21,12 @@ pub(crate) enum ScheduleCommands {
     Uninstall,
     #[command(about = "Show installation, load state, binary path, and recent log activity")]
     Status,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Job {
+    LocalSync,
+    RemoteSync,
 }
 
 fn parse_interval(value: &str) -> std::result::Result<u32, String> {
@@ -44,14 +50,14 @@ fn parse_interval(value: &str) -> std::result::Result<u32, String> {
         .ok_or_else(invalid)
 }
 
-pub(crate) fn run(command: ScheduleCommands) -> Result<()> {
+pub(crate) fn run(command: ScheduleCommands, job: Job) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        macos::run(command)
+        macos::run(command, job)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = command;
+        let _ = (command, job);
         unsupported(std::env::consts::OS)
     }
 }
@@ -63,16 +69,47 @@ fn unsupported(os: &str) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::ScheduleCommands;
+    use super::{Job, ScheduleCommands};
     use anyhow::{Context, Result};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
 
-    const LABEL: &str = "io.github.samzong.recall.sync";
+    impl Job {
+        fn label(self) -> &'static str {
+            match self {
+                Self::LocalSync => "io.github.samzong.recall.sync",
+                Self::RemoteSync => "io.github.samzong.recall.remote-sync",
+            }
+        }
+
+        fn log_name(self) -> &'static str {
+            match self {
+                Self::LocalSync => "sync",
+                Self::RemoteSync => "remote-sync",
+            }
+        }
+
+        fn arguments(self) -> &'static [&'static str] {
+            match self {
+                Self::LocalSync => &["sync", "--project", "all"],
+                Self::RemoteSync => &["remote", "sync"],
+            }
+        }
+
+        fn command(self) -> &'static str {
+            match self {
+                Self::LocalSync => "recall sync schedule",
+                Self::RemoteSync => "recall remote sync schedule",
+            }
+        }
+    }
 
     struct Agent {
+        job: Job,
         plist: PathBuf,
         stdout: PathBuf,
         stderr: PathBuf,
@@ -80,21 +117,26 @@ mod macos {
     }
 
     impl Agent {
-        fn new() -> Result<Self> {
+        fn new(job: Job) -> Result<Self> {
             let home = dirs::home_dir().context("cannot determine home directory")?;
             let uid = checked(Command::new("/usr/bin/id").arg("-u"))?;
             let uid = std::str::from_utf8(&uid.stdout)?.trim().parse::<u32>()?;
+            Ok(Self::for_home(job, &home, format!("gui/{uid}")))
+        }
+
+        fn for_home(job: Job, home: &Path, domain: String) -> Self {
             let logs = home.join("Library/Logs/recall");
-            Ok(Self {
-                plist: home.join("Library/LaunchAgents").join(format!("{LABEL}.plist")),
-                stdout: logs.join("sync.stdout.log"),
-                stderr: logs.join("sync.stderr.log"),
-                domain: format!("gui/{uid}"),
-            })
+            Self {
+                job,
+                plist: home.join("Library/LaunchAgents").join(format!("{}.plist", job.label())),
+                stdout: logs.join(format!("{}.stdout.log", job.log_name())),
+                stderr: logs.join(format!("{}.stderr.log", job.log_name())),
+                domain,
+            }
         }
 
         fn target(&self) -> String {
-            format!("{}/{LABEL}", self.domain)
+            format!("{}/{}", self.domain, self.job.label())
         }
 
         fn loaded_job(&self) -> Result<Option<String>> {
@@ -117,7 +159,17 @@ mod macos {
 
         fn install(&self, interval: u32) -> Result<()> {
             let binary = std::env::current_exe().context("cannot resolve Recall executable")?;
-            let plist = render_plist(&binary, interval, &self.stdout, &self.stderr)?;
+            let environment = job_environment(self.job)?;
+            let plist = render_plist(
+                self.job,
+                &binary,
+                interval,
+                &self.stdout,
+                &self.stderr,
+                &environment,
+            )?;
+            let command = self.job.command();
+            let label = self.job.label();
             let directory = self.plist.parent().context("LaunchAgent path has no parent")?;
             fs::create_dir_all(directory)?;
             fs::create_dir_all(self.stdout.parent().context("log path has no parent")?)?;
@@ -127,15 +179,15 @@ mod macos {
             self.bootout()?;
             temporary.persist(&self.plist).context("cannot write LaunchAgent plist")?;
             checked(Command::new("/bin/launchctl").args(["bootstrap", &self.domain]).arg(&self.plist))
-                .with_context(|| format!("could not load {}; inspect `recall sync schedule status` or remove it with `recall sync schedule uninstall`", self.plist.display()))?;
+                .with_context(|| format!("could not load {}; inspect `{command} status` or remove it with `{command} uninstall`", self.plist.display()))?;
             anyhow::ensure!(
                 self.loaded_job()?.is_some(),
                 "LaunchAgent was not loaded after bootstrap"
             );
             checked(Command::new("/bin/launchctl").args(["kickstart", &self.target()]))
-                .context("could not start the first sync; inspect `recall sync schedule status` or remove it with `recall sync schedule uninstall`")?;
+                .with_context(|| format!("could not start the first sync; inspect `{command} status` or remove it with `{command} uninstall`"))?;
             println!(
-                "Installed: {LABEL}\nInterval: {interval}s\nBinary: {}\nPlist: {}\nStdout: {}\nStderr: {}\nFirst sync: started now; macOS may ask for access to multiple folders in sequence (Documents, Downloads, Desktop, or other volumes). Click Allow within {} seconds for each prompt; if the first sync fails, rerun `recall sync schedule install`.",
+                "Installed: {label}\nInterval: {interval}s\nBinary: {}\nPlist: {}\nStdout: {}\nStderr: {}\nFirst sync: started now; macOS may ask for access to multiple folders in sequence (Documents, Downloads, Desktop, or other volumes). Click Allow within {} seconds for each prompt; if the first sync fails, rerun `{command} install`.",
                 binary.display(),
                 self.plist.display(),
                 self.stdout.display(),
@@ -153,7 +205,8 @@ mod macos {
                 Err(error) => return Err(error.into()),
             }
             println!(
-                "Not installed: {LABEL}\nLogs retained: {}",
+                "Not installed: {}\nLogs retained: {}",
+                self.job.label(),
                 self.stdout.parent().unwrap().display()
             );
             Ok(())
@@ -163,8 +216,9 @@ mod macos {
             let job = self.loaded_job()?;
             let installed = self.plist.try_exists()?;
             println!(
-                "{}: {LABEL}\nLoaded: {}\nPlist: {}",
+                "{}: {}\nLoaded: {}\nPlist: {}",
                 if installed { "Installed" } else { "Not installed" },
+                self.job.label(),
                 if job.is_some() { "yes" } else { "no" },
                 self.plist.display()
             );
@@ -243,10 +297,14 @@ mod macos {
 
     fn xml_path(path: &Path) -> Result<String> {
         let text = path.to_str().context("LaunchAgent paths must be valid UTF-8")?;
+        xml_text(text)
+    }
+
+    fn xml_text(text: &str) -> Result<String> {
         anyhow::ensure!(
             text.chars().all(|c| matches!(c, '\t' | '\n' | '\r')
                 || (c >= ' ' && c != '\u{fffe}' && c != '\u{ffff}')),
-            "LaunchAgent path contains a character unsupported by XML"
+            "LaunchAgent value contains a character unsupported by XML"
         );
         Ok(text
             .replace('&', "&amp;")
@@ -255,20 +313,78 @@ mod macos {
             .replace('\r', "&#13;"))
     }
 
-    fn render_plist(binary: &Path, interval: u32, stdout: &Path, stderr: &Path) -> Result<String> {
+    fn job_environment(job: Job) -> Result<BTreeMap<&'static str, String>> {
+        let home = dirs::home_dir().context("cannot determine home directory")?;
+        job_environment_with(job, &home, |name| std::env::var_os(name))
+    }
+
+    fn job_environment_with(
+        job: Job,
+        home: &Path,
+        variable: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<BTreeMap<&'static str, String>> {
+        let mut environment = BTreeMap::from([(
+            "HOME",
+            home.to_str().context("home directory must be valid UTF-8")?.to_string(),
+        )]);
+        if job == Job::LocalSync {
+            return Ok(environment);
+        }
+        environment.insert("PATH", "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+        for name in ["AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE"] {
+            if let Some(value) = variable(name) {
+                environment.insert(name, aws_file_path(Path::new(&value), home)?);
+            }
+        }
+        Ok(environment)
+    }
+
+    fn aws_file_path(value: &Path, home: &Path) -> Result<String> {
+        let path = if value.as_os_str().is_empty() {
+            PathBuf::new()
+        } else if let Ok(suffix) = value.strip_prefix("~") {
+            home.join(suffix)
+        } else {
+            std::path::absolute(value)?
+        };
+        Ok(path.to_str().context("AWS file path must be valid UTF-8")?.to_string())
+    }
+
+    fn render_plist(
+        job: Job,
+        binary: &Path,
+        interval: u32,
+        stdout: &Path,
+        stderr: &Path,
+        environment: &BTreeMap<&str, String>,
+    ) -> Result<String> {
         anyhow::ensure!(binary.is_absolute(), "Recall executable path must be absolute");
         let binary = xml_path(binary)?;
         let stdout = xml_path(stdout)?;
         let stderr = xml_path(stderr)?;
+        let label = job.label();
+        let arguments =
+            job.arguments().iter().map(|arg| format!("<string>{arg}</string>")).collect::<String>();
+        let environment = if environment.is_empty() {
+            String::new()
+        } else {
+            let values = environment
+                .iter()
+                .map(|(name, value)| {
+                    Ok(format!("<key>{name}</key><string>{}</string>", xml_text(value)?))
+                })
+                .collect::<Result<String>>()?;
+            format!("    <key>EnvironmentVariables</key><dict>{values}</dict>\n")
+        };
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>{LABEL}</string>
+    <key>Label</key><string>{label}</string>
     <key>ProgramArguments</key>
-    <array><string>{binary}</string><string>sync</string><string>--project</string><string>all</string></array>
-    <key>StartInterval</key><integer>{interval}</integer>
+    <array><string>{binary}</string>{arguments}</array>
+{environment}    <key>StartInterval</key><integer>{interval}</integer>
     <key>KeepAlive</key><false/>
     <key>AbandonProcessGroup</key><true/>
     <key>StandardOutPath</key><string>{stdout}</string>
@@ -280,8 +396,8 @@ mod macos {
         ))
     }
 
-    pub(super) fn run(command: ScheduleCommands) -> Result<()> {
-        let agent = Agent::new()?;
+    pub(super) fn run(command: ScheduleCommands, job: Job) -> Result<()> {
+        let agent = Agent::new(job)?;
         match command {
             ScheduleCommands::Install { interval } => agent.install(interval),
             ScheduleCommands::Uninstall => agent.uninstall(),
@@ -292,6 +408,59 @@ mod macos {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn job_environment_only_preserves_variables_allowed_for_each_job() {
+            let home = Path::new("/Users/example");
+            for (credentials, config) in [
+                (None, None),
+                (Some("~/.aws/custom"), None),
+                (None, Some("/profiles/config")),
+                (Some("~/.aws/custom"), Some("/profiles/config")),
+            ] {
+                let variables = BTreeMap::from([
+                    ("AWS_SHARED_CREDENTIALS_FILE", credentials),
+                    ("AWS_CONFIG_FILE", config),
+                    ("PATH", Some("/custom/bin")),
+                    ("AWS_ACCESS_KEY_ID", Some("ignored")),
+                    ("AWS_SECRET_ACCESS_KEY", Some("ignored")),
+                ]);
+                let variable =
+                    |name: &str| variables.get(name).copied().flatten().map(OsString::from);
+                let local = job_environment_with(Job::LocalSync, home, variable).unwrap();
+                assert_eq!(local, BTreeMap::from([("HOME", "/Users/example".to_string())]));
+                let remote = job_environment_with(Job::RemoteSync, home, variable).unwrap();
+                let mut expected = BTreeMap::from([
+                    ("HOME", "/Users/example".to_string()),
+                    ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin".to_string()),
+                ]);
+                if credentials.is_some() {
+                    expected.insert(
+                        "AWS_SHARED_CREDENTIALS_FILE",
+                        "/Users/example/.aws/custom".to_string(),
+                    );
+                }
+                if config.is_some() {
+                    expected.insert("AWS_CONFIG_FILE", "/profiles/config".to_string());
+                }
+                assert_eq!(remote, expected);
+            }
+        }
+
+        #[test]
+        fn aws_file_overrides_keep_the_same_location_without_a_shell() {
+            let home = Path::new("/Users/example");
+            assert_eq!(
+                aws_file_path(Path::new("~/.aws/custom"), home).unwrap(),
+                "/Users/example/.aws/custom"
+            );
+            assert_eq!(aws_file_path(Path::new("/profiles/r2"), home).unwrap(), "/profiles/r2");
+            assert_eq!(aws_file_path(Path::new(""), home).unwrap(), "");
+            assert_eq!(
+                aws_file_path(Path::new("profiles/r2"), home).unwrap(),
+                std::env::current_dir().unwrap().join("profiles/r2").to_str().unwrap()
+            );
+        }
 
         #[test]
         fn launchctl_exit_status_preserves_codes_and_pending_state() {
@@ -309,7 +478,11 @@ mod macos {
             let binary = Path::new("/Applications/Recall & <Tools>/recall");
             let stdout = Path::new("/Users/example/Library/Logs/recall/out\r.log");
             let stderr = Path::new("/Users/example/Library/Logs/recall/err.log");
-            let plist = render_plist(binary, 1800, stdout, stderr).unwrap();
+            let environment =
+                job_environment_with(Job::LocalSync, Path::new("/Users/example"), |_| None)
+                    .unwrap();
+            let plist =
+                render_plist(Job::LocalSync, binary, 1800, stdout, stderr, &environment).unwrap();
             let file = tempfile::NamedTempFile::new().unwrap();
             fs::write(file.path(), plist).unwrap();
             let output = checked(
@@ -319,7 +492,7 @@ mod macos {
             )
             .unwrap();
             let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(value["Label"], LABEL);
+            assert_eq!(value["Label"], "io.github.samzong.recall.sync");
             assert_eq!(
                 value["ProgramArguments"],
                 serde_json::json!([binary.to_str().unwrap(), "sync", "--project", "all"])
@@ -331,8 +504,81 @@ mod macos {
             let definition: Definition = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(definition.standard_out_path, stdout);
             assert_eq!(definition.standard_error_path, stderr);
-            assert!(render_plist(Path::new("recall"), 1800, stdout, stderr).is_err());
-            assert!(render_plist(Path::new("/bad\u{1}/recall"), 1800, stdout, stderr).is_err());
+            assert_eq!(
+                value["EnvironmentVariables"],
+                serde_json::json!({"HOME": "/Users/example"})
+            );
+            assert!(
+                render_plist(
+                    Job::LocalSync,
+                    Path::new("recall"),
+                    1800,
+                    stdout,
+                    stderr,
+                    &environment
+                )
+                .is_err()
+            );
+            assert!(
+                render_plist(
+                    Job::LocalSync,
+                    Path::new("/bad\u{1}/recall"),
+                    1800,
+                    stdout,
+                    stderr,
+                    &environment
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn schedules_keep_separate_identity_paths_arguments_and_environment() {
+            let home = Path::new("/Users/example");
+            let local = Agent::for_home(Job::LocalSync, home, "gui/501".to_string());
+            let remote = Agent::for_home(Job::RemoteSync, home, "gui/501".to_string());
+            assert_ne!(local.target(), remote.target());
+            assert_ne!(local.plist, remote.plist);
+            assert_ne!(local.stdout, remote.stdout);
+            assert_ne!(local.stderr, remote.stderr);
+            assert_eq!(
+                local.plist,
+                home.join("Library/LaunchAgents/io.github.samzong.recall.sync.plist")
+            );
+            assert_eq!(local.stdout, home.join("Library/Logs/recall/sync.stdout.log"));
+            assert_eq!(local.stderr, home.join("Library/Logs/recall/sync.stderr.log"));
+            let environment = job_environment_with(Job::RemoteSync, home, |name| match name {
+                "AWS_SHARED_CREDENTIALS_FILE" => Some("/profiles/R2 & <test>\r.ini".into()),
+                _ => None,
+            })
+            .unwrap();
+            let plist = render_plist(
+                Job::RemoteSync,
+                Path::new("/opt/homebrew/bin/recall"),
+                120,
+                &remote.stdout,
+                &remote.stderr,
+                &environment,
+            )
+            .unwrap();
+            let file = tempfile::NamedTempFile::new().unwrap();
+            fs::write(file.path(), plist).unwrap();
+            let output = checked(
+                Command::new("/usr/bin/plutil")
+                    .args(["-convert", "json", "-o", "-"])
+                    .arg(file.path()),
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["Label"], Job::RemoteSync.label());
+            assert_eq!(
+                value["ProgramArguments"],
+                serde_json::json!(["/opt/homebrew/bin/recall", "remote", "sync"])
+            );
+            assert_eq!(value["StartInterval"], 120);
+            assert_eq!(value["EnvironmentVariables"], serde_json::to_value(environment).unwrap());
+            assert_eq!(value["StandardOutPath"], remote.stdout.to_str().unwrap());
+            assert_eq!(value["StandardErrorPath"], remote.stderr.to_str().unwrap());
         }
     }
 }
@@ -375,12 +621,14 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn all_schedule_actions_reject_the_current_platform() {
-        for command in [
-            ScheduleCommands::Install { interval: 1800 },
-            ScheduleCommands::Uninstall,
-            ScheduleCommands::Status,
-        ] {
-            assert!(run(command).is_err());
+        for job in [Job::LocalSync, Job::RemoteSync] {
+            for command in [
+                ScheduleCommands::Install { interval: 1800 },
+                ScheduleCommands::Uninstall,
+                ScheduleCommands::Status,
+            ] {
+                assert!(run(command, job).is_err());
+            }
         }
     }
 }

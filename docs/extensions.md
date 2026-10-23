@@ -384,6 +384,14 @@ Recall does not scan PATH for `recall-*` binaries.
 `<data_dir>` follows the same `dirs::data_dir()` convention as
 `<data_dir>/recall/recall.db`.
 
+Scheduled remote sync uses this same managed directory. It does not discover
+providers through PATH. On macOS, `recall remote sync schedule install` records
+HOME and a system PATH in the LaunchAgent. It also preserves the paths from
+`AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` when set. The provider reads
+credential files itself. The plist contains file paths, never credential values.
+See [scheduled remote sync](remote-sync.md#scheduled-remote-sync-macos) for
+commands and failure diagnostics.
+
 `installed.json` is local host state, not a copy of the manifest or catalog. It
 stores only the installed version and the offline help description:
 

@@ -1,4 +1,4 @@
-# Manual Remote Synchronization
+# Remote Synchronization
 
 Status: implementation contract. Remote synchronization is not yet available in
 the released CLI. Core and the first provider extension are developed in
@@ -36,6 +36,9 @@ replica is outside this delivery.
 recall remote connect
 recall remote sync
 recall remote sync --format json
+recall remote sync schedule install --interval 30m
+recall remote sync schedule status
+recall remote sync schedule uninstall
 recall remote disconnect
 recall info --format json
 ```
@@ -63,6 +66,47 @@ a narrower upload scope does not remove previously published objects.
 and `uploaded` object counts and `sessions_with_alternatives`. Diagnostic output
 goes to stderr. `info` reports the configured connection, saved scope, and host;
 it does not perform a network health check.
+
+### Scheduled remote sync (macOS)
+
+Remote scheduling is opt-in. `recall remote sync schedule install` installs a
+user LaunchAgent and starts the first remote sync immediately. Each run executes
+`recall remote sync`, which scans the saved upload scope before exchanging
+objects. It does not run a separate global local sync.
+
+The interval defaults to `30m`. Use integer `s`, `m`, or `h` units, from 60 to
+2147483647 seconds. The schedule commands do not accept `--format`.
+
+The label is `io.github.samzong.recall.remote-sync`. Its plist is
+`~/Library/LaunchAgents/io.github.samzong.recall.remote-sync.plist`. Its logs are
+`~/Library/Logs/recall/remote-sync.stdout.log` and
+`~/Library/Logs/recall/remote-sync.stderr.log`. The local
+[`recall sync schedule`](session.md#scheduled-sync-macos) retains its existing
+label and paths. Each schedule has its own interval and load state. Installing,
+updating, or uninstalling one does not change the other. Repeat install with
+`--interval` to change an interval. Uninstall retains logs and the remote connection.
+
+The remote plist records the installing user's HOME and a system PATH. Core
+resolves the provider from its managed extension directory without PATH lookup.
+The provider reads its saved configuration and selected AWS profile under that
+HOME. If `AWS_SHARED_CREDENTIALS_FILE` or `AWS_CONFIG_FILE` is set during install,
+the plist records that file path. Relative paths become absolute. Reinstall the
+schedule after changing those paths. Credential values are never copied into
+the plist. Shell profiles are not loaded, and other shell environment variables
+are not copied.
+
+Connect before installing the schedule. If no remote connection exists, the job
+exits with code 1 and writes the diagnostic to `remote-sync.stderr.log`. Install
+success means launchd accepted and started the job, not that remote sync succeeded.
+`status` reports the last exit code, log paths, and log modification times.
+Inspect stderr for the failure reason. A modification time alone does not prove
+success. Disconnect does not uninstall the schedule. Reconnect or uninstall it
+to stop repeated disconnected failures.
+
+Both sync jobs use the existing exclusive sync lock. If they overlap, one waits
+for the other. launchd skips interval events during sleep or an active run. This
+schedule does not guarantee a fixed freshness deadline. Linux and Windows report
+`not supported yet on <os>`.
 
 ### Identity and retained revisions
 

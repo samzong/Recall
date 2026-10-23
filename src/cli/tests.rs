@@ -6,6 +6,49 @@ use crate::session;
 use clap::{CommandFactory, Parser};
 
 #[test]
+fn remote_schedule_preserves_manual_formats_and_reuses_interval_parsing() {
+    use crate::remote::{RemoteCommands, RemoteSyncCommands};
+    use crate::schedule::ScheduleCommands;
+
+    for (suffix, interval) in [(vec![], 1800), (vec!["--interval", "2m"], 120)] {
+        let mut args = vec!["recall", "remote", "sync", "schedule", "install"];
+        args.extend(suffix);
+        assert!(matches!(
+            Cli::try_parse_from(args).unwrap().command,
+            Some(Commands::Remote {
+                command: RemoteCommands::Sync {
+                    command: Some(RemoteSyncCommands::Schedule {
+                        command: ScheduleCommands::Install { interval: actual }
+                    }),
+                    ..
+                }
+            }) if actual == interval
+        ));
+    }
+    for action in ["status", "uninstall"] {
+        assert!(Cli::try_parse_from(["recall", "remote", "sync", "schedule", action]).is_ok());
+    }
+    for suffix in [vec![], vec!["--format", "text"], vec!["--format", "json"]] {
+        let mut args = vec!["recall", "remote", "sync"];
+        args.extend(suffix);
+        assert!(matches!(
+            Cli::try_parse_from(args).unwrap().command,
+            Some(Commands::Remote { command: RemoteCommands::Sync { command: None, .. } })
+        ));
+    }
+    for args in [
+        vec!["--format", "json", "schedule", "status"],
+        vec!["schedule", "status", "--format", "json"],
+        vec!["schedule", "install", "--interval", "59s"],
+        vec!["schedule", "install", "--interval", "2147483648s"],
+    ] {
+        let mut command = vec!["recall", "remote", "sync"];
+        command.extend(args);
+        assert!(Cli::try_parse_from(command).is_err());
+    }
+}
+
+#[test]
 fn sync_schedule_preserves_manual_sync_and_excludes_mixed_arguments() {
     use crate::schedule::{ScheduleCommands, SyncCommands};
 

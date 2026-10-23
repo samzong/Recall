@@ -611,6 +611,9 @@ its plist is `~/Library/LaunchAgents/io.github.samzong.recall.sync.plist` and
 logs are `~/Library/Logs/recall/sync.stdout.log` and
 `~/Library/Logs/recall/sync.stderr.log`.
 
+The plist records the installing user's HOME so the job uses that user's
+configuration and index.
+
 Install runs the first sync immediately. macOS may prompt for access to multiple
 folders in sequence; click Allow within 60 seconds for each prompt. If the first
 sync fails, rerun `recall sync schedule install` (include `--interval` again to
@@ -620,6 +623,23 @@ Git metadata probes time out after 60 seconds and abort the whole sync. The same
 timeout applies to manual syncs and read commands that infer a project from the
 current directory; read commands can bypass inference with `--project all`.
 Linux and Windows report `not supported yet on <os>`.
+
+Remote sync has a separate opt-in schedule:
+
+```bash
+recall remote sync schedule install --interval 30m
+recall remote sync schedule status
+recall remote sync schedule uninstall
+```
+
+It runs `recall remote sync` against the saved upload scope. Its label is
+`io.github.samzong.recall.remote-sync`, with `remote-sync.stdout.log` and
+`remote-sync.stderr.log` in the same log directory. It shares the local schedule's
+interval parser and launchd management code, with independent intervals and
+load state. Installing or uninstalling either schedule leaves the other intact.
+Both jobs use the existing sync lock and wait when another sync holds it.
+See [scheduled remote sync](remote-sync.md#scheduled-remote-sync-macos) for
+background credential discovery, failure diagnostics, and launchd limitations.
 
 ## Backward Compatibility
 
