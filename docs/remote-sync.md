@@ -155,8 +155,13 @@ Every synchronization starts a full paginated enumeration, including empty pages
 with a continuation cursor. Repeated cursors and malformed or unsupported objects
 fail the operation. There is no high-water mark or remote deletion. Missing
 objects within the upload scope are restored from the retained local bytes.
-Each data object is limited to 512 MiB and each sync transport operation has a
-120-second deadline. Configuration probes have a 30-second deadline.
+Each data object is limited to 512 MiB. Sync downloads and uploads run up to 16
+objects at a time. Each sync transport operation has a 120-second deadline plus
+one second per 64 KiB of the object it transfers. This allows each of 16
+concurrent transfers to average 64 KiB/s, which is a 1 MiB/s link shared evenly;
+provider retries and conflict verification consume the same budget. A transient
+get failure is retried at most twice. Configuration probes have a 30-second
+deadline.
 
 Downloaded objects are verified before caching; applying revisions and metadata
 is transactional. A failed transfer may leave verified cached objects or
