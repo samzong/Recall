@@ -365,17 +365,13 @@ mod macos {
         let label = job.label();
         let arguments =
             job.arguments().iter().map(|arg| format!("<string>{arg}</string>")).collect::<String>();
-        let environment = if environment.is_empty() {
-            String::new()
-        } else {
-            let values = environment
-                .iter()
-                .map(|(name, value)| {
-                    Ok(format!("<key>{name}</key><string>{}</string>", xml_text(value)?))
-                })
-                .collect::<Result<String>>()?;
-            format!("    <key>EnvironmentVariables</key><dict>{values}</dict>\n")
-        };
+        let values = environment
+            .iter()
+            .map(|(name, value)| {
+                Ok(format!("<key>{name}</key><string>{}</string>", xml_text(value)?))
+            })
+            .collect::<Result<String>>()?;
+        let environment = format!("    <key>EnvironmentVariables</key><dict>{values}</dict>\n");
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
