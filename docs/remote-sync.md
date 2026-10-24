@@ -1,27 +1,26 @@
 # Remote Synchronization
 
-Status: implementation contract. Remote synchronization is not yet available in
-the released CLI. Core and the first provider extension are developed in
-separate pull requests and require joint acceptance.
+Status: implementation contract.
 
 ## User contract
 
-Recall connects one local installation to one remote library. The first provider
-is Cloudflare R2 through its S3 API. Provider implementations may expand later;
+Recall connects one local installation to one remote library. The default provider
+is Cloudflare R2 through its S3 API. Other managed providers may be installed;
 multiple configured remotes and connection aliases are outside this delivery.
 
 The interactive entrypoint is `recall remote connect`. It collects provider
 configuration, an explicitly confirmed session scope, and a readable host name.
-It saves configuration without uploading sessions. Subsequent
+It saves configuration without uploading sessions. Connect uses `r2` when
+`--provider` is absent and displays `Storage: <provider>`. Subsequent
 `recall remote sync` calls scan that saved scope and exchange indexed session
 data. Running from another working directory does not change the saved scope.
-The existing `recall sync` local-scan command and `recall import` skip-existing
-behavior retain their meanings.
+Local `recall sync` and skip-existing `recall import` retain their meanings.
 
 Core owns session identity, merging, index transactions, local scan ownership,
-and synchronization/recovery orchestration. `recall-r2` owns R2 configuration,
-credentials, SDK calls, and object transport. Extensions never access Recall's
-database. The [extension boundary](extensions.md#boundary) still applies.
+and synchronization/recovery orchestration. A managed `recall-<provider>` owns
+provider configuration, SDK calls, and object transport. Extensions never
+access Recall's database. The [extension boundary](extensions.md#boundary)
+still applies.
 
 Session discovery and detail must expose a readable, evidenced native source
 host. A stable internal host ID is distinct from its editable display name.
@@ -36,6 +35,8 @@ replica is outside this delivery.
 recall remote connect
 recall remote sync
 recall remote sync --format json
+recall remote status
+recall remote status --format json
 recall remote sync schedule install --interval 30m
 recall remote sync schedule status
 recall remote sync schedule uninstall
@@ -46,7 +47,7 @@ recall info --format json
 Connect prompts for an explicit upload scope and suggests the system hostname
 as an editable display name. The provider then collects its destination and
 credential profile. There is no connection name or separate host registration.
-The internal host UUID survives reconnects, renames, and disconnects.
+The host UUID survives reconnects, renames, and disconnects.
 
 For scripts, supply every required setting:
 
@@ -65,17 +66,19 @@ a narrower upload scope does not remove previously published objects.
 `sync --format` accepts `text` (default) and `json`. JSON contains `downloaded`
 and `uploaded` object counts and `sessions_with_alternatives`. Diagnostic output
 goes to stderr. `info` reports the configured connection, saved scope, and host;
-it does not perform a network health check.
+it does not perform a network health check. `remote status` reads local settings
+only and does not contact the provider. JSON returns the settings object or
+`null` when no settings exist.
 
 ### Scheduled remote sync (macOS)
 
 Remote scheduling is opt-in. `recall remote sync schedule install` installs a
 user LaunchAgent and starts the first remote sync immediately. Each run executes
 `recall remote sync`, which scans the saved upload scope before exchanging
-objects. It does not run a separate global local sync.
+objects. It does not run global local sync.
 
 The interval defaults to `30m`. Use integer `s`, `m`, or `h` units, from 60 to
-2147483647 seconds. The schedule commands do not accept `--format`.
+2147483647 seconds. Schedule commands reject `--format`.
 
 The label is `io.github.samzong.recall.remote-sync`. Its plist is
 `~/Library/LaunchAgents/io.github.samzong.recall.remote-sync.plist`. Its logs are
@@ -89,7 +92,8 @@ updating, or uninstalling one does not change the other. Repeat install with
 The remote plist records the installing user's HOME and a system PATH. Core
 resolves the provider from its managed extension directory without PATH lookup.
 The provider reads its saved configuration and selected AWS profile under that
-HOME. If `AWS_SHARED_CREDENTIALS_FILE` or `AWS_CONFIG_FILE` is set during install,
+HOME. The plist also preserves `AWS_PROFILE` and `AWS_DEFAULT_PROFILE` when set.
+If `AWS_SHARED_CREDENTIALS_FILE` or `AWS_CONFIG_FILE` is set during install,
 the plist records that file path. Relative paths become absolute. Reinstall the
 schedule after changing those paths. Credential values are never copied into
 the plist. Shell profiles are not loaded, and other shell environment variables
@@ -183,29 +187,37 @@ without deleting cached sessions, remote objects, host identity, or credentials.
 
 ## Process interfaces
 
-Core resolves `recall-r2` through the existing managed extension directory.
-There is no PATH discovery or additional plugin registry.
+Core resolves managed `recall-<provider>` binaries without PATH lookup. See the
+[extension contract](extensions.md#manifest) for discovery and compatibility.
 
-The existing extension manifest retains its CLI compatibility meaning. This
-transport has an independent `transport_version`, initially `1`. Before the
-provider is released, its manifest must require an available compatible core
-release. Adding a new extension package can trigger publication after merge;
-joint acceptance and explicit release authorization precede that merge.
+Connect and sync check manifest identity, CLI `protocol`, `min_recall`, and
+`transport_version: 1`. Only legacy `r2` can omit `transport_version`.
+Manifest reads have a five-second deadline and a 2 MiB limit. Sync checks once
+before scanning and reuses the binary for all transport operations.
+Saved settings validate provider names without requiring installed providers.
+
+Before publication, provider `min_recall` must require a compatible released
+core. Every transport version increase must raise `min_recall` to the first
+core release that supports it; catalog selection uses this minimum.
+A new package can publish automatically after merge, so joint acceptance and
+explicit release authorization precede merge.
 
 ### Configuration
 
-Core invokes `recall-r2 --recall-remote-configure` as a separate terminal process.
-Provider arguments following the core command's `--` are forwarded unchanged.
+Core invokes `recall-<provider> --recall-remote-configure` as a separate
+terminal process. Provider arguments after the core command's `--` are forwarded unchanged.
 This process inherits terminal input/output; it does not use the transport JSON
-framing. Missing required parameters in a non-interactive invocation fail
-immediately.
+framing. Missing required non-interactive parameters fail immediately.
 
 R2 configuration consists of `--endpoint`, `--bucket`, `--prefix`, and
-`--credential-profile`. The endpoint is the appropriate R2 S3 endpoint, including
-jurisdiction when applicable, and never a public or cached custom domain.
-`credential_profile` refers to existing local SDK credentials. Credentials are
-not command arguments or session data. The plugin saves one non-sensitive target
-configuration; there are no named targets or shared-target reference counts.
+`--credential-profile`. Other providers define their own provider arguments.
+The R2 endpoint is the appropriate S3 endpoint, including jurisdiction when
+applicable, and never a public or cached custom domain.
+Credentials for every provider come from its SDK, environment, or profile. Do
+not put credentials in provider configuration files or command arguments. For R2,
+`credential_profile` refers to existing local SDK credentials. The provider
+saves one non-sensitive target configuration; there are no named targets or
+shared-target reference counts.
 
 Exit status zero means configuration was saved. It does not establish read or
 write permission. Interactive configuration confirms the proposed destination
@@ -213,9 +225,9 @@ before replacing an existing configuration. Core confirms the session scope
 and host name before starting the provider process.
 
 Core holds the local sync lock throughout connection changes. Before allowing
-the provider to change its target, core persists a disconnected state. It marks
-the connection active only after provider configuration, the read probe, and
-the final core configuration save succeed. Cancellation or failure leaves it
+the provider to change its target, core persists a disconnected state. The
+connection becomes active only after provider configuration and the read probe
+succeed and core saves the final settings. Cancellation or failure leaves it
 disconnected, preventing a later sync from combining the old selection with a
 new destination. Repeating connect is the recovery path; no cross-process
 transaction or automatic target deletion is required.
@@ -225,12 +237,12 @@ remote objects, host identity, SDK credentials, and provider configuration.
 
 ### Transport framing
 
-Core invokes `recall-r2 --recall-remote-transport` once per operation. Standard
-input contains exactly one JSON object followed by EOF. Standard output
+Core invokes `recall-<provider> --recall-remote-transport` for each operation.
+Standard input contains exactly one JSON object followed by EOF. Standard output
 contains exactly one JSON object, with optional surrounding whitespace. Progress
 and redacted diagnostics use standard error.
 
-Requests and responses are each limited to 2 MiB of UTF-8 bytes. A provider must
+Each request and response is limited to 2 MiB of UTF-8. A provider must
 not truncate an object page to fit the limit and falsely report it as complete.
 Malformed JSON, extra stdout data, exceeded limits, unsupported versions,
 abnormal exits, and expired deadlines are failures.

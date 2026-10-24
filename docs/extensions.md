@@ -68,10 +68,10 @@ Extensions own:
 Usage tracking stays in core. Token events are data-plane records written by
 source adapters during sync.
 
-Remote storage providers use the planned [remote synchronization
-contract](remote-sync.md). Core invokes a managed provider process for object
-transport; the provider never merges sessions or accesses the index. Provider
-transport versioning is independent of the existing CLI protocol version.
+Remote storage providers use the [remote synchronization
+contract](remote-sync.md). Core invokes a managed `recall-<provider>` process
+for object transport; the provider never merges sessions or accesses the
+index.
 
 Skills and extensions are different:
 
@@ -207,7 +207,8 @@ This is a later concern, not a v0.1 requirement.
   alias.
 - Host surface: `recall ext list`, `recall ext install`, `recall ext remove`,
   and `recall ext upgrade`.
-- Recall manages only official extensions from the official catalog.
+- Recall manages only official extensions from the official catalog. Local
+  package installation and catalog overrides are not supported.
 
 ## Manifest
 
@@ -232,6 +233,15 @@ Manifest fields are identity and compatibility metadata. Descriptions are
 catalog display metadata, not manifest contract.
 The command name is the extension name: `recall reflect` dispatches to
 `recall-reflect`.
+Remote providers declare `"transport_version": 1`, independently of CLI
+`protocol`. Only legacy R2 providers and non-provider extensions can omit it.
+Core validates manifests on connect and sync. See
+[transport details](remote-sync.md#process-interfaces).
+
+Managed discovery lets providers connect without core changes. A core allowlist
+would require a core release for each provider. This is not a security sandbox.
+A transport version increase must raise `min_recall` to the first core that
+supports it, because catalog selection filters on `min_recall`.
 Extensions that still advertise `min_recall` 0.2.10 may emit a legacy
 `commands` field for host compatibility; it is not part of the current
 manifest contract.
@@ -386,9 +396,11 @@ Recall does not scan PATH for `recall-*` binaries.
 
 Scheduled remote sync uses this same managed directory. It does not discover
 providers through PATH. On macOS, `recall remote sync schedule install` records
-HOME and a system PATH in the LaunchAgent. It also preserves the paths from
+HOME and a system PATH in the LaunchAgent. It also preserves
+`AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, and the paths from
 `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` when set. The provider reads
-credential files itself. The plist contains file paths, never credential values.
+credential files itself. The plist contains file paths and profile names, never
+credential values or arbitrary provider configuration.
 See [scheduled remote sync](remote-sync.md#scheduled-remote-sync-macos) for
 commands and failure diagnostics.
 

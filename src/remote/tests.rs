@@ -298,3 +298,25 @@ fn remote_concurrent_revisions_keep_one_projection_and_all_full_snapshots() {
     assert!(fresh.get_messages(&fresh_session.id).unwrap()[0].content.starts_with("concurrent "));
     assert_eq!(fresh_session.alternative_versions, 1);
 }
+
+#[test]
+fn saved_provider_names_roundtrip_without_requiring_an_installed_extension() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("remote.json");
+    for provider in ["r2", "opendal"] {
+        let settings = Settings {
+            host: Host {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "workstation".into(),
+                revision: 1,
+            },
+            connection: Some(Connection { provider: provider.into(), scope: ProjectScope::Global }),
+        };
+        settings.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).unwrap().unwrap().connection.unwrap().provider, provider);
+    }
+    let mut settings = load_from(&path).unwrap().unwrap();
+    settings.connection.as_mut().unwrap().provider = "../opendal".into();
+    settings.save_to(&path).unwrap();
+    assert!(load_from(&path).is_err());
+}

@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-const VERSION: u32 = 1;
+pub(super) const VERSION: u32 = 1;
 const CONTROL_LIMIT: usize = 2 * 1024 * 1024;
 const DIAGNOSTIC_LIMIT: usize = 64 * 1024;
 
@@ -84,17 +84,7 @@ struct Response {
     error: Option<RemoteError>,
 }
 
-pub(crate) fn invoke(provider: &str, operation: &Operation, budget: Duration) -> Result<Reply> {
-    invoke_with_root(provider, operation, budget, &super::extension_root()?)
-}
-
-fn invoke_with_root(
-    provider: &str,
-    operation: &Operation,
-    budget: Duration,
-    root: &Path,
-) -> Result<Reply> {
-    super::validate_extension_name(provider)?;
+pub(crate) fn invoke(binary: &Path, operation: &Operation, budget: Duration) -> Result<Reply> {
     validate_operation(operation)?;
     let timeout_ms = u64::try_from(budget.as_millis()).context("transport budget is too large")?;
     ensure!(timeout_ms > 0, "transport budget must be positive");
@@ -102,12 +92,16 @@ fn invoke_with_root(
     let request =
         serde_json::to_vec(&Request { transport_version: VERSION, timeout_ms, operation })?;
     ensure!(request.len() <= CONTROL_LIMIT, "transport request exceeds control limit");
-    let binary = super::managed_binary_path(root, provider);
-    ensure!(super::is_executable_file(&binary), "remote provider is not installed: {provider}");
-
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let (stdout, stderr, success) =
-        runtime.block_on(async { exchange(spawn_provider(&binary)?, &request, budget).await })?;
+    let (stdout, stderr, success) = runtime.block_on(async {
+        exchange(
+            spawn_provider(binary)?,
+            &request,
+            budget,
+            "provider deadline expired; a remote write may already have completed",
+        )
+        .await
+    })?;
     let response: Response = serde_json::from_slice(&stdout).with_context(|| {
         if stderr.is_empty() {
             "invalid remote transport response".to_string()
@@ -121,6 +115,23 @@ fn invoke_with_root(
         (false, None, Some(error)) => Err(error.into()),
         _ => bail!("remote transport response contradicts its exit status or envelope"),
     }
+}
+
+pub(super) fn manifest_output(binary: &Path) -> Result<Vec<u8>> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let (stdout, _, success) = runtime.block_on(async {
+        let child = tokio::process::Command::new(binary)
+            .arg("--recall-extension-manifest")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to start extension manifest command")?;
+        exchange(child, &[], Duration::from_secs(5), "extension manifest deadline expired").await
+    })?;
+    ensure!(success, "extension manifest command failed");
+    Ok(stdout)
 }
 
 fn spawn_provider(binary: &Path) -> Result<tokio::process::Child> {
@@ -138,6 +149,7 @@ async fn exchange(
     mut child: tokio::process::Child,
     request: &[u8],
     budget: Duration,
+    timeout_message: &str,
 ) -> Result<(Vec<u8>, Vec<u8>, bool)> {
     let mut stdin = child.stdin.take().context("remote provider stdin unavailable")?;
     let stdout = child.stdout.take().context("remote provider stdout unavailable")?;
@@ -158,12 +170,10 @@ async fn exchange(
     };
     let result = match tokio::time::timeout(budget, operation).await {
         Ok(result) => result,
-        Err(_) => Err(RemoteError {
-            code: ErrorCode::Transient,
-            message: "provider deadline expired; a remote write may already have completed"
-                .to_string(),
+        Err(_) => {
+            Err(RemoteError { code: ErrorCode::Transient, message: timeout_message.to_string() }
+                .into())
         }
-        .into()),
     };
     if result.is_err() {
         let _ = child.kill().await;
@@ -321,7 +331,12 @@ printf '%s' '{"transport_version":1,"result":{"readable":true}}'
 "#,
         );
         assert_eq!(
-            invoke_with_root("r2", &Operation::Probe, Duration::from_secs(5), root.path()).unwrap(),
+            invoke(
+                &super::super::managed_binary_path(root.path(), "r2"),
+                &Operation::Probe,
+                Duration::from_secs(5)
+            )
+            .unwrap(),
             Reply::Readable
         );
     }
@@ -335,8 +350,12 @@ printf '%s' '{"transport_version":1,"result":{"readable":true}}'
 printf '%s' '{"transport_version":1,"error":{"code":"permission","message":"denied"}}'
 exit 1"#,
         );
-        let error = invoke_with_root("r2", &Operation::Probe, Duration::from_secs(5), root.path())
-            .unwrap_err();
+        let error = invoke(
+            &super::super::managed_binary_path(root.path(), "r2"),
+            &Operation::Probe,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
         assert_eq!(error.downcast_ref::<RemoteError>().unwrap().code, ErrorCode::Permission);
         for body in [
             r#"{"transport_version":2,"result":{"readable":true}}"#,
@@ -346,8 +365,12 @@ exit 1"#,
         ] {
             provider(root.path(), &format!("cat >/dev/null\nprintf '%s' '{body}'"));
             assert!(
-                invoke_with_root("r2", &Operation::Probe, Duration::from_secs(5), root.path())
-                    .is_err()
+                invoke(
+                    &super::super::managed_binary_path(root.path(), "r2"),
+                    &Operation::Probe,
+                    Duration::from_secs(5)
+                )
+                .is_err()
             );
         }
     }
@@ -373,7 +396,11 @@ exit 1"#,
             let child =
                 spawn_provider(&super::super::managed_binary_path(root.path(), "r2")).unwrap();
             let pid = child.id().unwrap();
-            (exchange(child, &request, Duration::from_millis(200)).await, pid)
+            (
+                exchange(child, &request, Duration::from_millis(200), "transport deadline expired")
+                    .await,
+                pid,
+            )
         });
         let error = result.unwrap_err();
         assert_eq!(error.downcast_ref::<RemoteError>().unwrap().code, ErrorCode::Transient);
@@ -399,7 +426,12 @@ printf '%03000000d' 0
 printf '%s' '"}}'"#,
         );
         assert!(
-            invoke_with_root("r2", &Operation::Probe, Duration::from_secs(5), root.path()).is_err()
+            invoke(
+                &super::super::managed_binary_path(root.path(), "r2"),
+                &Operation::Probe,
+                Duration::from_secs(5)
+            )
+            .is_err()
         );
     }
 

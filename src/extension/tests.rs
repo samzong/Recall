@@ -201,3 +201,47 @@ fn write_executable(path: &Path, contents: &str) {
     fs::write(path, contents).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+#[test]
+#[cfg(unix)]
+fn remote_provider_requires_matching_identity_and_compatible_transport() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("bin")).unwrap();
+    let binary = managed_binary_path(root.path(), "opendal");
+    let base = serde_json::json!({"name":"opendal","version":"0.1.0","protocol":2,
+        "min_recall":"0.6.4","transport_version":1});
+    let write = |manifest: &serde_json::Value| {
+        write_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{}'\n", manifest));
+    };
+    write(&base);
+    assert_eq!(super::remote_binary_with_root("opendal", root.path()).unwrap(), binary);
+    for (field, value) in [
+        ("name", serde_json::json!("r2")),
+        ("protocol", serde_json::json!(crate::PROTOCOL_VERSION + 1)),
+        ("min_recall", serde_json::json!("999.0.0")),
+        ("transport_version", serde_json::json!(2)),
+        ("transport_version", serde_json::Value::Null),
+    ] {
+        let mut manifest = base.clone();
+        manifest[field] = value;
+        write(&manifest);
+        assert!(super::remote_binary_with_root("opendal", root.path()).is_err(), "{manifest}");
+    }
+    assert!(super::remote_binary_with_root("missing", root.path()).is_err());
+    assert!(super::remote_binary_with_root("../opendal", root.path()).is_err());
+}
+
+#[test]
+#[cfg(unix)]
+fn legacy_r2_manifest_remains_a_remote_provider() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("bin")).unwrap();
+    let binary = managed_binary_path(root.path(), "r2");
+    write_executable(
+        &binary,
+        r#"#!/bin/sh
+printf '%s' '{"name":"r2","version":"0.1.0","protocol":2,"min_recall":"0.6.3"}'
+"#,
+    );
+    assert_eq!(super::remote_binary_with_root("r2", root.path()).unwrap(), binary);
+}

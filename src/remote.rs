@@ -20,7 +20,7 @@ use transfer::{download_objects, upload_objects};
 pub(crate) enum RemoteCommands {
     #[command(about = "Configure the remote destination, upload scope, and host name")]
     Connect {
-        #[arg(long, help = "Storage provider (r2)")]
+        #[arg(long, help = "Installed storage provider (default: r2)")]
         provider: Option<String>,
         #[arg(long, help = "Upload scope: a path, owner/repo, remote URL, or all")]
         project: Option<String>,
@@ -28,6 +28,11 @@ pub(crate) enum RemoteCommands {
         host_name: Option<String>,
         #[arg(last = true, help = "Provider configuration arguments")]
         provider_args: Vec<OsString>,
+    },
+    #[command(about = "Show the saved remote connection without contacting storage")]
+    Status {
+        #[arg(long, value_enum, default_value_t = crate::info::InfoFormat::Text)]
+        format: crate::info::InfoFormat,
     },
     #[command(about = "Disconnect while retaining local sessions and remote objects")]
     Disconnect,
@@ -85,7 +90,7 @@ fn load_from(path: &Path) -> Result<Option<Settings>> {
         serde_json::from_slice(&bytes).context("invalid remote configuration")?;
     settings.host.validate()?;
     if let Some(connection) = &settings.connection {
-        ensure!(connection.provider == "r2", "unsupported remote provider");
+        crate::extension::validate_extension_name(&connection.provider)?;
         validate_scope(&connection.scope)?;
     }
     Ok(Some(settings))
@@ -125,6 +130,7 @@ pub(crate) fn run(command: RemoteCommands) -> Result<()> {
         RemoteCommands::Connect { provider, project, host_name, provider_args } => {
             connect(provider, project, host_name, &provider_args)
         }
+        RemoteCommands::Status { format } => status(format),
         RemoteCommands::Disconnect => {
             let _lock = crate::utils::acquire_sync_lock()?;
             if let Some(mut settings) = load_settings()? {
@@ -139,6 +145,29 @@ pub(crate) fn run(command: RemoteCommands) -> Result<()> {
         } => crate::schedule::run(command, crate::schedule::Job::RemoteSync),
         RemoteCommands::Sync { command: None, format } => synchronize(format),
     }
+}
+
+fn status(format: crate::info::InfoFormat) -> Result<()> {
+    let settings = load_settings()?;
+    match format {
+        crate::info::InfoFormat::Json => println!("{}", serde_json::to_string(&settings)?),
+        crate::info::InfoFormat::Text => match settings {
+            Some(settings) => {
+                if let Some(connection) = settings.connection {
+                    println!(
+                        "Remote: {}\nUpload scope: {}",
+                        connection.provider,
+                        connection.scope.value().unwrap_or("all")
+                    );
+                } else {
+                    println!("Remote: disconnected");
+                }
+                println!("Host: {}", settings.host.name);
+            }
+            None => println!("Remote: not configured"),
+        },
+    }
+    Ok(())
 }
 
 #[derive(Default, Serialize)]
@@ -166,16 +195,13 @@ fn synchronize(format: crate::info::InfoFormat) -> Result<()> {
         load_settings()?.context("remote is not connected; run recall remote connect")?;
     let connection =
         settings.connection.context("remote is disconnected; run recall remote connect")?;
+    let binary = crate::extension::remote_binary(&connection.provider)?;
     let mut progress = crate::sync_progress::SyncProgress::for_phases();
     progress.phase("Scanning sources");
     crate::sync::scan_remote_scope(connection.scope.clone())?;
     let store = Store::open()?;
     let summary = exchange(&store, &connection, &mut progress, &|operation| {
-        crate::extension::transport::invoke(
-            &connection.provider,
-            operation,
-            transport_budget(operation),
-        )
+        crate::extension::transport::invoke(&binary, operation, transport_budget(operation))
     })?;
     progress.finish();
     match format {
@@ -261,12 +287,11 @@ fn connect(
     provider_args: &[OsString],
 ) -> Result<()> {
     let provider = provider.unwrap_or_else(|| "r2".into());
-    ensure!(provider == "r2", "only the r2 provider is currently supported");
     let binary = crate::extension::remote_binary(&provider)?;
     let _lock = crate::utils::acquire_sync_lock()?;
     let existing = load_settings()?;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    eprintln!("Storage: Cloudflare R2");
+    eprintln!("Storage: {provider}");
     let project = match project {
         Some(project) => project,
         None => {
@@ -313,14 +338,14 @@ fn connect(
     let mut settings = Settings { host, connection: None };
     let path = settings_path()?;
     settings.save_to(&path)?;
-    let configured = std::process::Command::new(binary)
+    let configured = std::process::Command::new(&binary)
         .arg("--recall-remote-configure")
         .args(provider_args)
         .status()
         .context("cannot start provider configuration; remote remains disconnected")?;
     ensure!(configured.success(), "provider configuration failed; remote remains disconnected");
     ensure!(
-        crate::extension::transport::invoke(&provider, &Operation::Probe, Duration::from_secs(30))
+        crate::extension::transport::invoke(&binary, &Operation::Probe, Duration::from_secs(30))
             .context("remote probe failed; remote remains disconnected")?
             == Reply::Readable,
         "provider is not readable; remote remains disconnected"

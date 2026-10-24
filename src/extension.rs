@@ -13,10 +13,25 @@ use sha2::{Digest, Sha256};
 pub(crate) mod transport;
 
 pub(crate) fn remote_binary(provider: &str) -> Result<PathBuf> {
+    remote_binary_with_root(provider, &extension_root()?)
+}
+
+fn remote_binary_with_root(provider: &str, root: &Path) -> Result<PathBuf> {
     validate_extension_name(provider)?;
-    let path = managed_binary_path(&extension_root()?, provider);
+    let path = managed_binary_path(root, provider);
     if !is_executable_file(&path) {
         bail!("remote provider is not installed; run recall ext install {provider}");
+    }
+    let manifest = read_manifest(&path)?;
+    if manifest.name != provider {
+        bail!("provider manifest name '{}' does not match '{provider}'", manifest.name);
+    }
+    validate_compatibility(&manifest)?;
+    match manifest.transport_version {
+        Some(transport::VERSION) => {}
+        None if provider == "r2" => {}
+        None => bail!("extension '{provider}' does not declare a remote transport"),
+        Some(version) => bail!("unsupported remote transport version {version} for '{provider}'"),
     }
     Ok(path)
 }
@@ -30,6 +45,8 @@ struct ExtensionManifest {
     version: String,
     protocol: u32,
     min_recall: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport_version: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,6 +390,21 @@ fn validate_manifest(
             min_recall
         );
     }
+    validate_compatibility(manifest)
+}
+
+fn validate_compatibility(manifest: &ExtensionManifest) -> Result<()> {
+    if manifest.protocol > crate::PROTOCOL_VERSION {
+        bail!("extension requires CLI protocol {}; upgrade Recall", manifest.protocol);
+    }
+    if semver_key(&manifest.min_recall)? > semver_key(env!("CARGO_PKG_VERSION"))? {
+        bail!("extension requires Recall {} or later; upgrade Recall", manifest.min_recall);
+    }
+    if let Some(version) = manifest.transport_version
+        && version != transport::VERSION
+    {
+        bail!("unsupported remote transport version {version}");
+    }
     Ok(())
 }
 
@@ -402,15 +434,9 @@ fn save_installed_state(root: &Path, state: &InstalledState) -> Result<()> {
 }
 
 fn read_manifest(path: &Path) -> Result<ExtensionManifest> {
-    let output = Command::new(path)
-        .arg("--recall-extension-manifest")
-        .output()
-        .with_context(|| format!("failed to read manifest from {}", path.display()))?;
-    if !output.status.success() {
-        bail!("manifest command exited with status {}", output.status);
-    }
+    let output = transport::manifest_output(path)?;
     let manifest: ExtensionManifest =
-        serde_json::from_slice(&output.stdout).context("invalid extension manifest JSON")?;
+        serde_json::from_slice(&output).context("invalid extension manifest JSON")?;
     Ok(manifest)
 }
 
@@ -467,7 +493,7 @@ fn semver_key(version: &str) -> Result<(u64, u64, u64)> {
     Ok((parts[0].parse()?, parts[1].parse()?, parts[2].parse()?))
 }
 
-fn validate_extension_name(name: &str) -> Result<()> {
+pub(crate) fn validate_extension_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.starts_with('-')
         || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
