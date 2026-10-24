@@ -1,6 +1,14 @@
 # Changelog
 
 
+## [0.6.5](https://github.com/samzong/Recall/compare/v0.6.4...v0.6.5) (2026-10-24)
+
+
+### Features
+
+* **remote:** support managed storage provider extensions ([#326](https://github.com/samzong/Recall/issues/326))
+
+
 ## [0.6.4](https://github.com/samzong/Recall/compare/v0.6.3...v0.6.4) (2026-10-23)
 
 
