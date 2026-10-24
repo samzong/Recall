@@ -234,14 +234,25 @@ catalog display metadata, not manifest contract.
 The command name is the extension name: `recall reflect` dispatches to
 `recall-reflect`.
 Remote providers declare `"transport_version": 1`, independently of CLI
-`protocol`. Only legacy R2 providers and non-provider extensions can omit it.
-Core validates manifests on connect and sync. See
+`protocol`. Only legacy R2 and non-provider extensions can omit it.
+Core checks provider manifests on connect and sync. See
 [transport details](remote-sync.md#process-interfaces).
 
-Managed discovery lets providers connect without core changes. A core allowlist
-would require a core release for each provider. This is not a security sandbox.
-A transport version increase must raise `min_recall` to the first core that
-supports it, because catalog selection filters on `min_recall`.
+Only providers installed from the official Recall extension catalog are
+supported. `recall ext install` and `upgrade` verify catalog SHA-256 values and
+write the version to `installed.json`. Before remote use, core requires that
+record and a matching manifest version, then checks the provider name, CLI
+protocol, `min_recall`, and transport version. Schema-1 records without a
+description remain valid. Manual copies into the managed directory are rejected.
+
+Tests can seed an isolated HOME with fixture state and a local binary for an
+unreleased provider. This is test setup only. Users install after catalog
+publication. A core allowlist is the strongest alternative. It couples each
+provider to a core release and still accepts a copied binary with the same name.
+The catalog already gates provider availability.
+The record is a product boundary, not a sandbox or tamper defense. Each transport
+version increase must raise `min_recall` to the first supporting core because
+catalog selection uses that field.
 Extensions that still advertise `min_recall` 0.2.10 may emit a legacy
 `commands` field for host compatibility; it is not part of the current
 manifest contract.
@@ -252,7 +263,8 @@ only become meaningful in a sandboxed runtime such as WASM.
 
 ## Official Extension Distribution
 
-Official extensions live in this repository as workspace binary crates:
+These official extensions currently ship as workspace crates in this
+repository:
 
 ```text
 extensions/recall-probe/
@@ -260,13 +272,8 @@ extensions/recall-share/
 extensions/recall-reflect/
 ```
 
-Each official extension owns its own Cargo package version. Recall core releases
-and official extension releases are related by protocol compatibility, not by a
-shared version number.
-
-v0.1 includes `extensions/recall-probe/`, the official no-business-logic
-extension host probe. It verifies the required crate layout, binary naming,
-manifest output, managed install, and `recall <name>` dispatch behavior.
+Each extension owns its Cargo package version. The v0.1 `recall-probe` tests
+crate layout, binary naming, manifest output, managed install, and dispatch.
 
 ### Versioning
 
@@ -285,9 +292,9 @@ extension binary also changed.
 Changing extension code without changing that extension's Cargo package version
 does not release it. Changing the package version is the release intent.
 
-### Binary Releases
+### Current Binary Releases
 
-Official extension release workflow:
+The current release workflow for packages in this repository:
 
 1. A pull request changes `extensions/recall-<name>/`.
 2. If the package version changed, CI verifies that the version increased, the
@@ -344,10 +351,10 @@ Recall binary. A release may also attach a snapshot catalog as a GitHub Release
 asset for audit and reproduction, but the live install source is the Pages
 catalog.
 
-`website/public/extensions/catalog.json` is generated release state. Humans do
-not hand-edit version entries. The extension release workflow writes them after
-the release binaries exist, because the catalog must contain real asset URLs and
-SHA-256 checksums.
+`website/public/extensions/catalog.json` is generated release state. Today, the
+workflow builds entries from `extensions/**` in this repository. This is the
+current publishing source, not a provider eligibility rule. The workflow adds
+entries after release binaries exist, with their asset URLs and SHA-256 checksums.
 
 Catalog shape:
 
@@ -376,8 +383,7 @@ Catalog shape:
 
 ### Managed Install Root
 
-Official installs are managed by Recall. They do not mutate the user's PATH and
-Recall does not scan PATH for `recall-*` binaries.
+Recall manages official installs outside the user's PATH.
 
 ```text
 <data_dir>/recall/extensions/
@@ -394,15 +400,9 @@ Recall does not scan PATH for `recall-*` binaries.
 `<data_dir>` follows the same `dirs::data_dir()` convention as
 `<data_dir>/recall/recall.db`.
 
-Scheduled remote sync uses this same managed directory. It does not discover
-providers through PATH. On macOS, `recall remote sync schedule install` records
-HOME and a system PATH in the LaunchAgent. It also preserves
-`AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, and the paths from
-`AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` when set. The provider reads
-credential files itself. The plist contains file paths and profile names, never
-credential values or arbitrary provider configuration.
-See [scheduled remote sync](remote-sync.md#scheduled-remote-sync-macos) for
-commands and failure diagnostics.
+Scheduled remote sync uses this managed directory and does not use PATH.
+See [scheduled remote sync](remote-sync.md#scheduled-remote-sync-macos) for its
+LaunchAgent environment and failure diagnostics.
 
 `installed.json` is local host state, not a copy of the manifest or catalog. It
 stores only the installed version and the offline help description:
@@ -422,12 +422,6 @@ stores only the installed version and the offline help description:
 Compatibility metadata such as `protocol` and `min_recall` stays in the
 manifest and catalog. The installed package keeps `manifest.json` for audit or
 future compatibility checks, but `installed.json` should not duplicate it.
-
-Dispatch order:
-
-1. core subcommand;
-2. managed extension binary under `<data_dir>/recall/extensions/bin`;
-3. unknown command.
 
 ```mermaid
 flowchart TD

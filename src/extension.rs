@@ -18,6 +18,10 @@ pub(crate) fn remote_binary(provider: &str) -> Result<PathBuf> {
 
 fn remote_binary_with_root(provider: &str, root: &Path) -> Result<PathBuf> {
     validate_extension_name(provider)?;
+    let installed = load_installed_state(root)?;
+    let recorded = installed.extensions.get(provider).with_context(|| {
+        format!("remote provider '{provider}' is not installed from the official Recall extension catalog. Run recall ext install {provider}")
+    })?;
     let path = managed_binary_path(root, provider);
     if !is_executable_file(&path) {
         bail!("remote provider is not installed; run recall ext install {provider}");
@@ -25,6 +29,13 @@ fn remote_binary_with_root(provider: &str, root: &Path) -> Result<PathBuf> {
     let manifest = read_manifest(&path)?;
     if manifest.name != provider {
         bail!("provider manifest name '{}' does not match '{provider}'", manifest.name);
+    }
+    if manifest.version != recorded.version {
+        bail!(
+            "remote provider '{provider}' manifest version '{}' does not match installed version '{}'. Run recall ext remove {provider}, then recall ext install {provider}",
+            manifest.version,
+            recorded.version
+        );
     }
     validate_compatibility(&manifest)?;
     match manifest.transport_version {

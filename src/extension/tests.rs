@@ -213,6 +213,11 @@ fn remote_provider_requires_matching_identity_and_compatible_transport() {
     let write = |manifest: &serde_json::Value| {
         write_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{}'\n", manifest));
     };
+    fs::write(
+        root.path().join("installed.json"),
+        r#"{"schema":1,"extensions":{"opendal":{"version":"0.1.0"}}}"#,
+    )
+    .unwrap();
     write(&base);
     assert_eq!(super::remote_binary_with_root("opendal", root.path()).unwrap(), binary);
     for (field, value) in [
@@ -243,5 +248,37 @@ fn legacy_r2_manifest_remains_a_remote_provider() {
 printf '%s' '{"name":"r2","version":"0.1.0","protocol":2,"min_recall":"0.6.3"}'
 "#,
     );
+    fs::write(
+        root.path().join("installed.json"),
+        r#"{"schema":1,"extensions":{"r2":{"version":"0.1.0"}}}"#,
+    )
+    .unwrap();
     assert_eq!(super::remote_binary_with_root("r2", root.path()).unwrap(), binary);
+}
+
+#[test]
+#[cfg(unix)]
+fn remote_provider_requires_installed_catalog_record() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("bin")).unwrap();
+    let binary = managed_binary_path(root.path(), "opendal");
+    write_executable(
+        &binary,
+        r#"#!/bin/sh
+printf '%s' '{"name":"opendal","version":"0.1.0","protocol":2,"min_recall":"0.6.4","transport_version":1}'
+"#,
+    );
+    assert!(super::remote_binary_with_root("opendal", root.path()).is_err());
+    fs::write(
+        root.path().join("installed.json"),
+        r#"{"schema":1,"extensions":{"opendal":{"version":"0.2.0"}}}"#,
+    )
+    .unwrap();
+    assert!(super::remote_binary_with_root("opendal", root.path()).is_err());
+    fs::write(
+        root.path().join("installed.json"),
+        r#"{"schema":1,"extensions":{"opendal":{"version":"0.1.0"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(super::remote_binary_with_root("opendal", root.path()).unwrap(), binary);
 }

@@ -187,14 +187,13 @@ without deleting cached sessions, remote objects, host identity, or credentials.
 
 ## Process interfaces
 
-Core resolves managed `recall-<provider>` binaries without PATH lookup. See the
-[extension contract](extensions.md#manifest) for discovery and compatibility.
-
-Connect and sync check manifest identity, CLI `protocol`, `min_recall`, and
-`transport_version: 1`. Only legacy `r2` can omit `transport_version`.
-Manifest reads have a five-second deadline and a 2 MiB limit. Sync checks once
-before scanning and reuses the binary for all transport operations.
-Saved settings validate provider names without requiring installed providers.
+Providers must be installed from the official Recall extension catalog.
+Core requires an `installed.json` record matching the manifest version. Manual
+binary copies are rejected. Connect and sync also check manifest `name`, `protocol`,
+`min_recall`, and `transport_version: 1`. Legacy `r2` can omit the transport field.
+Manifest reads have a 2 MiB limit and five-second deadline. Sync checks once
+before scanning and reuses the binary. Saved connections keep their format and
+check provider-name syntax without requiring an installed binary.
 
 Before publication, provider `min_recall` must require a compatible released
 core. Every transport version increase must raise `min_recall` to the first

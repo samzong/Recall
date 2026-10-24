@@ -3,8 +3,9 @@
 Read `docs/extensions.md` for the core/extension boundary and CLI protocol.
 `recall-probe` is the minimal reference implementation.
 
-- Create standalone `recall-<name>` binaries under `extensions/` and add them
-  to root `workspace.members`; keep `default-members = ["."]`.
+- For packages developed in this repository, create standalone
+  `recall-<name>` binaries under `extensions/` and add them to root
+  `workspace.members`; keep `default-members = ["."]`.
   `recall <name>` dispatches to the managed binary.
 - Consume core through CLI JSON/JSONL, never SQLite or the Recall crate.
   Pass an explicit project selector; use `--project all` for global results.
@@ -17,6 +18,11 @@ Read `docs/extensions.md` for the core/extension boundary and CLI protocol.
   to stderr. Non-zero exit means failure.
 - Remote provider credentials come from the SDK, environment, or profile. Never
   put credentials in provider configuration files or command arguments.
+- Remote providers must be installed from the official Recall extension
+  catalog. Catalog installs verify SHA-256 and record the version. Core requires
+  that `installed.json` version to match the manifest. Direct binary copies are
+  unsupported. Seed an isolated HOME with fixture state and a local binary for
+  tests of unpublished providers.
 - Before release, a remote provider manifest must require a compatible released
   core. For each transport version increase, raise `min_recall` to the first
   core release that supports it. Catalog selection uses `min_recall`.
