@@ -377,7 +377,7 @@ fn parse_session(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse_message(
+pub(super) fn parse_message(
     entry: &Value,
     message: &Value,
     line_index: u32,
@@ -428,7 +428,7 @@ fn parse_message(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn extract_events(
+pub(super) fn extract_events(
     entry: &Value,
     message: &Value,
     line_index: usize,

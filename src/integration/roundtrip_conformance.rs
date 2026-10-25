@@ -287,6 +287,27 @@ fn cursor_agent_transcript_round_trip() {
 }
 
 #[test]
+fn rx_agent_log_round_trip() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "019a0000-0000-7000-8000-000000000001";
+    let path = root.path().join(format!("{id}.jsonl"));
+    fs::write(
+        &path,
+        include_str!("../../tests/fixtures/rx-agent/019a0000-0000-7000-8000-000000000001.jsonl"),
+    )
+    .unwrap();
+    let entry = crate::adapters::file_scan::FileScanEntry {
+        session_id: id.to_string(),
+        stat_target: path,
+        directory: None,
+    };
+    assert_roundtrip("rx-agent", || {
+        crate::adapters::rx_agent::parse_session(&entry, 1_792_922_410_000, true)?
+            .context("rx-agent fixture was not parsed")
+    });
+}
+
+#[test]
 fn kimi_composite_files_round_trip() {
     let root = tempfile::tempdir().unwrap();
     let session_dir = root.path().join("wd_fixture").join("session_kimi_contract");

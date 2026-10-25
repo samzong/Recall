@@ -34,6 +34,7 @@ mod pi_session;
 pub(crate) mod qoder;
 pub(crate) mod qwen;
 pub(crate) mod roo;
+pub(crate) mod rx_agent;
 pub(crate) mod sync_state;
 pub(crate) mod trae_cli;
 pub(crate) mod usage;
@@ -428,6 +429,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(codex::CodexAdapter),
         Box::new(pi::PiAdapter),
         Box::new(omp::OmpAdapter),
+        Box::new(rx_agent::RxAgentAdapter),
         Box::new(antigravity::AntigravityAdapter),
         Box::new(gemini::GeminiAdapter),
         Box::new(grok::GrokAdapter),
@@ -502,6 +504,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "gemini-cli"
             | "pi"
             | "omp"
+            | "rx-agent"
             | "muse-code"
             | "codebuddy"
             | "trae-cli"

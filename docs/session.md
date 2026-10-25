@@ -565,6 +565,7 @@ Per-adapter coverage:
 | Codex | primary / subagent | spawn + fork | `session_meta.thread_source` / `source`, `parent_thread_id` / `thread_spawn`, `forked_from_id` |
 | Claude Code | primary / subagent | spawn | `subagents/<agent>.jsonl` path + transcript `sessionId` parent |
 | Pi | primary | fork | session-header `parentSession` |
+| rx-agent | primary | none | version 1 session header; rx-agent records no parent relationship |
 | Others (OpenCode, Cursor, Copilot, Gemini, Grok, Antigravity, Cline, Kiro) | `null` | none | not yet classified |
 
 Grok retains its current skip-and-prune behavior; enabling classified Grok
