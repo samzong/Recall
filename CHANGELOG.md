@@ -1,6 +1,21 @@
 # Changelog
 
 
+## [0.6.6](https://github.com/samzong/Recall/compare/v0.6.5...v0.6.6) (2026-10-30)
+
+
+### Features
+
+* **extensions:** add OpenDAL storage provider ([#325](https://github.com/samzong/Recall/issues/325))
+* **adapters:** index rx-agent sessions ([#331](https://github.com/samzong/Recall/issues/331))
+
+
+### Fixes
+
+* **deps:** clear markdown and zstd audit failures ([#332](https://github.com/samzong/Recall/issues/332))
+* **remote:** avoid sorting revision bodies on disk ([#333](https://github.com/samzong/Recall/issues/333))
+
+
 ## [0.6.5](https://github.com/samzong/Recall/compare/v0.6.4...v0.6.5) (2026-10-24)
 
 
