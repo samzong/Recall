@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 
 use super::{OBJECT_LIMIT, ZSTD_LEVEL};
 
-const WINDOW_LOG_MAX: u32 = 31;
+const WINDOW_LOG_MAX: u32 = 30;
 
 pub(crate) fn decode_zstd(body: &[u8], prefix: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut decoder = match prefix {

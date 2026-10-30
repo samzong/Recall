@@ -161,10 +161,10 @@ An unchanged native path retains its observation timestamp; it is not a heartbea
 Core retains each object locally, compressed or uncompressed. A known
 descendant can update an indexed replica; an older revision cannot roll it back.
 Concurrent revisions remain available as complete snapshots while ordinary
-queries and usage count one row per proven logical session. A preexisting local selection is retained
-when concurrent descendants prevent a unique update. A new replica uses digest
-ordering for its initial display selection; this does not rank correctness or
-recency. Network revisions never overwrite a confirmed native scanner binding.
+queries and usage count one row per proven logical session. A preexisting local
+selection is retained when concurrent descendants prevent a unique update. A new
+replica uses digest ordering for its initial display selection; this does not
+rank correctness or recency. Network revisions never overwrite a confirmed native scanner binding.
 
 Every synchronization starts a full paginated enumeration of `v1/revisions/` and
 `v1/metadata/`. Core lists the two prefixes in parallel and follows empty pages
