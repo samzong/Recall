@@ -488,7 +488,7 @@ impl Store {
     }
 
     pub(crate) fn session_revisions(&self, id: &str) -> Result<BTreeMap<String, Revision>> {
-        let mut stmt = self.conn.prepare("SELECT r.digest, r.body FROM sync_revisions r JOIN sync_aliases a ON a.sync_id = r.sync_id WHERE a.session_id = ?1 ORDER BY r.digest")?;
+        let mut stmt = self.conn.prepare("SELECT r.digest, r.body FROM sync_revisions r JOIN sync_aliases a ON a.sync_id = r.sync_id WHERE a.session_id = ?1")?;
         let rows = stmt
             .query_map([id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
