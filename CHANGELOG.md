@@ -1,6 +1,34 @@
 # Changelog
 
 
+## [0.6.7](https://github.com/samzong/Recall/compare/v0.6.6...v0.6.7) (2026-10-30)
+
+
+### Fixes
+
+* **remote:** compress locally cached revision bodies ([#336](https://github.com/samzong/Recall/issues/336))
+
+
+### Performance
+
+* **remote:** make prepare and merge incremental ([#337](https://github.com/samzong/Recall/issues/337))
+* **remote:** upload compressed revisions as parent deltas ([#338](https://github.com/samzong/Recall/issues/338))
+* **sync:** skip git probes for missing session directories ([#339](https://github.com/samzong/Recall/issues/339))
+
+## Upgrade note
+
+Upgrade every host that synchronizes with a remote library before any host runs
+`recall remote sync` with 0.6.7. This release uploads new revisions as
+`.json.zst` and `.delta-<parent>.zst` objects. Recall 0.6.6 and earlier stop
+with `invalid remote object name` when the library contains these objects.
+Objects that earlier versions uploaded stay unchanged and remain readable.
+
+The first remote sync after the upgrade rebuilds snapshots for every session in
+the upload scope, so it takes longer than later runs. After 0.6.7 caches a
+compressed object, Recall 0.6.6 and earlier fail `recall remote sync` and
+`recall session show` for the affected sessions.
+
+
 ## [0.6.6](https://github.com/samzong/Recall/compare/v0.6.5...v0.6.6) (2026-10-30)
 
 
