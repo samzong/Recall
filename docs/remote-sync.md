@@ -181,9 +181,17 @@ database, core creates a consistent SQLite backup beside it and reports its
 path on stderr. Read-only consumers require an upgraded index. For the default
 index, running `recall info` with the new binary performs the upgrade.
 
-Rollback requires the old binary and the pre-upgrade backup together. Do not
-point the old binary at the upgraded index. Disconnect stops future exchanges
-without deleting cached sessions, remote objects, host identity, or credentials.
+Rolling back to a binary older than schema 17 requires that binary and the
+pre-upgrade backup together. Do not point the old binary at the upgraded index.
+Disconnect stops future exchanges without deleting cached sessions, remote
+objects, host identity, or credentials.
+
+Schema 18 stores newly cached remote objects zstd-compressed and records their
+original size. Rows cached by earlier versions stay readable unchanged. The
+upgrade from schema 17 only adds columns and creates no backup. Once the new
+binary caches a compressed row, Recall 0.6.6 and earlier fail `recall remote
+sync` and fail `recall session show` for affected sessions. The index stays
+readable by the newer binary; reinstall it to recover.
 
 ## Process interfaces
 

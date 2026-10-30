@@ -115,7 +115,8 @@ impl Store {
             .conn
             .prepare("SELECT body FROM sync_objects ORDER BY digest")?
             .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .map(|body| decode_stored(body?))
+            .collect::<Result<Vec<_>>>()?;
         for body in &metadata {
             if let Metadata::Association { left, right, .. } = serde_json::from_slice(body)? {
                 self.apply_association(&tx, &left, &right)?;

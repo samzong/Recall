@@ -16,6 +16,12 @@ mod merge;
 const SQLITE_MAX_LENGTH: usize = 1_000_000_000;
 pub(crate) const OBJECT_LIMIT: usize = 512 * 1024 * 1024;
 const _: () = assert!(OBJECT_LIMIT < SQLITE_MAX_LENGTH);
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+const ZSTD_LEVEL: i32 = 3;
+
+fn decode_stored(body: Vec<u8>) -> Result<Vec<u8>> {
+    if body.starts_with(&ZSTD_MAGIC) { Ok(zstd::decode_all(body.as_slice())?) } else { Ok(body) }
+}
 
 pub(crate) fn is_zero(value: &u32) -> bool {
     *value == 0
@@ -177,17 +183,18 @@ impl Store {
                 row.get(0)
             })
             .optional()?;
-        body.map(|body| serde_json::from_slice(&body).map_err(Into::into)).transpose()
+        body.map(|body| Ok(serde_json::from_slice(&decode_stored(body)?)?)).transpose()
     }
 
     pub(crate) fn cached_remote(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let (table, hash) = object_parts(key)?;
-        Ok(self
-            .conn
+        self.conn
             .query_row(&format!("SELECT body FROM {table} WHERE digest = ?1"), [hash], |row| {
                 row.get(0)
             })
-            .optional()?)
+            .optional()?
+            .map(decode_stored)
+            .transpose()
     }
 
     pub(crate) fn cached_remote_size(&self, key: &str) -> Result<Option<u64>> {
@@ -195,7 +202,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                &format!("SELECT LENGTH(body) FROM {table} WHERE digest = ?1"),
+                &format!("SELECT COALESCE(size, LENGTH(body)) FROM {table} WHERE digest = ?1"),
                 [hash],
                 |row| row.get(0),
             )
@@ -206,6 +213,7 @@ impl Store {
         ensure!(body.len() <= OBJECT_LIMIT, "remote object exceeds 512 MiB");
         let (table, hash) = object_parts(key)?;
         ensure!(digest(body) == hash, "remote object content hash mismatch");
+        let size = body.len() as i64;
         if table == "sync_revisions" {
             let revision: Revision = serde_json::from_slice(body)?;
             ensure!(revision.version == 1, "unsupported remote revision version");
@@ -223,8 +231,8 @@ impl Store {
                 "invalid portable parent links"
             );
             self.conn.execute(
-                "INSERT OR IGNORE INTO sync_revisions(digest, sync_id, body) VALUES (?1, ?2, ?3)",
-                params![hash, revision.sync_id, body],
+                "INSERT OR IGNORE INTO sync_revisions(digest, sync_id, body, size) VALUES (?1, ?2, ?3, ?4)",
+                params![hash, revision.sync_id, zstd::encode_all(body, ZSTD_LEVEL)?, size],
             )?;
         } else {
             let metadata: Metadata = serde_json::from_slice(body)?;
@@ -249,8 +257,8 @@ impl Store {
                 }
             }
             self.conn.execute(
-                "INSERT OR IGNORE INTO sync_objects(digest, body) VALUES (?1, ?2)",
-                params![hash, body],
+                "INSERT OR IGNORE INTO sync_objects(digest, body, size) VALUES (?1, ?2, ?3)",
+                params![hash, zstd::encode_all(body, ZSTD_LEVEL)?, size],
             )?;
         }
         Ok(())
@@ -260,7 +268,9 @@ impl Store {
         let rows = stmt
             .query_map([id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter().map(|(hash, body)| Ok((hash, serde_json::from_slice(&body)?))).collect()
+        rows.into_iter()
+            .map(|(hash, body)| Ok((hash, serde_json::from_slice(&decode_stored(body)?)?)))
+            .collect()
     }
 
     pub(crate) fn revision_summaries(&self, id: &str) -> Result<Vec<Value>> {
@@ -323,7 +333,7 @@ impl Store {
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (hash, body) in metadata {
-            let include = match serde_json::from_slice(&body)? {
+            let include = match serde_json::from_slice(&decode_stored(body)?)? {
                 Metadata::Locations { sync_id, .. } => identities.contains(&sync_id),
                 Metadata::Association { left, right, .. } => {
                     self.remote_revision(&left)?

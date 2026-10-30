@@ -300,6 +300,61 @@ fn remote_concurrent_revisions_keep_one_projection_and_all_full_snapshots() {
 }
 
 #[test]
+fn remote_objects_are_stored_compressed_and_legacy_raw_rows_stay_readable() {
+    crate::db::schema::register_sqlite_vec();
+    let a = Store::open_in_memory().unwrap();
+    seed(&a, "compressed synthetic message", true);
+    let mut cloud = BTreeMap::new();
+    transfer(&a, &mut cloud).unwrap();
+    assert!(!cloud.is_empty());
+    for (key, body) in &cloud {
+        let (table, hash) = key.trim_end_matches(".json").rsplit_once('/').unwrap();
+        let table = if table == "v1/revisions" { "sync_revisions" } else { "sync_objects" };
+        let stored: Vec<u8> = a
+            .conn
+            .query_row(&format!("SELECT body FROM {table} WHERE digest = ?1"), [hash], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(stored.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]));
+        assert_eq!(a.cached_remote(key).unwrap().as_ref(), Some(body));
+        assert_eq!(a.cached_remote_size(key).unwrap(), Some(body.len() as u64));
+    }
+
+    let legacy = Store::open_in_memory().unwrap();
+    for (key, body) in &cloud {
+        let hash = key.trim_end_matches(".json").rsplit_once('/').unwrap().1;
+        if key.starts_with("v1/revisions/") {
+            let revision: Revision = serde_json::from_slice(body).unwrap();
+            legacy
+                .conn
+                .execute(
+                    "INSERT INTO sync_revisions(digest, sync_id, body) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![hash, revision.sync_id, body],
+                )
+                .unwrap();
+        } else {
+            legacy
+                .conn
+                .execute(
+                    "INSERT INTO sync_objects(digest, body) VALUES (?1, ?2)",
+                    rusqlite::params![hash, body],
+                )
+                .unwrap();
+        }
+        assert_eq!(legacy.cached_remote(key).unwrap().as_ref(), Some(body));
+        assert_eq!(legacy.cached_remote_size(key).unwrap(), Some(body.len() as u64));
+    }
+    let summary = transfer(&legacy, &mut cloud).unwrap();
+    assert_eq!((summary.downloaded, summary.uploaded), (0, 0));
+    let session = legacy.list_recent_sessions(10).unwrap().pop().unwrap();
+    assert_eq!(
+        legacy.get_messages(&session.id).unwrap()[0].content,
+        "compressed synthetic message"
+    );
+}
+
+#[test]
 fn saved_provider_names_roundtrip_without_requiring_an_installed_extension() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("remote.json");
