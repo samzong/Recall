@@ -133,6 +133,9 @@ fn normalize_file_path(path: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn git_toplevel(directory: &str) -> Result<Option<String>> {
+    if !Path::new(directory).is_dir() {
+        return Ok(None);
+    }
     git_output(["-C", directory, "rev-parse", "--show-toplevel"])
         .with_context(|| format!("cannot probe Git repository root for directory {directory:?}"))
 }

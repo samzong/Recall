@@ -1,9 +1,11 @@
 mod entry;
+mod scope;
 mod single_session;
 pub(crate) use entry::{
     run_background_worker, run_cli, run_dashboard_sync_job, run_sync_job_inner, run_usage_sync_job,
     run_usage_sync_job_with_progress, scan_remote_scope,
 };
+use scope::{delete_excluded_sessions_for_source, path_matches_scope, paths_match_excluded};
 pub(crate) use single_session::{SessionSyncFormat, run as run_single_session};
 
 use std::collections::{HashMap, HashSet};
@@ -1370,79 +1372,6 @@ fn generate_title(messages: &[adapters::RawMessage]) -> String {
     let user_contents: Vec<&str> =
         messages.iter().filter(|m| m.role == Role::User).map(|m| m.content.as_str()).collect();
     utils::title_from_user_messages(&user_contents)
-}
-
-fn delete_excluded_sessions_for_source(
-    store: &Store,
-    source_id: &str,
-    matcher: &globset::GlobSet,
-    scope: &ProjectScope,
-    target_source_id: Option<&str>,
-    deleted: &mut HashSet<String>,
-) -> Result<u32> {
-    let mut count = 0;
-    for path in store.session_paths_for_source(source_id)? {
-        if target_source_id.is_some_and(|target| target != path.source_id) {
-            continue;
-        }
-        if !scope.matches(SessionScopeFields {
-            directory: path.directory.as_deref(),
-            repo_remote: path.repo_remote.as_deref(),
-            repo_slug: path.repo_slug.as_deref(),
-            repo_name: path.repo_name.as_deref(),
-        }) {
-            continue;
-        }
-        if paths_match_excluded(
-            path.directory.as_deref(),
-            path.source_file_path.as_deref(),
-            matcher,
-        ) {
-            let source_id_to_delete = path.source_id;
-            store.delete_session_data(source_id, &source_id_to_delete)?;
-            if deleted.insert(source_id_to_delete) {
-                count += 1;
-            }
-        }
-    }
-    Ok(count)
-}
-
-fn path_matches_scope(
-    scope: &ProjectScope,
-    path: &SessionPath,
-    cache: &mut RepoIdentityCache,
-) -> Result<bool> {
-    let repo = cache.resolve(path.directory.as_deref())?;
-    Ok(scope.matches(SessionScopeFields {
-        directory: path.directory.as_deref(),
-        repo_remote: path
-            .repo_remote
-            .as_deref()
-            .or_else(|| repo.as_ref().map(|repo| repo.remote.as_str())),
-        repo_slug: path
-            .repo_slug
-            .as_deref()
-            .or_else(|| repo.as_ref().map(|repo| repo.slug.as_str())),
-        repo_name: path
-            .repo_name
-            .as_deref()
-            .or_else(|| repo.as_ref().map(|repo| repo.name.as_str())),
-    }))
-}
-
-fn paths_match_excluded(
-    directory: Option<&str>,
-    source_file_path: Option<&str>,
-    matcher: &globset::GlobSet,
-) -> bool {
-    directory.is_some_and(|path| matcher.is_match(path))
-        || source_file_path.is_some_and(|path| path_or_ancestor_matches(path, matcher))
-}
-
-fn path_or_ancestor_matches(path: &str, matcher: &globset::GlobSet) -> bool {
-    let path = std::path::Path::new(path);
-    path.ancestors().any(|candidate| matcher.is_match(candidate))
 }
 
 #[cfg(test)]
