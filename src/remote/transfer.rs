@@ -1,12 +1,15 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 
 use crate::db::store::Store;
 use crate::extension::transport::{ErrorCode, Object, Operation, RemoteError, Reply};
+
+use super::object::{self, Name};
 
 const TRANSFER_CONCURRENCY: usize = 16;
 const GET_ATTEMPTS: usize = 3;
@@ -93,19 +96,42 @@ pub(super) fn download_objects(
 
         let mut downloaded = 0;
         let mut transferred = 0;
+        let mut waiting: HashMap<String, Vec<(Name, Vec<u8>)>> = HashMap::new();
         let cached = (|| -> Result<()> {
             for fetched in &receiver {
                 let (object, path) = fetched?;
                 let body = std::fs::read(&path)?;
                 ensure!(body.len() as u64 == object.size, "downloaded object length mismatch");
                 std::fs::remove_file(&path)?;
-                store.cache_remote(&object.key, &body)?;
-                downloaded += 1;
                 transferred += object.size;
+                let mut ready = vec![(Name::parse(&object.key)?, body)];
+                while let Some((name, body)) = ready.pop() {
+                    let base = match name.base() {
+                        Some(base) => match store.cached_remote(base)? {
+                            Some(raw) => Some(raw),
+                            None => {
+                                waiting.entry(base.to_string()).or_default().push((name, body));
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    let raw = name.decode(&body, base.as_deref())?;
+                    let stored = (name.encoding == object::Encoding::Zstd).then_some(&body[..]);
+                    store.cache_encoded(&name.canonical, &raw, stored)?;
+                    downloaded += 1;
+                    ready.extend(waiting.remove(&name.canonical).unwrap_or_default());
+                }
                 progress.detail(format!(
                     "Downloading objects {downloaded}/{pending} ({})",
                     crate::sync_progress::format_bytes(transferred)
                 ));
+            }
+            let unresolved: usize = waiting.values().map(Vec::len).sum();
+            if unresolved > 0 {
+                tracing::warn!(
+                    "skipped {unresolved} remote revisions whose base revision is not available yet"
+                );
             }
             Ok(())
         })();
@@ -124,9 +150,15 @@ struct Upload {
     sha256: String,
 }
 
-fn stage_upload(store: &Store, directory: &Path, index: usize, key: String) -> Result<Upload> {
-    let body = store.cached_remote(&key)?.context("remote recovery object is missing locally")?;
-    let path = directory.join(format!("upload-{index}.json"));
+fn stage_upload(
+    store: &Store,
+    directory: &Path,
+    index: usize,
+    canonical: &str,
+    available: &HashSet<String>,
+) -> Result<Upload> {
+    let (key, body) = object::encode(store, canonical, &|key| available.contains(key))?;
+    let path = directory.join(format!("upload-{index}"));
     std::fs::write(&path, &body)?;
     let sha256 = crate::db::remote_store::digest(&body);
     Ok(Upload { key, path, size: body.len() as u64, sha256 })
@@ -137,6 +169,7 @@ pub(super) fn upload_objects(
     progress: &mut crate::sync_progress::SyncProgress,
     transport: &(dyn Fn(&Operation) -> Result<Reply> + Sync),
     uploads: Vec<String>,
+    available: &HashSet<String>,
     directory: &Path,
 ) -> Result<usize> {
     let pending = uploads.len();
@@ -201,7 +234,7 @@ pub(super) fn upload_objects(
             if aborted.load(Ordering::Relaxed) {
                 break;
             }
-            match stage_upload(store, directory, index, key) {
+            match stage_upload(store, directory, index, &key, available) {
                 Ok(upload) => {
                     if sender.send(upload).is_err() {
                         break;

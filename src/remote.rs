@@ -1,6 +1,7 @@
+mod object;
 mod transfer;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -264,7 +265,8 @@ fn exchange(
     let mut summary = SyncSummary::default();
     let cached = store.cached_sizes()?;
     let mut remote_keys = HashSet::new();
-    let mut downloads = Vec::new();
+    let mut downloads = BTreeMap::new();
+    let mut listed = 0;
     let temporary = tempfile::tempdir()?;
     std::thread::scope(|scope| -> Result<()> {
         let (sender, pages) = std::sync::mpsc::channel();
@@ -279,34 +281,47 @@ fn exchange(
                     object.size <= crate::db::remote_store::OBJECT_LIMIT as u64,
                     "remote object exceeds 512 MiB"
                 );
-                if !remote_keys.insert(object.key.clone()) {
-                    continue;
-                }
-                if let Some(size) = cached.get(&object.key) {
+                listed += 1;
+                let name = object::Name::parse(&object.key)?;
+                remote_keys.insert(name.canonical.clone());
+                if let Some(size) = cached.get(&name.canonical) {
                     ensure!(
-                        *size == object.size,
+                        name.encoding != object::Encoding::Raw || *size == object.size,
                         "remote object size differs from its cached content"
                     );
                     continue;
                 }
-                crate::db::remote_store::validate_object_key(&object.key)?;
-                downloads.push(object);
+                let full = name.base().is_none();
+                match downloads.entry(name.canonical) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(object);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if full && object::Name::parse(&entry.get().key)?.base().is_some() {
+                            entry.insert(object);
+                        }
+                    }
+                }
             }
-            progress.detail(format!(
-                "Remote objects: {} listed, {} new",
-                remote_keys.len(),
-                downloads.len()
-            ));
+            progress.detail(format!("Remote objects: {listed} listed, {} new", downloads.len()));
         }
         Ok(())
     })?;
     progress.phase("Downloading objects");
-    summary.downloaded = download_objects(store, progress, transport, downloads, temporary.path())?;
+    summary.downloaded = download_objects(
+        store,
+        progress,
+        transport,
+        downloads.into_values().collect(),
+        temporary.path(),
+    )?;
     progress.phase("Merging revisions");
     summary.sessions_with_alternatives = store.merge_remote()?;
     let uploads = store.remote_uploads(&connection.scope, &remote_keys)?;
     progress.phase("Uploading objects");
-    summary.uploaded = upload_objects(store, progress, transport, uploads, temporary.path())?;
+    remote_keys.extend(uploads.iter().cloned());
+    summary.uploaded =
+        upload_objects(store, progress, transport, uploads, &remote_keys, temporary.path())?;
     Ok(summary)
 }
 

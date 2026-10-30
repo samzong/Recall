@@ -134,12 +134,23 @@ It requires all message, usage, and event arrays, including empty arrays. A
 revision is the complete indexed snapshot, not a promise that an adapter captured
 every native field. Old partial exports cannot restore fields they never carried.
 
-Objects use SHA-256 content addresses:
+Objects use SHA-256 content addresses. The digest is always the SHA-256 of the
+uncompressed JSON, whatever the encoding of the stored bytes:
 
 ```text
 v1/revisions/<sha256>.json
+v1/revisions/<sha256>.json.zst
+v1/revisions/<sha256>.delta-<parent>.zst
 v1/metadata/<sha256>.json
 ```
+
+Core uploads each revision in one of two compressed forms. A `.json.zst` object
+is a zstd frame of the revision JSON. A `.delta-<parent>.zst` object is a zstd
+frame that uses the uncompressed parent revision as its reference prefix. Core
+uploads a delta only when the parent revision is in the remote library or in the
+same upload. The delta must also be smaller than the `.json.zst` form.
+Metadata objects stay uncompressed. Core still reads `.json` revisions that
+earlier versions uploaded.
 
 Metadata carries evidenced locations or a strict legacy-association proof
 referencing two identical snapshots. Association proofs propagate when the old
@@ -147,10 +158,10 @@ import was already published. Host names and location observations are separate
 from content revisions, so renaming a host does not create a content branch.
 An unchanged native path retains its observation timestamp; it is not a heartbeat.
 
-Core retains the exact object bytes locally. A known descendant can update an
-indexed replica; an older revision cannot roll it back. Concurrent revisions
-remain available as complete snapshots while ordinary queries and usage count
-one row per proven logical session. A preexisting local selection is retained
+Core retains each object locally, compressed or uncompressed. A known
+descendant can update an indexed replica; an older revision cannot roll it back.
+Concurrent revisions remain available as complete snapshots while ordinary
+queries and usage count one row per proven logical session. A preexisting local selection is retained
 when concurrent descendants prevent a unique update. A new replica uses digest
 ordering for its initial display selection; this does not rank correctness or
 recency. Network revisions never overwrite a confirmed native scanner binding.
@@ -159,8 +170,13 @@ Every synchronization starts a full paginated enumeration of `v1/revisions/` and
 `v1/metadata/`. Core lists the two prefixes in parallel and follows empty pages
 that carry a continuation cursor. Repeated cursors and malformed or unsupported
 objects under these prefixes fail the operation. Core ignores keys outside these
-prefixes. There is no high-water mark or remote deletion. Missing objects within
-the upload scope are restored from the retained local bytes.
+prefixes. Core maps each listed key to its digest. If the library holds more
+than one encoding of a revision, core downloads only one of them. It prefers a
+form that does not need a parent. A delta whose parent is not cached locally
+waits for the parent in the same synchronization. If the parent is not
+available, core logs a warning and resolves the delta in a later
+synchronization. There is no high-water mark or remote deletion. Missing objects
+within the upload scope are restored from the retained local bytes.
 
 Core records which local sessions changed since the last synchronization. It
 rebuilds snapshots and merges revisions only for those sessions. After an
@@ -200,6 +216,10 @@ upgrade from schema 17 only adds columns and creates no backup. Once the new
 binary caches a compressed row, Recall 0.6.6 and earlier fail `recall remote
 sync` and fail `recall session show` for affected sessions. The index stays
 readable by the newer binary; reinstall it to recover.
+
+Recall 0.6.6 and earlier fail `recall remote sync` with `invalid remote object
+name` when the remote library contains a `.json.zst` or `.delta-` object. Upgrade
+every host that synchronizes with the library before a newer host uploads.
 
 Schema 19 adds the tables and triggers that record changed sessions. The upgrade
 from schema 18 only adds tables, triggers, an index, and a column, and creates

@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod objects;
+
 fn seed(store: &Store, text: &str, native: bool) -> String {
     let record = serde_json::json!({
         "schema_version": 7, "record_type": "session",
@@ -18,6 +20,29 @@ fn seed(store: &Store, text: &str, native: bool) -> String {
         store.clear_import_marker("codex", "shared-native-id").unwrap();
     }
     store.get_session_by_source_id("codex", "shared-native-id").unwrap().unwrap().id
+}
+
+fn raw_objects(cloud: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, Vec<u8>> {
+    let mut raw = BTreeMap::new();
+    let mut pending: Vec<_> =
+        cloud.iter().map(|(key, body)| (object::Name::parse(key).unwrap(), body)).collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|(name, body)| {
+            let base = match name.base() {
+                Some(base) => match raw.get(base) {
+                    Some(base) => Some(base),
+                    None => return true,
+                },
+                None => None,
+            };
+            let decoded = name.decode(body, base.map(Vec::as_slice)).unwrap();
+            raw.insert(name.canonical.clone(), decoded);
+            false
+        });
+        assert!(pending.len() < before, "delta base missing");
+    }
+    raw
 }
 
 fn transfer(store: &Store, cloud: &mut BTreeMap<String, Vec<u8>>) -> Result<SyncSummary> {
@@ -96,7 +121,8 @@ fn remote_large_revision_preserves_complete_events_and_recovers_objects() {
         .unwrap();
     let mut cloud = BTreeMap::new();
     transfer(&a, &mut cloud).unwrap();
-    assert!(cloud.values().any(|body| body.len() > 64 * 1024 * 1024));
+    assert!(raw_objects(&cloud).values().any(|body| body.len() > 64 * 1024 * 1024));
+    assert!(cloud.values().all(|body| body.len() < 1024 * 1024));
     transfer(&b, &mut cloud).unwrap();
     let received = b.list_recent_sessions(1).unwrap().pop().unwrap();
     let actual: String = b
@@ -224,6 +250,7 @@ fn remote_downloads_overlap_retry_transient_gets_and_stop_on_a_failed_get() {
         Ok(())
     });
     assert!(format!("{:#}", failed.err().unwrap()).contains("synthetic get failure"));
+    let broken = object::Name::parse(&broken).unwrap().canonical;
     assert_eq!(c.cached_remote_size(&broken).unwrap(), None);
 }
 
@@ -274,7 +301,8 @@ fn remote_concurrent_revisions_keep_one_projection_and_all_full_snapshots() {
     let mut cloud = BTreeMap::new();
     transfer(&source, &mut cloud).unwrap();
     transfer(&receiver, &mut cloud).unwrap();
-    let original = cloud.iter().find(|(key, _)| key.starts_with("v1/revisions/")).unwrap();
+    let raw = raw_objects(&cloud);
+    let original = raw.iter().find(|(key, _)| key.starts_with("v1/revisions/")).unwrap();
     let parent = digest(original.1);
     let body = original.1.clone();
     for text in ["concurrent left", "concurrent right"] {
@@ -360,61 +388,6 @@ fn remote_incremental_passes_match_a_forced_full_pass() {
     let summary = transfer(&b, &mut cloud).unwrap();
     assert_eq!((summary.downloaded, summary.uploaded), (0, 0));
     assert_eq!(b.list_recent_sessions(1).unwrap().pop().unwrap().title, received.title);
-}
-
-#[test]
-fn remote_objects_are_stored_compressed_and_legacy_raw_rows_stay_readable() {
-    crate::db::schema::register_sqlite_vec();
-    let a = Store::open_in_memory().unwrap();
-    seed(&a, "compressed synthetic message", true);
-    let mut cloud = BTreeMap::new();
-    transfer(&a, &mut cloud).unwrap();
-    assert!(!cloud.is_empty());
-    for (key, body) in &cloud {
-        let (table, hash) = key.trim_end_matches(".json").rsplit_once('/').unwrap();
-        let table = if table == "v1/revisions" { "sync_revisions" } else { "sync_objects" };
-        let stored: Vec<u8> = a
-            .conn
-            .query_row(&format!("SELECT body FROM {table} WHERE digest = ?1"), [hash], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert!(stored.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]));
-        assert_eq!(a.cached_remote(key).unwrap().as_ref(), Some(body));
-        assert_eq!(a.cached_remote_size(key).unwrap(), Some(body.len() as u64));
-    }
-
-    let legacy = Store::open_in_memory().unwrap();
-    for (key, body) in &cloud {
-        let hash = key.trim_end_matches(".json").rsplit_once('/').unwrap().1;
-        if key.starts_with("v1/revisions/") {
-            let revision: Revision = serde_json::from_slice(body).unwrap();
-            legacy
-                .conn
-                .execute(
-                    "INSERT INTO sync_revisions(digest, sync_id, body) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![hash, revision.sync_id, body],
-                )
-                .unwrap();
-        } else {
-            legacy
-                .conn
-                .execute(
-                    "INSERT INTO sync_objects(digest, body) VALUES (?1, ?2)",
-                    rusqlite::params![hash, body],
-                )
-                .unwrap();
-        }
-        assert_eq!(legacy.cached_remote(key).unwrap().as_ref(), Some(body));
-        assert_eq!(legacy.cached_remote_size(key).unwrap(), Some(body.len() as u64));
-    }
-    let summary = transfer(&legacy, &mut cloud).unwrap();
-    assert_eq!((summary.downloaded, summary.uploaded), (0, 0));
-    let session = legacy.list_recent_sessions(10).unwrap().pop().unwrap();
-    assert_eq!(
-        legacy.get_messages(&session.id).unwrap()[0].content,
-        "compressed synthetic message"
-    );
 }
 
 #[test]

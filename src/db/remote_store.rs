@@ -11,18 +11,21 @@ use crate::host::Location;
 use crate::project_scope::ProjectScope;
 use crate::types::Session;
 
+mod codec;
 mod merge;
+
+pub(crate) use codec::{decode_zstd, encode_delta};
 
 const SQLITE_MAX_LENGTH: usize = 1_000_000_000;
 pub(crate) const OBJECT_LIMIT: usize = 512 * 1024 * 1024;
 const _: () = assert!(OBJECT_LIMIT < SQLITE_MAX_LENGTH);
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
-const ZSTD_LEVEL: i32 = 3;
+pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+pub(crate) const ZSTD_LEVEL: i32 = 3;
 const PREPARE_STATE: &str = "prepare_version";
 const MERGE_STATE: &str = "merge_version";
 
-fn decode_stored(body: Vec<u8>) -> Result<Vec<u8>> {
-    if body.starts_with(&ZSTD_MAGIC) { Ok(zstd::decode_all(body.as_slice())?) } else { Ok(body) }
+pub(crate) fn decode_stored(body: Vec<u8>) -> Result<Vec<u8>> {
+    if body.starts_with(&ZSTD_MAGIC) { decode_zstd(&body, None) } else { Ok(body) }
 }
 
 pub(crate) fn is_zero(value: &u32) -> bool {
@@ -230,14 +233,17 @@ impl Store {
     }
 
     pub(crate) fn cached_remote(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.cached_stored(key)?.map(decode_stored).transpose()
+    }
+
+    pub(crate) fn cached_stored(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let (table, hash) = object_parts(key)?;
-        self.conn
+        Ok(self
+            .conn
             .query_row(&format!("SELECT body FROM {table} WHERE digest = ?1"), [hash], |row| {
                 row.get(0)
             })
-            .optional()?
-            .map(decode_stored)
-            .transpose()
+            .optional()?)
     }
 
     #[cfg(test)]
@@ -254,7 +260,20 @@ impl Store {
     }
 
     pub(crate) fn cache_remote(&self, key: &str, body: &[u8]) -> Result<()> {
+        self.cache_encoded(key, body, None)
+    }
+
+    pub(crate) fn cache_encoded(
+        &self,
+        key: &str,
+        body: &[u8],
+        stored: Option<&[u8]>,
+    ) -> Result<()> {
         ensure!(body.len() <= OBJECT_LIMIT, "remote object exceeds 512 MiB");
+        let stored = match stored.filter(|stored| stored.starts_with(&ZSTD_MAGIC)) {
+            Some(stored) => stored.to_vec(),
+            None => zstd::encode_all(body, ZSTD_LEVEL)?,
+        };
         let (table, hash) = object_parts(key)?;
         ensure!(digest(body) == hash, "remote object content hash mismatch");
         let size = body.len() as i64;
@@ -276,7 +295,7 @@ impl Store {
             );
             self.conn.execute(
                 "INSERT OR IGNORE INTO sync_revisions(digest, sync_id, body, size) VALUES (?1, ?2, ?3, ?4)",
-                params![hash, revision.sync_id, zstd::encode_all(body, ZSTD_LEVEL)?, size],
+                params![hash, revision.sync_id, stored, size],
             )?;
         } else {
             let metadata: Metadata = serde_json::from_slice(body)?;
@@ -302,7 +321,7 @@ impl Store {
             }
             self.conn.execute(
                 "INSERT OR IGNORE INTO sync_objects(digest, body, size) VALUES (?1, ?2, ?3)",
-                params![hash, zstd::encode_all(body, ZSTD_LEVEL)?, size],
+                params![hash, stored, size],
             )?;
         }
         Ok(())
