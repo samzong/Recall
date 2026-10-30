@@ -104,9 +104,9 @@ not access the service or save keys.
 
 `--recall-remote-transport` reads one JSON object from stdin and writes one JSON
 object to stdout. It implements transport version 1 with `probe`, `list`, `get`,
-and `put`. See the companion core's `docs/remote-sync.md` for the complete
-contract. Requests and responses are bounded to 2 MiB; object data uses
-core-owned absolute temporary paths and an independent byte limit.
+and `put`. See the companion core's `docs/remote-transport.md` for the
+complete contract. Requests and responses are bounded to 2 MiB; object data
+uses core-owned absolute temporary paths and an independent byte limit.
 
 Keys are relative to the configured directory. Each path segment uses lowercase
 ASCII letters, digits, `_`, `-`, and `.`. Empty, `.` and `..` segments are

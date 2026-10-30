@@ -236,7 +236,7 @@ The command name is the extension name: `recall reflect` dispatches to
 Remote providers declare `"transport_version": 1`, independently of CLI
 `protocol`. Only legacy R2 and non-provider extensions can omit it.
 Core checks provider manifests on connect and sync. See
-[transport details](remote-sync.md#process-interfaces).
+[transport details](remote-transport.md).
 
 Only providers installed from the official Recall extension catalog are
 supported. `recall ext install` and `upgrade` verify catalog SHA-256 values and
