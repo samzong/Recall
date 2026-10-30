@@ -214,6 +214,42 @@ fn synchronize(format: crate::info::InfoFormat) -> Result<()> {
     Ok(())
 }
 
+const REMOTE_PREFIXES: [&str; 2] = ["v1/revisions/", "v1/metadata/"];
+
+fn list_prefix(
+    transport: &(dyn Fn(&Operation) -> Result<Reply> + Sync),
+    prefix: &str,
+    pages: &std::sync::mpsc::Sender<Result<Vec<crate::extension::transport::Object>>>,
+) {
+    if let Err(error) = list_pages(transport, prefix, pages) {
+        let _ = pages.send(Err(error));
+    }
+}
+
+fn list_pages(
+    transport: &(dyn Fn(&Operation) -> Result<Reply> + Sync),
+    prefix: &str,
+    pages: &std::sync::mpsc::Sender<Result<Vec<crate::extension::transport::Object>>>,
+) -> Result<()> {
+    let mut cursor = None;
+    let mut cursors = HashSet::new();
+    loop {
+        let Reply::Listed(page) =
+            transport(&Operation::List { prefix: prefix.into(), cursor, page_size: 1000 })?
+        else {
+            anyhow::bail!("provider returned an invalid list result");
+        };
+        cursor = page.next_cursor;
+        if pages.send(Ok(page.objects)).is_err() {
+            return Ok(());
+        }
+        let Some(next) = &cursor else {
+            return Ok(());
+        };
+        ensure!(cursors.insert(next.clone()), "remote pagination cursor repeated");
+    }
+}
+
 fn exchange(
     store: &Store,
     connection: &Connection,
@@ -226,55 +262,49 @@ fn exchange(
     })?;
     progress.phase("Enumerating remote objects");
     let mut summary = SyncSummary::default();
-    let mut cursor = None;
-    let mut cursors = HashSet::new();
+    let cached = store.cached_sizes()?;
     let mut remote_keys = HashSet::new();
     let mut downloads = Vec::new();
     let temporary = tempfile::tempdir()?;
-    loop {
-        let Reply::Listed(page) =
-            transport(&Operation::List { prefix: "v1/".into(), cursor, page_size: 1000 })?
-        else {
-            anyhow::bail!("provider returned an invalid list result");
-        };
-        for object in page.objects {
-            ensure!(
-                object.size <= crate::db::remote_store::OBJECT_LIMIT as u64,
-                "remote object exceeds 512 MiB"
-            );
-            if !remote_keys.insert(object.key.clone()) {
-                continue;
-            }
-            if let Some(cached) = store.cached_remote_size(&object.key)? {
+    std::thread::scope(|scope| -> Result<()> {
+        let (sender, pages) = std::sync::mpsc::channel();
+        for prefix in REMOTE_PREFIXES {
+            let sender = sender.clone();
+            scope.spawn(move || list_prefix(transport, prefix, &sender));
+        }
+        drop(sender);
+        for page in pages {
+            for object in page? {
                 ensure!(
-                    cached == object.size,
-                    "remote object size differs from its cached content"
+                    object.size <= crate::db::remote_store::OBJECT_LIMIT as u64,
+                    "remote object exceeds 512 MiB"
                 );
-                continue;
+                if !remote_keys.insert(object.key.clone()) {
+                    continue;
+                }
+                if let Some(size) = cached.get(&object.key) {
+                    ensure!(
+                        *size == object.size,
+                        "remote object size differs from its cached content"
+                    );
+                    continue;
+                }
+                crate::db::remote_store::validate_object_key(&object.key)?;
+                downloads.push(object);
             }
-            downloads.push(object);
+            progress.detail(format!(
+                "Remote objects: {} listed, {} new",
+                remote_keys.len(),
+                downloads.len()
+            ));
         }
-        progress.detail(format!(
-            "Remote objects: {} listed, {} new",
-            remote_keys.len(),
-            downloads.len()
-        ));
-        cursor = page.next_cursor;
-        if let Some(cursor) = &cursor {
-            ensure!(cursors.insert(cursor.clone()), "remote pagination cursor repeated");
-        } else {
-            break;
-        }
-    }
+        Ok(())
+    })?;
     progress.phase("Downloading objects");
     summary.downloaded = download_objects(store, progress, transport, downloads, temporary.path())?;
     progress.phase("Merging revisions");
     summary.sessions_with_alternatives = store.merge_remote()?;
-    let uploads: Vec<String> = store
-        .remote_uploads(&connection.scope)?
-        .into_iter()
-        .filter(|key| !remote_keys.contains(key))
-        .collect();
+    let uploads = store.remote_uploads(&connection.scope, &remote_keys)?;
     progress.phase("Uploading objects");
     summary.uploaded = upload_objects(store, progress, transport, uploads, temporary.path())?;
     Ok(summary)

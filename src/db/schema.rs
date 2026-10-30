@@ -1,10 +1,11 @@
 use rusqlite::{Connection, OptionalExtension};
 
 mod legacy;
+mod remote_pending;
 use legacy::*;
 
 const V12_SCHEMA_VERSION: i64 = 12;
-pub(crate) const SCHEMA_VERSION: i64 = 18;
+pub(crate) const SCHEMA_VERSION: i64 = 19;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -71,6 +72,9 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     }
     if version < 18 {
         migrate_v18(conn)?;
+    }
+    if version < 19 {
+        remote_pending::migrate_v19(conn)?;
     }
     Ok(())
 }

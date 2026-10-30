@@ -131,11 +131,16 @@ impl Store {
                 }
             }
         }
+        let sql = if self.sync_state_current(MERGE_STATE, env!("CARGO_PKG_VERSION"))? {
+            "SELECT s.session_id, s.current_revision FROM session_sync s
+             JOIN sync_pending_heads p ON p.session_id = s.session_id"
+        } else {
+            "SELECT session_id, current_revision FROM session_sync"
+        };
         let sessions = tx
-            .prepare("SELECT session_id, current_revision FROM session_sync")?
+            .prepare(sql)?
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut conflicts = 0;
         for (id, current) in sessions {
             let revisions = self.session_revisions(&id)?;
             let session = self.get_session_by_id(&id)?.context("missing remote session")?;
@@ -166,12 +171,9 @@ impl Store {
                 })
                 .count();
             tx.execute(
-                "UPDATE session_sync SET alternative_versions = ?2 WHERE session_id = ?1",
-                params![id, alternatives],
+                "UPDATE session_sync SET alternative_versions = ?2, head_count = ?3 WHERE session_id = ?1",
+                params![id, alternatives, heads.len()],
             )?;
-            if heads.len() > 1 {
-                conflicts += 1;
-            }
             if self.has_native_binding(&id)? {
                 continue;
             }
@@ -196,6 +198,12 @@ impl Store {
                 )?;
             }
         }
+        tx.execute("DELETE FROM sync_pending_heads", [])?;
+        self.mark_sync_state(MERGE_STATE, env!("CARGO_PKG_VERSION"))?;
+        let conflicts =
+            tx.query_row("SELECT COUNT(*) FROM session_sync WHERE head_count > 1", [], |row| {
+                row.get(0)
+            })?;
         tx.commit()?;
         Ok(conflicts)
     }
@@ -206,6 +214,23 @@ impl Store {
         left: &str,
         right: &str,
     ) -> Result<()> {
+        let identity = |hash: &str| -> Result<Option<String>> {
+            Ok(tx
+                .query_row("SELECT sync_id FROM sync_revisions WHERE digest = ?1", [hash], |row| {
+                    row.get(0)
+                })
+                .optional()?)
+        };
+        let (Some(left_id), Some(right_id)) = (identity(left)?, identity(right)?) else {
+            return Ok(());
+        };
+        let (Some(a), Some(b)) = (self.alias_session(&left_id)?, self.alias_session(&right_id)?)
+        else {
+            return Ok(());
+        };
+        if a == b {
+            return Ok(());
+        }
         let (Some(left), Some(right)) = (self.remote_revision(left)?, self.remote_revision(right)?)
         else {
             return Ok(());
@@ -214,14 +239,6 @@ impl Store {
             left.record == right.record && left.sync_id != right.sync_id,
             "legacy association proof does not match"
         );
-        let (Some(a), Some(b)) =
-            (self.alias_session(&left.sync_id)?, self.alias_session(&right.sync_id)?)
-        else {
-            return Ok(());
-        };
-        if a == b {
-            return Ok(());
-        }
         let a_native = self.has_native_binding(&a)?;
         let b_native = self.has_native_binding(&b)?;
         ensure!(!(a_native && b_native), "legacy association cannot combine two native bindings");

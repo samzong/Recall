@@ -155,10 +155,18 @@ when concurrent descendants prevent a unique update. A new replica uses digest
 ordering for its initial display selection; this does not rank correctness or
 recency. Network revisions never overwrite a confirmed native scanner binding.
 
-Every synchronization starts a full paginated enumeration, including empty pages
-with a continuation cursor. Repeated cursors and malformed or unsupported objects
-fail the operation. There is no high-water mark or remote deletion. Missing
-objects within the upload scope are restored from the retained local bytes.
+Every synchronization starts a full paginated enumeration of `v1/revisions/` and
+`v1/metadata/`. Core lists the two prefixes in parallel and follows empty pages
+that carry a continuation cursor. Repeated cursors and malformed or unsupported
+objects under these prefixes fail the operation. Core ignores keys outside these
+prefixes. There is no high-water mark or remote deletion. Missing objects within
+the upload scope are restored from the retained local bytes.
+
+Core records which local sessions changed since the last synchronization. It
+rebuilds snapshots and merges revisions only for those sessions. After an
+upgrade, the first synchronization rebuilds snapshots for every session in the
+upload scope and merges every session. After a change of the upload scope, it
+rebuilds snapshots for every session in the new scope.
 Each data object is limited to 512 MiB. Sync downloads and uploads run up to 16
 objects at a time. Each sync transport operation has a 120-second deadline plus
 one second per 64 KiB of the object it transfers. This allows each of 16
@@ -192,6 +200,11 @@ upgrade from schema 17 only adds columns and creates no backup. Once the new
 binary caches a compressed row, Recall 0.6.6 and earlier fail `recall remote
 sync` and fail `recall session show` for affected sessions. The index stays
 readable by the newer binary; reinstall it to recover.
+
+Schema 19 adds the tables and triggers that record changed sessions. The upgrade
+from schema 18 only adds tables, triggers, an index, and a column, and creates
+no backup. Older binaries do not remove the triggers, so the index keeps a
+record of changes that an older binary makes.
 
 ## Process interfaces
 
