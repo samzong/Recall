@@ -8,12 +8,12 @@ use crate::project_scope::ProjectScope;
 use crate::types::{RawSessionEvent, Session};
 
 #[test]
-fn tokenize_query_strips_punctuation_and_case() {
+fn tokenize_query_trims_punctuation_and_case() {
     assert_eq!(
         tokenize_query("context power café Codex "),
         vec!["context", "power", "café", "codex"]
     );
-    assert_eq!(tokenize_query("bug OR 1=1 --"), vec!["bug", "or", "11"]);
+    assert_eq!(tokenize_query("bug OR 1=1 --"), vec!["bug", "or", "1=1"]);
 }
 
 #[test]

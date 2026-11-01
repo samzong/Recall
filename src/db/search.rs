@@ -605,14 +605,8 @@ fn message_excerpt(marked: &str) -> String {
 
 fn tokenize_query(query: &str) -> Vec<String> {
     query
-        .split_whitespace()
-        .map(|token| {
-            token
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
-                .collect::<String>()
-                .to_lowercase()
-        })
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .map(|token| token.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
         .filter(|token| !token.is_empty())
         .collect()
 }
@@ -653,6 +647,9 @@ fn unicode61_fts5_query(tokens: &[String], trigram_available: bool) -> String {
 fn token_uses_trigram(token: &str) -> bool {
     token.chars().count() >= FTS_TRIGRAM_MIN_CHARS && crate::utils::text_needs_trigram(token)
 }
+
+#[cfg(test)]
+mod punctuation_tests;
 
 #[cfg(test)]
 mod tests;
