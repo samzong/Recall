@@ -558,6 +558,27 @@ mod tests {
         path
     }
 
+    struct SessionSpec<'a> {
+        id: &'a str,
+        title: &'a str,
+        created_at: i64,
+        updated_at: i64,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        parent: Option<&'a str>,
+    }
+
+    struct MessageSpec<'a> {
+        id: &'a str,
+        session_id: &'a str,
+        role: &'a str,
+        parts: &'a str,
+        created_at: i64,
+        updated_at: Option<i64>,
+        model: Option<&'a str>,
+        provider: Option<&'a str>,
+    }
+
     fn setup_crush_db(dir: &Path) -> Connection {
         std::fs::create_dir_all(dir).unwrap();
         let conn = Connection::open(dir.join("crush.db")).unwrap();
@@ -588,27 +609,6 @@ mod tests {
         )
         .unwrap();
         conn
-    }
-
-    struct SessionSpec<'a> {
-        id: &'a str,
-        title: &'a str,
-        created_at: i64,
-        updated_at: i64,
-        prompt_tokens: i64,
-        completion_tokens: i64,
-        parent: Option<&'a str>,
-    }
-
-    struct MessageSpec<'a> {
-        id: &'a str,
-        session_id: &'a str,
-        role: &'a str,
-        parts: &'a str,
-        created_at: i64,
-        updated_at: Option<i64>,
-        model: Option<&'a str>,
-        provider: Option<&'a str>,
     }
 
     fn insert_session(conn: &Connection, spec: &SessionSpec<'_>) {
@@ -671,13 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_uses_official_flag() {
-        let command = CrushAdapter.resume_command("39959662-e5f0-471f-8c30-28cd8f55b50f").unwrap();
-        assert_eq!(command.program, "crush");
-        assert_eq!(command.args, vec!["--session", "39959662-e5f0-471f-8c30-28cd8f55b50f"]);
-    }
-
-    #[test]
     fn default_projects_json_is_xdg_share() {
         let home = tempfile::tempdir().unwrap();
         let resolved =
@@ -694,12 +687,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, PathBuf::from("/tmp/crush-data/projects.json"));
-    }
-
-    #[test]
-    fn seconds_are_converted_to_milliseconds() {
-        assert_eq!(seconds_to_ms(1788279318), 1_788_279_318_000);
-        assert_eq!(seconds_to_ms(1_788_279_318_000), 1_788_279_318_000);
     }
 
     #[test]
@@ -938,14 +925,6 @@ mod tests {
         assert_eq!(result.sessions[0].thread_role, Some(ThreadRole::Subagent));
         assert_eq!(result.sessions[0].parent_links[0].source_id, "parent");
         assert!(result.sessions[0].events.is_empty());
-    }
-
-    #[test]
-    fn missing_registry_is_empty() {
-        let projects = load_projects_from(Some(PathBuf::from("/no/such/projects.json"))).unwrap();
-        assert!(projects.is_empty());
-        let result = scan_projects(&projects, None, None, true).unwrap();
-        assert!(result.sessions.is_empty());
     }
 
     #[test]

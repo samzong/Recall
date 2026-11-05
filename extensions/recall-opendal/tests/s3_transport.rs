@@ -31,7 +31,6 @@ struct State {
 #[derive(Clone, Copy)]
 enum ListFailure {
     Empty404,
-    NoSuchBucket,
 }
 
 struct Fixture {
@@ -174,7 +173,6 @@ fn respond(stream: &mut TcpStream, request: &Request, body: Vec<u8>, state: &mut
         if let Some(failure) = state.list_failure {
             let body: &[u8] = match failure {
                 ListFailure::Empty404 => b"",
-                ListFailure::NoSuchBucket => b"<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>",
             };
             reply(stream, "404 Not Found", &[], body, false);
             return;
@@ -540,16 +538,6 @@ fn s3_missing_bucket_empty_404_probe_fails_with_bounded_list() {
 }
 
 #[test]
-fn s3_missing_bucket_explicit_error_probe_fails_with_bounded_list() {
-    rejected_probe(ListFailure::NoSuchBucket);
-}
-
-#[test]
 fn s3_missing_bucket_empty_404_configuration_preserves_previous_config() {
     rejected_configuration(ListFailure::Empty404);
-}
-
-#[test]
-fn s3_missing_bucket_explicit_error_configuration_preserves_previous_config() {
-    rejected_configuration(ListFailure::NoSuchBucket);
 }

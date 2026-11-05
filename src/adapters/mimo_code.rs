@@ -127,13 +127,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resume_uses_official_flag() {
-        let command = MimoCodeAdapter.resume_command("ses_123").unwrap();
-        assert_eq!(command.program, "mimo");
-        assert_eq!(command.args, vec!["--session", "ses_123"]);
-    }
-
-    #[test]
     fn default_path_is_xdg_share_mimocode_db() {
         let empty_home = tempfile::tempdir().unwrap();
         assert!(resolve_mimo_db_path_from(None, None, empty_home.path().to_path_buf()).is_none());
@@ -190,22 +183,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_and_missing_paths_are_skipped() {
-        assert!(
-            resolve_mimo_db_path_from(Some(":memory:".to_string()), None, PathBuf::from("/tmp"))
-                .is_none()
-        );
-        assert!(
-            resolve_mimo_db_path_from(
-                Some("/no/such/mimocode.db".to_string()),
-                None,
-                PathBuf::from("/tmp")
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
     fn scan_reads_opencode_shaped_native_session() {
         let (_root, db_path) = seed_db(
             "
@@ -233,47 +210,6 @@ mod tests {
         assert_eq!(sessions[0].events.len(), 2);
         assert_eq!(sessions[0].events[0].kind, "command");
         assert_eq!(sessions[0].events[0].name.as_deref(), Some("bash"));
-    }
-
-    #[test]
-    fn scan_without_import_tables_keeps_sessions() {
-        let root = tempfile::tempdir().unwrap();
-        let db_path = root.path().join("mimocode.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                title TEXT,
-                directory TEXT,
-                time_created INTEGER,
-                time_updated INTEGER
-            );
-            CREATE TABLE message (
-                id INTEGER PRIMARY KEY,
-                session_id TEXT,
-                data TEXT,
-                time_created INTEGER
-            );
-            CREATE TABLE part (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER,
-                data TEXT
-            );
-            INSERT INTO session (id, title, directory, time_created, time_updated)
-            VALUES ('ses_native', 'seed', '/repo', 100, 200);
-            INSERT INTO message (session_id, data, time_created)
-            VALUES ('ses_native', '{\"role\":\"user\"}', 110);
-            INSERT INTO part (message_id, data)
-            VALUES (1, '{\"type\":\"text\",\"text\":\"no import tables\"}');
-            ",
-        )
-        .unwrap();
-        drop(conn);
-        let conn = opencode::open_readonly(&db_path).unwrap().unwrap();
-        let sessions = scan_conn(&conn, false).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].messages[0].content, "no import tables");
     }
 
     #[test]

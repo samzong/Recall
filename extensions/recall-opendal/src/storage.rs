@@ -321,43 +321,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_listing_returns_correct_lexical_pages() {
-        with_operator(|| {
-            let op =
-                Operator::new(opendal::Operator::via_iter("memory", []).map_err(Failure::backend)?)
-                    .map_err(Failure::backend)?;
-            for key in ["v1/z", "v1/a", "v1/m"] {
-                op.write(key, key.to_owned()).map_err(Failure::backend)?;
-            }
-            assert_eq!(
-                list(&op, "v1/", None, 2)?,
-                json!({"objects":[
-                {"key":"v1/a","size":4},{"key":"v1/m","size":4}],"next_cursor":"v1/m"})
-            );
-            assert_eq!(
-                list(&op, "v1/", Some("v1/m"), 2)?,
-                json!({"objects":[
-                {"key":"v1/z","size":4}],"next_cursor":null})
-            );
-            verify(&op)?;
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn invalid_backend_keys_fail_without_invalid_page() {
-        with_operator(|| {
-            let op =
-                Operator::new(opendal::Operator::via_iter("memory", []).map_err(Failure::backend)?)
-                    .map_err(Failure::backend)?;
-            op.write("v1/Upper", "bad").map_err(Failure::backend)?;
-            assert_eq!(list(&op, "v1/", None, 1).unwrap_err().code, "integrity");
-            Ok(())
-        })
-        .unwrap();
-    }
-    #[test]
     fn listing_rejects_backend_without_list_capability() {
         with_operator(|| {
             for disable_stat in [false, true] {

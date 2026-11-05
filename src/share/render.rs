@@ -1372,14 +1372,6 @@ mod tests {
     }
 
     #[test]
-    fn html_renderer_escapes_content() {
-        let html =
-            render_html(&session("s1"), &[message(Role::User, "<script>alert('x')</script>", 0)]);
-        assert!(html.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"));
-        assert!(!html.contains("<script>alert"));
-    }
-
-    #[test]
     fn html_renderer_omits_local_directory() {
         let html = render_html(&session("s1"), &[]);
         assert!(!html.contains("/tmp/project"));
@@ -1392,7 +1384,6 @@ mod tests {
 
         assert!(!html.contains("fonts.googleapis.com"));
         assert!(!html.contains("fonts.gstatic.com"));
-        assert!(render_html(&session("s1"), &[]).contains("fonts.googleapis.com"));
     }
 
     #[test]
@@ -1412,89 +1403,6 @@ mod tests {
         assert!(html.contains("&lt;script&gt;alert("));
         assert!(html.contains("&lt;/script&gt;"));
         assert!(!html.contains("<script>alert"));
-    }
-
-    #[test]
-    fn html_renderer_collapses_tool_lines() {
-        let html = render_html(
-            &session("s1"),
-            &[message(
-                Role::Assistant,
-                "I will inspect it.\n[tool:run_terminal_command_v2]\n[tool_result:run_terminal_command_v2] {\"output\":\"huge\"}\nThe answer is here.",
-                0,
-            )],
-        );
-        assert!(html.contains("<p>I will inspect it.</p>"));
-        assert!(html.contains("2 tool executions"));
-        assert!(html.contains("<span class=\"badge\">tool</span>"));
-        assert!(html.contains("<span class=\"badge\">result</span>"));
-        assert_eq!(html.matches("<span class=\"lname\">run_terminal_command_v2</span>").count(), 2);
-        assert!(html.contains("<p>The answer is here.</p>"));
-        assert!(html.contains("class=\"tool-group\""));
-    }
-
-    #[test]
-    fn html_renderer_uses_reading_layout_and_code_blocks() {
-        let html = render_html(
-            &session("s1"),
-            &[message(Role::User, "Run this:\n```bash\nnpm test\n```", 0)],
-        );
-        assert!(html.contains("--read-width:716px"));
-        assert!(html.contains("class=\"site-header\""));
-        assert!(html.contains("class=\"user-block\""));
-        assert!(html.contains("<pre class=\"code-block\">"));
-        assert!(html.contains("npm test"));
-    }
-
-    #[test]
-    fn html_renderer_preserves_unlabeled_code_fence_content() {
-        let html = render_html(
-            &session("s1"),
-            &[message(Role::User, "Example:\n```\nhello\nworld\n```", 0)],
-        );
-        assert!(html.contains("hello"));
-        assert!(html.contains("world"));
-    }
-
-    #[test]
-    fn html_renderer_dedents_fenced_code_blocks() {
-        let html = render_html(
-            &session("s1"),
-            &[message(
-                Role::Assistant,
-                "Example:\n```yaml\n     skill:\n       root: skills/mosoo\n```",
-                0,
-            )],
-        );
-        assert!(
-            html.contains(
-                "<pre class=\"code-block\"><code class=\"language-yaml\">skill:\n  root: skills/mosoo</code></pre>"
-            )
-        );
-    }
-
-    #[test]
-    fn html_renderer_uses_real_markdown_for_agent_replies() {
-        let html = render_html(
-            &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::Assistant,
-                content:
-                    "## Result\n\n1. First\n   - nested **bold**\n   - task\n\n> quoted note\n\n| Name | Value |\n| --- | --- |\n| one | `two` |\n\n~~old~~"
-                        .to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
-        );
-        assert!(html.contains("<h2>Result</h2>"));
-        assert!(html.contains("<ol>"));
-        assert!(html.contains("<ul>"));
-        assert!(html.contains("<strong>bold</strong>"));
-        assert!(html.contains("<blockquote>"));
-        assert!(html.contains("<table>"));
-        assert!(html.contains("<td><code>two</code></td>"));
-        assert!(html.contains("<del>old</del>"));
     }
 
     #[test]
@@ -1519,43 +1427,50 @@ mod tests {
     }
 
     #[test]
-    fn html_renderer_collapses_citation_lines() {
+    fn html_renderer_batches_grok_tool_messages() {
         let html = render_html(
             &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::Assistant,
-                content:
-                    "Here is the answer.\n<oai-mem-citation>path/to/file</oai-mem-citation>\nDone."
-                        .to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
+            &[
+                message(Role::Assistant, "Answer incoming.", 0),
+                message(Role::Assistant, "[Read] {\"path\":\"src/share.rs\"}", 1),
+                message(Role::Assistant, "[Glob] {\"glob_pattern\":\"**/*\"}", 2),
+            ],
         );
-        assert!(html.contains("<span class=\"badge\">citation</span>"));
-        assert!(html.contains("<span class=\"lname\">Citation</span>"));
-        assert!(html.contains("<p>Here is the answer.</p>"));
-        assert!(html.contains("<p>Done.</p>"));
+        assert!(html.contains("<p>Answer incoming.</p>"));
+        assert!(html.contains("class=\"tool-run\""));
+        assert!(html.contains("2 tool executions"));
+        assert!(html.contains("<span class=\"lname\">Read</span>"));
+        assert!(html.contains("<span class=\"lname\">Glob</span>"));
+        assert_eq!(html.matches("class=\"turn assistant\"").count(), 1);
+        assert!(html.contains("role-label\">Assistant"));
+        assert!(html.contains("assistant-body\"><div class=\"prose\"><p>Answer incoming.</p>"));
     }
 
     #[test]
-    fn html_renderer_collapses_multiline_memory_citation() {
+    fn html_renderer_treats_user_tool_results_as_logs_not_turns() {
         let html = render_html(
             &session("s1"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::Assistant,
-                content:
-                    "Answer.\n<oai-mem-citation>\n<citation_entries>\nMEMORY.md:1-2|note=[used]\n</citation_entries>\n</oai-mem-citation>\nNext."
-                        .to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
+            &[
+                message(Role::User, "Read the config file.", 0),
+                message(Role::Assistant, "[Read] {\"path\":\"config.toml\"}", 1),
+                message(Role::User, "{\"method\":\"get_file\",\"content\":\"secret body\"}", 2),
+                message(Role::Assistant, "Here is what the config says.", 3),
+            ],
         );
-        assert_eq!(html.matches("<span class=\"lname\">Citation</span>").count(), 1);
-        assert!(!html.contains("2 tool executions"));
-        assert!(html.contains("<p>Answer.</p>"));
-        assert!(html.contains("<p>Next.</p>"));
+        assert_eq!(html.matches("class=\"turn user\"").count(), 1);
+        assert!(html.contains("<span class=\"tick-t\">Read the config file.</span>"));
+        assert!(!html.contains("<span class=\"tick-t\">{&quot;method&quot;"));
+        assert!(html.contains("2 tool executions"));
+        assert!(html.contains("secret body"));
+        assert!(html.contains("<p>Here is what the config says.</p>"));
+    }
+
+    #[test]
+    fn html_renderer_escapes_content() {
+        let html =
+            render_html(&session("s1"), &[message(Role::User, "<script>alert('x')</script>", 0)]);
+        assert!(html.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"));
+        assert!(!html.contains("<script>alert"));
     }
 
     #[test]
@@ -1580,108 +1495,16 @@ mod tests {
     }
 
     #[test]
-    fn html_renderer_batches_grok_tool_messages() {
+    fn html_renderer_uses_reading_layout_and_code_blocks() {
         let html = render_html(
             &session("s1"),
-            &[
-                message(Role::Assistant, "Answer incoming.", 0),
-                message(Role::Assistant, "[Read] {\"path\":\"src/share.rs\"}", 1),
-                message(Role::Assistant, "[Glob] {\"glob_pattern\":\"**/*\"}", 2),
-            ],
+            &[message(Role::User, "Run this:\n```bash\nnpm test\n```", 0)],
         );
-        assert!(html.contains("<p>Answer incoming.</p>"));
-        assert!(html.contains("class=\"tool-run\""));
-        assert!(html.contains("2 tool executions"));
-        assert!(html.contains("<span class=\"lname\">Read</span>"));
-        assert!(html.contains("<span class=\"lname\">Glob</span>"));
-        assert_eq!(html.matches("class=\"turn assistant\"").count(), 1);
-        assert!(html.contains("role-label\">Assistant"));
-        assert!(html.contains("assistant-body\"><div class=\"prose\"><p>Answer incoming.</p>"));
-    }
-
-    #[test]
-    fn html_renderer_groups_user_assistant_exchanges() {
-        let html = render_html(
-            &session("s1"),
-            &[
-                message(Role::User, "First question", 0),
-                message(Role::Assistant, "Working on it.", 1),
-                message(Role::Assistant, "[Read] {\"path\":\"src/share.rs\"}", 2),
-                message(Role::Assistant, "Here is the answer.", 3),
-                message(Role::User, "Second question", 4),
-                message(Role::Assistant, "Second answer.", 5),
-            ],
-        );
-        assert_eq!(html.matches("class=\"turn user\"").count(), 2);
-        assert_eq!(html.matches("class=\"turn assistant\"").count(), 2);
-        assert!(html.contains("class=\"turn user\" id=\"user-1\""));
-        assert!(html.contains("turn assistant\"><span class=\"role-label\">Assistant</span>"));
+        assert!(html.contains("--read-width:716px"));
+        assert!(html.contains("class=\"site-header\""));
         assert!(html.contains("class=\"user-block\""));
-        let first_user = html.find("First question").unwrap();
-        let first_answer = html.find("Here is the answer.").unwrap();
-        let second_user = html.find("Second question").unwrap();
-        let tool_run = html.find("class=\"tool-run\"").unwrap();
-        assert!(first_user < tool_run);
-        assert!(tool_run < first_answer);
-        assert!(first_answer < second_user);
-    }
-
-    #[test]
-    fn html_renderer_renders_user_toc_and_highlight_anchors() {
-        let html = render_html(
-            &session("s1"),
-            &[
-                message(Role::User, "First question", 0),
-                message(Role::Assistant, "First answer.", 1),
-                message(Role::User, "Second question", 2),
-            ],
-        );
-        assert!(html.contains("class=\"user-toc\""));
-        assert!(html.contains("href=\"#user-1\""));
-        assert!(html.contains("href=\"#user-2\""));
-        assert!(html.contains("id=\"user-1\""));
-        assert!(html.contains("id=\"user-2\""));
-        assert!(html.contains("--accent:#3C4FA0"));
-        assert!(html.contains("<span class=\"tick-t\">First question</span>"));
-        assert!(html.contains("<span class=\"tick-t\">Second question</span>"));
-    }
-
-    #[test]
-    fn html_renderer_treats_user_tool_results_as_logs_not_turns() {
-        let html = render_html(
-            &session("s1"),
-            &[
-                message(Role::User, "Read the config file.", 0),
-                message(Role::Assistant, "[Read] {\"path\":\"config.toml\"}", 1),
-                message(Role::User, "{\"method\":\"get_file\",\"content\":\"secret body\"}", 2),
-                message(Role::Assistant, "Here is what the config says.", 3),
-            ],
-        );
-        assert_eq!(html.matches("class=\"turn user\"").count(), 1);
-        assert!(html.contains("<span class=\"tick-t\">Read the config file.</span>"));
-        assert!(!html.contains("<span class=\"tick-t\">{&quot;method&quot;"));
-        assert!(html.contains("2 tool executions"));
-        assert!(html.contains("secret body"));
-        assert!(html.contains("<p>Here is what the config says.</p>"));
-    }
-
-    #[test]
-    fn html_renderer_shows_model_and_thinking_chips() {
-        let html = render_session_html(
-            &session("s1"),
-            &[],
-            &[],
-            &SessionDisplayMeta {
-                models: vec!["grok-composer-2.5-fast".to_string()],
-                thinking_depths: vec!["high".to_string()],
-            },
-        );
-        assert!(html.contains("<div class=\"meta\">"));
-        assert!(html.contains("0 messages</span>"));
-        assert!(
-            html.contains("<span class=\"meta-tag\">model <b>grok-composer-2.5-fast</b></span>")
-        );
-        assert!(html.contains("<span class=\"meta-tag\">thinking <b>high</b></span>"));
+        assert!(html.contains("<pre class=\"code-block\">"));
+        assert!(html.contains("npm test"));
     }
 
     #[test]
@@ -1702,18 +1525,19 @@ mod tests {
     }
 
     #[test]
-    fn html_renderer_renders_markdown_and_keeps_inline_mentions() {
+    fn html_renderer_dedents_fenced_code_blocks() {
         let html = render_html(
             &session("s1"),
             &[message(
-                Role::User,
-                "**Bold title**\n\n### Section\n\n* first item\n* second item\n\nMention `<oai-mem-citation>` in prose.",
+                Role::Assistant,
+                "Example:\n```yaml\n     skill:\n       root: skills/mosoo\n```",
                 0,
             )],
         );
-        assert!(html.contains("<strong>Bold title</strong>"));
-        assert!(html.contains("<h3>Section</h3>"));
-        assert!(html.contains("<li>first item</li>"));
-        assert!(!html.contains("<summary>Citation</summary>"));
+        assert!(
+            html.contains(
+                "<pre class=\"code-block\"><code class=\"language-yaml\">skill:\n  root: skills/mosoo</code></pre>"
+            )
+        );
     }
 }

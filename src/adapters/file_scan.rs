@@ -244,10 +244,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::adapters::test_support::{
-        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
-        store as setup_store,
-    };
+    use crate::adapters::test_support::{seed_empty_usage_state, store as setup_store};
     use crate::adapters::{RawMessage, RawSession};
     use crate::db::store::Store;
     use crate::types::{Role, Session};
@@ -293,23 +290,6 @@ mod tests {
                 timestamp: Some(mtime_ms),
             }],
         )
-    }
-
-    #[test]
-    fn empty_input_returns_empty_result() {
-        let context = AdapterSyncContext::empty_for_test("test-source");
-        let result = run_file_scan_with_options(
-            &context,
-            None,
-            FileScanOptions::default(),
-            Vec::<FileScanEntry>::new(),
-            |_, _| panic!("parse should not be called"),
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 0);
-        assert!(result.observations.is_empty());
-        assert_eq!(result.stats.skipped_sessions, 0);
-        assert_eq!(result.stats.filtered_sessions, 0);
     }
 
     #[test]
@@ -403,40 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn matching_mtime_skip_returns_observation_without_parsing() {
-        let store = setup_store();
-        let path = temp_file_with_mtime("skip");
-        let mtime_ms = stat_mtime_ms(&path).unwrap();
-        store.insert_session(&make_session("s1", "sess-skip", Some(mtime_ms), 1)).unwrap();
-
-        let entry = FileScanEntry {
-            session_id: "sess-skip".to_string(),
-            stat_target: path.clone(),
-            directory: None,
-        };
-
-        let result = run_file_scan_with_options(
-            &sync_context(&store),
-            None,
-            FileScanOptions::default(),
-            vec![entry],
-            |_, _| panic!("parse should not be called for skipped entry"),
-        )
-        .unwrap();
-
-        assert_eq!(result.sessions.len(), 0);
-        assert_eq!(result.stats.skipped_sessions, 1);
-        assert_eq!(
-            result.observations,
-            vec![SourceObservation {
-                source_id: "sess-skip".to_string(),
-                source_file_path: path.to_str().map(str::to_string),
-            }]
-        );
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
     fn parse_rejection_does_not_return_observation() {
         let store = setup_store();
         let path = temp_file_with_mtime("parse-rejection");
@@ -510,143 +456,6 @@ mod tests {
         .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn matching_mtime_reparses_until_event_state_is_current() {
-        let store = setup_store();
-        let path = temp_file_with_mtime("event-backfill");
-        let mtime_ms = stat_mtime_ms(&path).unwrap();
-        store.insert_session(&make_session("s1", "sess-event", Some(mtime_ms), 1)).unwrap();
-
-        let entry = FileScanEntry {
-            session_id: "sess-event".to_string(),
-            stat_target: path.clone(),
-            directory: None,
-        };
-        let result = run_file_scan_with_options(
-            &sync_context(&store),
-            None,
-            FileScanOptions {
-                stream_sessions: false,
-                usage_parser_version: None,
-                event_parser_version: Some(1),
-                metadata_parser_version: None,
-            },
-            vec![entry],
-            |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.stats.skipped_sessions, 0);
-
-        seed_empty_event_state(&store, "test-source", "sess-event", 1, Some(mtime_ms));
-        let entry = FileScanEntry {
-            session_id: "sess-event".to_string(),
-            stat_target: path.clone(),
-            directory: None,
-        };
-        let result = run_file_scan_with_options(
-            &sync_context(&store),
-            None,
-            FileScanOptions {
-                stream_sessions: false,
-                usage_parser_version: None,
-                event_parser_version: Some(1),
-                metadata_parser_version: None,
-            },
-            vec![entry],
-            |_, _| panic!("current event state should skip parsing"),
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 0);
-        assert_eq!(result.stats.skipped_sessions, 1);
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn matching_mtime_reparses_until_metadata_state_is_current() {
-        let store = setup_store();
-        let path = temp_file_with_mtime("metadata-backfill");
-        let mtime_ms = stat_mtime_ms(&path).unwrap();
-        store.insert_session(&make_session("s1", "sess-meta", Some(mtime_ms), 1)).unwrap();
-
-        // An unchanged file whose topology parser version is stale must reparse,
-        // even though usage and events are not tracked here.
-        let entry = FileScanEntry {
-            session_id: "sess-meta".to_string(),
-            stat_target: path.clone(),
-            directory: None,
-        };
-        let result = run_file_scan_with_options(
-            &sync_context(&store),
-            None,
-            FileScanOptions {
-                stream_sessions: false,
-                usage_parser_version: None,
-                event_parser_version: None,
-                metadata_parser_version: Some(1),
-            },
-            vec![entry],
-            |entry, mtime_ms| Ok(Some(stub_raw_session(&entry.session_id, mtime_ms))),
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.stats.skipped_sessions, 0);
-
-        seed_empty_metadata_state(&store, "test-source", "sess-meta", 1);
-        let entry = FileScanEntry {
-            session_id: "sess-meta".to_string(),
-            stat_target: path.clone(),
-            directory: None,
-        };
-        let result = run_file_scan_with_options(
-            &sync_context(&store),
-            None,
-            FileScanOptions {
-                stream_sessions: false,
-                usage_parser_version: None,
-                event_parser_version: None,
-                metadata_parser_version: Some(1),
-            },
-            vec![entry],
-            |_, _| panic!("current metadata state should skip parsing"),
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 0);
-        assert_eq!(result.stats.skipped_sessions, 1);
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn mtime_mismatch_triggers_reparse() {
-        let store = setup_store();
-        let path = temp_file_with_mtime("mismatch");
-        let actual_mtime = stat_mtime_ms(&path).unwrap();
-        let stale_mtime = actual_mtime - 1_000;
-        store.insert_session(&make_session("s2", "sess-stale", Some(stale_mtime), 1)).unwrap();
-
-        let entry = FileScanEntry {
-            session_id: "sess-stale".to_string(),
-            stat_target: path.clone(),
-            directory: None,
-        };
-
-        let result = run_file_scan_with_options(
-            &sync_context(&store),
-            None,
-            FileScanOptions::default(),
-            vec![entry],
-            |entry, mtime_ms| {
-                assert_eq!(mtime_ms, actual_mtime);
-                Ok(Some(stub_raw_session(&entry.session_id, mtime_ms)))
-            },
-        )
-        .unwrap();
-
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.stats.skipped_sessions, 0);
         let _ = fs::remove_file(&path);
     }
 

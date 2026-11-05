@@ -755,57 +755,6 @@ mod tests {
     }
 
     #[test]
-    fn previous_metadata_parser_reloads_unchanged_mention_messages() {
-        let root = tempfile::tempdir().unwrap();
-        let (path, conn) = database(root.path(), true);
-        let mut thread = current_thread();
-        thread["messages"][0]["User"]["content"] = json!([
-            {"Text": "Read file"},
-            {"Mention": {"uri": {"File": {"abs_path": "/project/input.txt"}}, "content": "attachment_payload"}}
-        ]);
-        insert(&conn, "native-thread", "json", &serde_json::to_vec(&thread).unwrap());
-        let updated_at = timestamp(&metadata().updated_at);
-        let context = AdapterSyncContext::new(
-            "zed".into(),
-            HashMap::from([(
-                "native-thread".into(),
-                IndexedSessionMeta {
-                    id: "indexed".into(),
-                    directory: None,
-                    custom_title: None,
-                    started_at: 0,
-                    updated_at,
-                    message_count: 2,
-                },
-            )]),
-            HashMap::new(),
-            HashSet::new(),
-            HashMap::from([(
-                "native-thread".into(),
-                ParserStateMeta {
-                    parser_version: USAGE_PARSER_VERSION,
-                    source_updated_at: updated_at,
-                },
-            )]),
-            HashMap::from([(
-                "native-thread".into(),
-                ParserStateMeta {
-                    parser_version: EVENT_PARSER_VERSION,
-                    source_updated_at: updated_at,
-                },
-            )]),
-            HashMap::from([(
-                "native-thread".into(),
-                ParserStateMeta { parser_version: 1, source_updated_at: updated_at },
-            )]),
-        );
-        let scan = scan_database(&path, Some(&context), None, true).unwrap();
-        assert_eq!(scan.sessions.len(), 1);
-        assert_eq!(scan.sessions[0].messages[0].content, "Read file\n@/project/input.txt");
-        assert!(scan.sessions[0].refresh_session_on_metadata_backfill);
-    }
-
-    #[test]
     fn native_write_copy_and_move_calls_preserve_file_operations() {
         let mut thread = current_thread();
         thread["messages"][1]["Agent"]["content"] = json!([

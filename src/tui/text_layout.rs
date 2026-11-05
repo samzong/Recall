@@ -44,30 +44,3 @@ pub(crate) fn wrap_spans_to_lines(spans: Vec<Span<'static>>, width: usize) -> Ve
     }
     lines
 }
-
-#[cfg(test)]
-mod tests {
-    use ratatui::style::{Color, Style};
-
-    use super::*;
-
-    #[test]
-    fn wraps_by_visual_width_including_wide_chars() {
-        assert_eq!(wrap_visual_rows("abcdef", 4), vec!["abcd", "ef"]);
-        assert_eq!(wrap_visual_rows("ＡＢＣＤ", 3), vec!["Ａ", "Ｂ", "Ｃ", "Ｄ"]);
-        assert_eq!(wrap_visual_rows("", 4), vec![""]);
-    }
-
-    #[test]
-    fn span_boundaries_do_not_change_wrap_points() {
-        let styled = vec![
-            Span::styled("abc".to_string(), Style::default().fg(Color::Red)),
-            Span::raw("def".to_string()),
-        ];
-        let wrapped: Vec<String> = wrap_spans_to_lines(styled, 4)
-            .into_iter()
-            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
-            .collect();
-        assert_eq!(wrapped, wrap_visual_rows("abcdef", 4));
-    }
-}

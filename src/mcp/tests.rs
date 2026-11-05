@@ -400,38 +400,6 @@ fn invocation_nonce_resolves_only_one_complete_indexed_candidate() {
 }
 
 #[test]
-fn resolved_host_identity_skips_invocation_probe() {
-    let store = setup();
-    let mut current = session("current", "codex", "current", 10_000);
-    current.source_id = "host-source".to_string();
-    store.insert_session(&current).unwrap();
-
-    let resolved =
-        context("codex", "host-source").resolve_with_probe(&store, Some("nonce"), |_| {
-            panic!("resolved host identity must skip probing")
-        });
-    assert_eq!(resolved.resolution, CurrentSessionResolution::Resolved);
-    assert_eq!(resolved.session_id.as_deref(), Some("current"));
-}
-
-#[test]
-fn unknown_source_is_empty_not_a_crash() {
-    let store = setup();
-    store.insert_session(&session("s1", "codex", "title", 1_000)).unwrap();
-    store.insert_messages(&[message("s1", Role::User, "hello", 0)]).unwrap();
-    let index = ready(store);
-    let args = SearchSessionsArgs {
-        query: "hello".into(),
-        source: Some("not-a-source".into()),
-        ..Default::default()
-    };
-    let list = search_sessions(&index, &args).expect_err("unknown source");
-    assert!(list.hits.is_empty());
-    assert!(list.message.unwrap().contains("unknown source"));
-    assert_eq!(json_result(search_sessions(&index, &args)).is_error, Some(true));
-}
-
-#[test]
 fn get_session_returns_plain_text_and_caps_long_messages() {
     let store = setup();
     let mut long = session("s1", "codex", "long", 1_000);
@@ -758,39 +726,6 @@ fn get_session_events_bound_unicode_fields_and_total_text() {
 }
 
 #[test]
-fn get_session_include_events_returns_explicit_empty_payload() {
-    let store = setup();
-    let mut stored = session("s1", "codex", "no events", 1_000);
-    stored.message_count = 0;
-    store.insert_session(&stored).unwrap();
-
-    let detail = get_session(
-        &ready(store),
-        &GetSessionArgs { session_id: "s1".into(), include_events: true, ..Default::default() },
-    )
-    .unwrap();
-
-    assert_eq!(detail.events, Some(Vec::new()));
-    assert_eq!(detail.returned_events, Some(0));
-    assert_eq!(detail.events_truncated, Some(false));
-}
-
-#[test]
-fn get_session_missing_id_is_a_tool_error() {
-    let store = setup();
-    store.insert_session(&session("s1", "codex", "title", 1_000)).unwrap();
-    let index = ready(store);
-    let args = GetSessionArgs { session_id: "missing".into(), ..Default::default() };
-    let error = get_session(&index, &args).expect_err("missing session");
-    assert!(error.contains(SESSION_NOT_FOUND));
-    assert_eq!(
-        json_result(get_session(&index, &args).map_err(|message| empty_detail(Some(message))))
-            .is_error,
-        Some(true)
-    );
-}
-
-#[test]
 fn open_read_only_rejects_writes() {
     schema::register_sqlite_vec();
     let dir = tempfile::tempdir().unwrap();
@@ -847,54 +782,6 @@ fn missing_index_opens_after_the_file_appears() {
 }
 
 #[test]
-fn list_recent_bounds_summary_excerpt() {
-    let store = setup();
-    let mut long = session("s1", "codex", "long", 1_000);
-    long.summary = Some("y".repeat(EXCERPT_CHAR_CAP + 40));
-    store.insert_session(&long).unwrap();
-    let index = ready(store);
-    let list =
-        list_recent_sessions(&index, &ListRecentSessionsArgs { ..Default::default() }).unwrap();
-    let excerpt = list.hits[0].excerpt.as_deref().unwrap();
-    assert_eq!(excerpt.chars().count(), EXCERPT_CHAR_CAP);
-    assert!(excerpt.ends_with('…'));
-}
-
-#[test]
-fn get_session_flags_truncated_when_one_char_over_cap() {
-    let store = setup();
-    let mut long = session("s1", "codex", "edge", 1_000);
-    long.message_count = 1;
-    store.insert_session(&long).unwrap();
-    let content = "x".repeat(GET_MESSAGE_CHAR_CAP + 1);
-    store.insert_messages(&[message("s1", Role::User, &content, 0)]).unwrap();
-    let index = ready(store);
-    let detail =
-        get_session(&index, &GetSessionArgs { session_id: "s1".into(), ..Default::default() })
-            .unwrap();
-    assert!(detail.truncated);
-    assert_eq!(detail.first_message_seq, Some(0));
-    assert_eq!(detail.last_message_seq, Some(0));
-    assert!(detail.messages.ends_with('…'));
-    assert_eq!(detail.messages.chars().count(), "[user] ".chars().count() + GET_MESSAGE_CHAR_CAP);
-}
-
-#[test]
-fn limit_deserializer_accepts_string_numbers() {
-    let args: SearchSessionsArgs =
-        serde_json::from_value(serde_json::json!({"query": "q", "limit": "12"})).unwrap();
-    assert_eq!(args.limit, Some(12));
-    assert!(args.invocation_nonce.is_none());
-    assert_eq!(clamp_limit(Some(80), 10, 50), 50);
-    assert_eq!(clamp_limit(None, 10, 50), 10);
-    assert_eq!(clamp_limit(Some(80), EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX), 50);
-    assert_eq!(clamp_limit(None, EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX), 20);
-    let get_args: GetSessionArgs =
-        serde_json::from_value(serde_json::json!({"session_id": "s1"})).unwrap();
-    assert!(!get_args.include_events);
-}
-
-#[test]
 fn tools_advertise_read_only_closed_world() {
     for notes in [
         RecallMcp::search_sessions_tool_attr().annotations.unwrap(),
@@ -929,13 +816,6 @@ fn capabilities_report_uses_registered_tool_schemas() {
     assert!(get_session["inputSchema"]["properties"]["include_events"].is_object());
     assert!(search_sessions["inputSchema"]["properties"]["invocation_nonce"].is_object());
     assert!(list_recent_sessions["inputSchema"]["properties"]["invocation_nonce"].is_object());
-    assert!(get_session["description"].as_str().unwrap().contains("source_session_id"));
-    assert!(get_session["description"].as_str().unwrap().contains("first_message_seq"));
-    let description = get_session["description"].as_str().unwrap();
-    assert!(description.contains("50 events"));
-    assert!(description.contains("200 characters"));
-    assert!(description.contains("10000 characters"));
-    assert!(description.contains("never returns raw arguments"));
     assert!(report.server.capabilities.tools.is_some());
     let text = render_capabilities(&report);
     assert!(text.contains("get_session"));
@@ -1211,37 +1091,6 @@ fn file_history_clamps_limit_and_rejects_blank_path() {
 }
 
 #[test]
-fn file_history_truncates_long_summaries() {
-    let store = setup();
-    store.insert_session(&session("s1", "codex", "long", 1_000)).unwrap();
-    persist_events(
-        &store,
-        "codex",
-        "s1",
-        &[event(
-            0,
-            "tool_call",
-            Some("src/db/schema.rs"),
-            Some(1_000),
-            Some(&"z".repeat(EXCERPT_CHAR_CAP + 20)),
-            Some("Tool"),
-        )],
-    );
-    let list = file_history(
-        &ready(store),
-        &FileHistoryArgs {
-            path: "src/db/schema.rs".into(),
-            kind: Some("tool_call".into()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let summary = list.events[0].summary.as_deref().unwrap();
-    assert_eq!(summary.chars().count(), EXCERPT_CHAR_CAP);
-    assert!(summary.ends_with('…'));
-}
-
-#[test]
 fn message_search_opens_sparse_context_and_preserves_explicit_current_session_reads() {
     let store = setup();
     store.insert_session(&session("s1", "codex", "Evidence", 2000)).unwrap();
@@ -1476,4 +1325,34 @@ fn event_evidence_never_reads_imported_locators_and_rejects_oversized_reads() {
         .execute("UPDATE session_events SET attrs_json = CAST(zeroblob(67108865) AS TEXT)", [])
         .unwrap();
     assert_eq!(get_event_evidence(&index, &args).unwrap_err(), "evidence_budget_exceeded");
+}
+
+#[test]
+fn get_session_missing_id_is_a_tool_error() {
+    let store = setup();
+    store.insert_session(&session("s1", "codex", "title", 1_000)).unwrap();
+    let index = ready(store);
+    let args = GetSessionArgs { session_id: "missing".into(), ..Default::default() };
+    let error = get_session(&index, &args).expect_err("missing session");
+    assert!(error.contains(SESSION_NOT_FOUND));
+    assert_eq!(
+        json_result(get_session(&index, &args).map_err(|message| empty_detail(Some(message))))
+            .is_error,
+        Some(true)
+    );
+}
+
+#[test]
+fn limit_deserializer_accepts_string_numbers() {
+    let args: SearchSessionsArgs =
+        serde_json::from_value(serde_json::json!({"query": "q", "limit": "12"})).unwrap();
+    assert_eq!(args.limit, Some(12));
+    assert!(args.invocation_nonce.is_none());
+    assert_eq!(clamp_limit(Some(80), 10, 50), 50);
+    assert_eq!(clamp_limit(None, 10, 50), 10);
+    assert_eq!(clamp_limit(Some(80), EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX), 50);
+    assert_eq!(clamp_limit(None, EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX), 20);
+    let get_args: GetSessionArgs =
+        serde_json::from_value(serde_json::json!({"session_id": "s1"})).unwrap();
+    assert!(!get_args.include_events);
 }

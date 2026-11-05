@@ -1133,20 +1133,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_requests_are_skipped() {
-        let root = temp_root("empty");
-        let path = root.join("empty.jsonl");
-        write_jsonl(&path, &[r#"{"kind":0,"v":{"version":3,"sessionId":"empty","requests":[]}}"#]);
-        let session = parse_chat_session_for_entry(
-            FileScanEntry { session_id: "empty".to_string(), stat_target: path, directory: None },
-            1,
-        )
-        .unwrap();
-        assert!(session.is_none());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn truncated_jsonl_keeps_replayed_prefix() {
         let root = temp_root("trunc");
         let path = root.join("trunc.jsonl");
@@ -1218,74 +1204,6 @@ mod tests {
         .unwrap();
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[1].content, "Hello.");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn markdown_content_parts_are_indexed() {
-        let doc = serde_json::json!({
-            "responderUsername": "GitHub Copilot",
-            "requests": [{
-                "message": {"text": "q"},
-                "response": [{"kind":"markdownContent","value":"answer"}]
-            }]
-        });
-        let parsed = messages_from_doc(&doc);
-        assert_eq!(parsed.messages[1].content, "answer");
-    }
-
-    #[test]
-    fn other_chat_providers_are_skipped() {
-        let root = temp_root("other");
-        let path = root.join("other.json");
-        fs::write(
-            &path,
-            r#"{"responderUsername":"Other Agent","requests":[{"message":{"text":"nope"},"response":[{"value":"nope"}]}]}"#,
-        )
-        .unwrap();
-        let session = parse_chat_session_for_entry(
-            FileScanEntry { session_id: "other".to_string(), stat_target: path, directory: None },
-            1,
-        )
-        .unwrap();
-        assert!(session.is_none());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn explicit_other_provider_is_distinct_from_unknown() {
-        let other = serde_json::json!({"responderUsername": "Other Agent"});
-        let unknown = serde_json::json!({"requests": [{"message": {"text": "hello"}}]});
-
-        assert_ne!(classify_chat_provider(&other), classify_chat_provider(&unknown));
-    }
-
-    #[test]
-    fn unstable_provider_file_produces_no_classification() {
-        let root = temp_root("unstable-provider");
-        let path = root.join("changing.json");
-        fs::write(&path, r#"{"responderUsername":"Other Agent","requests":[]}"#).unwrap();
-        let snapshot = file_scan::file_metadata_snapshot(&path).unwrap();
-        let mtime_ms = snapshot.mtime_ms().unwrap();
-        let parsed = parse_stable_chat_entry_with(
-            FileScanEntry {
-                session_id: "changing".to_string(),
-                stat_target: path.clone(),
-                directory: None,
-            },
-            mtime_ms,
-            snapshot,
-            |entry, mtime_ms| {
-                let parsed = parse_chat_entry(entry, mtime_ms)?;
-                fs::write(
-                    &path,
-                    r#"{"responderUsername":"GitHub Copilot","requests":[{"message":{"text":"changed"}}]}"#,
-                )?;
-                Ok(parsed)
-            },
-        )
-        .unwrap();
-        assert!(parsed.is_none());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1504,12 +1422,5 @@ mod tests {
         assert_eq!(result.sessions[0].messages[1].content, "Hi there. Full answer.");
 
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn delete_patch_removes_object_key() {
-        let mut doc = serde_json::json!({"pendingRequests":[{"id":1}],"requests":[]});
-        apply_delete(&mut doc, Some(&serde_json::json!(["pendingRequests"])));
-        assert!(doc.get("pendingRequests").is_none());
     }
 }

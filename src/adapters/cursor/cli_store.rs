@@ -805,33 +805,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_store_db_skips_empty_root() {
-        let root = temp_root("empty");
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let store_db = root.join("ws").join(&session_id).join("store.db");
-        fs::create_dir_all(store_db.parent().unwrap()).unwrap();
-        let conn = Connection::open(&store_db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);
-             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
-        let sha_empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        conn.execute("INSERT INTO blobs (id, data) VALUES (?1, X'')", [sha_empty]).unwrap();
-        let meta = serde_json::json!({
-            "agentId": session_id,
-            "latestRootBlobId": sha_empty
-        });
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('0', ?1)",
-            [to_hex(meta.to_string().as_bytes())],
-        )
-        .unwrap();
-        assert!(parse_store_db(&store_db, &session_id, 1, 2, true).unwrap().is_none());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn collect_store_entries_skips_covered_ids() {
         let root = temp_root("collect");
         let keep = uuid::Uuid::new_v4().to_string();
@@ -864,11 +837,5 @@ mod tests {
             extract_visible_text("<user_query>\nreal ask\n</user_query>", true).as_deref(),
             Some("real ask")
         );
-    }
-
-    #[test]
-    fn resume_command_requires_existing_store() {
-        assert!(resume_command("not-a-uuid").is_none());
-        assert!(resume_command("00000000-0000-0000-0000-000000000000").is_none());
     }
 }

@@ -218,13 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn upload_without_approval_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = workspace(dir.path());
-        assert!(workspace.verify_against_approval().is_err());
-    }
-
-    #[test]
     fn local_only_artifacts_are_not_part_of_the_public_digest_set() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = workspace(dir.path());

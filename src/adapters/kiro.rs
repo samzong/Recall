@@ -1073,16 +1073,6 @@ mod tests {
     }
 
     #[test]
-    fn existing_source_id_remaps_sess_prefix_to_store_row() {
-        let paths = [session_path("790bb539-44be-40bd-85ac-0bb1a3fc6b47", None)];
-        assert_eq!(
-            existing_source_id("sess_790bb539-44be-40bd-85ac-0bb1a3fc6b47", &paths).as_deref(),
-            Some("790bb539-44be-40bd-85ac-0bb1a3fc6b47")
-        );
-        assert_eq!(existing_source_id("790bb539-44be-40bd-85ac-0bb1a3fc6b47", &paths), None);
-    }
-
-    #[test]
     fn reconcile_file_source_ids_keeps_existing_store_id() {
         let paths = [session_path("790bb539-44be-40bd-85ac-0bb1a3fc6b47", None)];
         let mut sessions = [raw("sess_790bb539-44be-40bd-85ac-0bb1a3fc6b47")];

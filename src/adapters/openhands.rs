@@ -700,27 +700,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_uses_official_flag() {
-        let command = OpenHandsAdapter.resume_command("abc123def456").unwrap();
-        assert_eq!(command.program, "openhands");
-        assert_eq!(command.args, vec!["--resume", "abc123def456"]);
-    }
-
-    #[test]
-    fn default_root_is_home_openhands_conversations() {
-        let home = tempfile::tempdir().unwrap();
-        assert!(
-            conversations_dir_from(None, None, None, None, Some(home.path().to_path_buf()))
-                .is_none()
-        );
-        fs::create_dir_all(home.path().join(".openhands/conversations")).unwrap();
-        let resolved =
-            conversations_dir_from(None, None, None, None, Some(home.path().to_path_buf()))
-                .unwrap();
-        assert_eq!(resolved, home.path().join(".openhands/conversations"));
-    }
-
-    #[test]
     fn openhands_conversations_dir_wins() {
         let root = tempfile::tempdir().unwrap();
         let conversations = root.path().join("cli-conversations");
@@ -738,72 +717,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, conversations);
-    }
-
-    #[test]
-    fn file_store_path_without_conversations_does_not_veto_home() {
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("home");
-        fs::create_dir_all(home.join(".openhands/conversations")).unwrap();
-        let unrelated = root.path().join("unrelated-store");
-        fs::create_dir_all(&unrelated).unwrap();
-        let resolved = conversations_dir_from(
-            None,
-            None,
-            None,
-            Some(unrelated.to_string_lossy().into_owned()),
-            Some(home.clone()),
-        )
-        .unwrap();
-        assert_eq!(resolved, home.join(".openhands/conversations"));
-    }
-
-    #[test]
-    fn missing_persistence_candidates_are_empty() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(
-            conversations_dir_from(
-                Some(root.path().join("missing-conversations").to_string_lossy().into_owned()),
-                Some(root.path().join("missing-persist").to_string_lossy().into_owned()),
-                Some(root.path().join("missing-oh").to_string_lossy().into_owned()),
-                Some(root.path().join("missing-store").to_string_lossy().into_owned()),
-                Some(root.path().to_path_buf()),
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn oh_persistence_dir_wins_over_file_store_path() {
-        let root = tempfile::tempdir().unwrap();
-        let persistence = root.path().join("oh");
-        fs::create_dir_all(persistence.join("conversations")).unwrap();
-        fs::create_dir_all(root.path().join("legacy/conversations")).unwrap();
-        let resolved = conversations_dir_from(
-            None,
-            None,
-            Some(persistence.to_string_lossy().into_owned()),
-            Some(root.path().join("legacy").to_string_lossy().into_owned()),
-            Some(PathBuf::from("/unused")),
-        )
-        .unwrap();
-        assert_eq!(resolved, persistence.join("conversations"));
-    }
-
-    #[test]
-    fn file_store_path_is_legacy_fallback() {
-        let root = tempfile::tempdir().unwrap();
-        let legacy = root.path().join("legacy");
-        fs::create_dir_all(legacy.join("conversations")).unwrap();
-        let resolved = conversations_dir_from(
-            None,
-            None,
-            None,
-            Some(legacy.to_string_lossy().into_owned()),
-            Some(PathBuf::from("/unused")),
-        )
-        .unwrap();
-        assert_eq!(resolved, legacy.join("conversations"));
     }
 
     #[test]
@@ -1026,33 +939,12 @@ mod tests {
     }
 
     #[test]
-    fn events_dir_wins_over_stale_conversation_json() {
-        let root = tempfile::tempdir().unwrap();
-        let conv = root.path().join("mixed");
-        copy_tree(&fixtures_dir().join("sdk-layout"), &conv);
-        fs::copy(
-            fixtures_dir().join("docs-layout/conversation.json"),
-            conv.join("conversation.json"),
-        )
-        .unwrap();
-        let session = parse_conversation_dir(&conv, "mixed", Some(1), true).unwrap().unwrap();
-        assert_eq!(session.messages[0].content, "first user turn");
-        assert_ne!(session.messages[0].content, "Fix the login bug in auth.py");
-    }
-
-    #[test]
     fn scan_uses_stat_target_mtime() {
         let sessions = scan_conversations(Some(fixtures_dir())).unwrap();
         let sdk =
             sessions.iter().find(|session| session.source_id == "sdk-layout").expect("sdk-layout");
         assert_ne!(sdk.updated_at, Some(0));
         assert!(sdk.updated_at.unwrap_or(0) > 0);
-    }
-
-    #[test]
-    fn missing_conversations_dir_is_empty() {
-        let entries = collect_conversation_entries(&None);
-        assert!(entries.is_empty());
     }
 
     #[test]

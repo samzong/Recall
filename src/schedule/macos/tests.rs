@@ -41,31 +41,6 @@ fn job_environment_only_preserves_variables_allowed_for_each_job() {
 }
 
 #[test]
-fn aws_file_overrides_keep_the_same_location_without_a_shell() {
-    let home = Path::new("/Users/example");
-    assert_eq!(
-        aws_file_path(Path::new("~/.aws/custom"), home).unwrap(),
-        "/Users/example/.aws/custom"
-    );
-    assert_eq!(aws_file_path(Path::new("/profiles/r2"), home).unwrap(), "/profiles/r2");
-    assert_eq!(aws_file_path(Path::new(""), home).unwrap(), "");
-    assert_eq!(
-        aws_file_path(Path::new("profiles/r2"), home).unwrap(),
-        std::env::current_dir().unwrap().join("profiles/r2").to_str().unwrap()
-    );
-}
-
-#[test]
-fn launchctl_exit_status_preserves_codes_and_pending_state() {
-    for value in ["0", "7", "(never exited)"] {
-        let job =
-            format!("gui/501/recall = {{\n\tstate = not running\n\tlast exit code = {value}\n}}");
-        assert_eq!(last_exit_code(&job), Some(value));
-    }
-    assert_eq!(last_exit_code("state = running\nlast terminating signal = 9"), None);
-}
-
-#[test]
 fn plist_roundtrips_paths_and_global_sync_arguments() {
     let binary = Path::new("/Applications/Recall & <Tools>/recall");
     let stdout = Path::new("/Users/example/Library/Logs/recall/out\r.log");

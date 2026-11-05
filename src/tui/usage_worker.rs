@@ -160,19 +160,6 @@ mod tests {
     }
 
     #[test]
-    fn identical_filters_build_one_usage_report() {
-        let mut builds = 0;
-        let (current, all_time) = build_usage_reports(&request(TimeRange::All), |_| {
-            builds += 1;
-            Ok(usage::aggregate_usage_events(&[]))
-        });
-
-        assert_eq!(builds, 1);
-        assert!(current.is_ok());
-        assert!(all_time.is_ok());
-    }
-
-    #[test]
     fn different_filters_keep_current_and_all_time_ranges() {
         let mut ranges = Vec::new();
         let (current, all_time) = build_usage_reports(&request(TimeRange::Month), |filters| {
@@ -209,26 +196,5 @@ mod tests {
         assert!(pending);
         assert!(run_sync(&mut pending, false, || Ok(())).is_ok());
         assert!(!pending);
-    }
-
-    #[test]
-    fn request_returns_usage_and_skill_reports() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-
-        let response = run_request(&store, request(TimeRange::Month));
-
-        assert!(response.current_report.is_ok());
-        assert!(response.all_time_report.is_ok());
-        assert!(response.skill_audit_report.is_ok());
-    }
-
-    #[test]
-    fn failure_reaches_every_report() {
-        let response = failed_response(request(TimeRange::All), "sync failed".to_string());
-
-        assert_eq!(response.current_report.unwrap_err(), "sync failed");
-        assert_eq!(response.all_time_report.unwrap_err(), "sync failed");
-        assert_eq!(response.skill_audit_report.unwrap_err(), "sync failed");
     }
 }

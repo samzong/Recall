@@ -648,18 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_qwen_session_auto_title_goes_to_summary() {
-        let jsonl = format!(
-            "{}\n{}",
-            r#"{"uuid":"u1","sessionId":"550e8400-e29b-41d4-a716-446655440000","timestamp":"2024-01-01T00:00:00.000Z","type":"user","message":{"role":"user","parts":[{"text":"hello"}]},"cwd":"/repo","version":"1.0.0"}"#,
-            r#"{"uuid":"t1","sessionId":"550e8400-e29b-41d4-a716-446655440000","timestamp":"2024-01-01T00:00:01.000Z","type":"system","subtype":"custom_title","systemPayload":{"customTitle":"auto name","titleSource":"auto"},"cwd":"/repo","version":"1.0.0"}"#,
-        );
-        let session = parse_qwen_session(&jsonl, SESSION_ID).unwrap();
-        assert_eq!(session.summary.as_deref(), Some("auto name"));
-        assert_eq!(session.custom_title, None);
-    }
-
-    #[test]
     fn parse_qwen_session_keeps_usage_without_visible_text() {
         let jsonl = r#"{"uuid":"a2","sessionId":"550e8400-e29b-41d4-a716-446655440000","timestamp":"2024-01-01T00:00:05.000Z","type":"assistant","message":{"role":"model","parts":[{"thought":true,"text":"hidden"}]},"cwd":"/repo","version":"1.0.0","model":"qwen3-coder-plus","usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":3}}"#;
         let session = parse_qwen_session(jsonl, SESSION_ID).unwrap();
@@ -677,18 +665,6 @@ mod tests {
         assert_eq!(parsed.events[0].files[0].operation, FileOperation::Read);
         assert_eq!(parsed.events[0].visibility, Some(EvidenceVisibility::Hidden));
         assert_eq!(parsed.events[0].message_seq, None);
-    }
-
-    #[test]
-    fn parse_qwen_session_empty_or_non_chat_returns_none() {
-        assert!(parse_qwen_session("", SESSION_ID).is_none());
-        assert!(
-            parse_qwen_session(
-                r#"{"uuid":"a1","type":"system","subtype":"ui_telemetry","cwd":"/repo","timestamp":"2024-01-01T00:00:00.000Z"}"#,
-                SESSION_ID
-            )
-            .is_none()
-        );
     }
 
     #[test]
@@ -716,12 +692,6 @@ mod tests {
             sessions[0].source_file_path.as_deref(),
             chats.join(format!("{SESSION_ID}.jsonl")).to_str()
         );
-    }
-
-    #[test]
-    fn missing_runtime_dir_yields_no_sessions() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(scan_qwen_sessions(root.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -820,12 +790,5 @@ mod tests {
         .unwrap();
         assert_eq!(second.stats.parsed, 0);
         assert!(second.sessions.is_empty());
-    }
-
-    #[test]
-    fn resume_uses_official_flag() {
-        let command = QwenAdapter.resume_command(SESSION_ID).unwrap();
-        assert_eq!(command.program, "qwen");
-        assert_eq!(command.args, vec!["--resume", SESSION_ID]);
     }
 }

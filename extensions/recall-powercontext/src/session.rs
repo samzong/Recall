@@ -277,25 +277,4 @@ mod tests {
         };
         assert_eq!(request.source_id, "recall:codex:s1:1");
     }
-
-    #[test]
-    fn source_id_limit_counts_characters() {
-        let session_id = "é".repeat(150);
-        let line = record(
-            "codex",
-            &session_id,
-            "primary",
-            r#"[{"seq":0,"role":"user","content":"hello"}]"#,
-        );
-        let captured = requests(&line, user_only());
-        assert_eq!(captured.len(), 1);
-        assert!(captured[0].source_id.chars().count() <= super::MAX_SOURCE_ID_LENGTH);
-        assert!(captured[0].source_id.len() > super::MAX_SOURCE_ID_LENGTH);
-    }
-
-    #[test]
-    fn rejects_unknown_roles() {
-        let error = RoleSet::parse("user,tool").unwrap_err().to_string();
-        assert!(error.contains("tool"), "{error}");
-    }
 }

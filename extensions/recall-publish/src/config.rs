@@ -141,14 +141,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_configuration_falls_back_to_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(&dir.path().join("publish.json")).unwrap();
-        assert_eq!(config.languages, vec!["en".to_string(), "zh".to_string()]);
-        assert!(config.publisher.author.is_none());
-    }
-
-    #[test]
     fn substitutions_rewrite_local_paths_without_marking_them_redacted() {
         let mut config = Config::default();
         config.path_substitutions.insert("/Users/x/git".to_string(), "~/git".to_string());
@@ -172,5 +164,13 @@ mod tests {
         let path = dir.path().join("publish.json");
         fs::write(&path, br#"{"schema":1,"languages":["fr"]}"#).unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn missing_configuration_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load(&dir.path().join("publish.json")).unwrap();
+        assert_eq!(config.languages, vec!["en".to_string(), "zh".to_string()]);
+        assert!(config.publisher.author.is_none());
     }
 }

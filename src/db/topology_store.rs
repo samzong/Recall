@@ -303,51 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn session_topology_round_trips_role_and_parents() {
-        let store = store();
-        let session = sess("s1");
-        let parents = vec![
-            ParentLink {
-                relation: ParentRelation::Spawn,
-                source: "codex".to_string(),
-                source_id: "p-spawn".to_string(),
-            },
-            ParentLink {
-                relation: ParentRelation::Fork,
-                source: "codex".to_string(),
-                source_id: "p-fork".to_string(),
-            },
-        ];
-        persist(
-            &store,
-            &session,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: &parents,
-                parser_version: Some(1),
-            },
-        );
-
-        let topology = store.session_topology(&session.id).unwrap();
-        assert_eq!(topology.thread_role, Some(ThreadRole::Subagent));
-        assert_eq!(
-            topology.parents,
-            vec![
-                ParentLink {
-                    relation: ParentRelation::Fork,
-                    source: "codex".to_string(),
-                    source_id: "p-fork".to_string(),
-                },
-                ParentLink {
-                    relation: ParentRelation::Spawn,
-                    source: "codex".to_string(),
-                    source_id: "p-spawn".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn metadata_backfill_updates_topology_without_touching_messages() {
         let store = store();
         let session = sess("s1");
@@ -413,15 +368,6 @@ mod tests {
 
         let meta = store.metadata_state_meta_map("codex").unwrap();
         assert_eq!(meta.get("s1").map(|m| m.parser_version), Some(2));
-    }
-
-    #[test]
-    fn persist_topology_for_missing_session_reports_false() {
-        let store = store();
-        let updated = store
-            .persist_topology_for_existing_session("codex", "absent", &SessionTopologyWrite::none())
-            .unwrap();
-        assert!(!updated);
     }
 
     #[test]

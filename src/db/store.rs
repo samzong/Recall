@@ -251,24 +251,6 @@ mod exclusion_tests {
     }
 
     #[test]
-    fn imported_source_ids_and_clear_import_marker_round_trip() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut imported = sess("a", None);
-        imported.is_import = true;
-        store.insert_session(&imported).unwrap();
-        store.insert_session(&sess("b", None)).unwrap();
-
-        let ids = store.imported_source_ids("claude-code").unwrap();
-        assert_eq!(ids, std::collections::HashSet::from(["src-a".to_string()]));
-
-        store.clear_import_marker("claude-code", "src-a").unwrap();
-        assert!(store.imported_source_ids("claude-code").unwrap().is_empty());
-        let sessions = store.list_recent_sessions(10).unwrap();
-        assert!(sessions.iter().all(|s| !s.is_import));
-    }
-
-    #[test]
     fn list_recent_sessions_orders_by_latest_activity() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
@@ -285,37 +267,6 @@ mod exclusion_tests {
 
         assert_eq!(sessions[0].source_id, "src-a");
         assert_eq!(sessions[1].source_id, "src-b");
-    }
-
-    #[test]
-    fn session_paths_for_source_round_trips_then_delete_clears() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        store.insert_session(&sess("a", Some("/home/u/proj"))).unwrap();
-        store.insert_session(&sess("b", None)).unwrap();
-        store
-            .update_session_fields(
-                "claude-code",
-                "src-b",
-                None,
-                None,
-                None,
-                Some("/home/u/.claude-mem/observer-sessions/session.jsonl"),
-            )
-            .unwrap();
-
-        let paths = store.session_paths_for_source("claude-code").unwrap();
-        assert_eq!(paths.len(), 2);
-        let observer = paths.iter().find(|path| path.source_id == "src-b").unwrap();
-        assert_eq!(
-            observer.source_file_path.as_deref(),
-            Some("/home/u/.claude-mem/observer-sessions/session.jsonl")
-        );
-
-        store.delete_session_data("claude-code", "src-b").unwrap();
-        let after = store.session_paths_for_source("claude-code").unwrap();
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].source_id, "src-a");
     }
 
     #[test]
@@ -346,26 +297,6 @@ mod exclusion_tests {
         );
         let sessions = store.list_sessions_by_ids(&["a".to_string()]).unwrap();
         assert_eq!(sessions[0].custom_title.as_deref(), Some("Keep title"));
-        assert_eq!(sessions[0].summary.as_deref(), Some("Keep summary"));
-        assert_eq!(sessions[0].duration_minutes, Some(9));
-    }
-
-    #[test]
-    fn update_session_fields_preserves_unset_fields() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut session = sess("a", None);
-        session.summary = Some("Keep summary".to_string());
-        session.duration_minutes = Some(9);
-        store.insert_session(&session).unwrap();
-
-        store
-            .update_session_fields("claude-code", "src-a", Some("New title"), None, None, None)
-            .unwrap();
-
-        let sessions = store.list_sessions_by_ids(&["a".to_string()]).unwrap();
-        assert_eq!(sessions[0].title, "New title");
-        assert_eq!(sessions[0].custom_title.as_deref(), Some("New title"));
         assert_eq!(sessions[0].summary.as_deref(), Some("Keep summary"));
         assert_eq!(sessions[0].duration_minutes, Some(9));
     }

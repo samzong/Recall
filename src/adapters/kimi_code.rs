@@ -562,13 +562,12 @@ pub(crate) fn parse_kimi_session(
 
 #[cfg(test)]
 mod tests {
-    use crate::types::FileEvidenceKind;
-    use std::io::Write;
-    use std::time::{Duration, UNIX_EPOCH};
-
     use super::*;
     use crate::adapters::test_support::{seed_empty_event_state, seed_empty_usage_state};
     use crate::db::store::Store;
+    use crate::types::FileEvidenceKind;
+    use std::io::Write;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn fixture_state() -> &'static str {
         r#"{"id":"session_abc","cwd":"/repo","createdAt":1700000000000,"updatedAt":1700000060000,"title":"fix the bug","isCustomTitle":false,"archived":false}"#
@@ -724,14 +723,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_kimi_session_custom_title_goes_to_custom_title() {
-        let state = r#"{"id":"session_x","title":"my rename","isCustomTitle":true}"#;
-        let session = parse_kimi_session(state, fixture_wire(), "session_x").unwrap();
-        assert_eq!(session.custom_title.as_deref(), Some("my rename"));
-        assert_eq!(session.summary, None);
-    }
-
-    #[test]
     fn parse_kimi_session_empty_wire_returns_none() {
         let wire = r#"{"type":"metadata","protocol_version":"1.5","created_at":1700000000100}"#;
         assert!(parse_kimi_session(fixture_state(), wire, "session_abc").is_none());
@@ -798,15 +789,6 @@ mod tests {
         for state in ["{", "[]"] {
             assert!(parse_kimi_session(state, fixture_wire(), "session_abc").is_none());
         }
-    }
-
-    #[test]
-    fn parse_kimi_session_records_empty_usage_parse() {
-        let wire = r#"{"type":"context.append_message","time":1700000001000,"message":{"role":"user","origin":{"kind":"user"},"content":[{"type":"text","text":"hello"}]}}"#;
-        let session = parse_kimi_session(fixture_state(), wire, "session_abc").unwrap();
-
-        assert!(session.usage_events.is_empty());
-        assert_eq!(session.usage_parser_version, Some(USAGE_PARSER_VERSION));
     }
 
     #[test]

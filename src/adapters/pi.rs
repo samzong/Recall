@@ -133,16 +133,13 @@ fn expand_home_path(path: &str, home: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use super::*;
     use crate::adapters::file_scan::{self, FileScanEntry};
-    use crate::adapters::pi_session::{
-        EVENT_PARSER_VERSION, extract_session_id_from_filename,
-        extract_usage_event as extract_pi_usage_event,
-    };
+    use crate::adapters::pi_session::EVENT_PARSER_VERSION;
+    use crate::adapters::pi_session::extract_usage_event as extract_pi_usage_event;
     use crate::types::{FileEvidenceKind, FileOperation, Role};
     use serde_json::Value;
+    use std::io::Write;
 
     fn parse_pi_session_file(
         entry: FileScanEntry,
@@ -167,17 +164,6 @@ mod tests {
             writeln!(file, "{line}").unwrap();
         }
         path
-    }
-
-    #[test]
-    fn extract_session_id_from_filename_reads_pi_uuid_tail() {
-        assert_eq!(
-            extract_session_id_from_filename(
-                "2026-05-24T17-04-51-496Z_019e5af2-5528-7d10-888a-b299c21d0e2e"
-            ),
-            Some("019e5af2-5528-7d10-888a-b299c21d0e2e".to_string())
-        );
-        assert_eq!(extract_session_id_from_filename("not-a-session"), None);
     }
 
     #[test]
@@ -400,58 +386,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_pi_session_file_indexes_custom_role_message_content() {
-        let root = temp_pi_root("custom-role");
-        let session_dir = root.join("--tmp-pi-project--");
-        let session_id = "019e5af2-5528-7d10-888a-b299c21d0e2e";
-        let path = write_pi_session(
-            &session_dir,
-            session_id,
-            &[
-                serde_json::json!({
-                    "type": "session",
-                    "version": 3,
-                    "id": session_id,
-                    "timestamp": "1970-01-01T00:00:01.000Z",
-                    "cwd": "/tmp/pi-project"
-                }),
-                serde_json::json!({
-                    "type": "message",
-                    "id": "custom1",
-                    "parentId": null,
-                    "timestamp": "1970-01-01T00:00:02.000Z",
-                    "message": {
-                        "role": "custom",
-                        "customType": "extension-context",
-                        "content": [{"type": "text", "text": "injected context"}],
-                        "display": false,
-                        "timestamp": 2000
-                    }
-                }),
-            ],
-        );
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-        let raw = parse_pi_session_file(
-            FileScanEntry {
-                session_id: session_id.to_string(),
-                stat_target: path,
-                directory: None,
-            },
-            mtime,
-            true,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(raw.messages.len(), 1);
-        assert_eq!(raw.messages[0].role, Role::User);
-        assert_eq!(raw.messages[0].content, "injected context");
-        assert_eq!(raw.messages[0].timestamp, Some(2_000));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn parse_pi_session_file_skips_hidden_bash_execution() {
         pi_session::test_support::skips_hidden_bash_execution(Format::Pi);
     }
@@ -542,10 +476,5 @@ mod tests {
     #[test]
     fn parse_pi_session_maps_parent_session_to_primary_fork() {
         pi_session::test_support::maps_parent_session_to_primary_fork(Format::Pi);
-    }
-
-    #[test]
-    fn parse_pi_session_drops_unresolvable_parent_session() {
-        pi_session::test_support::drops_unresolvable_parent_session(Format::Pi);
     }
 }

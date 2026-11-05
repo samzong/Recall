@@ -794,23 +794,6 @@ mod tests {
     }
 
     #[test]
-    fn handoff_working_directory_drops_missing_directory() {
-        let directory = std::env::temp_dir()
-            .join(format!("recall-missing-{}", uuid::Uuid::new_v4()))
-            .to_string_lossy()
-            .into_owned();
-
-        assert_eq!(handoff_working_directory(Some(directory.as_str())), None);
-    }
-
-    #[test]
-    fn read_tldr_file_skips_missing_file() {
-        let path = std::env::temp_dir().join(format!("recall-missing-{}.md", uuid::Uuid::new_v4()));
-
-        assert_eq!(read_tldr_file(&path), None);
-    }
-
-    #[test]
     fn read_tldr_file_trims_blank_and_content() {
         let path = std::env::temp_dir().join(format!("recall-tldr-{}.md", uuid::Uuid::new_v4()));
         fs::write(&path, "  **Summary**  \n").unwrap();

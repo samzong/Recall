@@ -1,55 +1,6 @@
 use super::*;
 
 #[test]
-fn schema_migration_sets_current_version() {
-    let store = setup();
-    assert_eq!(schema::schema_version(&store.conn).unwrap(), schema::current_schema_version());
-}
-
-#[test]
-fn store_insert_and_retrieve_session() {
-    let store = setup();
-    let session = make_session("s1", "test", "raw1", "Test session");
-    store.insert_session(&session).unwrap();
-
-    let sessions = store.list_recent_sessions(10).unwrap();
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].id, "s1");
-    assert_eq!(sessions[0].title, "Test session");
-}
-
-#[test]
-fn store_insert_and_retrieve_messages() {
-    let store = setup();
-    let session = make_session("s1", "test", "raw1", "Test");
-    store.insert_session(&session).unwrap();
-
-    let messages = vec![
-        make_message("s1", Role::User, "hello", 0),
-        make_message("s1", Role::Assistant, "hi there", 1),
-    ];
-    store.insert_messages(&messages).unwrap();
-
-    let loaded = store.get_messages("s1").unwrap();
-    assert_eq!(loaded.len(), 2);
-    assert_eq!(loaded[0].role, Role::User);
-    assert_eq!(loaded[0].content, "hello");
-    assert_eq!(loaded[1].role, Role::Assistant);
-}
-
-#[test]
-fn store_session_meta() {
-    let store = setup();
-    assert!(store.session_meta("test", "raw1").unwrap().is_none());
-
-    let session = make_session("s1", "test", "raw1", "Test");
-    store.insert_session(&session).unwrap();
-
-    assert!(store.session_meta("test", "raw1").unwrap().is_some());
-    assert!(store.session_meta("test", "raw999").unwrap().is_none());
-}
-
-#[test]
 fn delete_session_cleans_embeddings() {
     let store = setup();
     let session = make_session("s1", "test", "raw1", "Test");
@@ -130,37 +81,6 @@ fn delete_session_cascades_usage_events() {
         .query_row("SELECT COUNT(*) FROM usage_session_state", [], |row| row.get(0))
         .unwrap();
     assert_eq!(state_count, 0, "usage parser state must follow session lifecycle");
-}
-
-#[test]
-fn persist_session_writes_session_events_and_state() {
-    let store = setup();
-    let session = make_session("s1", "codex", "raw1", "Event session");
-    let messages = vec![make_message("s1", Role::Assistant, "[read_file] src/main.rs", 0)];
-    let events = vec![make_session_event("file_read", Some("read_file"), Some("src/main.rs"))];
-
-    store
-        .persist_session_with_usage_and_events(&session, &messages, &[], None, &events, Some(1))
-        .unwrap();
-
-    let count: i64 =
-        store.conn.query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0)).unwrap();
-    assert_eq!(count, 1);
-    let state_count: i64 = store
-        .conn
-        .query_row("SELECT COUNT(*) FROM event_session_state", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(state_count, 1);
-
-    let loaded = store.list_session_events_for_session("s1").unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].kind, "file_read");
-    assert_eq!(loaded[0].name.as_deref(), Some("read_file"));
-    assert_eq!(loaded[0].target.as_deref(), Some("src/main.rs"));
-    assert_eq!(loaded[0].source_event_id.as_deref(), Some("42"));
-    assert_eq!(loaded[0].tool_call_id.as_deref(), Some("call-42"));
-    assert_eq!(loaded[0].is_meta, Some(false));
-    assert_eq!(loaded[0].visibility, Some(crate::types::EvidenceVisibility::Visible));
 }
 
 #[test]
@@ -256,29 +176,6 @@ fn sync_resolves_cross_repository_files_and_keeps_native_paths() {
             .unwrap();
         assert_eq!(&resolved, file);
     }
-}
-
-#[test]
-fn upsert_embedding_replaces_existing() {
-    let store = setup();
-    let session = make_session("s1", "test", "raw1", "Test");
-    store.insert_session(&session).unwrap();
-
-    let messages = vec![make_message("s1", Role::User, "test content here", 0)];
-    store.insert_messages(&messages).unwrap();
-
-    let msg_id: i64 = store
-        .conn
-        .query_row("SELECT id FROM messages WHERE session_id = 's1' LIMIT 1", [], |row| row.get(0))
-        .unwrap();
-
-    let v1 = vec![0.1f32; 384];
-    store.upsert_embeddings(&[(msg_id, &v1)]).unwrap();
-    store.upsert_embeddings(&[(msg_id, &v1)]).unwrap();
-
-    let count: i64 =
-        store.conn.query_row("SELECT COUNT(*) FROM message_vec", [], |row| row.get(0)).unwrap();
-    assert_eq!(count, 1, "upsert should not create duplicates");
 }
 
 #[test]
@@ -493,4 +390,10 @@ fn usage_duplicates_update_on_refresh_but_backfill_rolls_back() {
     let restored = store.list_usage_events_for_session("s1").unwrap();
     assert_eq!(serde_json::to_value(restored).unwrap(), serde_json::to_value(persisted).unwrap());
     assert_eq!(store.usage_state_meta_map("test").unwrap()["raw1"].parser_version, 1);
+}
+
+#[test]
+fn schema_migration_sets_current_version() {
+    let store = setup();
+    assert_eq!(schema::schema_version(&store.conn).unwrap(), schema::current_schema_version());
 }

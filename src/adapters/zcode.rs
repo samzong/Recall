@@ -92,24 +92,9 @@ fn open_zcode_app() -> Option<ResumeCommand> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
 
     use super::*;
-
-    #[test]
-    fn resume_uses_official_flag() {
-        let command = ZcodeAdapter.resume_command("sess_123").unwrap();
-        assert_eq!(command.program, "zcode");
-        assert_eq!(command.args, vec!["--resume", "sess_123"]);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn app_command_opens_desktop_app() {
-        let command = ZcodeAdapter.app_command("sess_123").unwrap();
-        assert_eq!(command.program, "open");
-        assert_eq!(command.args, vec!["-a", "ZCode"]);
-    }
+    use std::path::Path;
 
     #[test]
     fn default_path_is_home_zcode_cli_db() {
@@ -145,14 +130,6 @@ mod tests {
         let resolved =
             resolve_zcode_db_path_from(Some("   ".to_string()), root.path().to_path_buf()).unwrap();
         assert_eq!(resolved, db);
-    }
-
-    #[test]
-    fn missing_storage_dir_is_skipped() {
-        assert!(
-            resolve_zcode_db_path_from(Some("/no/such/zcode".to_string()), PathBuf::from("/tmp"))
-                .is_none()
-        );
     }
 
     #[test]

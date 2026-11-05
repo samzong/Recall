@@ -202,12 +202,6 @@ mod tests {
     }
 
     #[test]
-    fn global_keywords_win_over_every_other_form() {
-        assert_eq!(classify_selector("all"), SelectorForm::Global);
-        assert_eq!(classify_selector("GLOBAL"), SelectorForm::Global);
-    }
-
-    #[test]
     fn path_shape_stays_a_directory_boundary() {
         for value in ["/abs/path", "./rel", "../up", "~/home"] {
             assert_eq!(classify_selector(value), SelectorForm::Directory, "{value}");

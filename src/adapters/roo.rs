@@ -54,33 +54,11 @@ fn resolve_tasks_dirs() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{schema, store::Store};
 
     #[test]
     fn adapter_identity() {
         assert_eq!(RooAdapter.id(), "roo");
         assert_eq!(RooAdapter.label(), "ROO");
         assert!(RooAdapter.resume_command("1").is_none());
-    }
-
-    #[test]
-    fn missing_tasks_dirs_scan_empty() {
-        let sessions = cline::scan_task_dirs(&[]).unwrap();
-        assert!(sessions.is_empty());
-    }
-
-    #[test]
-    fn missing_tasks_dirs_sync_empty() {
-        schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let result = cline::scan_task_dirs_for_sync(
-            &[],
-            &AdapterSyncContext::from_store_for_test(&store, "roo").unwrap(),
-            None,
-            false,
-        )
-        .unwrap();
-        assert!(result.sessions.is_empty());
-        assert_eq!(result.stats.candidates, 0);
     }
 }

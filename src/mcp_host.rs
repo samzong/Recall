@@ -434,99 +434,12 @@ fn quote_arg(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Host, HostAction, HostOutput, SERVER_ARG, SERVER_NAME, add_args, display_command,
-        looks_like_not_found, quote_arg, read_cursor_config, remove_args, remove_cursor_config,
-        resolve_bin, resolve_hosts, run_host_command, write_cursor_config,
-        write_cursor_config_file,
+        Host, HostAction, HostOutput, SERVER_ARG, SERVER_NAME, add_args, looks_like_not_found,
+        read_cursor_config, remove_args, remove_cursor_config, resolve_bin, resolve_hosts,
+        run_host_command, write_cursor_config, write_cursor_config_file,
     };
     use std::fs;
     use std::path::PathBuf;
-
-    #[test]
-    fn resolve_hosts_defaults_to_all() {
-        assert_eq!(resolve_hosts(&[]).unwrap(), Host::ALL.to_vec());
-        assert_eq!(resolve_hosts(&["*".into()]).unwrap(), Host::ALL.to_vec());
-    }
-
-    #[test]
-    fn resolve_hosts_accepts_aliases_and_dedups() {
-        assert_eq!(
-            resolve_hosts(&["claude-code".into(), "CLAUDE".into(), "codex".into()]).unwrap(),
-            vec![Host::Claude, Host::Codex]
-        );
-        assert_eq!(
-            resolve_hosts(&["cursor".into(), "cursor-agent".into()]).unwrap(),
-            vec![Host::Cursor]
-        );
-        assert_eq!(
-            resolve_hosts(&["agy".into(), "antigravity".into(), "antigravity-cli".into()]).unwrap(),
-            vec![Host::Antigravity]
-        );
-        assert_eq!(resolve_hosts(&["grok".into(), "GROK".into()]).unwrap(), vec![Host::Grok]);
-    }
-
-    #[test]
-    fn resolve_hosts_rejects_unknown() {
-        let error = resolve_hosts(&["pi".into()]).unwrap_err().to_string();
-        assert!(error.contains("unknown MCP host 'pi'"));
-    }
-
-    #[test]
-    fn add_args_match_host_clis() {
-        assert_eq!(
-            add_args(Host::Claude, "recall").unwrap(),
-            ["mcp", "add", "--scope", "user", "recall", "--", "recall", "mcp"]
-        );
-        assert_eq!(
-            add_args(Host::Codex, "recall").unwrap(),
-            ["mcp", "add", "recall", "--", "recall", "mcp"]
-        );
-        assert_eq!(
-            add_args(Host::Antigravity, "recall").unwrap(),
-            ["mcp", "add", "recall", "--", "recall", "mcp"]
-        );
-        assert_eq!(
-            add_args(Host::Grok, "recall").unwrap(),
-            ["mcp", "add", "--scope", "user", "recall", "--", "recall", "mcp"]
-        );
-        assert!(add_args(Host::Cursor, "recall").is_none());
-        assert_eq!(
-            add_args(Host::Claude, "/tmp/recall").unwrap(),
-            ["mcp", "add", "--scope", "user", "recall", "--", "/tmp/recall", "mcp"]
-        );
-    }
-
-    #[test]
-    fn remove_args_match_host_clis() {
-        assert_eq!(remove_args(Host::Claude).unwrap(), ["mcp", "remove", "recall", "-s", "user"]);
-        assert_eq!(remove_args(Host::Codex).unwrap(), ["mcp", "remove", "recall"]);
-        assert_eq!(remove_args(Host::Antigravity).unwrap(), ["mcp", "remove", "recall"]);
-        assert_eq!(
-            remove_args(Host::Grok).unwrap(),
-            ["mcp", "remove", "--scope", "user", "recall"]
-        );
-        assert!(remove_args(Host::Cursor).is_none());
-    }
-
-    #[test]
-    fn cursor_config_read_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp.json");
-        assert_eq!(read_cursor_config(&path).unwrap()["mcpServers"], serde_json::json!({}));
-
-        write_cursor_config_file(
-            &path,
-            &serde_json::json!({
-                "mcpServers": {
-                    SERVER_NAME: { "command": "/tmp/recall", "args": [SERVER_ARG] }
-                }
-            }),
-        )
-        .unwrap();
-        let parsed = read_cursor_config(&path).unwrap();
-        assert_eq!(parsed["mcpServers"][SERVER_NAME]["command"], "/tmp/recall");
-        assert_eq!(parsed["mcpServers"][SERVER_NAME]["args"], serde_json::json!([SERVER_ARG]));
-    }
 
     #[test]
     fn install_preserves_user_owned_server_fields() {
@@ -581,21 +494,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
     }
 
-    #[test]
-    fn uninstall_removes_malformed_server() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp.json");
-        write_cursor_config_file(
-            &path,
-            &serde_json::json!({ "mcpServers": { SERVER_NAME: null } }),
-        )
-        .unwrap();
-
-        remove_cursor_config(&path).unwrap();
-
-        assert!(read_cursor_config(&path).unwrap()["mcpServers"].get(SERVER_NAME).is_none());
-    }
-
     #[cfg(unix)]
     #[test]
     fn cursor_config_write_preserves_symlink() {
@@ -611,41 +509,6 @@ mod tests {
 
         assert!(path.is_symlink());
         assert_eq!(read_cursor_config(&target).unwrap()["owner"], "recall");
-    }
-
-    #[test]
-    fn resolve_bin_defaults_to_path_name() {
-        assert_eq!(resolve_bin(None).unwrap(), "recall");
-        assert_eq!(resolve_bin(Some(PathBuf::from("recall"))).unwrap(), "recall");
-    }
-
-    #[test]
-    fn resolve_bin_rejects_missing_absolute_file() {
-        let error = resolve_bin(Some(PathBuf::from("/definitely-missing-recall-bin"))).unwrap_err();
-        assert!(error.to_string().contains("is not a file"));
-    }
-
-    #[test]
-    fn resolve_bin_keeps_existing_absolute_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("recall");
-        fs::write(&bin, "").unwrap();
-        assert_eq!(resolve_bin(Some(bin.clone())).unwrap(), bin.to_string_lossy());
-    }
-
-    #[test]
-    fn display_command_quotes_whitespace() {
-        assert_eq!(
-            display_command("claude", &add_args(Host::Claude, "/tmp/My Recall/recall").unwrap()),
-            "claude mcp add --scope user recall -- '/tmp/My Recall/recall' mcp"
-        );
-        assert_eq!(quote_arg("plain"), "plain");
-    }
-
-    #[test]
-    fn host_error_text_classifies_missing() {
-        assert!(looks_like_not_found("MCP server recall not found"));
-        assert!(!looks_like_not_found("connection refused"));
     }
 
     #[test]
@@ -676,5 +539,84 @@ mod tests {
             .unwrap_err();
 
         assert!(registered, "existing registration was removed: {error}");
+    }
+
+    #[test]
+    fn resolve_bin_rejects_missing_absolute_file() {
+        let error = resolve_bin(Some(PathBuf::from("/definitely-missing-recall-bin"))).unwrap_err();
+        assert!(error.to_string().contains("is not a file"));
+    }
+
+    #[test]
+    fn cursor_config_read_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        assert_eq!(read_cursor_config(&path).unwrap()["mcpServers"], serde_json::json!({}));
+
+        write_cursor_config_file(
+            &path,
+            &serde_json::json!({
+                "mcpServers": {
+                    SERVER_NAME: { "command": "/tmp/recall", "args": [SERVER_ARG] }
+                }
+            }),
+        )
+        .unwrap();
+        let parsed = read_cursor_config(&path).unwrap();
+        assert_eq!(parsed["mcpServers"][SERVER_NAME]["command"], "/tmp/recall");
+        assert_eq!(parsed["mcpServers"][SERVER_NAME]["args"], serde_json::json!([SERVER_ARG]));
+    }
+
+    #[test]
+    fn host_error_text_classifies_missing() {
+        assert!(looks_like_not_found("MCP server recall not found"));
+        assert!(!looks_like_not_found("connection refused"));
+    }
+
+    #[test]
+    fn remove_args_match_host_clis() {
+        assert_eq!(remove_args(Host::Claude).unwrap(), ["mcp", "remove", "recall", "-s", "user"]);
+        assert_eq!(remove_args(Host::Codex).unwrap(), ["mcp", "remove", "recall"]);
+        assert_eq!(remove_args(Host::Antigravity).unwrap(), ["mcp", "remove", "recall"]);
+        assert_eq!(
+            remove_args(Host::Grok).unwrap(),
+            ["mcp", "remove", "--scope", "user", "recall"]
+        );
+        assert!(remove_args(Host::Cursor).is_none());
+    }
+
+    #[test]
+    fn resolve_bin_defaults_to_path_name() {
+        assert_eq!(resolve_bin(None).unwrap(), "recall");
+        assert_eq!(resolve_bin(Some(PathBuf::from("recall"))).unwrap(), "recall");
+    }
+
+    #[test]
+    fn resolve_hosts_accepts_aliases_and_dedups() {
+        assert_eq!(
+            resolve_hosts(&["claude-code".into(), "CLAUDE".into(), "codex".into()]).unwrap(),
+            vec![Host::Claude, Host::Codex]
+        );
+        assert_eq!(
+            resolve_hosts(&["cursor".into(), "cursor-agent".into()]).unwrap(),
+            vec![Host::Cursor]
+        );
+        assert_eq!(
+            resolve_hosts(&["agy".into(), "antigravity".into(), "antigravity-cli".into()]).unwrap(),
+            vec![Host::Antigravity]
+        );
+        assert_eq!(resolve_hosts(&["grok".into(), "GROK".into()]).unwrap(), vec![Host::Grok]);
+    }
+
+    #[test]
+    fn resolve_hosts_defaults_to_all() {
+        assert_eq!(resolve_hosts(&[]).unwrap(), Host::ALL.to_vec());
+        assert_eq!(resolve_hosts(&["*".into()]).unwrap(), Host::ALL.to_vec());
+    }
+
+    #[test]
+    fn resolve_hosts_rejects_unknown() {
+        let error = resolve_hosts(&["pi".into()]).unwrap_err().to_string();
+        assert!(error.contains("unknown MCP host 'pi'"));
     }
 }

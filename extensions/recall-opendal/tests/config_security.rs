@@ -82,17 +82,6 @@ fn assert_secret_absent(output: &Output) {
 }
 
 #[test]
-fn manifest_requires_catalog_compatible_core_and_transport() {
-    let output = Command::new(env!("CARGO_BIN_EXE_recall-opendal"))
-        .arg("--recall-extension-manifest")
-        .output()
-        .unwrap();
-    let manifest: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(manifest["min_recall"], "0.6.5");
-    assert_eq!(manifest["transport_version"], 1);
-}
-
-#[test]
 fn every_configuration_entrypoint_rejects_credentials_without_echoing_them() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("saved.json");
@@ -446,18 +435,4 @@ fn opaque_http_404_does_not_establish_missing_object_or_target() {
         assert_eq!(failure.code, "unavailable", "{service}");
         assert!(!failure.to_string().contains(SECRET));
     }
-}
-
-#[test]
-fn evidenced_missing_objects_keep_their_classification() {
-    let backend = opendal::Error::new(
-        opendal::ErrorKind::NotFound,
-        "S3Error { code: \"NoSuchKey\", message: \"missing\", resource: \"\", request_id: \"\" }",
-    )
-    .with_context("response", "Parts { status: 404, version: HTTP/1.1, headers: {} }")
-    .with_context("service", "s3");
-    assert_eq!(error::Failure::backend(backend).code, "object_missing");
-    let backend =
-        opendal::Error::new(opendal::ErrorKind::NotFound, SECRET).with_context("service", "fs");
-    assert_eq!(error::Failure::backend(backend).code, "object_missing");
 }

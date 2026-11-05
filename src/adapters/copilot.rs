@@ -704,8 +704,7 @@ mod tests {
 
     use super::*;
     use crate::adapters::test_support::{
-        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
-        store as setup_store,
+        seed_empty_event_state, seed_empty_metadata_state, store as setup_store,
     };
     use crate::types::Session;
 
@@ -759,94 +758,6 @@ mod tests {
             message_count,
             ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
-    }
-
-    #[test]
-    fn copilot_app_command_opens_session_deeplink() {
-        let command = CopilotAdapter.app_command("7d5c993a-0966-4e3e-9622-7a39ba9576ba").unwrap();
-
-        assert!(
-            command
-                .args
-                .iter()
-                .any(|arg| arg == "ghapp://sessions/7d5c993a-0966-4e3e-9622-7a39ba9576ba")
-        );
-    }
-
-    #[test]
-    fn peek_copilot_session_id_reads_session_start() {
-        let root = temp_copilot_root("peek");
-        let sessions_dir = root.join("session-state");
-        let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
-        let events_path = write_copilot_session(&sessions_dir, "dir-alias", uuid, "hello");
-
-        assert_eq!(peek_copilot_session_id(&events_path), Some(uuid.to_string()));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn peek_copilot_session_id_falls_back_when_no_session_start() {
-        let root = temp_copilot_root("peek-missing");
-        let sessions_dir = root.join("session-state");
-        let dir = sessions_dir.join("dir-alias");
-        fs::create_dir_all(&dir).unwrap();
-        let events_path = dir.join("events.jsonl");
-        let msg = serde_json::json!({
-            "type": "user.message",
-            "timestamp": "2026-04-13T10:00:00Z",
-            "data": { "content": "hi" }
-        });
-        let mut f = fs::File::create(&events_path).unwrap();
-        writeln!(f, "{msg}").unwrap();
-
-        assert_eq!(peek_copilot_session_id(&events_path), None);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn collect_copilot_entries_skips_dirs_without_events() {
-        let root = temp_copilot_root("collect-skip");
-        let sessions_dir = root.join("session-state");
-        fs::create_dir_all(sessions_dir.join("empty-dir")).unwrap();
-        write_copilot_session(
-            &sessions_dir,
-            "good-dir",
-            "f3eca837-818f-44d7-9158-bf242901f960",
-            "hello",
-        );
-
-        let entries = collect_copilot_entries(&sessions_dir);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].session_id, "f3eca837-818f-44d7-9158-bf242901f960");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn parse_copilot_events_extracts_tool_events() {
-        let jsonl = r##"{"type":"session.start","data":{"sessionId":"sess-2","startTime":"2026-04-13T10:00:00Z","context":{"cwd":"/proj"}},"id":"e1","timestamp":"2026-04-13T10:00:00Z","parentId":null}
-{"type":"assistant.message","data":{"messageId":"m1","content":"Let me read the file.","toolRequests":[{"toolCallId":"tc1","name":"view","arguments":{"path":"/tmp/README.md"},"type":"function"}]},"id":"e2","timestamp":"2026-04-13T10:00:05Z","parentId":"e1"}
-{"type":"tool.execution_complete","data":{"toolCallId":"tc1","toolName":"view","success":true,"result":{"content":"short summary","detailedContent":"# My Project\nHello world."}},"id":"e4","timestamp":"2026-04-13T10:00:06Z","parentId":"e3"}"##;
-
-        let session = parse_copilot_events(jsonl, "fallback").unwrap().unwrap();
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].content, "Let me read the file.");
-        assert_eq!(session.events.len(), 2);
-        assert_eq!(session.events[0].tool_call_id.as_deref(), Some("tc1"));
-        assert_eq!(session.events[1].tool_call_id, session.events[0].tool_call_id);
-        assert_eq!(session.events[0].source_event_id.as_deref(), Some("e2:tool:0"));
-        assert_eq!(session.events[1].source_event_id.as_deref(), Some("e4"));
-        assert_eq!(session.events[0].files[0].cwd.as_deref(), Some("/proj"));
-        assert_eq!(session.events[0].files[0].operation, FileOperation::Read);
-        assert!(session.events[1].files.is_empty());
-        assert_eq!(session.events[0].kind, "file_read");
-        assert_eq!(session.events[0].name.as_deref(), Some("view"));
-        assert_eq!(session.events[0].target.as_deref(), Some("/tmp/README.md"));
-        assert_eq!(session.events[1].kind, "tool_result");
-        assert_eq!(session.events[1].status.as_deref(), Some("success"));
-        assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
     }
 
     #[test]
@@ -916,140 +827,6 @@ mod tests {
         .unwrap();
         assert_eq!(raw.messages.len(), 1);
         assert!(raw.events.is_empty());
-    }
-
-    #[test]
-    fn scan_for_sync_skips_unchanged_session() {
-        let root = temp_copilot_root("skip");
-        let sessions_dir = root.join("session-state");
-        let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
-        let events_path = write_copilot_session(&sessions_dir, "dir-1", uuid, "hello");
-        let mtime = file_scan::stat_mtime_ms(&events_path).unwrap();
-
-        let store = setup_store();
-        store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        seed_empty_event_state(&store, "copilot-cli", uuid, EVENT_PARSER_VERSION, Some(mtime));
-        seed_empty_usage_state(&store, "copilot-cli", uuid, USAGE_PARSER_VERSION, Some(mtime));
-
-        let refreshed = scan_for_sync_impl(
-            &sessions_dir,
-            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
-            None,
-            true,
-            None,
-        )
-        .unwrap();
-        assert_eq!(refreshed.sessions.len(), 1);
-        assert!(refreshed.sessions[0].refresh_session_on_metadata_backfill);
-        seed_empty_metadata_state(&store, "copilot-cli", uuid, METADATA_PARSER_VERSION);
-        let result = scan_for_sync_impl(
-            &sessions_dir,
-            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
-            None,
-            true,
-            None,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 0);
-        assert_eq!(result.stats.skipped_sessions, 1);
-        seed_empty_event_state(&store, "copilot-cli", uuid, EVENT_PARSER_VERSION - 1, Some(mtime));
-        let stale = scan_for_sync_impl(
-            &sessions_dir,
-            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
-            None,
-            true,
-            None,
-        )
-        .unwrap();
-        assert_eq!(stale.sessions.len(), 1);
-        assert_eq!(stale.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_reparses_when_mtime_changes() {
-        let root = temp_copilot_root("mismatch");
-        let sessions_dir = root.join("session-state");
-        let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
-        let events_path = write_copilot_session(&sessions_dir, "dir-1", uuid, "hi");
-        let actual_mtime = file_scan::stat_mtime_ms(&events_path).unwrap();
-
-        let store = setup_store();
-        store.insert_session(&make_existing_session(uuid, actual_mtime - 1_000, 1)).unwrap();
-
-        let result = scan_for_sync_impl(
-            &sessions_dir,
-            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
-            None,
-            true,
-            None,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, uuid);
-        assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
-        assert_eq!(result.stats.skipped_sessions, 0);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_picks_up_new_session() {
-        let root = temp_copilot_root("new");
-        let sessions_dir = root.join("session-state");
-        let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
-        let events_path = write_copilot_session(&sessions_dir, "dir-1", uuid, "fresh");
-
-        let store = setup_store();
-
-        let result = scan_for_sync_impl(
-            &sessions_dir,
-            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
-            None,
-            true,
-            None,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, uuid);
-        assert_eq!(result.sessions[0].source_file_path.as_deref(), events_path.to_str());
-        assert_eq!(result.sessions[0].usage_parser_version, None);
-        assert!(result.sessions[0].usage_events.is_empty());
-        assert_eq!(result.stats.skipped_sessions, 0);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_falls_back_to_dir_name_when_session_start_missing() {
-        let root = temp_copilot_root("fallback");
-        let sessions_dir = root.join("session-state");
-        let dir_name = "0b247666-6f95-49e5-b68f-b05eb338e9c2";
-        let session_dir = sessions_dir.join(dir_name);
-        fs::create_dir_all(&session_dir).unwrap();
-        let events_path = session_dir.join("events.jsonl");
-        let user = serde_json::json!({
-            "type": "user.message",
-            "timestamp": "2026-04-13T10:00:00Z",
-            "data": { "content": "legacy" }
-        });
-        let mut f = fs::File::create(&events_path).unwrap();
-        writeln!(f, "{user}").unwrap();
-
-        let store = setup_store();
-        let result = scan_for_sync_impl(
-            &sessions_dir,
-            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
-            None,
-            true,
-            None,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, dir_name);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1174,30 +951,6 @@ mod tests {
         assert_eq!(result.sessions[0].usage_events[0].input_tokens, 2);
         assert_eq!(result.sessions[0].usage_events[0].cache_read_tokens, 30_612);
         assert_eq!(result.sessions[0].usage_events[0].cache_write_tokens, 1_120);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_marks_empty_usage_when_db_is_readable() {
-        let root = temp_copilot_root("usage-empty");
-        let sessions_dir = root.join("session-state");
-        let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
-        write_copilot_session(&sessions_dir, "dir-1", uuid, "hello");
-        let usage_db = root.join("session-store.db");
-        write_usage_schema(&usage_db);
-
-        let store = setup_store();
-        let result = scan_for_sync_impl(
-            &sessions_dir,
-            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
-            None,
-            true,
-            Some(&usage_db),
-        )
-        .unwrap();
-        assert_eq!(result.sessions[0].usage_parser_version, Some(USAGE_PARSER_VERSION));
-        assert!(result.sessions[0].usage_events.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }

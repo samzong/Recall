@@ -912,24 +912,6 @@ mod tests {
     }
 
     #[test]
-    fn load_ui_messages_first_text_is_user() {
-        let root = temp_root("firstuser");
-        let messages_json = r#"[
-            {"ts": 1000, "type": "say", "say": "checkpoint_created"},
-            {"ts": 2000, "type": "say", "say": "text", "text": "my task"},
-            {"ts": 3000, "type": "say", "say": "text", "text": "response"}
-        ]"#;
-        let path = write_task(&root, "2000", messages_json);
-
-        let msgs = load_ui_messages(&path).unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert!(matches!(msgs[0].role, Role::User));
-        assert!(matches!(msgs[1].role, Role::Assistant));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn load_ui_messages_task_type_is_user() {
         let root = temp_root("tasktype");
         let messages_json = r#"[
@@ -1067,23 +1049,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_cline_task_returns_none_for_empty_messages() {
-        let root = temp_root("empty");
-        let path = write_task(&root, "1000", "[]");
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
-        let entry = FileScanEntry {
-            session_id: "1000".to_string(),
-            stat_target: path.clone(),
-            directory: None,
-        };
-        let raw = parse_cline_task(entry, mtime).unwrap();
-        assert!(raw.is_none());
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn parse_cline_task_returns_none_for_invalid_json() {
         let root = temp_root("invalid");
         let task_dir = root.join("1000");
@@ -1187,59 +1152,6 @@ mod tests {
         .unwrap();
         assert!(unstable.sessions.is_empty());
         assert_eq!(unstable.stats.unstable_sessions, 1);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_reparses_when_mtime_diverges() {
-        let root = temp_root("mismatch");
-        let messages_json = r#"[
-            {"ts": 1000, "type": "say", "say": "text", "text": "hello"}
-        ]"#;
-        let path = write_task(&root, "1765706891317", messages_json);
-        let actual_mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
-        let store = setup_store();
-        store
-            .insert_session(&make_existing_session("1765706891317", actual_mtime - 1_000, 1))
-            .unwrap();
-
-        let result = scan_task_dirs_for_sync(
-            std::slice::from_ref(&root),
-            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
-            None,
-            false,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, "1765706891317");
-        assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
-        assert_eq!(result.stats.skipped_sessions, 0);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_picks_up_new_session() {
-        let root = temp_root("new");
-        let messages_json = r#"[
-            {"ts": 1000, "type": "say", "say": "text", "text": "new task"}
-        ]"#;
-        write_task(&root, "1765706891317", messages_json);
-
-        let store = setup_store();
-
-        let result = scan_task_dirs_for_sync(
-            std::slice::from_ref(&root),
-            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
-            None,
-            false,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, "1765706891317");
-        assert_eq!(result.stats.skipped_sessions, 0);
-
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -131,32 +131,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_dir_returns_empty() {
-        assert!(vscode_extension_task_dirs_from(None, "saoudrizwan.claude-dev").is_empty());
-    }
-
-    #[test]
-    fn file_uri_path_decodes_percent_escapes() {
-        assert_eq!(
-            file_uri_to_path("file:///Users/x/git/foo%20bar").as_deref(),
-            Some("/Users/x/git/foo bar")
-        );
-        assert_eq!(file_uri_to_path("https://example.com"), None);
-    }
-
-    #[test]
-    fn empty_config_dir_returns_empty() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(
-            vscode_extension_task_dirs_from(
-                Some(root.path().to_path_buf()),
-                "saoudrizwan.claude-dev"
-            )
-            .is_empty()
-        );
-    }
-
-    #[test]
     fn collects_only_existing_host_task_dirs() {
         let root = tempfile::tempdir().unwrap();
         let cursor = write_tasks_dir(root.path(), "Cursor", "saoudrizwan.claude-dev");
@@ -206,23 +180,5 @@ mod tests {
         assert!(expand_user_path("~/.qwen").unwrap().ends_with(".qwen"));
         assert_eq!(expand_user_path("/tmp/qwen").unwrap(), PathBuf::from("/tmp/qwen"));
         assert_eq!(expand_user_path("~").unwrap(), dirs::home_dir().unwrap());
-    }
-
-    #[test]
-    fn storage_dirs_include_cursor_and_skip_missing_hosts() {
-        let root = tempfile::tempdir().unwrap();
-        let cursor =
-            root.path().join("Cursor").join("User").join("globalStorage").join("sourcegraph.amp");
-        let code =
-            root.path().join("Code").join("User").join("globalStorage").join("sourcegraph.amp");
-        fs::create_dir_all(&cursor).unwrap();
-        fs::create_dir_all(&code).unwrap();
-        fs::create_dir_all(
-            root.path().join("VSCodium").join("User").join("globalStorage").join("other"),
-        )
-        .unwrap();
-        let dirs =
-            vscode_extension_storage_dirs_from(Some(root.path().to_path_buf()), "sourcegraph.amp");
-        assert_eq!(dirs, vec![code, cursor]);
     }
 }

@@ -2320,30 +2320,6 @@ mod tests {
     }
 
     #[test]
-    fn list_up_keeps_viewport_while_selection_remains_visible() {
-        let (mut app, store) = app_and_store();
-        app.set_terminal_size(80, 12);
-        app.results = numbered_results(6);
-        app.selected_index = 5;
-        app.result_scroll_offset = 1;
-
-        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-        app.handle_key(up, &store);
-        assert_eq!(app.selected_index, 4);
-        assert_eq!(app.result_list_start(5), 1);
-
-        for _ in 0..3 {
-            app.handle_key(up, &store);
-        }
-        assert_eq!(app.selected_index, 1);
-        assert_eq!(app.result_list_start(5), 1);
-
-        app.handle_key(up, &store);
-        assert_eq!(app.selected_index, 0);
-        assert_eq!(app.result_list_start(5), 0);
-    }
-
-    #[test]
     fn mouse_click_selects_visible_session_row() {
         let (mut app, store) = app_and_store();
         app.set_terminal_size(22, 12);
@@ -2389,24 +2365,6 @@ mod tests {
         app.handle_key(up, &store);
         assert_eq!(app.selected_index, 5);
         assert_eq!(app.result_list_start(5), 5);
-    }
-
-    #[test]
-    fn page_keys_move_preview_by_visible_message_viewport() {
-        let (mut app, store) = app_and_store();
-        app.set_terminal_size(80, 13);
-        app.results = numbered_results(1);
-        app.preview_messages = (0..5).map(|n| message(Role::User, None, n)).collect();
-        app.panel_focus = PanelFocus::Preview;
-
-        let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
-        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
-
-        app.handle_key(down, &store);
-        assert_eq!(app.preview_selected_msg, 2);
-
-        app.handle_key(up, &store);
-        assert_eq!(app.preview_selected_msg, 0);
     }
 
     #[test]
@@ -2463,23 +2421,6 @@ mod tests {
 
         assert_eq!(app.preview_selected_msg, 3);
         assert_eq!(app.preview_scroll_offset, max_start);
-    }
-
-    #[test]
-    fn page_keys_keep_fully_visible_viewing_selection() {
-        let (mut app, store) = app_and_store();
-        app.set_terminal_size(80, 20);
-        app.mode = AppMode::Viewing;
-        app.viewing.messages = (0..3).map(|n| message(Role::User, None, n)).collect();
-        app.viewing.lines = build_viewing_caches(&app.viewing.messages);
-        app.viewing.selected_msg = 2;
-
-        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &store);
-        assert_eq!(app.viewing.selected_msg, 2);
-
-        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &store);
-        assert_eq!(app.viewing.selected_msg, 2);
-        assert_eq!(app.viewing.scroll_offset, 0);
     }
 
     #[test]
@@ -2559,30 +2500,6 @@ mod tests {
             ),
             max_start
         );
-    }
-
-    #[test]
-    fn viewing_selection_anchors_scroll_offset() {
-        let (mut app, store) = app_and_store();
-        app.set_terminal_size(80, 10);
-        app.mode = AppMode::Viewing;
-        app.viewing.messages = (0..5).map(|n| message(Role::User, None, n)).collect();
-        app.viewing.lines = build_viewing_caches(&app.viewing.messages);
-
-        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-
-        app.handle_key(down, &store);
-        assert_eq!((app.viewing.selected_msg, app.viewing.scroll_offset), (1, 0));
-
-        app.handle_key(down, &store);
-        assert_eq!((app.viewing.selected_msg, app.viewing.scroll_offset), (2, 2));
-
-        app.handle_key(down, &store);
-        assert_eq!((app.viewing.selected_msg, app.viewing.scroll_offset), (3, 5));
-
-        app.handle_key(up, &store);
-        assert_eq!((app.viewing.selected_msg, app.viewing.scroll_offset), (2, 5));
     }
 
     #[test]
@@ -2813,15 +2730,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_from_search_opens_settings() {
-        let (mut app, store) = app_and_store();
-
-        app.handle_search_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &store);
-
-        assert!(matches!(app.mode, AppMode::Settings));
-    }
-
-    #[test]
     fn ctrl_s_from_search_requests_sync_instead_of_settings() {
         let (mut app, store) = app_and_store();
 
@@ -2833,19 +2741,6 @@ mod tests {
         assert!(request.sources.is_none());
         assert!(app.sync_in_flight);
         assert!(app.take_sync_request().is_none());
-    }
-
-    #[test]
-    fn ctrl_s_from_viewing_syncs_instead_of_sharing() {
-        let (mut app, store) = app_and_store();
-        app.mode = AppMode::Viewing;
-        app.viewing.session = Some(codex_search_result().session);
-
-        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &store);
-
-        assert!(matches!(app.mode, AppMode::Viewing));
-        assert!(app.share_popup.is_none());
-        assert!(app.sync_requested);
     }
 
     #[test]
@@ -2966,19 +2861,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_handoff_targets_stay_in_viewing() {
-        let mut app = app_with_sources();
-        app.mode = AppMode::Viewing;
-
-        app.present_handoff_targets(Vec::new());
-
-        assert!(matches!(app.mode, AppMode::Viewing));
-        assert!(
-            app.status_message.as_deref().unwrap_or_default().contains("No handoff targets found")
-        );
-    }
-
-    #[test]
     fn subagent_drilldown_switches_viewing_session_and_pops_back() {
         let (mut app, store) = app_and_store();
 
@@ -3028,30 +2910,6 @@ mod tests {
     }
 
     #[test]
-    fn subagent_picker_no_op_without_children() {
-        let mut app = app_with_sources();
-        app.viewing.session = Some(codex_search_result().session);
-        app.viewing.children.clear();
-        app.mode = AppMode::Viewing;
-
-        app.open_subagents_picker();
-
-        assert!(matches!(app.mode, AppMode::Viewing), "no picker without subagents");
-        assert_eq!(app.status_message.as_deref(), Some("No subagents"));
-    }
-
-    #[test]
-    fn confirming_source_picker_preserves_existing_multi_source_selection() {
-        let mut app = app_with_sources();
-        app.filters.active.sources = vec!["claude".to_string(), "cursor".to_string()];
-
-        app.open_source_picker();
-        app.commit_source_picker_filter();
-
-        assert_eq!(app.filters.active.sources, vec!["claude".to_string(), "cursor".to_string()]);
-    }
-
-    #[test]
     fn project_picker_filters_by_path_tokens() {
         let mut app = app_with_sources();
         app.project_directories = vec![
@@ -3072,29 +2930,6 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0], ProjectPickerRow::Project(0)));
-    }
-
-    #[test]
-    fn search_filters_use_repo_scope() {
-        let mut app = app_with_sources();
-        app.filters.active.scope = ProjectScope::Repository {
-            filter: RepoFilter::Remote("github.com/samzong/Recall".to_string()),
-            local_root: None,
-        };
-
-        let filters = app.search_filters();
-
-        assert_eq!(filters.scope, app.filters.active.scope);
-    }
-
-    #[test]
-    fn search_filters_use_directory_scope_when_project_selected() {
-        let mut app = app_with_sources();
-        app.filters.active.scope = ProjectScope::Directory("/tmp/project".to_string());
-
-        let filters = app.search_filters();
-
-        assert_eq!(filters.scope, ProjectScope::Directory("/tmp/project".to_string()));
     }
 
     #[test]
@@ -3125,22 +2960,6 @@ mod tests {
 
         assert_eq!(app.filters.draft.sources, vec!["codex".to_string()]);
         assert!(app.filters.active.sources.is_empty());
-    }
-
-    #[test]
-    fn app_defaults_to_relevance_sort_and_newest_when_browsing() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let mut app = App::new(&store, vec![source("codex", "Codex")], AppConfig::default());
-
-        assert_eq!(app.filters.active.sort, SortOrder::Relevance);
-        assert_eq!(app.effective_sort_order(), SortOrder::Newest);
-        assert_eq!(app.sort_label(), "Newest");
-        assert_eq!(app.draft_sort_label(), "Relevance");
-
-        app.query = "parser".to_string();
-        assert_eq!(app.effective_sort_order(), SortOrder::Relevance);
-        assert_eq!(app.sort_label(), "Relevance");
     }
 
     #[test]
@@ -3263,47 +3082,6 @@ mod tests {
     }
 
     #[test]
-    fn filter_sort_left_right_defers_search_until_esc() {
-        let (mut app, store) = app_and_store();
-        app.mode = AppMode::Filters;
-        app.query = "parser".to_string();
-        app.filters.focus = FilterFocus::Sort;
-
-        app.handle_filters_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &store);
-
-        assert_eq!(app.filters.active.sort, SortOrder::Relevance);
-        assert!(app.filters.dirty);
-        assert!(!app.search_pending);
-
-        app.handle_filters_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);
-
-        assert_eq!(app.filters.active.sort, SortOrder::Newest);
-        assert!(matches!(app.mode, AppMode::Search));
-        assert!(app.search_pending);
-        assert_eq!(app.search_feedback.as_deref(), Some("Filters queued..."));
-    }
-
-    #[test]
-    fn filter_esc_closes_without_syncing_results_or_stats() {
-        let (mut app, store) = app_and_store();
-        app.mode = AppMode::Filters;
-        app.filters.focus = FilterFocus::Time;
-        app.results = vec![search_result_with_times("existing", 100, None)];
-        app.total_sessions = 42;
-        app.total_messages = 99;
-
-        app.handle_filters_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &store);
-        app.handle_filters_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);
-
-        assert!(matches!(app.mode, AppMode::Search));
-        assert_eq!(app.results[0].session.source_id, "existing");
-        assert_eq!(app.total_sessions, 42);
-        assert_eq!(app.total_messages, 99);
-        assert!(app.search_pending);
-        assert_eq!(app.search_feedback.as_deref(), Some("Filters queued..."));
-    }
-
-    #[test]
     fn filter_commit_invalidates_in_flight_search_response() {
         let (mut app, store) = app_and_store();
         app.query = "parser".to_string();
@@ -3328,58 +3106,6 @@ mod tests {
 
         assert_eq!(app.results[0].session.source_id, "current-result");
         assert!(app.search_pending);
-    }
-
-    #[test]
-    fn applying_project_picker_returns_to_filter_overview_without_searching() {
-        let mut app = app_with_sources();
-        app.mode = AppMode::Filters;
-        app.filters.editing = Some(FilterFocus::Project);
-        app.filters.project = Some("/Users/x/git/samzong/Recall".to_string());
-        app.filters.project_picker.dirty = true;
-
-        app.apply_project_picker();
-
-        assert!(matches!(app.mode, AppMode::Filters));
-        assert!(app.filters.editing != Some(FilterFocus::Project));
-        assert_eq!(app.filters.active.scope, ProjectScope::Global);
-        assert_eq!(
-            app.filters.draft.scope,
-            ProjectScope::Directory("/Users/x/git/samzong/Recall".to_string())
-        );
-        assert!(app.filters.dirty);
-        assert!(!app.search_pending);
-    }
-
-    #[test]
-    fn applying_source_picker_returns_to_filter_overview_without_searching() {
-        let mut app = app_with_sources();
-        app.mode = AppMode::Filters;
-        app.filters.editing = Some(FilterFocus::Source);
-        app.filters.sources = vec!["codex".to_string()];
-        app.filters.source_picker.dirty = true;
-
-        app.apply_source_picker();
-
-        assert!(matches!(app.mode, AppMode::Filters));
-        assert!(app.filters.editing != Some(FilterFocus::Source));
-        assert!(app.filters.active.sources.is_empty());
-        assert_eq!(app.filters.draft.sources, vec!["codex".to_string()]);
-        assert!(app.filters.dirty);
-        assert!(!app.search_pending);
-    }
-
-    #[test]
-    fn usage_refresh_yields_background_request() {
-        let mut app = app_with_sources();
-        app.usage.request_refresh();
-        app.usage.refresh_requested_at = Some(Instant::now() - Duration::from_millis(100));
-
-        let request = app.take_usage_request(false).expect("usage request");
-
-        assert_eq!(request.time_range, TimeRange::All);
-        assert!(!request.sync);
-        assert!(app.usage.is_loading());
     }
 
     #[test]

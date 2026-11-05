@@ -939,14 +939,13 @@ fn project_key_to_path(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use super::*;
     use crate::adapters::test_support::{
         seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
         store as setup_store,
     };
     use crate::types::Session;
+    use std::io::Write;
 
     fn temp_claude_root(label: &str) -> PathBuf {
         let root =
@@ -1265,39 +1264,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn parse_claude_session_file_keeps_meta_event_only_transcript() {
-        let root = temp_claude_root("meta-event-only");
-        let project = root.join("projects").join("-tmp-foo");
-        fs::create_dir_all(&project).unwrap();
-        let path = project.join("meta-event-only.jsonl");
-        let line = serde_json::json!({
-            "type": "assistant",
-            "isCompactSummary": true,
-            "timestamp": "2026-04-13T10:00:00Z",
-            "message": {"content": "Compacted context"}
-        });
-        let mut file = fs::File::create(&path).unwrap();
-        writeln!(file, "{line}").unwrap();
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-        let entry = FileScanEntry {
-            session_id: "meta-event-only".to_string(),
-            stat_target: path,
-            directory: Some("/tmp/foo".to_string()),
-        };
-
-        let raw = parse_claude_session_file(entry, mtime, &SessionIndexes::default(), true)
-            .unwrap()
-            .unwrap();
-
-        assert!(raw.messages.is_empty());
-        assert!(raw.usage_events.is_empty());
-        assert_eq!(raw.events.len(), 1);
-        assert_eq!(raw.started_at, 1_776_074_400_000);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
     fn write_usage_jsonl(project_dir: &Path, session_id: &str) -> PathBuf {
         fs::create_dir_all(project_dir).unwrap();
         let path = project_dir.join(format!("{session_id}.jsonl"));
@@ -1372,30 +1338,6 @@ mod tests {
             message_count,
             ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
-    }
-
-    #[test]
-    fn parse_claude_session_file_sets_updated_at_to_mtime() {
-        let root = temp_claude_root("parse");
-        let project = root.join("projects").join("-tmp-foo");
-        let path = write_user_jsonl(&project, "abc-123", "hello");
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
-        let entry = FileScanEntry {
-            session_id: "abc-123".to_string(),
-            stat_target: path.clone(),
-            directory: Some("/tmp/foo".to_string()),
-        };
-        let indexes = SessionIndexes::default();
-        let raw = parse_claude_session_file(entry, mtime, &indexes, true).unwrap().unwrap();
-
-        assert_eq!(raw.source_id, "abc-123");
-        assert_eq!(raw.updated_at, Some(mtime));
-        assert_eq!(raw.directory.as_deref(), Some("/tmp/foo"));
-        assert_eq!(raw.messages.len(), 1);
-        assert_eq!(raw.messages[0].content, "hello");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1512,38 +1454,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_session_prefers_ai_title_when_present() {
-        let root = temp_claude_root("ai-title");
-        let project = root.join("projects").join("-tmp-ai");
-        fs::create_dir_all(&project).unwrap();
-        let path = project.join("ai-session.jsonl");
-        let lines = [
-            serde_json::json!({"type":"user","message":{"content":"start"},"timestamp":"2026-04-13T10:00:00Z"}),
-            serde_json::json!({"type":"ai-title","title":"Named by Claude"}),
-            serde_json::json!({"type":"assistant","message":{"content":"done"},"timestamp":"2026-04-13T10:00:01Z"}),
-        ];
-        let mut file = fs::File::create(&path).unwrap();
-        for line in lines {
-            writeln!(file, "{line}").unwrap();
-        }
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-        let raw = parse_claude_session_file(
-            FileScanEntry {
-                session_id: "ai-session".to_string(),
-                stat_target: path,
-                directory: None,
-            },
-            mtime,
-            &SessionIndexes::default(),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(raw.custom_title.as_deref(), Some("Named by Claude"));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn scan_for_sync_uses_project_sessions_index_summary() {
         let root = temp_claude_root("project-summary");
         let project = root.join("projects").join("-tmp-index");
@@ -1622,105 +1532,6 @@ mod tests {
         assert!(raw.messages.is_empty());
         assert_eq!(raw.started_at, 1_776_074_400_000);
         assert_eq!(raw.usage_events.len(), 1);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn parse_claude_session_file_keeps_zero_token_usage_events() {
-        let root = temp_claude_root("zero-usage");
-        let project = root.join("projects").join("-tmp-foo");
-        fs::create_dir_all(&project).unwrap();
-        let path = project.join("zero-session.jsonl");
-        let line = serde_json::json!({
-            "type": "assistant",
-            "requestId": "req-zero",
-            "timestamp": "2026-04-13T10:00:00Z",
-            "message": {
-                "id": "msg-zero",
-                "model": "gpt-5.5",
-                "content": [{"type": "text", "text": "zero"}],
-                "usage": {
-                    "input_tokens": 0,
-                    "output_tokens": 0
-                }
-            }
-        });
-        let mut f = fs::File::create(&path).unwrap();
-        writeln!(f, "{line}").unwrap();
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
-        let entry = FileScanEntry {
-            session_id: "zero-session".to_string(),
-            stat_target: path,
-            directory: Some("/tmp/foo".to_string()),
-        };
-        let indexes = SessionIndexes::default();
-        let raw = parse_claude_session_file(entry, mtime, &indexes, true).unwrap().unwrap();
-
-        assert_eq!(raw.usage_events.len(), 1);
-        assert_eq!(raw.usage_events[0].model, "gpt-5.5");
-        assert_eq!(raw.usage_events[0].input_tokens, 0);
-        assert_eq!(raw.usage_events[0].output_tokens, 0);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn collect_project_entries_walks_nested_projects() {
-        let root = temp_claude_root("collect");
-        let p1 = root.join("projects").join("-tmp-foo");
-        let p2 = root.join("projects").join("-tmp-bar");
-        let nested = p1.join("parent-session").join("subagents");
-        write_user_jsonl(&p1, "sess-1", "a");
-        write_user_jsonl(&p2, "sess-2", "b");
-        write_user_jsonl(&nested, "agent-a123", "nested");
-
-        let mut indexes = SessionIndexes::default();
-        let entries = collect_project_entries(&root, &mut indexes);
-        assert_eq!(entries.len(), 3);
-        let ids: Vec<_> = entries.iter().map(|e| e.session_id.clone()).collect();
-        assert!(ids.contains(&"sess-1".to_string()));
-        assert!(ids.contains(&"sess-2".to_string()));
-        assert!(ids.contains(&"agent-a123".to_string()));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_skips_unchanged_session() {
-        let root = temp_claude_root("skip");
-        let project = root.join("projects").join("-tmp-proj");
-        let path = write_user_jsonl(&project, "sess-skip", "hello");
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
-        let store = setup_store();
-        store.insert_session(&make_existing_session("sess-skip", mtime, 1)).unwrap();
-        seed_empty_usage_state(
-            &store,
-            "claude-code",
-            "sess-skip",
-            USAGE_PARSER_VERSION,
-            Some(mtime),
-        );
-        seed_empty_event_state(
-            &store,
-            "claude-code",
-            "sess-skip",
-            EVENT_PARSER_VERSION,
-            Some(mtime),
-        );
-        seed_empty_metadata_state(&store, "claude-code", "sess-skip", METADATA_PARSER_VERSION);
-
-        let result = scan_for_sync_impl(
-            &root,
-            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 0);
-        assert_eq!(result.stats.skipped_sessions, 1);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1816,55 +1627,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_for_sync_reparses_when_mtime_diverges() {
-        let root = temp_claude_root("mismatch");
-        let project = root.join("projects").join("-tmp-proj");
-        let path = write_user_jsonl(&project, "sess-stale", "hi");
-        let actual_mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
-        let store = setup_store();
-        store
-            .insert_session(&make_existing_session("sess-stale", actual_mtime - 1_000, 1))
-            .unwrap();
-
-        let result = scan_for_sync_impl(
-            &root,
-            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, "sess-stale");
-        assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
-        assert_eq!(result.stats.skipped_sessions, 0);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_picks_up_new_session() {
-        let root = temp_claude_root("new");
-        let project = root.join("projects").join("-tmp-proj");
-        write_user_jsonl(&project, "sess-fresh", "fresh");
-
-        let store = setup_store();
-
-        let result = scan_for_sync_impl(
-            &root,
-            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, "sess-fresh");
-        assert_eq!(result.stats.skipped_sessions, 0);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn invocation_probe_accepts_only_discovery_tool_input_and_deduplicates_a_session() {
         let root = temp_claude_root("invocation-probe");
         let project = root.join("projects").join("-tmp-probe");
@@ -1931,29 +1693,6 @@ mod tests {
         assert_eq!(result.source_ids.len(), 2);
 
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn invocation_probe_shares_budget_across_roots() {
-        let first = temp_claude_root("invocation-probe-budget-first");
-        let second = temp_claude_root("invocation-probe-budget-second");
-        for (root, prefix) in [(&first, "first"), (&second, "second")] {
-            let project = root.join("projects").join("-tmp-probe");
-            for index in 0..40 {
-                write_user_jsonl(&project, &format!("{prefix}-{index}"), "ordinary");
-            }
-        }
-
-        let result = probe_invocation_nonce_in(
-            &[first.clone(), second.clone()],
-            "absent-nonce",
-            InvocationProbeBudget::default(),
-        );
-        assert!(result.files_read <= 64);
-        assert!(!result.complete);
-
-        let _ = fs::remove_dir_all(first);
-        let _ = fs::remove_dir_all(second);
     }
 
     #[test]

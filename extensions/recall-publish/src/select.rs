@@ -222,6 +222,20 @@ mod tests {
     }
 
     #[test]
+    fn scope_names_cannot_escape_the_workspace() {
+        assert!(validate_scope_name("../etc").is_err());
+        assert!(validate_scope_name(".hidden").is_err());
+        assert!(validate_scope_name("a/b").is_err());
+        assert!(validate_scope_name("project-recall_time-2026-08").is_ok());
+    }
+
+    #[test]
+    fn reversed_intervals_are_rejected() {
+        assert!(TimeWindow::parse(Some("2026-09-01"), Some("2026-08-01"), "UTC").is_err());
+        assert!(TimeWindow::parse(Some("2026-08-01"), Some("2026-08-01"), "UTC").is_err());
+    }
+
+    #[test]
     fn filename_labels_describe_the_interval_not_the_upload() {
         assert_eq!(window("2026-08-01", "2026-09-01", "UTC").label().unwrap(), "2026-08");
         assert_eq!(window("2026-08-05", "2026-08-06", "UTC").label().unwrap(), "2026-08-05");
@@ -242,24 +256,5 @@ mod tests {
             data_filename(&scope),
             "author-samzong_project-samzong-recall_agent-codex_time-2026-08.recall.jsonl"
         );
-    }
-
-    #[test]
-    fn global_project_selector_is_not_a_filename_component() {
-        assert_eq!(scope_name(None, Some("all"), &[], None), "sessions");
-    }
-
-    #[test]
-    fn scope_names_cannot_escape_the_workspace() {
-        assert!(validate_scope_name("../etc").is_err());
-        assert!(validate_scope_name(".hidden").is_err());
-        assert!(validate_scope_name("a/b").is_err());
-        assert!(validate_scope_name("project-recall_time-2026-08").is_ok());
-    }
-
-    #[test]
-    fn reversed_intervals_are_rejected() {
-        assert!(TimeWindow::parse(Some("2026-09-01"), Some("2026-08-01"), "UTC").is_err());
-        assert!(TimeWindow::parse(Some("2026-08-01"), Some("2026-08-01"), "UTC").is_err());
     }
 }

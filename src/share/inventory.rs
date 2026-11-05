@@ -496,6 +496,74 @@ mod tests {
     }
 
     #[test]
+    fn list_reads_managed_html_and_skips_control_files() {
+        let dir = tempfile::tempdir().unwrap();
+        init_publish_dir(dir.path()).unwrap();
+        let session = session("019e6d8d-588b-7fd2-a326-c525469ed120");
+        let meta = collect_session_display_meta(&session, &[]);
+        fs::write(
+            dir.path().join("019e6d8d-588b-7fd2-a326-c525469ed120.html"),
+            render_session_html(&session, &[], &[], &meta),
+        )
+        .unwrap();
+
+        let config = config_for(dir.path());
+        let inventory = list_share_pages(&config).unwrap();
+        assert_eq!(inventory.shares.len(), 1);
+        assert_eq!(inventory.shares[0].share_id, "019e6d8d-588b-7fd2-a326-c525469ed120");
+        assert_eq!(
+            inventory.shares[0].url,
+            "https://recall-share-test.pages.dev/019e6d8d-588b-7fd2-a326-c525469ed120"
+        );
+        assert_eq!(inventory.shares[0].title.as_deref(), Some("Fix <bug>"));
+        assert_eq!(inventory.shares[0].source.as_deref(), Some("Codex"));
+    }
+
+    #[test]
+    fn list_rejects_unmanaged_publish_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("notes.txt"), "not a share page").unwrap();
+        let error = list_share_pages(&config_for(dir.path())).unwrap_err();
+        assert!(error.to_string().contains("not managed by Recall"));
+    }
+
+    #[test]
+    fn unpublish_removes_file_and_restores_on_deploy_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        init_publish_dir(dir.path()).unwrap();
+        let session = session("keep-me");
+        let meta = collect_session_display_meta(&session, &[]);
+        let html = render_session_html(&session, &[], &[], &meta);
+        let path = dir.path().join("keep-me.html");
+        fs::write(&path, &html).unwrap();
+        let share = share_config(dir.path());
+
+        let error =
+            unpublish_share_page_with(&share, "keep-me", |_, _| bail!("deploy boom")).unwrap_err();
+        assert!(error.to_string().contains("deploy boom"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), html);
+
+        let page = unpublish_share_page_with(&share, "keep-me", |_, _| Ok(())).unwrap();
+        assert_eq!(page.share_id, "keep-me");
+        assert!(!path.exists());
+    }
+
+    fn config_for(publish_dir: &Path) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.share = Some(share_config(publish_dir));
+        config
+    }
+
+    fn share_config(publish_dir: &Path) -> ShareConfig {
+        ShareConfig {
+            provider: "cloudflare-pages".to_string(),
+            project_name: "recall-share-test".to_string(),
+            project_domain: "recall-share-test.pages.dev".to_string(),
+            publish_dir: publish_dir.to_string_lossy().to_string(),
+        }
+    }
+
+    #[test]
     fn inventory_text_is_one_line_table_with_footer() {
         let inventory = ShareInventory {
             provider: "cloudflare-pages".to_string(),
@@ -535,90 +603,5 @@ mod tests {
         assert_eq!(lines[4], "2 shares  https://recall-share-test.pages.dev");
         let header_title_width = lines[0].find("SOURCE").unwrap();
         assert!(header_title_width <= TITLE_COL_MAX + 2);
-    }
-
-    #[test]
-    fn list_reads_managed_html_and_skips_control_files() {
-        let dir = tempfile::tempdir().unwrap();
-        init_publish_dir(dir.path()).unwrap();
-        let session = session("019e6d8d-588b-7fd2-a326-c525469ed120");
-        let meta = collect_session_display_meta(&session, &[]);
-        fs::write(
-            dir.path().join("019e6d8d-588b-7fd2-a326-c525469ed120.html"),
-            render_session_html(&session, &[], &[], &meta),
-        )
-        .unwrap();
-
-        let config = config_for(dir.path());
-        let inventory = list_share_pages(&config).unwrap();
-        assert_eq!(inventory.shares.len(), 1);
-        assert_eq!(inventory.shares[0].share_id, "019e6d8d-588b-7fd2-a326-c525469ed120");
-        assert_eq!(
-            inventory.shares[0].url,
-            "https://recall-share-test.pages.dev/019e6d8d-588b-7fd2-a326-c525469ed120"
-        );
-        assert_eq!(inventory.shares[0].title.as_deref(), Some("Fix <bug>"));
-        assert_eq!(inventory.shares[0].source.as_deref(), Some("Codex"));
-    }
-
-    #[test]
-    fn list_missing_publish_dir_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("gone");
-        let inventory = list_share_pages(&config_for(&missing)).unwrap();
-        assert!(inventory.shares.is_empty());
-    }
-
-    #[test]
-    fn list_rejects_unmanaged_publish_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("notes.txt"), "not a share page").unwrap();
-        let error = list_share_pages(&config_for(dir.path())).unwrap_err();
-        assert!(error.to_string().contains("not managed by Recall"));
-    }
-
-    #[test]
-    fn unpublish_removes_file_and_restores_on_deploy_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        init_publish_dir(dir.path()).unwrap();
-        let session = session("keep-me");
-        let meta = collect_session_display_meta(&session, &[]);
-        let html = render_session_html(&session, &[], &[], &meta);
-        let path = dir.path().join("keep-me.html");
-        fs::write(&path, &html).unwrap();
-        let share = share_config(dir.path());
-
-        let error =
-            unpublish_share_page_with(&share, "keep-me", |_, _| bail!("deploy boom")).unwrap_err();
-        assert!(error.to_string().contains("deploy boom"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), html);
-
-        let page = unpublish_share_page_with(&share, "keep-me", |_, _| Ok(())).unwrap();
-        assert_eq!(page.share_id, "keep-me");
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn unpublish_rejects_unknown_id() {
-        let dir = tempfile::tempdir().unwrap();
-        init_publish_dir(dir.path()).unwrap();
-        let share = share_config(dir.path());
-        let error = find_share_page(&share, "missing").unwrap_err();
-        assert!(error.to_string().contains("share page not found"));
-    }
-
-    fn config_for(publish_dir: &Path) -> AppConfig {
-        let mut config = AppConfig::default();
-        config.share = Some(share_config(publish_dir));
-        config
-    }
-
-    fn share_config(publish_dir: &Path) -> ShareConfig {
-        ShareConfig {
-            provider: "cloudflare-pages".to_string(),
-            project_name: "recall-share-test".to_string(),
-            project_domain: "recall-share-test.pages.dev".to_string(),
-            publish_dir: publish_dir.to_string_lossy().to_string(),
-        }
     }
 }
