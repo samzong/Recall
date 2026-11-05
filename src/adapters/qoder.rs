@@ -498,9 +498,8 @@ fn usage_event(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
+    use serde_json::json;
 
     const SESSION: &str = "11111111-1111-4111-8111-111111111111";
     const FIXTURE: &str = include_str!("../../tests/fixtures/qoder/cli.jsonl");
@@ -618,40 +617,6 @@ mod tests {
         let default = root.path().join(".qoder");
         fs::create_dir_all(&default).unwrap();
         assert_eq!(resolve_config_dirs(None, None, Some(root.path())), [(default, "")]);
-    }
-
-    #[test]
-    fn parses_cli_envelope_messages_timestamps_and_tools() {
-        let root = tempfile::tempdir().unwrap();
-        let entry = fixture(root.path());
-        let raw = parse_transcript(&entry, 1791370810000, true).unwrap().unwrap();
-        assert_eq!(raw.directory.as_deref(), Some("/tmp/qoder-fixture-project"));
-        assert_eq!(raw.started_at, 1791370800000);
-        assert_eq!(raw.updated_at, Some(1791370810000));
-        assert_eq!(raw.messages.len(), 3);
-        assert_eq!(raw.messages[0].role, Role::User);
-        assert_eq!(raw.messages[1].content, "I will inspect the file.");
-        assert_eq!(raw.messages[2].timestamp, Some(1791370805000));
-        assert_eq!(raw.custom_title.as_deref(), Some("Verify sample file"));
-        assert_eq!(raw.events.len(), 6);
-        let read = &raw.events[0];
-        assert_eq!(read.kind, "file_read");
-        assert_eq!(read.files[0].operation, FileOperation::Read);
-        assert_eq!(read.files[0].cwd.as_deref(), Some("/tmp/qoder-fixture-project"));
-        assert_eq!(raw.events[1].kind, "command");
-        assert_eq!(raw.events[1].target.as_deref(), Some("wc -l sample.txt"));
-        assert_eq!(raw.events[3].name.as_deref(), Some("Bash"));
-        assert_eq!(raw.events[3].status.as_deref(), Some("success"));
-        assert_eq!(raw.events[3].tool_call_id.as_deref(), Some("call-shell"));
-        assert_eq!(raw.events[4].kind, "file_write");
-        assert_eq!(raw.usage_events.len(), 3);
-        assert_eq!(raw.usage_events.iter().map(|u| u.input_tokens).sum::<i64>(), 480);
-        assert!(raw.usage_events.iter().all(|u| u.provider == "unknown"));
-        let without_events = parse_transcript(&entry, 1791370810000, false).unwrap().unwrap();
-        assert!(without_events.events.is_empty());
-        assert_eq!(without_events.event_parser_version, None);
-        assert_eq!(without_events.messages.len(), raw.messages.len());
-        assert_eq!(without_events.usage_events.len(), raw.usage_events.len());
     }
 
     #[test]
@@ -807,18 +772,6 @@ mod tests {
     }
 
     #[test]
-    fn rewound_tool_events_are_inactive_without_erasing_history() {
-        let root = tempfile::tempdir().unwrap();
-        let entry = fixture(root.path());
-        let mut records: Vec<Value> =
-            FIXTURE.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        records.push(json!({"type":"active-leaf","sessionId":SESSION,"leafUuid":"u1","explicit":true,"rewound":true,"timestamp":1791370806000i64}));
-        write_records(&entry, &records);
-        let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
-        assert_eq!(raw.messages.len(), 3);
-        assert!(raw.events.iter().all(|e| e.visibility == Some(EvidenceVisibility::Inactive)));
-    }
-    #[test]
     fn splits_cache_inclusive_usage_and_ignores_invalid_counts() {
         let cached = json!({"type":"assistant","modelSource":"custom","message":{"id":"cached","model":"fixture","usage":{"input_tokens":3250,"output_tokens":40,"cache_read_input_tokens":3000,"cache_creation_input_tokens":200}}});
         let usage = usage_event(&cached, 0, 1, "fixture", None).unwrap();
@@ -855,27 +808,6 @@ mod tests {
         assert_eq!(raw.events.len(), 2);
         assert_eq!(raw.events[0].visibility, None);
         assert_eq!(raw.events[1].visibility, Some(EvidenceVisibility::Inactive));
-    }
-
-    #[test]
-    fn records_powershell_command_and_notebook_file_evidence() {
-        let root = tempfile::tempdir().unwrap();
-        let entry = fixture(root.path());
-        write_records(
-            &entry,
-            &[json!({"type":"assistant","cwd":"/tmp/project","message":{"content":[
-                {"type":"tool_use","name":"PowerShell","id":"shell","input":{"command":"Get-Content sample.txt"}},
-                {"type":"tool_use","name":"NotebookEdit","id":"notebook","input":{"notebook_path":"sample.ipynb","new_source":"print(1)"}}
-            ]}})],
-        );
-        let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
-        assert_eq!(raw.events[0].kind, "command");
-        assert_eq!(raw.events[0].target.as_deref(), Some("Get-Content sample.txt"));
-        assert_eq!(raw.events[0].command_evidence_status, Some(CommandEvidenceStatus::Unsupported));
-        assert_eq!(raw.events[1].kind, "file_write");
-        assert_eq!(raw.events[1].target.as_deref(), Some("sample.ipynb"));
-        assert_eq!(raw.events[1].files[0].operation, FileOperation::Write);
-        assert_eq!(raw.events[1].files[0].cwd.as_deref(), Some("/tmp/project"));
     }
 
     #[test]

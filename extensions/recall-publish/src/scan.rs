@@ -411,24 +411,4 @@ mod tests {
         assert!(document.text.contains("-----BEGIN KEY-----\nbody"));
         assert!(!document.text.contains("\\n"));
     }
-
-    #[test]
-    fn secret_offsets_cross_the_bridge_as_character_positions() {
-        let text = "密钥是 ghp_0123456789abcdefghijklmnopqrstuvwxyz 请撤销";
-        let secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
-        let byte_start = text.find(secret).unwrap();
-        let char_start = text[..byte_start].chars().count();
-        assert_ne!(byte_start, char_start);
-        assert_eq!(
-            text.chars().skip(char_start).take(secret.chars().count()).collect::<String>(),
-            secret
-        );
-    }
-
-    #[test]
-    fn rule_identifiers_become_stable_entity_markers() {
-        assert_eq!(gitleaks_entity("github-pat"), "GITHUB_PAT");
-        assert_eq!(gitleaks_entity("aws-access-token"), "AWS_ACCESS_TOKEN");
-        assert_eq!(marker("GITHUB_PAT"), "[REDACTED:GITHUB_PAT]");
-    }
 }

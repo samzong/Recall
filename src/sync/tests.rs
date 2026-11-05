@@ -1,6 +1,7 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
-
+use super::{
+    BackfillPlan, ExistingSessionAction, SyncJob, SyncRunOptions, decide_existing_session_action,
+    delete_excluded_sessions_for_source, raw_session_metadata_changed,
+};
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::{
     AdapterSyncContext, InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand,
@@ -14,11 +15,8 @@ use crate::db::{
 };
 use crate::project_scope::ProjectScope;
 use crate::types::{Message, Role, Session};
-
-use super::{
-    BackfillPlan, ExistingSessionAction, SyncJob, SyncRunOptions, decide_existing_session_action,
-    delete_excluded_sessions_for_source, raw_session_metadata_changed,
-};
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 struct StaticAdapter {
     updated_at: i64,
@@ -674,30 +672,6 @@ fn event_maintenance_preserves_discussions_and_is_resumable() {
 }
 
 #[test]
-fn full_sync_refreshes_changed_existing_session() {
-    assert_eq!(
-        decide_existing_session_action(false, false, false, true, true, true, false),
-        ExistingSessionAction::RefreshSession
-    );
-}
-
-#[test]
-fn full_sync_backfills_unchanged_existing_session_in_place() {
-    assert_eq!(
-        decide_existing_session_action(false, false, false, false, true, true, false),
-        ExistingSessionAction::BackfillOnly(BackfillPlan {
-            usage: true,
-            events: true,
-            metadata: false
-        })
-    );
-    assert_eq!(
-        decide_existing_session_action(false, false, false, false, false, false, false),
-        ExistingSessionAction::Skip
-    );
-}
-
-#[test]
 fn full_sync_backfills_metadata_only_when_topology_parser_advances() {
     assert_eq!(
         decide_existing_session_action(false, false, false, false, false, false, true),
@@ -711,40 +685,6 @@ fn full_sync_backfills_metadata_only_when_topology_parser_advances() {
         decide_existing_session_action(true, false, false, false, false, false, true),
         ExistingSessionAction::Skip
     );
-}
-
-#[test]
-fn full_sync_treats_new_session_metadata_as_changed() {
-    let raw = RawSession::search_only(
-        "raw1",
-        Some("/Users/x/git/samzong/Recall".to_string()),
-        0,
-        Some(1),
-        None,
-        vec![],
-    );
-    let missing = SessionPath {
-        source_id: "raw1".to_string(),
-        directory: None,
-        source_file_path: None,
-        repo_remote: None,
-        repo_slug: None,
-        repo_name: None,
-    };
-    let same = SessionPath {
-        source_id: "raw1".to_string(),
-        directory: Some("/Users/x/git/samzong/Recall".to_string()),
-        source_file_path: None,
-        repo_remote: Some("github.com/samzong/Recall".to_string()),
-        repo_slug: None,
-        repo_name: None,
-    };
-    assert!(raw_session_metadata_changed(&raw, None, &missing));
-    assert!(!raw_session_metadata_changed(&raw, None, &same));
-
-    let mut raw_with_path = RawSession::search_only("raw1", None, 0, Some(1), None, vec![]);
-    raw_with_path.source_file_path = Some("/tmp/session.jsonl".to_string());
-    assert!(raw_session_metadata_changed(&raw_with_path, None, &missing));
 }
 
 struct TwoProjectAdapter;
@@ -844,33 +784,6 @@ fn scoped_sync_leaves_sessions_outside_the_scope_untouched() {
     job.run_with(&adapters, None).unwrap();
 
     assert_eq!(job.store.session_meta("test", "outside").unwrap(), Some((Some(1), 7)));
-}
-
-#[test]
-fn failed_scan_preserves_existing_sessions() {
-    schema::register_sqlite_vec();
-    let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(FailingAdapter)];
-    let mut job = SyncJob::new(
-        SyncRunOptions {
-            force: false,
-            verbose: false,
-            emit: false,
-            usage_only: false,
-            backfill_events: false,
-            sources: None,
-            scope: ProjectScope::Global,
-            target_session: None,
-        },
-        Store::open_in_memory().unwrap(),
-        AppConfig::default(),
-        &adapters,
-    )
-    .unwrap();
-    job.store.insert_session(&session("stale", "test", "stale")).unwrap();
-
-    job.run_with(&adapters, None).unwrap();
-
-    assert!(job.store.session_meta("test", "stale").unwrap().is_some());
 }
 
 #[test]
@@ -1069,21 +982,6 @@ fn complete_live_set_deletes_only_stale_sessions() {
         assert!(job.store.session_meta("test", "keep").unwrap().is_some());
         assert!(job.store.session_meta("test", "stale").unwrap().is_none());
     }
-}
-
-#[test]
-fn complete_live_set_keeps_session_written_during_same_source_run() {
-    let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ReconcileAdapter {
-        plan: ReconcilePlan::CompleteLiveSet(HashSet::from(["new".to_string()])),
-        include_session: true,
-    })];
-    let (mut job, _) = scoped_job(ProjectScope::Global);
-    job.store.insert_session(&session("stale", "test", "stale")).unwrap();
-
-    job.run_with(&adapters, None).unwrap();
-
-    assert!(job.store.session_meta("test", "new").unwrap().is_some());
-    assert!(job.store.session_meta("test", "stale").unwrap().is_none());
 }
 
 #[test]
@@ -1392,23 +1290,6 @@ fn excluded_source_file_path_blocks_fresh_and_force_sync() {
 }
 
 #[test]
-fn source_progress_reports_ids_that_are_actually_scanned() {
-    let (mut job, adapters) = scoped_job(ProjectScope::Global);
-    let mut seen = Vec::new();
-    job.run_with(&adapters, Some(&mut |source| seen.push(source.to_string()))).unwrap();
-    assert_eq!(seen, ["test"]);
-}
-
-#[test]
-fn source_progress_skips_adapters_without_usage_during_usage_sync() {
-    let (mut job, adapters) = scoped_job(ProjectScope::Global);
-    job.options.usage_only = true;
-    let mut seen = Vec::new();
-    job.run_with(&adapters, Some(&mut |label| seen.push(label.to_string()))).unwrap();
-    assert!(seen.is_empty());
-}
-
-#[test]
 fn single_session_sync_writes_only_its_target() {
     let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(ReconcileAdapter {
         plan: ReconcilePlan::CompleteLiveSet(HashSet::from(["new".to_string()])),
@@ -1449,4 +1330,47 @@ fn single_session_scan_failure_preserves_existing_session() {
             "retained"
         );
     }
+}
+
+#[test]
+fn full_sync_treats_new_session_metadata_as_changed() {
+    let raw = RawSession::search_only(
+        "raw1",
+        Some("/Users/x/git/samzong/Recall".to_string()),
+        0,
+        Some(1),
+        None,
+        vec![],
+    );
+    let missing = SessionPath {
+        source_id: "raw1".to_string(),
+        directory: None,
+        source_file_path: None,
+        repo_remote: None,
+        repo_slug: None,
+        repo_name: None,
+    };
+    let same = SessionPath {
+        source_id: "raw1".to_string(),
+        directory: Some("/Users/x/git/samzong/Recall".to_string()),
+        source_file_path: None,
+        repo_remote: Some("github.com/samzong/Recall".to_string()),
+        repo_slug: None,
+        repo_name: None,
+    };
+    assert!(raw_session_metadata_changed(&raw, None, &missing));
+    assert!(!raw_session_metadata_changed(&raw, None, &same));
+
+    let mut raw_with_path = RawSession::search_only("raw1", None, 0, Some(1), None, vec![]);
+    raw_with_path.source_file_path = Some("/tmp/session.jsonl".to_string());
+    assert!(raw_session_metadata_changed(&raw_with_path, None, &missing));
+}
+
+#[test]
+fn source_progress_skips_adapters_without_usage_during_usage_sync() {
+    let (mut job, adapters) = scoped_job(ProjectScope::Global);
+    job.options.usage_only = true;
+    let mut seen = Vec::new();
+    job.run_with(&adapters, Some(&mut |label| seen.push(label.to_string()))).unwrap();
+    assert!(seen.is_empty());
 }

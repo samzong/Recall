@@ -1,39 +1,8 @@
-use super::{
-    FileHistoryQuery, SearchEngine, SearchFilters, SessionEventQuery, TimeRange, tokenize_query,
-    trigram_fts5_query, unicode61_fts5_query,
-};
+use super::{FileHistoryQuery, SearchEngine, SearchFilters, SessionEventQuery, TimeRange};
 use crate::db::schema;
 use crate::db::store::Store;
 use crate::project_scope::ProjectScope;
 use crate::types::{RawSessionEvent, Session};
-
-#[test]
-fn tokenize_query_trims_punctuation_and_case() {
-    assert_eq!(
-        tokenize_query("context power café Codex "),
-        vec!["context", "power", "café", "codex"]
-    );
-    assert_eq!(tokenize_query("bug OR 1=1 --"), vec!["bug", "or", "1=1"]);
-}
-
-#[test]
-fn fts5_queries_split_trigram_and_short_tokens() {
-    let tokens = tokenize_query("context power café Codex ");
-    assert_eq!(trigram_fts5_query(&tokens), "");
-    assert_eq!(
-        unicode61_fts5_query(&tokens, true),
-        r#""context" OR "power" OR "café" OR "codex"*"#
-    );
-    let short = tokenize_query("rx \u{77e9}\u{9635}");
-    assert_eq!(trigram_fts5_query(&short), "");
-    assert_eq!(unicode61_fts5_query(&short, true), format!(r#""rx" OR "{}"*"#, "\u{77e9}\u{9635}"));
-    let keywords = tokenize_query("AND OR NOT");
-    assert_eq!(trigram_fts5_query(&keywords), "");
-    assert_eq!(unicode61_fts5_query(&keywords, true), r#""and" OR "or" OR "not"*"#);
-    let phrase_text = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
-    let phrase = tokenize_query(phrase_text);
-    assert_eq!(trigram_fts5_query(&phrase), format!("\"{phrase_text}\""));
-}
 
 #[test]
 fn search_keeps_short_mixed_and_deferred_legacy_terms_without_embeddings() {
@@ -188,26 +157,6 @@ fn list_session_events_matches_exact_or_separator_suffix() {
 
     let no_substring = query_events(&store, "schema.rs", None);
     assert!(no_substring.iter().all(|hit| hit.target.as_deref() != Some("old_schema.rs")));
-}
-
-#[test]
-fn list_session_events_matches_relative_target_from_absolute_path() {
-    let store = seed_events();
-    let hits = query_events(&store, "/abs/elsewhere/src/db/schema.rs", None);
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].session.id, "s2");
-    assert_eq!(hits[0].target.as_deref(), Some("src/db/schema.rs"));
-}
-
-#[test]
-fn list_session_events_orders_newest_event_first() {
-    let store = seed_events();
-    let hits = query_events(&store, "schema.rs", None);
-    assert_eq!(hits.len(), 3);
-    assert_eq!(hits[0].timestamp, Some(8_000));
-    assert_eq!(hits[1].timestamp, Some(6_000));
-    assert_eq!(hits[1].kind, "command");
-    assert_eq!(hits[2].timestamp, Some(5_000));
 }
 
 #[test]

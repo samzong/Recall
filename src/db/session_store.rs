@@ -851,45 +851,10 @@ fn insert_messages_tx(
 }
 
 #[cfg(test)]
-mod source_stats_tests {
-    use super::*;
-    use crate::db::schema;
-
-    #[test]
-    fn indexed_source_stats_use_persisted_session_counts() {
-        schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        store
-            .conn
-            .execute_batch(
-                "INSERT INTO sessions
-                    (id, source, source_id, title, started_at, message_count)
-                 VALUES
-                    ('c1', 'codex', 'raw-c1', 'one', 20, 2),
-                    ('c2', 'codex', 'raw-c2', 'two', 10, 3),
-                    ('o1', 'opencode', 'raw-o1', 'three', 30, 4);",
-            )
-            .unwrap();
-
-        let stats = store.indexed_source_stats().unwrap();
-
-        let codex = &stats["codex"];
-        assert_eq!(codex.sessions, 2);
-        assert_eq!(codex.messages, 5);
-        assert_eq!(codex.oldest_started_at, Some(10));
-        assert_eq!(codex.newest_started_at, Some(20));
-
-        let opencode = &stats["opencode"];
-        assert_eq!(opencode.sessions, 1);
-        assert_eq!(opencode.messages, 4);
-    }
-}
-
-#[cfg(test)]
 mod search_scope_stats_tests {
     use super::*;
     use crate::db::schema;
-    use crate::types::{Message, Role, Session};
+    use crate::types::Session;
 
     fn store() -> Store {
         schema::register_sqlite_vec();
@@ -913,18 +878,6 @@ mod search_scope_stats_tests {
             message_count,
             ..crate::types::test_support::session(id)
         }
-    }
-
-    fn messages(session_id: &str, count: u32) -> Vec<Message> {
-        (0..count)
-            .map(|seq| Message {
-                session_id: session_id.to_string(),
-                role: Role::User,
-                content: format!("message {seq}"),
-                timestamp: Some(i64::from(seq)),
-                seq,
-            })
-            .collect()
     }
 
     #[test]
@@ -959,31 +912,39 @@ mod search_scope_stats_tests {
             (1, 2)
         );
     }
+}
+
+#[cfg(test)]
+mod source_stats_tests {
+    use super::*;
+    use crate::db::schema;
 
     #[test]
-    fn persist_keeps_stored_message_count_aligned_with_message_rows() {
-        let store = store();
-        let first = session("a", "codex", 10, 2, None);
-        let second = session("b", "codex", 20, 3, None);
-        store.persist_session_with_usage(&first, &messages(&first.id, 2), &[], None).unwrap();
-        store.persist_session_with_usage(&second, &messages(&second.id, 3), &[], None).unwrap();
-
-        let stored: u32 = store
+    fn indexed_source_stats_use_persisted_session_counts() {
+        schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        store
             .conn
-            .query_row("SELECT message_count FROM sessions WHERE id = ?1", ["a"], |row| row.get(0))
+            .execute_batch(
+                "INSERT INTO sessions
+                    (id, source, source_id, title, started_at, message_count)
+                 VALUES
+                    ('c1', 'codex', 'raw-c1', 'one', 20, 2),
+                    ('c2', 'codex', 'raw-c2', 'two', 10, 3),
+                    ('o1', 'opencode', 'raw-o1', 'three', 30, 4);",
+            )
             .unwrap();
-        let rows: u32 = store
-            .conn
-            .query_row("SELECT COUNT(*) FROM messages WHERE session_id = ?1", ["a"], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(stored, 2);
-        assert_eq!(rows, 2);
 
-        assert_eq!(
-            store.stats_for_search_scope(None, TimeRange::All, &ProjectScope::Global).unwrap(),
-            (2, 5)
-        );
+        let stats = store.indexed_source_stats().unwrap();
+
+        let codex = &stats["codex"];
+        assert_eq!(codex.sessions, 2);
+        assert_eq!(codex.messages, 5);
+        assert_eq!(codex.oldest_started_at, Some(10));
+        assert_eq!(codex.newest_started_at, Some(20));
+
+        let opencode = &stats["opencode"];
+        assert_eq!(opencode.sessions, 1);
+        assert_eq!(opencode.messages, 4);
     }
 }

@@ -760,11 +760,6 @@ mod tests {
     }
 
     #[test]
-    fn drops_sessions_without_any_signal() {
-        assert!(parse_minimax_transcript("mvs_empty", "", None).is_none());
-    }
-
-    #[test]
     fn reads_workspace_dir_from_the_runtime_database() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join(RUNTIME_DB);

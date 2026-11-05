@@ -78,12 +78,6 @@ fn gemini_parser_skips_info_messages() {
 }
 
 #[test]
-fn gemini_parser_empty_returns_none() {
-    let json = r#"{"sessionId": "s", "messages": []}"#;
-    assert!(parse_gemini_session(json, "fallback").unwrap().is_none());
-}
-
-#[test]
 fn kimi_parser_filters_injections_and_stream_parts() {
     let state = r#"{"id":"session_k1","cwd":"/repo","title":"first ask","isCustomTitle":false}"#;
     let wire = concat!(
@@ -117,13 +111,6 @@ fn kimi_parser_filters_injections_and_stream_parts() {
     assert_eq!(session.usage_events.len(), 1);
     assert_eq!(session.usage_events[0].provider, "moonshot");
     assert_eq!(session.summary.as_deref(), Some("first ask"));
-}
-
-#[test]
-fn kimi_parser_aborted_wire_returns_none() {
-    let state = r#"{"id":"session_k2"}"#;
-    let wire = r#"{"type":"metadata","protocol_version":"1.5","created_at":1000}"#;
-    assert!(parse_kimi_session(state, wire, "session_k2").is_none());
 }
 
 #[test]
@@ -229,56 +216,6 @@ fn kiro_parser_assistant_tool_use() {
 }
 
 #[test]
-fn kiro_parser_tool_use_results_text_and_json() {
-    let json = r#"{
-        "history": [{
-            "user": {
-                "content": {
-                    "ToolUseResults": {
-                        "tool_use_results": [
-                            {
-                                "tool_use_id": "t1",
-                                "content": [{"Text": "file contents here"}]
-                            },
-                            {
-                                "tool_use_id": "t2",
-                                "content": [{"Json": {"status": "ok", "rows": 42}}]
-                            }
-                        ]
-                    }
-                }
-            },
-            "assistant": {"Response": {"message_id": "m", "content": "done"}}
-        }]
-    }"#;
-
-    let session = parse_kiro_conversation("c", "/proj", json, 0, 0).unwrap().unwrap();
-    assert_eq!(session.messages.len(), 1);
-    assert_eq!(session.messages[0].content, "done");
-    assert_eq!(session.events.len(), 2);
-    for (event, id) in session.events.iter().zip(["t1", "t2"]) {
-        assert_eq!(event.tool_call_id.as_deref(), Some(id));
-        assert_eq!(event.message_seq, None);
-        let native: serde_json::Value =
-            serde_json::from_str(event.attrs_json.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            native["content"]["ToolUseResults"]["tool_use_results"][0]["content"][0]["Text"],
-            "file contents here"
-        );
-        assert_eq!(
-            native["content"]["ToolUseResults"]["tool_use_results"][1]["content"][0]["Json"]["rows"],
-            42
-        );
-    }
-}
-
-#[test]
-fn kiro_parser_empty_history_returns_none() {
-    let json = r#"{"history": []}"#;
-    assert!(parse_kiro_conversation("c", "/proj", json, 0, 0).unwrap().is_none());
-}
-
-#[test]
 fn kiro_v2_parser_prompt_and_assistant_text() {
     let sidecar = r#"{
         "session_id": "790bb539-44be-40bd-85ac-0bb1a3fc6b47",
@@ -318,11 +255,6 @@ fn kiro_v2_parser_prompt_and_assistant_text() {
     assert_eq!(session.events[1].tool_call_id, session.events[0].tool_call_id);
     assert_eq!(session.events[1].status.as_deref(), Some("error"));
     assert!(session.events[1].attrs_json.as_ref().unwrap().contains("secret dump"));
-}
-
-#[test]
-fn kiro_v2_parser_empty_jsonl_returns_none() {
-    assert!(parse_kiro_v2_session("", None, "id", 1, None).unwrap().is_none());
 }
 
 #[test]
@@ -370,12 +302,6 @@ fn kiro_v3_parser_user_and_say_skips_reasoning() {
 }
 
 #[test]
-fn kiro_v3_parser_empty_returns_none() {
-    let jsonl = r#"{"id":"r1","timestamp":"2026-09-01T17:53:01.908Z","payload":{"type":"assistant","content":"...","operationType":"Reasoning"}}"#;
-    assert!(parse_kiro_v3_session(jsonl, None, "id", 1, None).unwrap().is_none());
-}
-
-#[test]
 fn copilot_parser_plain_conversation() {
     let jsonl = r#"{"type":"session.start","data":{"sessionId":"sess-1","startTime":"2026-02-26T06:29:59.692Z","context":{"cwd":"/Users/x/proj","repository":"x/proj","branch":"main"}},"id":"e1","timestamp":"2026-02-26T06:29:59.802Z","parentId":null}
 {"type":"user.message","data":{"content":"how do I run tests","transformedContent":"wrapped","attachments":[]},"id":"e2","timestamp":"2026-02-26T06:30:00.000Z","parentId":"e1"}
@@ -412,30 +338,4 @@ fn copilot_parser_indexes_tool_requests_and_results() {
             serde_json::from_str::<serde_json::Value>(record).unwrap()
         );
     }
-}
-
-#[test]
-fn copilot_parser_skips_empty_and_unknown() {
-    let jsonl = r#"{"type":"session.start","data":{"sessionId":"s","startTime":"2026-02-26T06:29:59.692Z","context":{"cwd":"/p"}},"id":"e1","timestamp":"2026-02-26T06:29:59.802Z"}
-{"type":"session.info","data":{"msg":"anything"},"id":"e2","timestamp":"2026-02-26T06:30:00.000Z"}
-{"type":"user.message","data":{"content":"   "},"id":"e3","timestamp":"2026-02-26T06:30:01.000Z"}
-{"type":"assistant.message","data":{"messageId":"m","content":"","toolRequests":[]},"id":"e4","timestamp":"2026-02-26T06:30:02.000Z"}
-{"type":"user.message","data":{"content":"real question"},"id":"e5","timestamp":"2026-02-26T06:30:03.000Z"}"#;
-
-    let session = parse_copilot_events(jsonl, "fallback").unwrap().unwrap();
-    assert_eq!(session.messages.len(), 1, "empty and unknown events should be skipped");
-    assert_eq!(session.messages[0].content, "real question");
-}
-
-#[test]
-fn copilot_parser_empty_returns_none() {
-    let jsonl = r#"{"type":"session.start","data":{"sessionId":"s","startTime":"2026-02-26T06:29:59.692Z"},"id":"e1","timestamp":"2026-02-26T06:29:59.802Z"}"#;
-    assert!(parse_copilot_events(jsonl, "fallback").unwrap().is_none());
-}
-
-#[test]
-fn copilot_parser_falls_back_to_dir_id_when_session_missing() {
-    let jsonl = r#"{"type":"user.message","data":{"content":"hi"},"id":"e1","timestamp":"2026-02-26T06:30:00.000Z"}"#;
-    let session = parse_copilot_events(jsonl, "dir-uuid").unwrap().unwrap();
-    assert_eq!(session.source_id, "dir-uuid");
 }

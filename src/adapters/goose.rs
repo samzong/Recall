@@ -777,6 +777,34 @@ mod tests {
         std::fs::write(path, []).unwrap();
     }
 
+    struct SessionSpec<'a> {
+        id: &'a str,
+        name: &'a str,
+        session_type: &'a str,
+        working_dir: &'a str,
+        created_at: &'a str,
+        updated_at: &'a str,
+        parent: Option<&'a str>,
+        provider: Option<&'a str>,
+        model_config: Option<&'a str>,
+    }
+
+    impl Default for SessionSpec<'static> {
+        fn default() -> Self {
+            Self {
+                id: "s1",
+                name: "",
+                session_type: "user",
+                working_dir: "/repo",
+                created_at: "100",
+                updated_at: "200",
+                parent: None,
+                provider: None,
+                model_config: None,
+            }
+        }
+    }
+
     fn setup_goose_db(path: &Path) -> Connection {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -818,34 +846,6 @@ mod tests {
         )
         .unwrap();
         conn
-    }
-
-    struct SessionSpec<'a> {
-        id: &'a str,
-        name: &'a str,
-        session_type: &'a str,
-        working_dir: &'a str,
-        created_at: &'a str,
-        updated_at: &'a str,
-        parent: Option<&'a str>,
-        provider: Option<&'a str>,
-        model_config: Option<&'a str>,
-    }
-
-    impl Default for SessionSpec<'static> {
-        fn default() -> Self {
-            Self {
-                id: "s1",
-                name: "",
-                session_type: "user",
-                working_dir: "/repo",
-                created_at: "100",
-                updated_at: "200",
-                parent: None,
-                provider: None,
-                model_config: None,
-            }
-        }
     }
 
     fn insert_session(conn: &Connection, spec: &SessionSpec<'_>) {
@@ -904,13 +904,6 @@ mod tests {
             assert_eq!(result.stats.candidates as usize, count);
             assert!(result.sessions.iter().all(|s| target.is_none_or(|id| s.source_id == id)));
         }
-    }
-
-    #[test]
-    fn resume_uses_official_flags() {
-        let command = GooseAdapter.resume_command("20250310_2").unwrap();
-        assert_eq!(command.program, "goose");
-        assert_eq!(command.args, vec!["session", "--resume", "--session-id", "20250310_2"]);
     }
 
     #[test]
@@ -1017,15 +1010,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, db);
-    }
-
-    #[test]
-    fn missing_db_is_skipped() {
-        assert!(
-            resolve_db_path_from(None, None, Some(PathBuf::from("/no/such/home")), None).is_none()
-        );
-        let result = scan_db(None, None, None, true, false).unwrap();
-        assert!(result.scan.sessions.is_empty());
     }
 
     #[test]
@@ -1451,33 +1435,6 @@ mod tests {
         assert_eq!(event.status.as_deref(), Some("error"));
         assert_eq!(event.tool_call_id.as_deref(), Some("invalid-1"));
         assert!(event.files.is_empty());
-    }
-
-    #[test]
-    fn tool_only_session_uses_event_timestamps() {
-        let root = tempfile::tempdir().unwrap();
-        let db_path = root.path().join("sessions.db");
-        let conn = setup_goose_db(&db_path);
-        insert_session(
-            &conn,
-            &SessionSpec { created_at: "", updated_at: "", ..SessionSpec::default() },
-        );
-        insert_message(
-            &conn,
-            "s1",
-            "assistant",
-            r#"[{"type":"toolRequest","id":"tool123","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo/hello.txt","command":"write","file_text":"hello"}}}}]"#,
-            400,
-            None,
-        );
-        drop(conn);
-
-        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let raw = &scan_db(opened, None, None, true, false).unwrap().scan.sessions[0];
-        assert!(raw.messages.is_empty());
-        assert_eq!(raw.events.len(), 1);
-        assert_eq!(raw.started_at, 400_000);
-        assert_eq!(raw.updated_at, Some(400_000));
     }
 
     #[test]

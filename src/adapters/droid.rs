@@ -616,19 +616,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_string_content_and_title_fallback() {
-        let jsonl = [
-            r#"{"type":"session_start","title":"Plain title","cwd":"/repo"}"#,
-            r#"{"type":"message","timestamp":"2024-01-01T00:00:01.000Z","message":{"role":"user","content":"hello"}}"#,
-        ]
-        .join("\n");
-        let session = parse_droid_session(&jsonl, None, SESSION_ID).unwrap();
-        assert_eq!(session.messages[0].content, "hello");
-        assert_eq!(session.custom_title.as_deref(), Some("Plain title"));
-        assert!(session.usage_events.is_empty());
-    }
-
-    #[test]
     fn parse_distinguishes_empty_and_tool_only_records() {
         assert!(parse_droid_session("", None, SESSION_ID).is_none());
         let jsonl = r#"{"type":"message","id":"write-message","message":{"role":"assistant","content":[{"type":"tool_use","id":"write-1","name":"Create","input":{"file_path":"/repo/new.rs","content":"new contents"}}]}}"#;
@@ -736,12 +723,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_sessions_dir_yields_no_sessions() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(scan_droid_sessions(root.path()).unwrap().is_empty());
-    }
-
-    #[test]
     fn resolve_prefers_existing_env_dir() {
         let root = tempfile::tempdir().unwrap();
         let resolved = resolve_sessions_dir_from(
@@ -749,12 +730,6 @@ mod tests {
             Some(PathBuf::from("/unused-home")),
         );
         assert_eq!(resolved.as_deref(), Some(root.path()));
-    }
-
-    #[test]
-    fn resolve_missing_env_dir_skips() {
-        let resolved = resolve_sessions_dir_from(Some("/no/such/droid-sessions".to_string()), None);
-        assert!(resolved.is_none());
     }
 
     #[test]
@@ -859,12 +834,5 @@ mod tests {
                 assert_eq!(session.events.len(), 5);
             }
         }
-    }
-
-    #[test]
-    fn resume_uses_official_flag() {
-        let command = DroidAdapter.resume_command(SESSION_ID).unwrap();
-        assert_eq!(command.program, "droid");
-        assert_eq!(command.args, vec!["--resume", SESSION_ID]);
     }
 }

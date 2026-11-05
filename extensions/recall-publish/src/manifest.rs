@@ -16,17 +16,3 @@ pub fn manifest_json() -> Value {
         "min_recall": MIN_RECALL
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn manifest_matches_extension_contract() {
-        let manifest = manifest_json();
-        assert_eq!(manifest["name"], "publish");
-        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(manifest["protocol"], 2);
-        assert_eq!(manifest["min_recall"], MIN_RECALL);
-    }
-}

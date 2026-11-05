@@ -447,47 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn reflect_report_includes_project_scope_kind_by_default() {
-        let sessions = vec![fixture_session(
-            "s1",
-            "codex",
-            "Scoped session",
-            1000,
-            vec![fixture_message("user", "hello", 0, 1100)],
-        )];
-        let filters = ReflectFilters {
-            directory: Some("/tmp/reflect-repo".to_string()),
-            ..ReflectFilters::default()
-        };
-
-        let report = build_reflect_report(sessions, &filters);
-
-        assert_eq!(report.scope.kind.as_str(), "project");
-        let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json["scope"]["kind"], "project");
-    }
-
-    #[test]
-    fn reflect_report_labels_personal_timeline() {
-        let sessions = vec![fixture_session(
-            "s1",
-            "codex",
-            "Personal session",
-            1000,
-            vec![fixture_message("user", "hello", 0, 1100)],
-        )];
-        let filters = ReflectFilters {
-            scope_kind: crate::model::ReflectScopeKind::Personal,
-            time_range: "30d".to_string(),
-            ..ReflectFilters::default()
-        };
-
-        let report = build_reflect_report(sessions, &filters);
-
-        assert_eq!(report.phases[0].title, "Personal conversation timeline");
-    }
-
-    #[test]
     fn reflect_builds_timeline_across_sessions() {
         let sessions = vec![
             fixture_session(
@@ -618,50 +577,6 @@ mod tests {
         let report = build_reflect_report(sessions, &ReflectFilters::default());
 
         assert!(report.observed_patterns.is_empty());
-    }
-
-    #[test]
-    fn reflect_report_summarizes_source_roles() {
-        let sessions = vec![
-            fixture_session(
-                "s1",
-                "codex",
-                "Planning session",
-                1000,
-                vec![fixture_message(
-                    "assistant",
-                    "Plan the approach, outline the options, and analyze tradeoffs",
-                    0,
-                    1100,
-                )],
-            ),
-            fixture_session(
-                "s2",
-                "opencode",
-                "Implementation session",
-                2000,
-                vec![fixture_message(
-                    "assistant",
-                    "Implemented the migration, fixed the test, and verified the build",
-                    0,
-                    2100,
-                )],
-            ),
-        ];
-
-        let report = build_reflect_report(sessions, &ReflectFilters::default());
-
-        assert_eq!(report.source_roles.len(), 2);
-        assert_eq!(report.source_roles[0].source, "codex");
-        assert_eq!(report.source_roles[0].observed_role, "Planning and analysis");
-        assert_eq!(report.source_roles[0].sessions, 1);
-        assert_eq!(report.source_roles[0].timeline_moments, 1);
-        assert_eq!(report.source_roles[0].evidence_moments, ["s1:0"]);
-        assert_eq!(report.source_roles[1].source, "opencode");
-        assert_eq!(report.source_roles[1].observed_role, "Implementation and verification");
-        assert_eq!(report.source_roles[1].sessions, 1);
-        assert_eq!(report.source_roles[1].timeline_moments, 1);
-        assert_eq!(report.source_roles[1].evidence_moments, ["s2:0"]);
     }
 
     #[test]

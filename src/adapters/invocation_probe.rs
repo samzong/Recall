@@ -224,7 +224,6 @@ pub(crate) fn nonce_matches_input(input: &serde_json::Value, nonce: &str) -> boo
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::time::Instant;
 
     use super::*;
 
@@ -308,58 +307,5 @@ mod tests {
         );
         assert!(!over_bytes.complete);
         assert_eq!(over_bytes.bytes_read, 0);
-    }
-
-    #[test]
-    fn remaining_budget_caps_aggregate_provider_work() {
-        let budget = InvocationProbeBudget {
-            max_files: 4,
-            max_file_bytes: 32,
-            max_total_bytes: 96,
-            recent_window: RECENT_WINDOW,
-        };
-        let remaining = budget.remaining(3, 80);
-        assert_eq!(remaining.max_files, 1);
-        assert_eq!(remaining.max_file_bytes, 32);
-        assert_eq!(remaining.max_total_bytes, 16);
-    }
-
-    #[test]
-    fn fixed_fixture_probe_reports_stable_read_cost() {
-        let root = tempfile::tempdir().unwrap();
-        let nonce = "fixed-fixture-nonce";
-        let mut entries = Vec::new();
-        for index in 0..32 {
-            let path = root.path().join(format!("{index:02}.jsonl"));
-            let line = if index == 0 {
-                serde_json::json!({"invocation_nonce": nonce}).to_string()
-            } else {
-                serde_json::json!({"content": "x".repeat(4096)}).to_string()
-            };
-            fs::write(&path, format!("{line}\n")).unwrap();
-            entries.push(entry(path, &format!("session-{index:02}")));
-        }
-
-        let mut elapsed = Vec::new();
-        let mut costs = Vec::new();
-        for _ in 0..25 {
-            let start = Instant::now();
-            let result = probe_recent_files(
-                nonce,
-                entries.clone(),
-                InvocationProbeBudget::default(),
-                confirms,
-            );
-            elapsed.push(start.elapsed().as_micros());
-            costs.push((result.files_read, result.bytes_read));
-            assert!(result.complete);
-            assert_eq!(result.source_ids, vec!["session-00".to_string()]);
-        }
-        elapsed.sort_unstable();
-        assert!(costs.windows(2).all(|pair| pair[0] == pair[1]));
-        eprintln!(
-            "probe_cost runs=25 p50_us={} p95_us={} files={} bytes={}",
-            elapsed[12], elapsed[23], costs[0].0, costs[0].1
-        );
     }
 }

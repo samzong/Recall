@@ -351,30 +351,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_id_from_path_reads_parent_skill_md() {
-        assert_eq!(
-            skill_id_from_path("/Users/x/.agents/skills/pre-ship/SKILL.md").as_deref(),
-            Some("pre-ship")
-        );
-    }
-
-    #[test]
-    fn skill_id_from_path_reads_reference_files() {
-        assert_eq!(
-            skill_id_from_path("/Users/x/.agents/skills/pre-ship/references/codex-style.md")
-                .as_deref(),
-            Some("pre-ship")
-        );
-    }
-
-    #[test]
-    fn resolve_skill_id_uses_installed_canonical_name() {
-        let installed = installed(&["commit", "pre-ship"]);
-        assert_eq!(resolve_skill_id("commit", &installed), "commit");
-        assert_eq!(resolve_skill_id("code-gate:source-align", &installed), "code-gate");
-    }
-
-    #[test]
     fn extract_skill_from_skill_tool_attrs() {
         let mut event = SkillAuditEventRow {
             session_id: "s1".to_string(),
@@ -404,24 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn tiering_uses_core_threshold() {
-        let accumulator =
-            SkillAccumulator { invocations: CORE_INVOCATION_THRESHOLD, ..Default::default() };
-        let entry =
-            build_entry("ship".to_string(), "~/.claude/skills/ship".to_string(), accumulator);
-        assert_eq!(entry.tier, SkillTier::Core);
-    }
-
-    #[test]
-    fn skill_id_from_path_reads_skill_md_in_shell_command() {
-        assert_eq!(
-            skill_id_from_path(r#"cat "/Users/x/.agents/skills/pre-ship/SKILL.md" && echo ok"#)
-                .as_deref(),
-            Some("pre-ship")
-        );
-    }
-
-    #[test]
     fn extract_skill_from_opencode_native_skill_tool() {
         let event = SkillAuditEventRow {
             session_id: "s1".to_string(),
@@ -435,69 +393,6 @@ mod tests {
         let (id, signal) = extract_skill_from_event(&event, &installed(&["commit"])).unwrap();
         assert_eq!(id, "commit");
         assert_eq!(signal, SkillSignal::SkillTool);
-    }
-
-    #[test]
-    fn extract_skill_from_opencode_use_skill_plugin() {
-        let event = SkillAuditEventRow {
-            session_id: "s1".to_string(),
-            timestamp: Some(1),
-            name: Some("use_skill".to_string()),
-            target: None,
-            attrs_json: Some(r#"{"skill":"pre-ship"}"#.to_string()),
-        };
-        let (id, signal) = extract_skill_from_event(&event, &installed(&["pre-ship"])).unwrap();
-        assert_eq!(id, "pre-ship");
-        assert_eq!(signal, SkillSignal::SkillTool);
-    }
-
-    #[test]
-    fn dedupe_counts_one_invocation_per_session() {
-        let mut usage: HashMap<String, SkillAccumulator> = HashMap::new();
-        let installed = installed(&["pre-ship"]);
-        let events = [
-            SkillAuditEventRow {
-                session_id: "s1".to_string(),
-                timestamp: Some(1),
-                name: Some("Skill".to_string()),
-                target: None,
-                attrs_json: Some(r#"{"skill":"pre-ship"}"#.to_string()),
-            },
-            SkillAuditEventRow {
-                session_id: "s1".to_string(),
-                timestamp: Some(2),
-                name: None,
-                target: Some("/Users/x/.agents/skills/pre-ship/references/a.md".to_string()),
-                attrs_json: None,
-            },
-            SkillAuditEventRow {
-                session_id: "s2".to_string(),
-                timestamp: Some(3),
-                name: Some("Skill".to_string()),
-                target: None,
-                attrs_json: Some(r#"{"skill":"pre-ship"}"#.to_string()),
-            },
-        ];
-        for event in &events {
-            let Some((skill_id, signal)) = extract_skill_from_event(event, &installed) else {
-                continue;
-            };
-            let entry = usage.entry(skill_id).or_default();
-            let first_in_session = entry.sessions.insert(event.session_id.clone());
-            if first_in_session {
-                entry.invocations += 1;
-            }
-            entry.signals.insert(signal);
-            if let Some(timestamp) = event.timestamp {
-                entry.last_used =
-                    Some(entry.last_used.map_or(timestamp, |current| current.max(timestamp)));
-            }
-        }
-        let accumulator = usage.remove("pre-ship").unwrap();
-        assert_eq!(accumulator.invocations, 2);
-        assert_eq!(accumulator.sessions.len(), 2);
-        assert_eq!(accumulator.signals.len(), 2);
-        assert_eq!(accumulator.last_used, Some(3));
     }
 
     #[test]

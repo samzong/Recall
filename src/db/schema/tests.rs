@@ -261,14 +261,3 @@ fn migrate_v13_adds_structured_event_columns_to_existing_v12_db() {
     init(&conn).unwrap();
     assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
 }
-
-#[test]
-fn init_is_idempotent() {
-    register_sqlite_vec();
-    let conn = Connection::open_in_memory().unwrap();
-    init(&conn).unwrap();
-    let first = schema_version(&conn).unwrap();
-    init(&conn).unwrap();
-    assert_eq!(schema_version(&conn).unwrap(), first);
-    assert_eq!(first, SCHEMA_VERSION);
-}

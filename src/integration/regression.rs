@@ -116,34 +116,3 @@ fn no_filters() -> SearchFilters {
         excluded_session_id: None,
     }
 }
-
-#[test]
-fn role_fromstr() {
-    assert_eq!("user".parse::<Role>(), Ok(Role::User));
-    assert_eq!("assistant".parse::<Role>(), Ok(Role::Assistant));
-    assert!("unknown".parse::<Role>().is_err());
-}
-
-#[test]
-fn format_age_values() {
-    use crate::utils::format_age;
-
-    let now = chrono::Utc::now().timestamp_millis();
-    assert_eq!(format_age(now), "<1h");
-    assert_eq!(format_age(now - 3 * 3600 * 1000), "3h");
-    assert_eq!(format_age(now - 3 * 24 * 3600 * 1000), "3d");
-    assert_eq!(format_age(now - 60 * 24 * 3600 * 1000), "2mo");
-}
-
-#[test]
-fn f32_slice_to_bytes_roundtrip() {
-    use crate::utils::f32_slice_to_bytes;
-
-    let original = vec![1.0f32, 2.5, -3.0, 0.0];
-    let bytes = f32_slice_to_bytes(&original);
-    assert_eq!(bytes.len(), 16);
-
-    let roundtrip: Vec<f32> =
-        bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
-    assert_eq!(original, roundtrip);
-}

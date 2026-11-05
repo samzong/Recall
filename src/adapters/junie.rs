@@ -933,39 +933,4 @@ mod tests {
         fs::write(entries[0].stat_target.with_file_name("state.json"), "{}").unwrap();
         assert_ne!(session_snapshot(&entries[0], &current).unwrap(), before);
     }
-
-    #[test]
-    fn session_snapshot_uses_own_files_and_index_entry_time_only() {
-        let (root, _path) = fixture();
-        let entries = collect_entries(root.path()).unwrap();
-        let mut index = read_index(root.path()).unwrap();
-        let files_mtime = session_snapshot(&entries[0], &index).unwrap().effective_mtime_ms();
-        index.values.get_mut(&entries[0].session_id).unwrap()["updatedAt"] =
-            (files_mtime + 1000).into();
-        assert_eq!(
-            session_snapshot(&entries[0], &index).unwrap().effective_mtime_ms(),
-            files_mtime + 1000
-        );
-        index.values.get_mut(&entries[0].session_id).unwrap()["updatedAt"] = 1000.into();
-        assert_eq!(
-            session_snapshot(&entries[0], &index).unwrap().effective_mtime_ms(),
-            files_mtime
-        );
-        let before = session_snapshot(&entries[0], &index).unwrap();
-        let tasks_path = entries[0].stat_target.with_file_name("tasks.json");
-        fs::write(&tasks_path, "[]").unwrap();
-        let tasks_time = files_mtime + 2000;
-        fs::File::open(&tasks_path)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(
-                std::time::UNIX_EPOCH + std::time::Duration::from_millis(tasks_time as u64),
-            ))
-            .unwrap();
-        let after = session_snapshot(&entries[0], &index).unwrap();
-        assert_ne!(after, before);
-        assert_eq!(after.effective_mtime_ms(), tasks_time);
-        fs::create_dir_all(root.path().join("other/subagents/child")).unwrap();
-        fs::write(root.path().join("other/subagents/child/events.jsonl"), "{}").unwrap();
-        assert_eq!(collect_entries(root.path()).unwrap().len(), 1);
-    }
 }

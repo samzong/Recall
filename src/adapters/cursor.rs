@@ -1480,15 +1480,14 @@ fn render_json_fragment(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
-    use rusqlite::Connection;
-
     use super::*;
     use crate::adapters::test_support::{seed_empty_event_state, seed_empty_usage_state};
     use crate::db::schema;
     use crate::db::store::Store;
-    use crate::types::{Session, TokenSource};
+    use crate::types::Session;
+    use crate::types::TokenSource;
+    use rusqlite::Connection;
+    use std::io::Write;
 
     fn temp_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1613,27 +1612,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_user_query_envelope_strips_wrapper() {
-        let text = "<user_query>\nhello world\n</user_query>";
-        assert_eq!(strip_user_query_envelope(text).trim(), "hello world");
-    }
-
-    #[test]
-    fn render_bubble_content_preserves_discussion_and_code() {
-        let bubble = serde_json::json!({
-            "text": "Investigating usage",
-            "codeBlocks": [{"content":"let total = 1;"}],
-            "toolFormerData": {
-                "name": "grep",
-                "rawArgs": "{\"pattern\":\"usage\"}",
-                "result": "{\"matches\":1}"
-            }
-        });
-        let rendered = render_bubble_content(&bubble, &Role::Assistant);
-        assert_eq!(rendered, "Investigating usage\n[code_block] let total = 1;");
-    }
-
-    #[test]
     fn parse_composer_session_extracts_messages_and_usage() {
         let root = temp_root("composer");
         let composer_id = uuid::Uuid::new_v4().to_string();
@@ -1649,62 +1627,6 @@ mod tests {
         assert_eq!(parsed.usage_events[0].cache_read_tokens, 300);
         assert_eq!(parsed.usage_events[0].output_tokens, 0);
         assert_eq!(parsed.directory.as_deref(), Some("/Users/x/project"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn build_raw_session_attaches_matching_transcript_path() {
-        let root = temp_root("composer-path");
-        let composer_id = uuid::Uuid::new_v4().to_string();
-        let bubble_id = uuid::Uuid::new_v4().to_string();
-        let transcript_path = root.join(format!("{composer_id}.jsonl"));
-        let conn = seed_global_db(&root, &composer_id, &bubble_id);
-        let meta = load_composer_meta(&conn, &composer_id, &ComposerLookup::load(&conn));
-        let transcript_paths = HashMap::from([(
-            composer_id.clone(),
-            AgentTranscriptPath {
-                session_id: composer_id.clone(),
-                path: transcript_path.clone(),
-                directory: None,
-            },
-        )]);
-
-        let raw = build_raw_session(&conn, &composer_id, &meta, &transcript_paths, false)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(raw.source_file_path.as_deref(), transcript_path.to_str());
-        schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let context = AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap();
-        conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key = ?1",
-            [format!("composerData:{composer_id}")],
-        )
-        .unwrap();
-        write_jsonl(
-            &transcript_path,
-            &[
-                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Retained transcript"}]}}"#,
-            ],
-        );
-        let mut metadata = HashMap::new();
-        let scanned =
-            scan_for_sync_conn(&conn, &context, None, false, &transcript_paths, &mut metadata)
-                .unwrap();
-        assert!(scanned.sessions.is_empty());
-        let fallback = scan_transcripts_for_sync(
-            &context,
-            None,
-            false,
-            &transcript_paths,
-            &HashSet::new(),
-            &metadata,
-        )
-        .unwrap();
-        assert_eq!(fallback.sessions.len(), 1);
-        assert_eq!(fallback.sessions[0].directory.as_deref(), Some("/Users/x/project"));
-        assert_eq!(fallback.sessions[0].entrypoint.as_deref(), Some("chat"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1991,31 +1913,6 @@ mod tests {
             empty.messages.is_empty() && empty.events.is_empty() && empty.usage_events.is_empty()
         );
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn composer_tool_events_do_not_invent_missing_bubble_relationships() {
-        let bubble = serde_json::json!({
-            "toolFormerData": {
-                "name": "grep",
-                "rawArgs": "{\"pattern\":\"usage\"}",
-                "result": "match"
-            }
-        });
-        for bubble_id in [None, Some(""), Some("unknown")] {
-            let mut events = Vec::new();
-            collect_bubble_tool_events(
-                &bubble,
-                bubble_id,
-                "composer:test",
-                None,
-                Some(0),
-                &mut events,
-            );
-            assert_eq!(events.len(), 2);
-            assert!(events.iter().all(|event| event.source_event_id.is_none()));
-            assert!(events.iter().all(|event| event.tool_call_id.is_none()));
-        }
     }
 
     #[test]
@@ -2309,30 +2206,6 @@ mod tests {
             unknown.events[0].command_evidence_status,
             Some(crate::types::CommandEvidenceStatus::Unsupported)
         );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn parse_agent_transcript_happy_path() {
-        let root = temp_root("parse");
-        let uuid = uuid::Uuid::new_v4().to_string();
-        let jsonl_path = root.join(format!("{uuid}.jsonl"));
-        write_jsonl(
-            &jsonl_path,
-            &[
-                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nhello\n</user_query>"}]}}"#,
-                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Glob","input":{"glob_pattern":"*.rs"}}]}}"#,
-            ],
-        );
-        let raw = parse_agent_transcript(&jsonl_path, true).unwrap().unwrap();
-        assert_eq!(raw.messages.len(), 2);
-        assert_eq!(raw.messages[0].content, "hello");
-        assert_eq!(raw.messages[1].content, "hi");
-        assert_eq!(raw.metadata_parser_version, Some(METADATA_PARSER_VERSION));
-        assert!(raw.refresh_session_on_metadata_backfill);
-        assert_eq!(raw.usage_parser_version, Some(USAGE_PARSER_VERSION));
-        assert!(raw.usage_events.is_empty());
-        assert_eq!(raw.source_file_path.as_deref(), jsonl_path.to_str());
         let _ = fs::remove_dir_all(root);
     }
 

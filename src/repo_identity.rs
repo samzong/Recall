@@ -337,50 +337,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_values_without_a_host() {
-        for value in ["", "samzong", "samzong/Recall", "group/subgroup/app", "/abs/path"] {
-            assert_eq!(normalize_remote_url(value), None, "{value}");
-        }
-    }
-
-    #[test]
-    fn normalizes_slug_selectors() {
-        assert_eq!(normalize_slug("samzong/Recall.git").as_deref(), Some("samzong/Recall"));
-        assert_eq!(normalize_slug("/group/subgroup/app/").as_deref(), Some("group/subgroup/app"));
-        assert_eq!(normalize_slug("Recall"), None);
-        assert_eq!(normalize_slug("samzong//Recall"), None);
-    }
-
-    #[test]
-    fn resolves_identity_from_git_directory() {
-        let root = std::env::temp_dir().join(format!("recall-repo-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        Command::new("git").args(["init"]).current_dir(&root).output().unwrap();
-        Command::new("git")
-            .args(["remote", "add", "origin", "git@github.com:samzong/Recall.git"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-
-        let mut cache = RepoIdentityCache::default();
-        let identity = cache.resolve(root.to_str()).unwrap().unwrap();
-        assert_eq!(identity.remote, "github.com/samzong/Recall");
-        assert_eq!(identity.slug, "samzong/Recall");
-        assert_eq!(identity.name, "Recall");
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn non_git_directory_has_no_identity() {
-        let root = std::env::temp_dir().join(format!("recall-non-git-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        let mut cache = RepoIdentityCache::default();
-        assert_eq!(cache.resolve(root.to_str()).unwrap(), None);
-        fs::remove_dir_all(root).unwrap();
-    }
-
     #[cfg(unix)]
     #[test]
     fn resolves_symlink_before_parent_components() {

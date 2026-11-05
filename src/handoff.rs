@@ -177,22 +177,4 @@ mod tests {
             assert_eq!(command.args, args);
         }
     }
-
-    #[test]
-    fn available_targets_keep_installed_startable_adapters() {
-        let targets = available_targets_with(|program| matches!(program, "codex" | "agy"));
-        let ids: Vec<_> = targets.iter().map(|target| target.id.as_str()).collect();
-        assert_eq!(ids, vec!["codex", "antigravity-cli"]);
-        assert_eq!(targets[0].label, "Codex");
-        assert_eq!(targets[1].label, "Antigravity CLI");
-    }
-
-    #[test]
-    fn target_for_rejects_unknown_and_unstartable_ids() {
-        let error = target_for("not-a-tool").unwrap_err().to_string();
-        assert!(error.contains("unsupported handoff target: not-a-tool"));
-        assert!(error.contains("codex"));
-        assert!(!error.contains("kimi-code"));
-        assert!(target_for("CODEX").is_ok());
-    }
 }

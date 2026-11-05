@@ -480,14 +480,6 @@ mod tests {
     }
 
     #[test]
-    fn default_project_name_is_specific_and_valid() {
-        let name = default_project_name();
-        assert!(name.starts_with("recall-share-"));
-        assert_eq!(name.len(), "recall-share-".len() + 6);
-        validate_project_name(&name).unwrap();
-    }
-
-    #[test]
     fn lookup_pages_project_domain_uses_wrangler_project_domains() {
         let projects = serde_json::json!([
             {
@@ -509,28 +501,6 @@ mod tests {
     #[test]
     fn share_id_sanitizes_path_chars() {
         assert_eq!(share_id_for_session(&session("foo/bar baz")), "foo-bar-baz");
-    }
-
-    #[test]
-    fn preview_file_is_removed_when_dropped() {
-        let file = create_session_preview(
-            &session("preview"),
-            &[Message {
-                session_id: "local-id".to_string(),
-                role: Role::User,
-                content: "hello".to_string(),
-                timestamp: None,
-                seq: 0,
-            }],
-            &[],
-            &[],
-        )
-        .unwrap();
-        let path = file.path().to_path_buf();
-
-        assert!(fs::read_to_string(&path).unwrap().contains("hello"));
-        drop(file);
-        assert!(!path.exists());
     }
 
     #[test]

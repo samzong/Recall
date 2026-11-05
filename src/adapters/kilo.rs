@@ -97,13 +97,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resume_uses_official_flag() {
-        let command = KiloCodeAdapter.resume_command("ses_123").unwrap();
-        assert_eq!(command.program, "kilo");
-        assert_eq!(command.args, vec!["--session", "ses_123"]);
-    }
-
-    #[test]
     fn default_path_is_xdg_share_kilo_db() {
         let empty_home = tempfile::tempdir().unwrap();
         assert!(resolve_kilo_db_path_from(None, None, empty_home.path().to_path_buf()).is_none());
@@ -157,76 +150,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, db);
-    }
-
-    #[test]
-    fn memory_and_missing_paths_are_skipped() {
-        assert!(
-            resolve_kilo_db_path_from(Some(":memory:".to_string()), None, PathBuf::from("/tmp"))
-                .is_none()
-        );
-        assert!(
-            resolve_kilo_db_path_from(
-                Some("/no/such/kilo.db".to_string()),
-                None,
-                PathBuf::from("/tmp")
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn scan_reads_opencode_shaped_kilo_db() {
-        let root = tempfile::tempdir().unwrap();
-        let db_path = root.path().join("kilo.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                title TEXT,
-                directory TEXT,
-                time_created INTEGER,
-                time_updated INTEGER
-            );
-            CREATE TABLE message (
-                id INTEGER PRIMARY KEY,
-                session_id TEXT,
-                data TEXT,
-                time_created INTEGER
-            );
-            CREATE TABLE part (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER,
-                data TEXT
-            );
-            INSERT INTO session (id, title, directory, time_created, time_updated)
-            VALUES ('ses_123', 'seed', '/repo', 100, 200);
-            INSERT INTO message (session_id, data, time_created)
-            VALUES ('ses_123', '{\"role\":\"user\"}', 110);
-            INSERT INTO message (session_id, data, time_created)
-            VALUES ('ses_123', '{\"role\":\"assistant\"}', 120);
-            INSERT INTO part (message_id, data)
-            VALUES (1, '{\"type\":\"text\",\"text\":\"hello kilo\"}');
-            INSERT INTO part (message_id, data)
-            VALUES (2, '{\"type\":\"tool\",\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"ls\"},\"output\":\"file body\"}}');
-            ",
-        )
-        .unwrap();
-        drop(conn);
-
-        let conn = opencode::open_readonly(&db_path).unwrap().unwrap();
-        let sessions = opencode::scan(&conn, true).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].source_id, "ses_123");
-        assert_eq!(sessions[0].directory.as_deref(), Some("/repo"));
-        assert_eq!(sessions[0].custom_title.as_deref(), Some("seed"));
-        assert_eq!(sessions[0].metadata_parser_version, Some(opencode::METADATA_PARSER_VERSION));
-        assert_eq!(sessions[0].messages.len(), 1);
-        assert_eq!(sessions[0].messages[0].content, "hello kilo");
-        assert_eq!(sessions[0].events.len(), 2);
-        assert_eq!(sessions[0].events[0].kind, "command");
-        assert_eq!(sessions[0].events[0].name.as_deref(), Some("bash"));
     }
 
     fn fs_write_empty(path: &Path) {

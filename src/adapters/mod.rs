@@ -534,17 +534,6 @@ pub(crate) fn dashboard_source_labels() -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::all_adapters;
-
-    #[test]
-    fn all_adapters_includes_amp() {
-        let ids: Vec<_> = all_adapters().iter().map(|adapter| adapter.id().to_string()).collect();
-        assert!(ids.iter().any(|id| id == "amp"), "amp missing from all_adapters()");
-    }
-}
-
-#[cfg(test)]
 pub(crate) mod test_support {
     use crate::db::store::{SessionTopologyWrite, Store};
 
@@ -606,5 +595,16 @@ pub(crate) mod test_support {
                 },
             )
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_adapters;
+
+    #[test]
+    fn all_adapters_includes_amp() {
+        let ids: Vec<_> = all_adapters().iter().map(|adapter| adapter.id().to_string()).collect();
+        assert!(ids.iter().any(|id| id == "amp"), "amp missing from all_adapters()");
     }
 }

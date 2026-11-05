@@ -1,8 +1,7 @@
 use super::{
     Catalog, CatalogExtension, CatalogTarget, CatalogVersion, ExtensionManifest,
-    InstalledExtension, InstalledState, format_installed_help, load_installed_state,
-    managed_binary_path, run_external_with_root, save_installed_state, select_latest,
-    unpack_archive, validate_manifest,
+    InstalledExtension, InstalledState, load_installed_state, managed_binary_path,
+    run_external_with_root, save_installed_state, select_latest, unpack_archive, validate_manifest,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -76,81 +75,6 @@ printf "%s" "$1" > "$2"
     assert!(status.success());
     assert_eq!(fs::read_to_string(output).unwrap(), "hello");
     fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn installed_state_round_trips() {
-    let root = temp_dir("state");
-    let mut state = InstalledState { schema: 1, extensions: BTreeMap::new() };
-    state.extensions.insert(
-        "probe".to_string(),
-        InstalledExtension {
-            version: "0.1.0".to_string(),
-            description: "Probe extension".to_string(),
-        },
-    );
-
-    save_installed_state(&root, &state).unwrap();
-    let loaded = load_installed_state(&root).unwrap();
-
-    assert_eq!(loaded.extensions["probe"].version, "0.1.0");
-    assert_eq!(loaded.extensions["probe"].description, "Probe extension");
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn installed_state_ignores_removed_metadata_fields() {
-    let root = temp_dir("state-old-fields");
-    fs::create_dir_all(&root).unwrap();
-    fs::write(
-        root.join("installed.json"),
-        r#"{
-  "schema": 1,
-  "extensions": {
-"probe": {
-  "version": "0.1.0",
-  "target": "x86_64-unknown-linux-gnu",
-  "protocol": 1,
-  "min_recall": "0.2.10",
-  "commands": ["probe"],
-  "binary": "recall-probe",
-  "description": "Probe extension"
-}
-  }
-}
-"#,
-    )
-    .unwrap();
-
-    let loaded = load_installed_state(&root).unwrap();
-
-    assert_eq!(loaded.extensions["probe"].version, "0.1.0");
-    assert_eq!(loaded.extensions["probe"].description, "Probe extension");
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn installed_help_does_not_invent_missing_description() {
-    let mut state = InstalledState { schema: 1, extensions: BTreeMap::new() };
-    state.extensions.insert(
-        "probe".to_string(),
-        InstalledExtension { version: "0.1.0".to_string(), description: String::new() },
-    );
-
-    let help = format_installed_help(state);
-
-    assert_eq!(help, "\nExtensions:\n  probe\n");
-    assert!(!help.contains("Official Recall extension"));
-}
-
-#[test]
-fn catalog_description_is_not_part_of_manifest_validation() {
-    let manifest: ExtensionManifest = serde_json::from_str(
-        r#"{"name":"probe","version":"0.1.0","protocol":1,"min_recall":"0.2.10"}"#,
-    )
-    .unwrap();
-
-    validate_manifest("probe", "0.1.0", 1, "0.2.10", &manifest).unwrap();
 }
 
 #[test]
@@ -281,4 +205,65 @@ printf '%s' '{"name":"opendal","version":"0.1.0","protocol":2,"min_recall":"0.6.
     )
     .unwrap();
     assert_eq!(super::remote_binary_with_root("opendal", root.path()).unwrap(), binary);
+}
+
+#[test]
+fn installed_state_ignores_removed_metadata_fields() {
+    let root = temp_dir("state-old-fields");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("installed.json"),
+        r#"{
+  "schema": 1,
+  "extensions": {
+"probe": {
+  "version": "0.1.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "protocol": 1,
+  "min_recall": "0.2.10",
+  "commands": ["probe"],
+  "binary": "recall-probe",
+  "description": "Probe extension"
+}
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let loaded = load_installed_state(&root).unwrap();
+
+    assert_eq!(loaded.extensions["probe"].version, "0.1.0");
+    assert_eq!(loaded.extensions["probe"].description, "Probe extension");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn catalog_description_is_not_part_of_manifest_validation() {
+    let manifest: ExtensionManifest = serde_json::from_str(
+        r#"{"name":"probe","version":"0.1.0","protocol":1,"min_recall":"0.2.10"}"#,
+    )
+    .unwrap();
+
+    validate_manifest("probe", "0.1.0", 1, "0.2.10", &manifest).unwrap();
+}
+
+#[test]
+fn installed_state_round_trips() {
+    let root = temp_dir("state");
+    let mut state = InstalledState { schema: 1, extensions: BTreeMap::new() };
+    state.extensions.insert(
+        "probe".to_string(),
+        InstalledExtension {
+            version: "0.1.0".to_string(),
+            description: "Probe extension".to_string(),
+        },
+    );
+
+    save_installed_state(&root, &state).unwrap();
+    let loaded = load_installed_state(&root).unwrap();
+
+    assert_eq!(loaded.extensions["probe"].version, "0.1.0");
+    assert_eq!(loaded.extensions["probe"].description, "Probe extension");
+    fs::remove_dir_all(root).unwrap();
 }

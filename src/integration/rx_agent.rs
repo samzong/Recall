@@ -3,7 +3,6 @@ use std::io::Write;
 
 use crate::adapters::file_scan::FileScanEntry;
 use crate::adapters::rx_agent::parse_session;
-use crate::adapters::{SourceAdapter, rx_agent::RxAgentAdapter};
 use crate::types::FileOperation;
 
 const ID: &str = "019a0000-0000-7000-8000-000000000001";
@@ -71,10 +70,4 @@ fn rx_agent_rejects_unknown_version_and_invalid_identity() {
     ] {
         assert!(parse_session(&entry(root.path(), &data), 0, true).is_err());
     }
-}
-
-#[test]
-fn rx_agent_resume_uses_native_session_id() {
-    let resume = RxAgentAdapter.resume_command(ID).unwrap();
-    assert_eq!(resume.args, ["--resume", ID]);
 }

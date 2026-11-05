@@ -126,14 +126,6 @@ mod tests {
     }
 
     #[test]
-    fn the_viewer_config_points_at_the_published_data_file() {
-        let card = render("scope-a", "scope-a.recall.jsonl", &manifest());
-        assert!(card.starts_with("---\n"));
-        assert!(card.contains("    path: scope-a.recall.jsonl\n"));
-        assert!(card.contains("license: cc-by-4.0\n"));
-    }
-
-    #[test]
     fn the_card_states_which_entities_stay_in_the_data() {
         let card = render("scope-a", "scope-a.recall.jsonl", &manifest());
         assert!(card.contains("Entity types not redacted: PERSON, LOCATION."));

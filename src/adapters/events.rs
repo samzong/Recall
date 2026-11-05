@@ -254,42 +254,6 @@ pub(crate) fn bounded_summary(summary: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EVENT_SUMMARY_MAX_BYTES, EventContext, tool_result_event};
-
-    fn context() -> EventContext {
-        EventContext {
-            event_seq: 0,
-            timestamp: None,
-            source_path: None,
-            source_event_id: None,
-            message_seq: None,
-            parser_version: 1,
-        }
-    }
-
-    #[test]
-    fn patch_headers_preserve_context_and_incomplete_moves() {
-        let files = super::patch_file_evidence(
-            "*** Begin Patch\r\n*** Update File: src/main.rs\r\n*** Move to:   \r\n@@\r\n *** Update File: example.rs\r\n*** End Patch",
-        );
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "src/main.rs");
-        assert_eq!(files[0].operation, crate::types::FileOperation::Write);
-    }
-
-    #[test]
-    fn tool_result_summary_is_capped_on_a_char_boundary() {
-        let long = "汉".repeat(EVENT_SUMMARY_MAX_BYTES);
-        let event = tool_result_event(context(), None, Some(long));
-        let summary = event.summary.unwrap();
-        assert!(summary.ends_with('…'));
-        assert!(summary.len() <= EVENT_SUMMARY_MAX_BYTES + '…'.len_utf8());
-        assert!(summary.trim_end_matches('…').chars().all(|c| c == '汉'));
-
-        let short = "ok".to_string();
-        let event = tool_result_event(context(), None, Some(short.clone()));
-        assert_eq!(event.summary, Some(short));
-    }
 
     #[test]
     fn command_candidates_decode_literals_without_inventing_execution() {

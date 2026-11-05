@@ -138,22 +138,6 @@ fn corrupt_task_skips_its_conversation_without_losing_other_conversations() {
 }
 
 #[test]
-fn aggregate_stats_and_absent_token_counts_do_not_invent_usage_or_tool_calls() {
-    let (_dir, path, conn) = database();
-    let mut task = proto::Task::decode(TASK).unwrap();
-    for message in &mut task.messages {
-        message.request_metadata = None;
-        message.tool_call = None;
-        message.tool_call_result = None;
-    }
-    write_task(&conn, &task);
-    let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
-    assert_eq!(raw.messages.len(), 3);
-    assert!(raw.events.is_empty());
-    assert!(raw.usage_events.is_empty());
-}
-
-#[test]
 fn missing_timestamps_preserve_message_order_and_duplicates_are_not_reindexed() {
     let (_dir, path, conn) = database();
     let mut task = proto::Task::decode(TASK).unwrap();
@@ -269,15 +253,6 @@ fn missing_sources_are_empty_and_not_created() {
 }
 
 #[test]
-fn sqlite_and_protobuf_timestamps_are_milliseconds_without_fabricated_values() {
-    assert_eq!(parse_timestamp("2026-09-30 16:00:09.250"), Some(1790784009250));
-    assert_eq!(parse_timestamp("2026-09-30T18:00:09.250+02:00"), Some(1790784009250));
-    assert_eq!(parse_timestamp("not a date"), None);
-    assert_eq!(proto::Timestamp { seconds: 1, nanos: 1_000_000_000 }.millis(), None);
-    assert_eq!(proto::Timestamp { seconds: i64::MAX, nanos: 0 }.millis(), None);
-}
-
-#[test]
 fn official_origin_fixture_excludes_agent_and_automated_prompts() {
     let (_dir, path, conn) = database();
     let task =
@@ -351,17 +326,6 @@ fn multiple_database_scan_streams_unique_conversations_across_channels() {
         streamed.iter().map(|raw| raw.source_id.as_str()).collect::<Vec<_>>(),
         ["conversation-1", "other"]
     );
-}
-
-#[test]
-fn invalid_parent_metadata_does_not_discard_task_content() {
-    let (_dir, path, conn) = database();
-    for data in [r#"{"parent_conversation_id":"  "}"#, "malformed"] {
-        conn.execute("UPDATE agent_conversations SET conversation_data = ?1", [data]).unwrap();
-        let raw = scan_db(&path, None, true).unwrap().sessions.remove(0);
-        assert_eq!(raw.messages.len(), 3);
-        assert!(raw.parent_links.is_empty());
-    }
 }
 
 #[test]

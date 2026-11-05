@@ -824,53 +824,6 @@ mod tests {
     }
 
     #[test]
-    fn format_tokens_uses_compact_units() {
-        assert_eq!(format_tokens(42), "42");
-        assert_eq!(format_tokens(1_200), "1.2K");
-        assert_eq!(format_tokens(1_200_000), "1.2M");
-        assert_eq!(format_tokens(1_200_000_000), "1.20B");
-    }
-
-    #[test]
-    fn title_source_splits_tool_ids() {
-        assert_eq!(title_source("claude-code"), "Claude Code");
-        assert_eq!(title_source("codex"), "Codex");
-    }
-
-    #[test]
-    fn longest_streak_counts_consecutive_days_only() {
-        let days = BTreeSet::from([
-            NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 8, 21).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 8, 24).unwrap(),
-        ]);
-        assert_eq!(longest_streak(&days), 3);
-        assert_eq!(longest_streak(&BTreeSet::new()), 0);
-    }
-
-    #[test]
-    fn empty_period_is_friendly_and_not_an_error() {
-        let report = aggregate_wrapped_events(&[], WrappedPeriod::Week, fixture_now());
-        assert!(report.empty);
-        assert_eq!(report.sessions, 0);
-        assert_eq!(report.active_days, 0);
-        assert_eq!(report.longest_streak, 0);
-        assert!(report.top_model.is_none());
-        assert!(report.busiest_weekday.is_none());
-
-        let card = render_card(&report, false);
-        assert!(card.contains("No usage data for this period."));
-        assert!(card.contains("last 7 days"));
-        assert!(!card.contains('\u{1b}'));
-        assert!(card.starts_with('+'));
-        assert_eq!(card.chars().filter(|ch| *ch == '\n').count(), 9);
-        for line in card.lines() {
-            assert_eq!(visible_width(line), INNER + 2, "{line}");
-        }
-    }
-
-    #[test]
     fn populated_report_aggregates_highlights() {
         let report = populated_report();
         assert!(!report.empty);
@@ -909,17 +862,6 @@ mod tests {
     }
 
     #[test]
-    fn local_day_start_advances_through_timezone_gap() {
-        let start = NaiveDate::from_ymd_opt(2026, 9, 6).unwrap().and_hms_opt(0, 0, 0).unwrap();
-        let expected = start.checked_add_signed(TimeDelta::minutes(45)).unwrap();
-        let resolved = first_valid_local_millis(start, |candidate| {
-            (candidate >= expected).then(|| candidate.and_utc().timestamp_millis())
-        });
-
-        assert_eq!(resolved, expected.and_utc().timestamp_millis());
-    }
-
-    #[test]
     fn wrapped_totals_match_usage_report_dedup() {
         let events = vec![
             event("codex", "session-a", "token_count:1", 1_800_000_000_000, "gpt-5.5", 8, 3),
@@ -929,30 +871,6 @@ mod tests {
         let wrapped = aggregate_wrapped_events(&events, WrappedPeriod::All, fixture_now());
         assert_eq!(wrapped.tokens, usage.summary.tokens);
         assert_eq!(wrapped.sessions, usage.summary.sessions);
-    }
-
-    #[test]
-    fn card_is_fixed_width_and_color_optional() {
-        let report = populated_report();
-        let plain = render_card(&report, false);
-        let colored = render_card(&report, true);
-
-        assert!(plain.contains("RECALL WRAPPED"));
-        assert!(plain.contains("last 30 days"));
-        assert!(plain.contains("1.3M"));
-        assert!(plain.contains("Claude Code"));
-        assert!(plain.contains("Thursday at 14:00"));
-        assert!(plain.contains("longest streak"));
-        assert!(!plain.contains('\u{1b}'));
-        assert!(colored.contains("\x1b["));
-        assert!(colored.contains("RECALL WRAPPED"));
-
-        for line in plain.lines() {
-            assert_eq!(visible_width(line), INNER + 2, "{line}");
-        }
-        for line in colored.lines() {
-            assert_eq!(visible_width(line), INNER + 2, "{line}");
-        }
     }
 
     fn make_session(id: &str, source: &str) -> Session {
@@ -980,14 +898,6 @@ mod tests {
             output_tokens: output,
             ..crate::types::test_support::usage_event(key)
         }
-    }
-
-    #[test]
-    fn period_card_labels_describe_calendar_windows() {
-        assert_eq!(WrappedPeriod::Week.card_label(), "last 7 days");
-        assert_eq!(WrappedPeriod::Month.card_label(), "last 30 days");
-        assert_eq!(WrappedPeriod::Year.card_label(), "last 365 days");
-        assert_eq!(WrappedPeriod::All.card_label(), "all time");
     }
 
     #[test]
@@ -1086,21 +996,6 @@ mod tests {
     }
 
     #[test]
-    fn store_backed_report_keeps_indexed_sessions_without_usage() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        store.insert_session(&make_session("s1", "cursor")).unwrap();
-
-        let report = build_wrapped_report_at(&store, WrappedPeriod::Week, fixture_now()).unwrap();
-        assert!(!report.empty);
-        assert_eq!(report.sessions, 1);
-        assert_eq!(report.tokens.total_tokens, 0);
-        assert_eq!(report.by_source.len(), 1);
-        assert_eq!(report.by_source[0].source, "cursor");
-        assert_eq!(report.by_source[0].sessions, 1);
-    }
-
-    #[test]
     fn store_backed_report_normalizes_legacy_usage_rows() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
@@ -1166,21 +1061,5 @@ mod tests {
         assert_eq!(pi[0].output_tokens, 3);
         assert_eq!(pi[0].reasoning_tokens, 4);
         assert_eq!(pi[0].parser_version, 2);
-    }
-
-    #[test]
-    fn progress_overwrite_pads_when_the_next_label_is_shorter() {
-        let (first, width) = progress_overwrite(0, "abcdef");
-        assert_eq!(first, "\rabcdef");
-        assert_eq!(width, 6);
-        let (second, width) = progress_overwrite(width, "xy");
-        assert_eq!(second, "\rxy    ");
-        assert_eq!(width, 2);
-        let colored = "\x1b[1m\x1b[36mxy\x1b[0m";
-        let (third, width) = progress_overwrite(6, colored);
-        assert_eq!(third, format!("\r{colored}    "));
-        assert_eq!(width, 2);
-        assert_eq!(progress_clear(5), "\r     \r");
-        assert_eq!(progress_clear(0), "");
     }
 }

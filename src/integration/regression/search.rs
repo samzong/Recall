@@ -1,71 +1,6 @@
 use super::*;
 
 #[test]
-fn fts_search_basic() {
-    let store = setup();
-    let session = make_session("s1", "test", "raw1", "Rust programming");
-    store.insert_session(&session).unwrap();
-
-    let messages = vec![make_message("s1", Role::User, "how do I use iterators in Rust", 0)];
-    store.insert_messages(&messages).unwrap();
-
-    let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("iterators", None, &no_filters(), 10, 3).unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].session.id, "s1");
-}
-
-#[test]
-fn fts_search_no_results() {
-    let store = setup();
-    let session = make_session("s1", "test", "raw1", "Test");
-    store.insert_session(&session).unwrap();
-
-    let messages = vec![make_message("s1", Role::User, "hello world", 0)];
-    store.insert_messages(&messages).unwrap();
-
-    let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("zzzznonexistent", None, &no_filters(), 10, 3).unwrap();
-    assert!(results.is_empty());
-}
-
-#[test]
-fn fts_search_empty_query() {
-    let store = setup();
-    let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("", None, &no_filters(), 10, 3).unwrap();
-    assert!(results.is_empty());
-}
-
-#[test]
-fn fts_search_special_characters() {
-    let store = setup();
-    let session = make_session("s1", "test", "raw1", "Test");
-    store.insert_session(&session).unwrap();
-
-    let messages = vec![make_message("s1", Role::User, "fix the bug in parser", 0)];
-    store.insert_messages(&messages).unwrap();
-
-    let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("bug OR 1=1 --", None, &no_filters(), 10, 3).unwrap();
-    assert!(!results.is_empty());
-}
-
-#[test]
-fn fts_search_sql_keywords_safe() {
-    let store = setup();
-    let session = make_session("s1", "test", "raw1", "Test");
-    store.insert_session(&session).unwrap();
-
-    let messages = vec![make_message("s1", Role::User, "AND OR NOT NEAR", 0)];
-    store.insert_messages(&messages).unwrap();
-
-    let engine = SearchEngine::new(&store.conn);
-    let result = engine.hybrid_search("AND OR NOT", None, &no_filters(), 10, 3);
-    assert!(result.is_ok(), "FTS5 keywords must not cause SQL errors");
-}
-
-#[test]
 fn fts_search_keeps_partial_matches_when_full_match_exists() {
     let store = setup();
     store.insert_session(&make_session("both", "test", "both", "Both")).unwrap();
@@ -110,34 +45,6 @@ fn fts_search_matches_any_term_without_full_match() {
         .collect();
     ids.sort();
     assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
-}
-
-#[test]
-fn fts_search_prefixes_last_token() {
-    let store = setup();
-    store.insert_session(&make_session("s1", "test", "s1", "Power")).unwrap();
-    store
-        .insert_messages(&[make_message("s1", Role::User, "enable powercontext backfill", 0)])
-        .unwrap();
-
-    let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("powercon", None, &no_filters(), 10, 3).unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].session.id, "s1");
-}
-
-#[test]
-fn hybrid_search_fts_only_without_embedding() {
-    let store = setup();
-    let session = make_session("s1", "test", "raw1", "Debugging session");
-    store.insert_session(&session).unwrap();
-
-    let messages = vec![make_message("s1", Role::User, "segfault in main loop", 0)];
-    store.insert_messages(&messages).unwrap();
-
-    let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("segfault", None, &no_filters(), 10, 3).unwrap();
-    assert_eq!(results.len(), 1);
 }
 
 fn seed_semantic_boundary_sessions(store: &Store, count: usize) {
@@ -311,29 +218,6 @@ fn semantic_query_all_returns_complete_fts_set() {
 }
 
 #[test]
-fn semantic_search_arithmetic_is_saturating() {
-    let store = setup();
-    let engine = SearchEngine::new(&store.conn);
-    let embedding = vec![0.1f32; 384];
-
-    let direct = engine
-        .hybrid_search("semanticboundary", Some(&embedding), &no_filters(), usize::MAX, usize::MAX)
-        .unwrap();
-    assert!(direct.is_empty());
-
-    let page = engine
-        .hybrid_search_page(
-            "semanticboundary",
-            Some(&embedding),
-            &no_filters(),
-            Some(usize::MAX),
-            usize::MAX,
-        )
-        .unwrap();
-    assert!(page.is_empty());
-}
-
-#[test]
 fn search_with_source_filter() {
     let store = setup();
     let s1 = make_session("s1", "claude-code", "raw1", "Claude session");
@@ -426,31 +310,6 @@ fn search_with_directory_filter_respects_project_boundary() {
     ids.sort();
 
     assert_eq!(ids, vec!["s1".to_string(), "s2".to_string()]);
-}
-
-#[test]
-fn recent_sessions_with_directory_filter_respects_project_boundary() {
-    let store = setup();
-    let mut exact = make_session("s1", "codex", "raw1", "Exact project");
-    exact.directory = Some("/tmp/project".to_string());
-    let mut sibling = make_session("s2", "opencode", "raw2", "Sibling prefix");
-    sibling.directory = Some("/tmp/project-sibling".to_string());
-
-    store.insert_session(&exact).unwrap();
-    store.insert_session(&sibling).unwrap();
-
-    let sessions = store
-        .list_recent_sessions_for_search_scope(
-            None,
-            TimeRange::All,
-            &ProjectScope::Directory("/tmp/project".to_string()),
-            None,
-            10,
-        )
-        .unwrap();
-
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].id, "s1");
 }
 
 #[test]

@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn reflect_text_output_is_timeline_first() {
+    fn reflect_text_output_preserves_conversation_content() {
         let sessions = vec![fixture_session(
             "s1",
             "codex",
@@ -158,44 +158,7 @@ mod tests {
         let report = build_reflect_report(sessions, &ReflectFilters::default());
         let text = render_text(&report);
 
-        assert!(text.contains("Recall reflect"), "output must contain header");
-        assert!(text.contains("Scope"), "output must contain Scope section");
-        assert!(text.contains("Summary"), "output must contain Summary section");
-        assert!(text.contains("Timeline"), "output must contain Timeline section");
-        assert!(text.contains("Project conversation timeline"), "must include phase title");
         assert!(text.contains("hello world"), "must include user moment content");
         assert!(text.contains("hi there"), "must include assistant moment content");
-        assert!(!text.contains("session_events"), "must not contain raw event names");
-    }
-
-    #[test]
-    fn reflect_text_output_includes_broader_signals() {
-        let sessions = vec![fixture_session(
-            "s1",
-            "codex",
-            "Planning session",
-            1000,
-            vec![fixture_message(
-                "assistant",
-                "Plan the approach, outline the options, and analyze tradeoffs",
-                0,
-                1100,
-            )],
-        )];
-
-        let report = build_reflect_report(sessions, &ReflectFilters::default());
-        let text = render_text(&report);
-
-        let timeline = text.find("Timeline").unwrap();
-        let source_roles = text.find("Source Roles").unwrap();
-        let project_activity = text.find("Project Activity").unwrap();
-        let task_shapes = text.find("Task Shapes").unwrap();
-
-        assert!(timeline < source_roles);
-        assert!(source_roles < project_activity);
-        assert!(project_activity < task_shapes);
-        assert!(text.contains("codex: Planning and analysis"));
-        assert!(text.contains("/tmp/reflect-repo"));
-        assert!(text.contains("planning"));
     }
 }

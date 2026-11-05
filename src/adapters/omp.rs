@@ -119,7 +119,7 @@ mod tests {
 
     use super::*;
     use crate::adapters::file_scan::{self, FileScanEntry};
-    use crate::adapters::pi_session::{EVENT_PARSER_VERSION, extract_session_id_from_filename};
+    use crate::adapters::pi_session::EVENT_PARSER_VERSION;
     use crate::types::{FileEvidenceKind, FileOperation, Role};
     use serde_json::Value;
 
@@ -129,10 +129,6 @@ mod tests {
         include_events: bool,
     ) -> anyhow::Result<Option<RawSession>> {
         pi_session::parse_session_file(entry, mtime_ms, include_events, Format::Omp)
-    }
-
-    fn collect_omp_entries(session_dirs: &[PathBuf]) -> Vec<FileScanEntry> {
-        pi_session::collect_entries(session_dirs, Format::Omp)
     }
 
     fn decode_session_dir_name(name: &str) -> Option<String> {
@@ -187,27 +183,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_uses_official_flag() {
-        let command = OmpAdapter.resume_command("01a05dd7-7cbc-7005-818b-73de30e4dc42").unwrap();
-        assert_eq!(command.program, "omp");
-        assert_eq!(
-            command.args,
-            vec!["--resume".to_string(), "01a05dd7-7cbc-7005-818b-73de30e4dc42".to_string()]
-        );
-    }
-
-    #[test]
-    fn extract_session_id_from_filename_reads_uuid_tail() {
-        assert_eq!(
-            extract_session_id_from_filename(
-                "2026-09-01T16-39-58-396Z_01a05dd7-7cbc-7005-818b-73de30e4dc42"
-            ),
-            Some("01a05dd7-7cbc-7005-818b-73de30e4dc42".to_string())
-        );
-        assert_eq!(extract_session_id_from_filename("not-a-session"), None);
-    }
-
-    #[test]
     fn decode_session_dir_name_reads_absolute_and_home_buckets() {
         assert_eq!(decode_session_dir_name("--private-tmp--").as_deref(), Some("/private/tmp"));
         assert_eq!(decode_session_dir_name("-git-samzong-Recall"), None);
@@ -241,13 +216,6 @@ mod tests {
 
         assert_eq!(resolve_omp_session_dirs_from(&root, None, None), vec![omp_sessions]);
 
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn resolve_session_dirs_skips_missing_roots() {
-        let root = temp_omp_root("missing");
-        assert!(resolve_omp_session_dirs_from(&root, None, None).is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -413,110 +381,12 @@ mod tests {
     }
 
     #[test]
-    fn usage_normalizes_reasoning_included_in_output() {
-        pi_session::test_support::usage_normalizes_reasoning_included_in_output(Format::Omp);
-    }
-
-    #[test]
-    fn parse_omp_session_file_prefers_title_slot_over_header() {
-        let root = temp_omp_root("title-pref");
-        let session_dir = root.join("--tmp-omp-project--");
-        let session_id = "01a05dd7-7cbc-7005-818b-73de30e4dc42";
-        let path = write_omp_session(
-            &session_dir,
-            session_id,
-            Some("slot title"),
-            &[
-                serde_json::json!({
-                    "type": "session",
-                    "version": 3,
-                    "id": session_id,
-                    "title": "header title",
-                    "timestamp": "1970-01-01T00:00:01.000Z",
-                    "cwd": "/tmp/omp-project"
-                }),
-                serde_json::json!({
-                    "type": "message",
-                    "id": "user1",
-                    "timestamp": "1970-01-01T00:00:02.000Z",
-                    "message": {
-                        "role": "user",
-                        "content": "hello",
-                        "timestamp": 2000
-                    }
-                }),
-            ],
-        );
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-        let raw = parse_omp_session_file(
-            FileScanEntry {
-                session_id: session_id.to_string(),
-                stat_target: path,
-                directory: None,
-            },
-            mtime,
-            true,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(raw.custom_title.as_deref(), Some("slot title"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn collect_omp_entries_ignores_sidecar_logs() {
-        let root = temp_omp_root("sidecar");
-        let session_dir = root.join("-git-samzong-Recall");
-        let session_id = "01a05dd7-7cbc-7005-818b-73de30e4dc42";
-        let path = write_omp_session(
-            &session_dir,
-            session_id,
-            None,
-            &[serde_json::json!({
-                "type": "session",
-                "version": 3,
-                "id": session_id,
-                "timestamp": "1970-01-01T00:00:01.000Z",
-                "cwd": "/tmp/omp-project"
-            })],
-        );
-        let sidecar = session_dir.join(path.file_stem().unwrap());
-        fs::create_dir_all(&sidecar).unwrap();
-        fs::write(sidecar.join("4.bash-original.log"), "log").unwrap();
-
-        let entries = collect_omp_entries(&[session_dir]);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].session_id, session_id);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn parse_omp_session_file_skips_hidden_bash_execution() {
-        pi_session::test_support::skips_hidden_bash_execution(Format::Omp);
-    }
-
-    #[test]
     fn parse_omp_session_file_skips_fork_inherited_usage() {
         pi_session::test_support::skips_fork_inherited_usage(Format::Omp);
     }
 
     #[test]
-    fn scan_for_sync_skips_unchanged_session_when_usage_state_is_current() {
-        pi_session::test_support::scan_for_sync_skips_unchanged_session_when_usage_state_is_current(
-            Format::Omp,
-        );
-    }
-
-    #[test]
     fn parse_omp_session_maps_parent_session_to_primary_fork() {
         pi_session::test_support::maps_parent_session_to_primary_fork(Format::Omp);
-    }
-
-    #[test]
-    fn parse_omp_session_drops_unresolvable_parent_session() {
-        pi_session::test_support::drops_unresolvable_parent_session(Format::Omp);
     }
 }

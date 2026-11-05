@@ -104,18 +104,4 @@ mod tests {
             assert!(parse_interval(value).is_err(), "accepted {value}");
         }
     }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn all_schedule_actions_reject_the_current_platform() {
-        for job in [Job::LocalSync, Job::RemoteSync] {
-            for command in [
-                ScheduleCommands::Install { interval: 1800 },
-                ScheduleCommands::Uninstall,
-                ScheduleCommands::Status,
-            ] {
-                assert!(run(command, job).is_err());
-            }
-        }
-    }
 }

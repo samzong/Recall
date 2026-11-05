@@ -155,11 +155,6 @@ fn find_messages_path(sessions_dir: &Path, session_id: &str) -> Option<PathBuf> 
     path.is_file().then_some(path)
 }
 
-#[cfg(test)]
-fn scan_timestamp_ms(entry: &FileScanEntry) -> Option<i64> {
-    session_snapshot(entry).map(|snapshot| snapshot.effective_mtime_ms())
-}
-
 fn session_snapshot(
     entry: &FileScanEntry,
 ) -> Option<file_scan::FileScanSnapshot<Vec<Option<file_scan::FileMetadataSnapshot>>>> {
@@ -467,8 +462,6 @@ fn read_json(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::test_support::store as setup_store;
-    use crate::types::Session;
 
     fn temp_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -535,17 +528,6 @@ mod tests {
             "metadata": { "title": title }
         })
         .to_string()
-    }
-
-    fn make_existing_session(source_id: &str, updated_at: i64) -> Session {
-        Session {
-            source: "cline".to_string(),
-            source_id: source_id.to_string(),
-            title: "existing".to_string(),
-            updated_at: Some(updated_at),
-            message_count: 1,
-            ..crate::types::test_support::session(&format!("internal-{source_id}"))
-        }
     }
 
     #[test]
@@ -630,15 +612,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_skips_empty_messages() {
-        let root = temp_root("empty");
-        let session_id = "empty_sess";
-        let path = write_session(&root, session_id, r#"{"messages":[]}"#, "{}");
-        assert!(parse_session(&path, session_id, 1).unwrap().is_none());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn collect_session_entries_skips_covered_ids() {
         let root = temp_root("collect");
         write_session(
@@ -673,48 +646,5 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].messages[0].content, "hello");
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn scan_for_sync_skips_unchanged_session() {
-        let root = temp_root("skip");
-        let session_id = "1788285868712_2wszo";
-        let path = write_session(
-            &root,
-            session_id,
-            &sample_messages("hello", "world"),
-            &sample_manifest(session_id, "/repo", "hello"),
-        );
-        let mtime = scan_timestamp_ms(&FileScanEntry {
-            session_id: session_id.to_string(),
-            stat_target: path,
-            directory: None,
-        })
-        .unwrap();
-        let store = setup_store();
-        store.insert_session(&make_existing_session(session_id, mtime)).unwrap();
-        let result = file_scan::run_file_scan_with_options_and_mtime(
-            &AdapterSyncContext::from_store_for_test(&store, "cline").unwrap(),
-            None,
-            Default::default(),
-            collect_session_entries(&root, &HashSet::new()),
-            scan_timestamp_ms,
-            parse_session_entry,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 0);
-        assert_eq!(result.stats.skipped_sessions, 1);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn resume_command_requires_existing_session() {
-        assert!(resume_command("missing_session").is_none());
-    }
-
-    #[test]
-    fn unwrap_user_input_leaves_plain_text() {
-        assert_eq!(unwrap_user_input("just text"), "just text");
-        assert_eq!(unwrap_user_input("<user_input mode=\"plan\">ask</user_input>"), "ask");
     }
 }

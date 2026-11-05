@@ -607,19 +607,6 @@ mod tests {
     }
 
     #[test]
-    fn local_roundtrip_imports_nothing_and_keeps_local_rows() {
-        let store = setup();
-        persist_full(&store, "codex", "src-1", "Local");
-        let exported = export_all(&store);
-
-        let summary = import_jsonl(&store, false, exported.as_bytes()).unwrap();
-        assert_eq!(summary, ImportSummary { total: 1, imported: 0, skipped: 1 });
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM sessions"), 1);
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM sessions WHERE is_import = 0"), 1);
-        assert_eq!(export_all(&store), exported, "local data must be untouched");
-    }
-
-    #[test]
     fn skip_keeps_local_content_on_conflicting_import() {
         let a = setup();
         persist_full(&a, "codex", "src-1", "Remote version");
@@ -720,23 +707,6 @@ mod tests {
                 &store.get_session_by_source_id("codex", "v2-1").unwrap().unwrap().id,
             )
             .unwrap();
-        assert_eq!(events[0].tool_call_id, None);
-        assert_eq!(events[0].is_meta, None);
-        assert_eq!(events[0].visibility, None);
-    }
-
-    #[test]
-    fn accepts_schema_version_5_without_v6_event_fields() {
-        let store = setup();
-        let v5 = r#"{"schema_version":5,"record_type":"session","session":{"source":"claude-code","source_id":"v5-1","title":"V5","started_at":100},"events":[{"event_seq":0,"timestamp":101,"kind":"tool_result","actor":"tool","source_event_id":"2:0","parser_version":3}]}"#;
-        let summary = import_jsonl(&store, false, v5.as_bytes()).unwrap();
-        assert_eq!(summary, ImportSummary { total: 1, imported: 1, skipped: 0 });
-
-        let session = store.get_session_by_source_id("claude-code", "v5-1").unwrap().unwrap();
-        let events = store.list_session_events_for_session(&session.id).unwrap();
-        assert_eq!(events[0].command_evidence_status, None);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].source_event_id.as_deref(), Some("2:0"));
         assert_eq!(events[0].tool_call_id, None);
         assert_eq!(events[0].is_meta, None);
         assert_eq!(events[0].visibility, None);

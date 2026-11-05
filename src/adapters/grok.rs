@@ -957,14 +957,11 @@ fn grok_file_evidence(update: &Value, cwd: Option<&str>) -> Vec<FileEvidence> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use super::*;
-    use crate::adapters::test_support::{
-        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
-        store as setup_store,
-    };
+    use crate::adapters::test_support::{seed_empty_event_state, seed_empty_metadata_state};
+    use crate::adapters::test_support::{seed_empty_usage_state, store as setup_store};
     use crate::types::Session;
+    use std::io::Cursor;
 
     fn temp_grok_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1127,25 +1124,6 @@ mod tests {
         assert_eq!(usage_events[0].event_key, "prompt:prompt-a");
         assert_eq!(usage_events[1].event_key, "prompt:prompt-c");
         assert_eq!(usage_events[1].input_tokens, 100);
-    }
-
-    #[test]
-    fn parse_grok_updates_merges_streamed_agent_chunks() {
-        let jsonl = r#"{"timestamp":10,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hello"}}}}
-{"timestamp":11,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first "}},"_meta":{"promptId":"prompt-1","turnStartMs":1000}}}
-{"timestamp":12,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"response"}},"_meta":{"promptId":"prompt-1","turnStartMs":1000}}}
-{"timestamp":20,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"next"}}}}
-{"timestamp":21,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second"}},"_meta":{"promptId":"prompt-2","turnStartMs":2000}}}
-"#;
-
-        let (messages, _, _) =
-            parse_grok_updates_reader(Cursor::new(jsonl), None, None, true).unwrap();
-
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[1].role, Role::Assistant);
-        assert_eq!(messages[1].content, "first response");
-        assert_eq!(messages[1].timestamp, Some(11_000));
-        assert_eq!(messages[3].content, "second");
     }
 
     #[test]

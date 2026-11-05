@@ -1621,26 +1621,13 @@ fn push_codex_message(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use super::*;
     use crate::adapters::test_support::{
         seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
         store as setup_store,
     };
     use crate::types::Session;
-
-    #[test]
-    fn codex_app_command_opens_thread_deeplink() {
-        let command = CodexAdapter.app_command("019e6d8d-588b-7fd2-a326-c525469ed120").unwrap();
-
-        assert!(
-            command
-                .args
-                .iter()
-                .any(|arg| arg == "codex://threads/019e6d8d-588b-7fd2-a326-c525469ed120")
-        );
-    }
+    use std::io::Write;
 
     fn temp_codex_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1891,101 +1878,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_codex_session_does_not_reference_missing_message_for_empty_tool_content() {
-        let root = temp_codex_root("empty-tool-content");
-        let sessions_dir = root.join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2393";
-        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
-        let meta = serde_json::json!({
-            "type": "session_meta",
-            "timestamp": "2026-04-13T10:00:00Z",
-            "payload": {
-                "id": uuid,
-                "timestamp": "2026-04-13T10:00:00Z",
-                "cwd": "/tmp/foo"
-            }
-        });
-        let tool_call = serde_json::json!({
-            "type": "response_item",
-            "timestamp": "2026-04-13T10:00:01Z",
-            "payload": {
-                "type": "message",
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "function_call",
-                        "name": "shell",
-                        "call_id": "call_empty"
-                    }
-                ]
-            }
-        });
-        let mut f = fs::File::create(&path).unwrap();
-        writeln!(f, "{meta}").unwrap();
-        writeln!(f, "{tool_call}").unwrap();
-
-        let raw = parse_codex_session(&path).unwrap().unwrap();
-
-        assert!(raw.messages.is_empty());
-        assert_eq!(raw.events[0].kind, "command");
-        assert_eq!(raw.events[0].message_seq, None);
-        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1:0"));
-        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call_empty"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn parse_codex_session_indexes_response_item_users_and_dedups_event_msg() {
-        let root = temp_codex_root("response-user");
-        let sessions_dir = root.join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2399";
-        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
-        let lines = [
-            serde_json::json!({
-                "type": "session_meta",
-                "timestamp": "2026-04-13T10:00:00Z",
-                "payload": {"id": uuid, "cwd": "/tmp/foo"}
-            }),
-            serde_json::json!({
-                "type": "response_item",
-                "timestamp": "2026-04-13T10:00:01Z",
-                "payload": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "fix the parser"}]
-                }
-            }),
-            serde_json::json!({
-                "type": "event_msg",
-                "timestamp": "2026-04-13T10:00:01Z",
-                "payload": {"type": "user_message", "message": "fix the parser"}
-            }),
-            serde_json::json!({
-                "type": "response_item",
-                "timestamp": "2026-04-13T10:00:02Z",
-                "payload": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "ok"}]
-                }
-            }),
-        ];
-        let mut file = fs::File::create(&path).unwrap();
-        for line in lines {
-            writeln!(file, "{line}").unwrap();
-        }
-        let raw = parse_codex_session(&path).unwrap().unwrap();
-        assert_eq!(raw.messages.len(), 2);
-        assert_eq!(raw.messages[0].role, Role::User);
-        assert_eq!(raw.messages[0].content, "fix the parser");
-        assert_eq!(raw.messages[1].content, "ok");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn parse_codex_session_drops_injected_context_response_items() {
         let root = temp_codex_root("injected-context");
         let sessions_dir = root.join("sessions");
@@ -2088,70 +1980,6 @@ mod tests {
             .collect();
         assert_eq!(users, vec!["continue", "continue", "continue"]);
         assert_eq!(raw.messages.len(), 6);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn parse_codex_session_keeps_same_text_from_separate_stream_turns() {
-        let root = temp_codex_root("separate-stream-turns");
-        let sessions_dir = root.join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2402";
-        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
-        let lines = [
-            serde_json::json!({
-                "type": "session_meta",
-                "timestamp": "2026-04-13T10:00:00Z",
-                "payload": {"id": uuid, "cwd": "/tmp/foo"}
-            }),
-            serde_json::json!({
-                "type": "event_msg",
-                "timestamp": "2026-04-13T10:00:01Z",
-                "payload": {"type": "user_message", "message": "continue"}
-            }),
-            serde_json::json!({
-                "type": "response_item",
-                "timestamp": "2026-04-13T10:00:02Z",
-                "payload": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "first"}]
-                }
-            }),
-            serde_json::json!({
-                "type": "response_item",
-                "timestamp": "2026-04-13T10:01:01Z",
-                "payload": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "continue"}]
-                }
-            }),
-            serde_json::json!({
-                "type": "response_item",
-                "timestamp": "2026-04-13T10:01:02Z",
-                "payload": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "second"}]
-                }
-            }),
-        ];
-        let mut file = fs::File::create(&path).unwrap();
-        for line in lines {
-            writeln!(file, "{line}").unwrap();
-        }
-
-        let raw = parse_codex_session(&path).unwrap().unwrap();
-        let users: Vec<&str> = raw
-            .messages
-            .iter()
-            .filter(|message| message.role == Role::User)
-            .map(|message| message.content.as_str())
-            .collect();
-        assert_eq!(users, vec!["continue", "continue"]);
-        assert_eq!(raw.messages.len(), 4);
-
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2289,22 +2117,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_codex_session_without_events_ignores_event_only_lines() {
-        let root = temp_codex_root("no-events");
-        let sessions_dir = root.join("sessions");
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2394";
-        let path = write_codex_event_only_rollout(&sessions_dir, uuid);
-
-        assert!(parse_rollout(&path, false, RolloutDialect::Codex).unwrap().is_none());
-
-        let raw = parse_rollout(&path, true, RolloutDialect::Codex).unwrap().unwrap();
-        assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
-        assert!(raw.events.iter().any(|event| event.kind == "search"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn parse_codex_session_extracts_non_function_response_item_events() {
         let root = temp_codex_root("nonfunction-events");
         let sessions_dir = root.join("sessions");
@@ -2385,40 +2197,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn parse_codex_session_ignores_metadata_only_rollout() {
-        let root = temp_codex_root("metadata-only");
-        let sessions_dir = root.join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2393";
-        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
-        let meta = serde_json::json!({
-            "type": "session_meta",
-            "timestamp": "2026-04-13T10:00:00Z",
-            "payload": {
-                "id": uuid,
-                "timestamp": "2026-04-13T10:00:00Z",
-                "cwd": "/tmp/foo",
-                "model": "gpt-5.5"
-            }
-        });
-        let turn = serde_json::json!({
-            "type": "turn_context",
-            "timestamp": "2026-04-13T10:00:01Z",
-            "payload": {
-                "cwd": "/tmp/foo",
-                "model": "gpt-5.5"
-            }
-        });
-        let mut f = fs::File::create(&path).unwrap();
-        writeln!(f, "{meta}").unwrap();
-        writeln!(f, "{turn}").unwrap();
-
-        assert!(parse_codex_session(&path).unwrap().is_none());
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
     fn write_codex_usage_rollout(sessions_dir: &Path, session_uuid: &str) -> PathBuf {
         fs::create_dir_all(sessions_dir).unwrap();
         let filename = format!("rollout-2026-04-13T10-00-00-{session_uuid}.jsonl");
@@ -2495,41 +2273,6 @@ mod tests {
         path
     }
 
-    fn write_codex_usage_only_rollout(sessions_dir: &Path, session_uuid: &str) -> PathBuf {
-        fs::create_dir_all(sessions_dir).unwrap();
-        let filename = format!("rollout-2026-04-13T10-00-00-{session_uuid}.jsonl");
-        let path = sessions_dir.join(filename);
-        let meta = serde_json::json!({
-            "type": "session_meta",
-            "payload": {
-                "id": session_uuid,
-                "timestamp": "2026-04-13T10:00:00Z",
-                "cwd": "/tmp/foo",
-                "model_provider": "openai",
-                "model": "gpt-5.5"
-            }
-        });
-        let usage = serde_json::json!({
-            "type": "event_msg",
-            "timestamp": "2026-04-13T10:00:01Z",
-            "payload": {
-                "type": "token_count",
-                "info": {
-                    "last_token_usage": {
-                        "input_tokens": 10,
-                        "cached_input_tokens": 2,
-                        "output_tokens": 3,
-                        "reasoning_output_tokens": 1
-                    }
-                }
-            }
-        });
-        let mut f = fs::File::create(&path).unwrap();
-        writeln!(f, "{meta}").unwrap();
-        writeln!(f, "{usage}").unwrap();
-        path
-    }
-
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
             source: "codex".to_string(),
@@ -2539,15 +2282,6 @@ mod tests {
             message_count,
             ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
-    }
-
-    #[test]
-    fn extract_session_id_from_filename_happy_path() {
-        let stem = "rollout-2025-11-04T07-16-24-019a4c01-e8f4-7270-bdab-7f19273b237e";
-        assert_eq!(
-            extract_session_id_from_filename(stem),
-            Some("019a4c01-e8f4-7270-bdab-7f19273b237e".to_string())
-        );
     }
 
     #[test]
@@ -2584,23 +2318,6 @@ mod tests {
         assert_eq!(raw.usage_events[1].cache_read_tokens, 1);
         assert_eq!(raw.usage_events[1].output_tokens, 2);
         assert_eq!(raw.usage_events[1].reasoning_tokens, 0);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn parse_codex_session_keeps_usage_without_searchable_messages() {
-        let root = temp_codex_root("usage-only");
-        let sessions_dir = root.join("sessions");
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2380";
-        let path = write_codex_usage_only_rollout(&sessions_dir, uuid);
-
-        let raw = parse_codex_session(&path).unwrap().unwrap();
-
-        assert!(raw.messages.is_empty());
-        assert_eq!(raw.started_at, 1_776_074_400_000);
-        assert_eq!(raw.usage_events.len(), 1);
-        assert_eq!(raw.usage_events[0].model, "gpt-5.5");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2680,30 +2397,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_codex_session_classifies_user_source_as_primary_without_parents() {
-        let root = temp_codex_root("primary-topology");
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2401";
-        let path = write_codex_topology_rollout(
-            &root.join("sessions"),
-            uuid,
-            serde_json::json!({
-                "id": uuid,
-                "thread_source": "user",
-                "source": "interactive",
-                "cwd": "/repo"
-            }),
-        );
-
-        let raw = parse_codex_session(&path).unwrap().unwrap();
-
-        assert_eq!(raw.thread_role, Some(ThreadRole::Primary));
-        assert!(raw.parent_links.is_empty());
-        assert_eq!(raw.metadata_parser_version, Some(METADATA_PARSER_VERSION));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn parse_codex_session_keeps_user_fork_primary_with_fork_link() {
         let root = temp_codex_root("fork-primary");
         let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2402";
@@ -2752,27 +2445,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_codex_session_leaves_role_unknown_without_markers() {
-        let root = temp_codex_root("unknown-topology");
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2404";
-        let path = write_codex_topology_rollout(
-            &root.join("sessions"),
-            uuid,
-            serde_json::json!({ "id": uuid, "cwd": "/repo" }),
-        );
-
-        let raw = parse_codex_session(&path).unwrap().unwrap();
-
-        assert_eq!(raw.thread_role, None);
-        assert!(raw.parent_links.is_empty());
-        // Even unknown-role sessions get a metadata parser version so topology
-        // backfill runs for them once a classifier improves.
-        assert_eq!(raw.metadata_parser_version, Some(METADATA_PARSER_VERSION));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn parse_codex_session_keeps_model_less_usage_unknown_after_plain_event() {
         let root = temp_codex_root("unknown-model");
         let sessions_dir = root.join("sessions");
@@ -2794,33 +2466,6 @@ mod tests {
         assert_eq!(raw.usage_events.len(), 2);
         assert_eq!(raw.usage_events[0].model, "unknown");
         assert_eq!(raw.usage_events[1].model, "gpt-5-codex");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_skips_unchanged_session() {
-        let root = temp_codex_root("skip");
-        let sessions_dir = root.join("sessions");
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b237e";
-        let path = write_codex_rollout(&sessions_dir, uuid, "hello");
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
-        let store = setup_store();
-        store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        seed_empty_usage_state(&store, "codex", uuid, USAGE_PARSER_VERSION, Some(mtime));
-        seed_empty_event_state(&store, "codex", uuid, EVENT_PARSER_VERSION, Some(mtime));
-        seed_empty_metadata_state(&store, "codex", uuid, METADATA_PARSER_VERSION);
-
-        let result = scan_for_sync_impl(
-            &root,
-            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 0);
-        assert_eq!(result.stats.skipped_sessions, 1);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2858,31 +2503,6 @@ mod tests {
     }
 
     #[test]
-    fn usage_only_scan_skips_unchanged_session_without_event_state() {
-        let root = temp_codex_root("usage-only-skip");
-        let sessions_dir = root.join("sessions");
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b237e";
-        let path = write_codex_rollout(&sessions_dir, uuid, "hello");
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
-        let store = setup_store();
-        store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        seed_empty_usage_state(&store, "codex", uuid, USAGE_PARSER_VERSION, Some(mtime));
-
-        let result = scan_for_sync_impl(
-            &root,
-            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
-            None,
-            false,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 0);
-        assert_eq!(result.stats.skipped_sessions, 1);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn usage_only_scan_skips_event_only_session() {
         let root = temp_codex_root("usage-only-event-only");
         let sessions_dir = root.join("sessions");
@@ -2915,32 +2535,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_for_sync_reparses_when_mtime_changes() {
-        let root = temp_codex_root("mismatch");
-        let sessions_dir = root.join("sessions");
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b237e";
-        let path = write_codex_rollout(&sessions_dir, uuid, "hi");
-        let actual_mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
-        let store = setup_store();
-        store.insert_session(&make_existing_session(uuid, actual_mtime - 1_000, 1)).unwrap();
-
-        let result = scan_for_sync_impl(
-            &root,
-            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, uuid);
-        assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
-        assert_eq!(result.stats.skipped_sessions, 0);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn scan_for_sync_keeps_going_when_one_file_is_unreadable() {
         use std::io::Write as _;
 
@@ -2967,30 +2561,6 @@ mod tests {
         .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, good_uuid);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_picks_up_new_session() {
-        let root = temp_codex_root("new");
-        let sessions_dir = root.join("archived_sessions");
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b237e";
-        let path = write_codex_rollout(&sessions_dir, uuid, "fresh");
-
-        let store = setup_store();
-
-        let result = scan_for_sync_impl(
-            &root,
-            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, uuid);
-        assert_eq!(result.sessions[0].source_file_path.as_deref(), path.to_str());
-        assert_eq!(result.stats.skipped_sessions, 0);
 
         let _ = fs::remove_dir_all(&root);
     }

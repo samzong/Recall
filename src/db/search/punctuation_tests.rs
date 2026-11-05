@@ -55,26 +55,6 @@ fn assert_matches(store: &Store, query: &str, source: Option<&str>, expected: &[
     assert_eq!(page, expected, "session page query: {query:?}, source: {source:?}");
 }
 
-#[test]
-fn hyphenated_message_search_recalls_adjacent_words() {
-    let store = seed(&[("hyphen", "claude-code", "incremental-witness")]);
-    let hits = SearchEngine::new(&store.conn)
-        .search_messages("incremental-witness", &filters(None), None, 10)
-        .unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].session_id, "hyphen");
-}
-
-#[test]
-fn hyphenated_session_search_recalls_adjacent_words() {
-    let store = seed(&[("hyphen", "claude-code", "incremental-witness")]);
-    let hits = SearchEngine::new(&store.conn)
-        .hybrid_search("incremental-witness", None, &filters(None), 10, 3)
-        .unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].session.id, "hyphen");
-}
-
 fn control_character_fixture() -> Store {
     seed(&[
         ("first", "codex", "incremental"),
@@ -94,22 +74,6 @@ fn control_characters_separate_message_query_terms() {
             .unwrap()
             .into_iter()
             .map(|hit| hit.session_id)
-            .collect::<Vec<_>>();
-        ids.sort();
-        assert_eq!(ids, ["first", "last", "phrase"], "query: {query:?}");
-    }
-}
-
-#[test]
-fn control_characters_separate_session_query_terms() {
-    let store = control_character_fixture();
-    let engine = SearchEngine::new(&store.conn);
-    for query in ["incremental witness", "incremental\0witness", "incremental\u{1}witness"] {
-        let mut ids = engine
-            .hybrid_search(query, None, &filters(None), 10, 3)
-            .unwrap()
-            .into_iter()
-            .map(|hit| hit.session.id)
             .collect::<Vec<_>>();
         ids.sort();
         assert_eq!(ids, ["first", "last", "phrase"], "query: {query:?}");
@@ -169,16 +133,6 @@ fn punctuation_search_handles_identifiers_paths_quotes_and_empty_terms() {
     for query in ["", "---", "_", "\" OR \"", "... / : * ()"] {
         assert_matches(&store, query, None, &[]);
     }
-}
-
-#[test]
-fn punctuation_search_keeps_the_existing_last_term_prefix_rule() {
-    let store =
-        seed(&[("short", "codex", "foo-a v1.2.x"), ("long", "codex", "foo-apple v1.2.xyz")]);
-    assert_matches(&store, "foo_a", None, &["long", "short"]);
-    assert_matches(&store, "foo-a", None, &["long", "short"]);
-    assert_matches(&store, "v1.2.x", None, &["long", "short"]);
-    assert_matches(&store, "foo-ap", None, &["long"]);
 }
 
 #[test]

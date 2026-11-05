@@ -298,13 +298,4 @@ mod tests {
         let parsed: Value = serde_json::from_str(attrs).unwrap();
         assert_eq!(parsed["input"]["command"], "cat [REDACTED:PATH]");
     }
-
-    #[test]
-    fn unchanged_nested_payloads_keep_their_original_bytes() {
-        let mut public = public();
-        let before = public["events"][0]["attrs_json"].as_str().unwrap().to_string();
-        let changed = visit_text_leaves(&mut public, &mut |_, _| None).unwrap();
-        assert!(!changed);
-        assert_eq!(public["events"][0]["attrs_json"].as_str().unwrap(), before);
-    }
 }

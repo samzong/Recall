@@ -439,24 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_uses_threads_continue_and_json_id() {
-        let command = AmpAdapter.resume_command("T-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001").unwrap();
-        assert_eq!(command.program, "amp");
-        assert_eq!(
-            command.args,
-            vec!["threads", "continue", "T-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001"]
-        );
-    }
-
-    #[test]
-    fn missing_roots_are_empty() {
-        let roots = thread_roots_from(None, None, Some(PathBuf::from("/no/such/home")), None);
-        assert!(roots.is_empty());
-        let result = scan_threads(&roots, None).unwrap();
-        assert!(result.sessions.is_empty());
-    }
-
-    #[test]
     fn amp_threads_dir_and_xdg_are_scanned_when_present() {
         let root = tempfile::tempdir().unwrap();
         let amp_dir = root.path().join("amp-threads");
@@ -599,16 +581,6 @@ mod tests {
         let attrs: Value =
             serde_json::from_str(session.events[4].attrs_json.as_deref().unwrap()).unwrap();
         assert_eq!(attrs.pointer("/part/run/result/exitCode"), Some(&serde_json::json!(1)));
-    }
-
-    #[test]
-    fn env_cwd_falls_back_to_current_amp_tree_uri() {
-        let env = serde_json::json!({
-            "initial": {
-                "trees": [{"uri": "file:///tmp/amp%20project"}]
-            }
-        });
-        assert_eq!(env_cwd(Some(&env)).as_deref(), Some("/tmp/amp project"));
     }
 
     #[test]

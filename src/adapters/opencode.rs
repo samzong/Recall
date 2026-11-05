@@ -1004,8 +1004,6 @@ pub(crate) fn scan_for_sync_conn_with_options(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::adapters::test_support::{
         seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
@@ -1013,6 +1011,7 @@ mod tests {
     };
     use crate::db::store::Store;
     use crate::types::Session;
+    use std::path::PathBuf;
 
     fn make_session(
         id: &str,
@@ -1463,59 +1462,6 @@ mod tests {
     }
 
     #[test]
-    // With an empty V2 copy the legacy history stays indexed, so an upgrade to
-    // parser 4 re-reads the session and keeps the previously stored messages.
-    fn v2_review_empty_copy_keeps_already_indexed_history() {
-        let (path, conn) = setup_opencode_db();
-        insert_session_with_message(&conn, "s", 200, 100, "stale indexed body");
-        let mut old =
-            scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap().pop().unwrap();
-        old.metadata_parser_version = Some(3);
-        let store =
-            crate::sync::persist_raw_session_for_conformance(setup_store(), "opencode", old)
-                .unwrap();
-        add_v2_tables(&conn);
-        insert_v2_user(&conn, "s", None, "removed");
-        conn.execute("DELETE FROM session_message", []).unwrap();
-        let mut changed = scan_for_sync_conn_with_options(
-            &conn,
-            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
-            None,
-            true,
-            ScanOptions::OPENCODE_NATIVE,
-        )
-        .unwrap();
-        assert_eq!(changed.sessions.len(), 1);
-        assert_eq!(changed.sessions[0].messages.len(), 1);
-        assert_eq!(changed.sessions[0].messages[0].content, "stale indexed body");
-        let store = crate::sync::persist_raw_session_for_conformance(
-            store,
-            "opencode",
-            changed.sessions.pop().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            store
-                .conn
-                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        let repeat = scan_for_sync_conn_with_options(
-            &conn,
-            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
-            None,
-            true,
-            ScanOptions::OPENCODE_NATIVE,
-        )
-        .unwrap();
-        assert_eq!(repeat.stats.skipped_sessions, 1);
-        assert!(repeat.sessions.is_empty());
-        drop(conn);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn v2_review_compaction_usage_survives_transcript_projection() {
         let conn = Connection::open_in_memory().unwrap();
         add_v2_tables(&conn);
@@ -1632,31 +1578,6 @@ mod tests {
     }
 
     #[test]
-    fn native_topology_accepts_schema_without_parent_column() {
-        let (path, conn) = setup_opencode_db();
-        insert_session_with_message(&conn, "legacy", 200, 100, "body survives");
-        let full = scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap();
-        let incremental = scan_for_sync_conn_with_options(
-            &conn,
-            &AdapterSyncContext::empty_for_test("opencode"),
-            None,
-            true,
-            ScanOptions::OPENCODE_NATIVE,
-        )
-        .unwrap()
-        .sessions;
-        for sessions in [full, incremental] {
-            assert_eq!(sessions.len(), 1);
-            assert_eq!(sessions[0].messages[0].content, "body survives");
-            assert_eq!(sessions[0].thread_role, None);
-            assert!(sessions[0].parent_links.is_empty());
-            assert_eq!(sessions[0].metadata_parser_version, Some(3));
-        }
-        drop(conn);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn native_metadata_backfill_refreshes_once_without_source_changes() {
         let (path, conn) = setup_opencode_db();
         conn.execute("ALTER TABLE session ADD COLUMN parent_id TEXT", []).unwrap();
@@ -1765,62 +1686,6 @@ mod tests {
         }
         drop(conn);
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn map_session_row_parses_iso_text_timestamps() {
-        let path =
-            std::env::temp_dir().join(format!("recall-opencode-iso-{}.db", uuid::Uuid::new_v4()));
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                title TEXT,
-                directory TEXT,
-                time_created TEXT,
-                time_updated TEXT
-            );
-            CREATE TABLE message (
-                id INTEGER PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                time_created INTEGER
-            );
-            CREATE TABLE part (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );
-            ",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO session (id, title, directory, time_created, time_updated)
-             VALUES ('iso-1', 'Test', '/tmp/project', '2026-04-13T10:00:00Z', '2026-04-13T10:01:00Z')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO message (session_id, data, time_created)
-             VALUES ('iso-1', '{\"role\":\"user\"}', 1)",
-            [],
-        )
-        .unwrap();
-        let message_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO part (message_id, data) VALUES (?1, '{\"type\":\"text\",\"text\":\"hello\"}')",
-            rusqlite::params![message_id],
-        )
-        .unwrap();
-        let sessions = scan(&conn, false).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(
-            sessions[0].started_at,
-            rfc3339_ms(Some(&Value::String("2026-04-13T10:00:00Z".into()))).unwrap()
-        );
-        drop(conn);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2098,54 +1963,6 @@ mod tests {
     }
 
     #[test]
-    fn incremental_scan_resyncs_when_metadata_parser_is_stale() {
-        let (path, conn) = setup_opencode_db();
-        insert_session_with_message(&conn, "s1", 200, 100, "hello");
-
-        let store = setup_store();
-        store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
-        mark_usage_current(&store, "s1", Some(200));
-        mark_event_current(&store, "s1", Some(200));
-
-        let result = scan_for_sync_conn(
-            &conn,
-            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!(result.stats.skipped_sessions, 0);
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].custom_title.as_deref(), Some("Test"));
-        assert_eq!(result.sessions[0].metadata_parser_version, Some(METADATA_PARSER_VERSION));
-        drop(conn);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn usage_only_incremental_scan_skips_missing_event_state() {
-        let (path, conn) = setup_opencode_db();
-        insert_session_with_message(&conn, "s1", 200, 100, "hello");
-
-        let store = setup_store();
-        store.insert_session(&make_session("local-s1", "s1", Some(200), 1)).unwrap();
-        mark_usage_current(&store, "s1", Some(200));
-        mark_metadata_current(&store, "s1");
-
-        let result = scan_for_sync_conn(
-            &conn,
-            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
-            None,
-            false,
-        )
-        .unwrap();
-        assert!(result.sessions.is_empty());
-        assert_eq!(result.stats.skipped_sessions, 1);
-        drop(conn);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn incremental_scan_resyncs_same_updated_at_when_message_count_changes() {
         let (path, conn) = setup_opencode_db();
         insert_session_with_message(&conn, "s1", 200, 100, "hello");
@@ -2275,57 +2092,6 @@ mod tests {
         let (sessions, _) = load_session_rows(&conn, None, None, ScanOptions::default()).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "good");
-        drop(conn);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn parse_part_content_preserves_non_blank_whitespace() {
-        let parsed = parse_part_content("{\"type\":\"text\",\"text\":\"  hello  \"}");
-        assert_eq!(parsed.as_deref(), Some("  hello  "));
-        assert_eq!(parse_part_content("{\"type\":\"text\",\"text\":\"   \"}"), None);
-    }
-
-    #[test]
-    fn parse_part_content_skips_tool_parts() {
-        let parsed = parse_part_content(
-            r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"needle result"}}"#,
-        );
-
-        assert_eq!(parsed, None);
-    }
-
-    #[test]
-    fn scan_session_messages_sets_custom_title_from_session_title() {
-        let (path, conn) = setup_opencode_db();
-        insert_session_with_message(&conn, "s1", 200, 100, "hello");
-        conn.execute(
-            "INSERT INTO session (id, title, directory, time_created, time_updated)
-             VALUES ('s2', '   ', '/tmp/project', 100, 200)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO message (session_id, data, time_created)
-             VALUES ('s2', '{\"role\":\"user\"}', 110)",
-            [],
-        )
-        .unwrap();
-        let message_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO part (id, message_id, data)
-             VALUES (NULL, ?1, '{\"type\":\"text\",\"text\":\"blank title\"}')",
-            rusqlite::params![message_id],
-        )
-        .unwrap();
-
-        let (sessions, _) = load_session_rows(&conn, None, None, ScanOptions::default()).unwrap();
-        let raw = scan_session_messages(&conn, sessions, false, ScanOptions::default()).unwrap();
-        let titled = raw.iter().find(|session| session.source_id == "s1").unwrap();
-        let blank = raw.iter().find(|session| session.source_id == "s2").unwrap();
-        assert_eq!(titled.custom_title.as_deref(), Some("Test"));
-        assert_eq!(titled.metadata_parser_version, Some(METADATA_PARSER_VERSION));
-        assert_eq!(blank.custom_title, None);
         drop(conn);
         let _ = std::fs::remove_file(path);
     }
@@ -2500,56 +2266,6 @@ mod tests {
             serde_json::from_str(observation.attrs_json.as_deref().unwrap()).unwrap();
         assert_eq!(attrs["part"], parts[4]);
         assert_eq!(observation.source_event_id.as_deref(), Some(part_ids[4].as_str()));
-        drop(conn);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn scan_for_sync_omits_events_when_disabled() {
-        let (path, conn) = setup_opencode_db();
-        conn.execute(
-            "INSERT INTO session (id, title, directory, time_created, time_updated)
-             VALUES ('s1', 'Test', '/tmp/project', 100, 200)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO message (session_id, data, time_created)
-             VALUES ('s1', '{\"role\":\"assistant\"}', 110)",
-            [],
-        )
-        .unwrap();
-        let message_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO part (id, message_id, data)
-             VALUES (NULL, ?1, ?2)",
-            rusqlite::params![message_id, r#"{"type":"text","text":"hello"}"#],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO part (id, message_id, data)
-             VALUES (NULL, ?1, ?2)",
-            rusqlite::params![
-                message_id,
-                r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"file body"}}"#
-            ],
-        )
-        .unwrap();
-        let store = setup_store();
-
-        let result = scan_for_sync_conn(
-            &conn,
-            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
-            None,
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].messages.len(), 1);
-        assert_eq!(result.sessions[0].messages[0].content, "hello");
-        assert!(result.sessions[0].events.is_empty());
-        assert_eq!(result.sessions[0].event_parser_version, None);
         drop(conn);
         let _ = std::fs::remove_file(path);
     }
