@@ -139,13 +139,13 @@ recall session list --project /absolute/project/path --source <source> --limit 5
 
 Base the TL;DR on the selected session. For the current conversation, use the existing context without reloading its transcript solely for a summary. For another session, use its retrieved transcript; omit the optional TL;DR if evidence is insufficient. Never substitute the current conversation for a different session.
 
-When including a TL;DR, create a unique file with `mktemp /tmp/recall-tldr.XXXXXX`, write the short Markdown summary, and publish with that path:
+When including a TL;DR, create a temporary directory. If `/Volumes/git` is mounted, use `mktemp -d /Volumes/git/scratch/recall-tldr-XXXXXX`. Otherwise, use `mktemp -d`. Write the short Markdown summary to `<temporary-directory>/tldr.md`, then publish with that file path:
 
 ```bash
 recall session share --id <session-id> --tldr-file <temporary-tldr-path> --format json
 ```
 
-Omit `--tldr-file` when no summary is supplied; remove any temporary file after publishing. Missing, unreadable, or blank TL;DR input does not block publishing. Read `share.url` from the JSON and verify it with `curl -I -L`. If the first check returns 404, publish once more and recheck, then stop. If sharing is not configured, tell the user to run `recall share init`. Return the live URL rather than raw JSON.
+Omit `--tldr-file` when no summary is supplied. After publishing succeeds or fails, delete only the temporary directory you created and its contents. Missing, unreadable, or blank TL;DR input does not block publishing. Read `share.url` from the JSON and verify it with `curl -I -L`. If the first check returns 404, publish once more and recheck, then stop. If sharing is not configured, tell the user to run `recall share init`. Return the live URL rather than raw JSON.
 
 List and unpublish shared pages with:
 
