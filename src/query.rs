@@ -100,7 +100,7 @@ pub(crate) fn run_search(
     let sources = adapters::source_labels();
     let resolved_source = resolve_source_filter(source_filter, &sources)?;
     let scope = store.resolve_scope(project_filter, repo_filter)?.announce();
-    let embedding = query_embedding(&store, query, |message| println!("{message}"))?;
+    let embedding = query_embedding(&store, query, |message| eprintln!("{message}"))?;
 
     let filters = SearchFilters {
         sources: resolved_source,
@@ -184,14 +184,27 @@ pub(crate) fn parse_time_range(time_filter: Option<&str>) -> Result<TimeRange> {
     }
 }
 
-pub(crate) fn query_embedding<F>(
+pub(crate) fn query_embedding<F>(store: &Store, query: &str, emit: F) -> Result<Option<Vec<f32>>>
+where
+    F: FnMut(&str),
+{
+    let semantic_enabled = crate::config::AppConfig::load()?.semantic_enabled;
+    query_embedding_with(store, semantic_enabled, query, emit)
+}
+
+pub(crate) fn query_embedding_with<F>(
     store: &Store,
+    semantic_enabled: bool,
     query: &str,
     mut emit: F,
 ) -> Result<Option<Vec<f32>>>
 where
     F: FnMut(&str),
 {
+    if !semantic_enabled {
+        emit("Semantic search is disabled; showing full-text matches only.");
+        return Ok(None);
+    }
     let progress = store.semantic_progress().unwrap_or_default();
     if progress.done_sessions == 0 && progress.processing_sessions == 0 {
         return Ok(None);

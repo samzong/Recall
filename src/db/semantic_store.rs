@@ -71,6 +71,23 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Move jobs a killed worker left in `processing` back to `pending`.
+    /// Called under the worker lock at startup, so no other worker can be
+    /// claiming right now. `done` and `failed` rows are untouched; partial
+    /// vectors are preserved and `pending_embeddable_messages` skips them.
+    pub(crate) fn requeue_processing_jobs(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session_embedding_state
+             SET status = 'pending',
+                 started_at = NULL,
+                 finished_at = NULL,
+                 last_error = NULL
+             WHERE status = 'processing'",
+            [],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn claim_next_session_embedding_job(&self) -> Result<Option<SemanticSessionJob>> {
         let now = Utc::now().timestamp_millis();
         let session_id: Option<String> = self

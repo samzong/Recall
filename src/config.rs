@@ -55,7 +55,7 @@ impl SyncWindow {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AppConfig {
     #[serde(default)]
     pub(crate) disabled_sources: Vec<String>,
@@ -75,6 +75,29 @@ pub(crate) struct AppConfig {
     pub(crate) excluded_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) share: Option<ShareConfig>,
+    /// Master switch for semantic indexing and search. When false, no
+    /// embedding worker runs and session search stays on full-text search;
+    /// sessions keep queuing `pending` embedding rows so re-enabling later
+    /// backfills the archive without a reimport.
+    #[serde(default = "default_semantic_enabled")]
+    pub(crate) semantic_enabled: bool,
+}
+
+fn default_semantic_enabled() -> bool {
+    true
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            disabled_sources: Vec::new(),
+            legacy_enabled_sources: Vec::new(),
+            sync_window: SyncWindow::default(),
+            excluded_paths: Vec::new(),
+            share: None,
+            semantic_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,6 +219,27 @@ mod tests {
         let reloaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(reloaded.disabled_sources, vec!["codex"]);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn semantic_defaults_to_enabled() {
+        assert!(AppConfig::default().semantic_enabled);
+        let parsed: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(parsed.semantic_enabled);
+        let parsed: AppConfig = serde_json::from_str(r#"{"semantic_enabled": false}"#).unwrap();
+        assert!(!parsed.semantic_enabled);
+    }
+
+    #[test]
+    fn semantic_enabled_survives_save_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = AppConfig { semantic_enabled: false, ..AppConfig::default() };
+
+        config.save_to(&path).unwrap();
+
+        let reloaded = AppConfig::load_from(&path).unwrap();
+        assert!(!reloaded.semantic_enabled);
     }
 
     #[test]

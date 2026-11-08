@@ -2,6 +2,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
+use crate::config::AppConfig;
 use crate::db::store::Store;
 use crate::embedding::EmbeddingProvider;
 use crate::utils::try_acquire_worker_lock;
@@ -10,6 +11,11 @@ const SESSION_EMBED_BATCH: usize = 8;
 const BACKGROUND_JOB: &str = "pipeline";
 
 pub(crate) fn ensure_background_worker(sync_first: bool) -> Result<()> {
+    // `sync_first` spawns still run: the release TUI uses the worker process
+    // as its startup-sync vehicle, and the child exits before semantic work.
+    if !sync_first && !AppConfig::load()?.semantic_enabled {
+        return Ok(());
+    }
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("__background-worker");
@@ -40,6 +46,13 @@ where
         }
     }
 
+    if !AppConfig::load()?.semantic_enabled {
+        store.clear_background_job_state(BACKGROUND_JOB)?;
+        return Ok(());
+    }
+
+    store.requeue_processing_jobs()?;
+
     let provider = match EmbeddingProvider::new(false) {
         Ok(provider) => provider,
         Err(err) => {
@@ -54,7 +67,16 @@ where
         Some(&format!("starting on {}", provider.device_name())),
     )?;
 
-    while process_next_session(&store, &provider)? {}
+    loop {
+        // Re-read config between sessions so disabling stops the drain at the
+        // next job boundary instead of at process exit.
+        if !AppConfig::load()?.semantic_enabled {
+            break;
+        }
+        if !process_next_session(&store, &provider)? {
+            break;
+        }
+    }
 
     store.clear_background_job_state(BACKGROUND_JOB)?;
     Ok(())
@@ -113,4 +135,57 @@ fn process_session(
 pub(crate) fn build_embedding_text(title: &str, content: &str) -> String {
     let text = format!("{title}: {content}");
     if text.chars().count() > 500 { text.chars().take(500).collect() } else { text }
+}
+
+#[derive(clap::Subcommand)]
+pub(crate) enum SemanticCommands {
+    #[command(about = "Enable semantic indexing and search, and start indexing queued sessions")]
+    Enable,
+    #[command(about = "Disable semantic indexing and search; full-text search keeps working")]
+    Disable,
+    #[command(about = "Show the semantic setting and indexing queue")]
+    Status,
+}
+
+pub(crate) fn run_semantic_command(command: SemanticCommands) -> Result<()> {
+    match command {
+        SemanticCommands::Enable => {
+            let mut config = AppConfig::load()?;
+            config.semantic_enabled = true;
+            config.save()?;
+            let pending = Store::open()
+                .and_then(|store| store.semantic_progress())
+                .map(|progress| progress.pending_sessions + progress.processing_sessions)
+                .unwrap_or(0);
+            println!("Semantic search enabled.");
+            println!("{pending} sessions queued; indexing runs in the background.");
+            ensure_background_worker(false)?;
+        }
+        SemanticCommands::Disable => {
+            let mut config = AppConfig::load()?;
+            config.semantic_enabled = false;
+            config.save()?;
+            println!("Semantic search disabled; sync and full-text search keep working.");
+            println!(
+                "A running indexer stops after its current session; queued sessions backfill when re-enabled."
+            );
+        }
+        SemanticCommands::Status => {
+            let config = AppConfig::load()?;
+            let progress =
+                Store::open().and_then(|store| store.semantic_progress()).unwrap_or_default();
+            if config.semantic_enabled {
+                println!("Semantic search: enabled");
+            } else {
+                println!("Semantic search: disabled (full-text search only)");
+            }
+            println!(
+                "Index queue: {} done, {} pending, {} failed",
+                progress.done_sessions,
+                progress.pending_sessions + progress.processing_sessions,
+                progress.failed_sessions
+            );
+        }
+    }
+    Ok(())
 }

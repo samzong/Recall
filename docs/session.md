@@ -466,6 +466,28 @@ recall session open --id <id> --print-command
 
 Options mirror `session resume`.
 
+### `recall semantic`
+
+Manage semantic indexing and search. The setting persists as
+`"semantic_enabled"` in `config.json` and defaults to `true`.
+
+```bash
+recall semantic status
+recall semantic disable
+recall semantic enable
+```
+
+While disabled, sync, import, browsing, export, and full-text search keep
+working; no embedding worker is spawned and neither indexing nor search
+downloads or loads the model. Sessions still queue `pending` embedding rows,
+so `recall semantic enable` (or any later sync) resumes indexing over the
+existing archive without a reimport.
+
+`recall info` reports the setting under Settings and Semantic Queue, and JSON
+session search responses carry a top-level `semantic_enabled` field; MCP
+session search responses carry the same field. Text searches print a stderr
+note that results are full-text only.
+
 ## Agent-Friendly Workflows
 
 ### Share A User-Selected Codex Session
