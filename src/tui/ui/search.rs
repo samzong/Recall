@@ -90,7 +90,7 @@ pub(super) fn render_filters(f: &mut Frame, app: &App, area: Rect) {
 
 pub(super) fn render_filter_picker(f: &mut Frame, app: &App) {
     if app.filters.editing.is_some() {
-        super::popups::render_filter_picker(f, app);
+        super::pickers::render_filter_picker(f, app);
     } else {
         render_filter_overview(f, app);
     }

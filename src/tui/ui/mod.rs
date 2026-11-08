@@ -1,3 +1,4 @@
+mod pickers;
 mod popups;
 mod search;
 mod usage;
@@ -159,11 +160,11 @@ pub(crate) fn render(f: &mut Frame, app: &App) {
         }
         AppMode::HandoffTarget => {
             viewing::render_viewing(f, app);
-            popups::render_handoff_target_picker(f, app);
+            pickers::render_handoff_target_picker(f, app);
         }
         AppMode::Subagents => {
             viewing::render_viewing(f, app);
-            popups::render_subagents_picker(f, app);
+            pickers::render_subagents_picker(f, app);
         }
         AppMode::ExportInput => {
             viewing::render_viewing(f, app);
