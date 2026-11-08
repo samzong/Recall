@@ -95,7 +95,9 @@ filters still apply. JSON contains `protocol_version` and `matches`; each match
 has `session_id`, `source_session_id`, `source`, `title`, `seq`, `role`,
 `timestamp` (Unix milliseconds or null), and a match-centered `excerpt`.
 Matches are ranked and bounded, not an exhaustive list. This mode uses keyword
-matching only; existing session search retains hybrid retrieval.
+matching only. Session search combines keyword and vector results when semantic
+search is enabled and the required embeddings are available. Otherwise, it uses
+keyword results only.
 
 ### `recall session list`
 
@@ -112,7 +114,9 @@ recall session list --sync --source codex --time today
 
 Options:
 
-- `--query <text>`: run the same hybrid search path as `recall search`.
+- `--query <text>`: use the same search path as `recall search`. When semantic
+  search is enabled and embeddings are available, this path combines keyword
+  and vector results. Otherwise, it uses keyword results only.
 - `--source <source>`: source id or label, matching existing source filters.
 - `--project <selector>`: scope selector. A path is a directory boundary
   including child paths; `owner/repo` or a remote URL is a repository identity
@@ -133,6 +137,7 @@ JSON output:
 
 ```json
 {
+  "semantic_enabled": true,
   "filters": {
     "query": "cloudflare api token",
     "source": "codex",
@@ -163,6 +168,10 @@ JSON output:
   "next_offset": null
 }
 ```
+
+`match_source` is `hybrid` only when keyword and vector results contribute to the
+match. It is `fts` when keyword results alone contribute, or `vector` when only
+vector results contribute. The example shows a hybrid match.
 
 `topology` is always present. `thread_role` is `primary`, `subagent`, or `null`
 when the source provides no reliable classification. `parents` lists portable

@@ -9,7 +9,9 @@ use crate::db::store::{SessionListSort, Store};
 use crate::export::{ExportIncludes, ExportOptions};
 use crate::handoff;
 use crate::project_scope::ProjectScope;
-use crate::query::{parse_time_range, query_embedding, resolve_source_filter};
+use crate::query::{
+    parse_time_range, query_embedding_with, resolve_source_filter, search_semantic_enabled,
+};
 use crate::semantic;
 use crate::session_action::{self, SessionAction};
 use crate::types::{MatchSource, Session};

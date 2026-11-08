@@ -39,10 +39,15 @@ pub(crate) fn run_session_list(args: &SessionListArgs) -> Result<()> {
         semantic::ensure_background_worker(false)?;
     }
 
+    let query = query.filter(|q| !q.trim().is_empty());
+    let semantic_enabled = query.map(|_| search_semantic_enabled());
     let effective_limit = if all { None } else { Some(limit) };
-    let rows: Vec<SessionListRow> = if let Some(query) = query.filter(|q| !q.trim().is_empty()) {
+    let rows: Vec<SessionListRow> = if let Some(query) = query {
         let engine = SearchEngine::new(&store.conn);
-        let embedding = query_embedding(&store, query, |message| eprintln!("{message}"))?;
+        let embedding =
+            query_embedding_with(&store, semantic_enabled.unwrap_or(false), query, |message| {
+                eprintln!("{message}")
+            })?;
         let filters = SearchFilters {
             sources: resolved_source.clone(),
             time_range,
@@ -88,7 +93,9 @@ pub(crate) fn run_session_list(args: &SessionListArgs) -> Result<()> {
 
     match format {
         SessionListFormat::Table => print_session_list_table(&rows, &sources),
-        SessionListFormat::Json => print_session_list_json(&store, &rows, &sources, args, &scope)?,
+        SessionListFormat::Json => {
+            print_session_list_json(&store, &rows, &sources, args, &scope, semantic_enabled)?
+        }
         SessionListFormat::Jsonl => {
             for row in &rows {
                 println!(
@@ -130,39 +137,39 @@ fn print_session_list_json(
     sources: &[(String, String)],
     args: &SessionListArgs,
     scope: &ProjectScope,
+    semantic_enabled: Option<bool>,
 ) -> Result<()> {
     let sessions = rows
         .iter()
         .map(|row| session_list_row_json(store, row, sources))
         .collect::<Result<Vec<_>>>()?;
-    let semantic_enabled = crate::config::AppConfig::load()?.semantic_enabled;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "semantic_enabled": semantic_enabled,
-            "filters": {
-                "query": args.query,
-                "source": args.source,
-                "project": args.project,
-                "repo": args.repo,
-                "effective_scope": {
-                    "kind": scope.kind(),
-                    "value": scope.value()
-                },
-                "time": args.time.as_deref().unwrap_or("all"),
-                "thread_role": args.thread_role.map(|role| role.as_str()),
-                "limit": if args.all { serde_json::Value::Null } else { serde_json::json!(args.limit) },
-                "offset": args.offset,
-                "sort": args.sort.map(session_sort_label)
+    let mut output = serde_json::json!({
+        "filters": {
+            "query": args.query,
+            "source": args.source,
+            "project": args.project,
+            "repo": args.repo,
+            "effective_scope": {
+                "kind": scope.kind(),
+                "value": scope.value()
             },
-            "sessions": sessions,
-            "next_offset": if args.all || rows.len() < args.limit {
-                serde_json::Value::Null
-            } else {
-                serde_json::json!(args.offset.saturating_add(rows.len()))
-            }
-        }))?
-    );
+            "time": args.time.as_deref().unwrap_or("all"),
+            "thread_role": args.thread_role.map(|role| role.as_str()),
+            "limit": if args.all { serde_json::Value::Null } else { serde_json::json!(args.limit) },
+            "offset": args.offset,
+            "sort": args.sort.map(session_sort_label)
+        },
+        "sessions": sessions,
+        "next_offset": if args.all || rows.len() < args.limit {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(args.offset.saturating_add(rows.len()))
+        }
+    });
+    if let Some(enabled) = semantic_enabled {
+        output["semantic_enabled"] = serde_json::json!(enabled);
+    }
+    println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
 

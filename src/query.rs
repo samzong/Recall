@@ -184,11 +184,21 @@ pub(crate) fn parse_time_range(time_filter: Option<&str>) -> Result<TimeRange> {
     }
 }
 
+pub(crate) fn search_semantic_enabled() -> bool {
+    match crate::config::AppConfig::load() {
+        Ok(config) => config.semantic_enabled,
+        Err(error) => {
+            eprintln!("Warning: {error:#}. Using full-text search only.");
+            false
+        }
+    }
+}
+
 pub(crate) fn query_embedding<F>(store: &Store, query: &str, emit: F) -> Result<Option<Vec<f32>>>
 where
     F: FnMut(&str),
 {
-    let semantic_enabled = crate::config::AppConfig::load()?.semantic_enabled;
+    let semantic_enabled = search_semantic_enabled();
     query_embedding_with(store, semantic_enabled, query, emit)
 }
 
@@ -202,7 +212,6 @@ where
     F: FnMut(&str),
 {
     if !semantic_enabled {
-        emit("Semantic search is disabled; showing full-text matches only.");
         return Ok(None);
     }
     let progress = store.semantic_progress().unwrap_or_default();
