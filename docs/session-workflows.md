@@ -35,7 +35,9 @@ Options mirror `session resume`.
 ### `recall semantic`
 
 Manage semantic indexing and search. The setting persists as
-`"semantic_enabled"` in `config.json` and defaults to `true`.
+`"semantic_enabled"` in `config.json` and defaults to `false`. A config file
+without this field also defaults to `false`, so upgrades do not enable semantic
+search.
 
 ```bash
 recall semantic status
@@ -43,16 +45,33 @@ recall semantic disable
 recall semantic enable
 ```
 
-While disabled, sync, import, browsing, export, and full-text search keep
-working; no embedding worker is spawned and neither indexing nor search
-downloads or loads the model. Sessions still queue `pending` embedding rows,
-so `recall semantic enable` (or any later sync) resumes indexing over the
-existing archive without a reimport.
+When semantic search is disabled, sync, import, browsing, export, and full-text
+search keep working. Recall does not start an embedding worker or download or
+load the model for indexing or search. Sessions still queue `pending` embedding
+rows. `recall semantic enable` saves the setting and starts the background
+indexer for queued sessions in the existing archive. It does not require a
+reimport. If the model is not already available, enabling semantic search
+requires a download of about 465 MiB.
 
-`recall info` reports the setting under Settings and Semantic Queue, and JSON
-session search responses carry a top-level `semantic_enabled` field; MCP
-session search responses carry the same field. Text searches print a stderr
-note that results are full-text only.
+Disabled semantic search uses full-text results without a notice on each CLI
+search. `recall info` and `recall semantic status` report the setting and queue.
+JSON responses for `recall search`, `recall session list --query`, and MCP
+session search include a top-level `semantic_enabled` field. CLI list responses
+without a nonempty query do not include this field.
+
+If the config file is damaged or unreadable, CLI and MCP searches each write one
+warning to stderr and continue with full-text search. Search does not change the
+config file in this case. A requested sync still requires a valid config file.
+
+In the TUI, press Ctrl+P to open Settings. The Semantic row toggles the setting
+when you press Enter or Space. Saving applies the setting to the current TUI
+immediately. Enabling it also starts the background indexer. A CLI
+`recall semantic enable` or `disable` command does not update search in an
+already running TUI. The TUI reads the setting at startup or when you next save
+its settings. The background indexer rereads the setting at each session
+boundary, so a running indexer applies an external CLI change at that boundary.
+
+Benchmark commands bypass the semantic setting.
 
 ## Agent-Friendly Workflows
 

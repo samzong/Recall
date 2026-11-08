@@ -91,8 +91,7 @@ pub(super) fn search_ready(
 ) -> std::result::Result<HitList, String> {
     let (scope, sources) = resolve_filters(store, args.project.as_deref(), args.source.as_deref())?;
     let limit = clamp_limit(args.limit, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX);
-    let semantic_enabled =
-        crate::config::AppConfig::load().map_err(|error| error.to_string())?.semantic_enabled;
+    let semantic_enabled = crate::query::search_semantic_enabled();
     let embedding = query_embedding_with(store, semantic_enabled, &args.query, |message| {
         tracing::info!("{message}");
     })

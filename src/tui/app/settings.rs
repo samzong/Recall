@@ -69,16 +69,16 @@ impl App {
     }
 
     pub(super) fn settings_row_count(&self) -> usize {
-        1 + self.all_sources.len()
+        2 + self.all_sources.len()
     }
 
     fn update_setting(&mut self, store: &Store) {
-        // Re-read the file so saving preserves keys edited outside this TUI
-        // (e.g. `recall semantic disable` run while it was open).
         let mut config = AppConfig::load().unwrap_or_else(|_| self.config.clone());
         if self.settings_selected == 0 {
             config.sync_window = config.sync_window.next();
-        } else if let Some((source_id, _)) = self.all_sources.get(self.settings_selected - 1) {
+        } else if self.settings_selected == 1 {
+            config.semantic_enabled = !self.config.semantic_enabled;
+        } else if let Some((source_id, _)) = self.all_sources.get(self.settings_selected - 2) {
             if config.is_source_enabled(source_id) {
                 let enabled_count =
                     self.all_sources.iter().filter(|(id, _)| config.is_source_enabled(id)).count();
@@ -98,11 +98,17 @@ impl App {
             self.status_message = Some(format!("Failed to save settings: {e}"));
             return;
         }
+        let enabling_semantic = config.semantic_enabled && !self.config.semantic_enabled;
         self.config = config;
+        self.invalidate_active_search();
 
         self.reset_search_defaults();
         self.update_scope_metrics(store);
         self.status_message = Some("Settings saved".to_string());
+        if enabling_semantic && let Err(error) = crate::semantic::ensure_background_worker(false) {
+            self.status_message =
+                Some(format!("Settings saved. Failed to start indexing: {error}"));
+        }
         if self.query.is_empty() {
             self.load_recent(store);
         } else {

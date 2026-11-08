@@ -65,8 +65,6 @@ fn disabled_query_embedding_returns_none_before_touching_the_model() {
     let session = make_session("s1", "test", "raw1", "Test");
     let messages = vec![make_message("s1", Role::User, "hello world test", 0)];
     store.persist_session_with_usage(&session, &messages, &[], Some(1)).unwrap();
-    // A `done` row is the state in which an ungated call would construct the
-    // provider and emit "Loading embedding model...".
     store
         .conn
         .execute("UPDATE session_embedding_state SET status = 'done' WHERE session_id = 's1'", [])
@@ -78,7 +76,12 @@ fn disabled_query_embedding_returns_none_before_touching_the_model() {
             .unwrap();
 
     assert!(result.is_none());
-    assert_eq!(emitted, ["Semantic search is disabled; showing full-text matches only."]);
+    assert!(emitted.is_empty());
+    let results = SearchEngine::new(&store.conn)
+        .hybrid_search("hello", result.as_deref(), &no_filters(), 10, 3)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(matches!(results[0].match_source, crate::types::MatchSource::Fts));
 }
 
 #[test]
@@ -87,8 +90,6 @@ fn enabled_query_embedding_still_short_circuits_without_indexed_sessions() {
     let session = make_session("s1", "test", "raw1", "Test");
     let messages = vec![make_message("s1", Role::User, "hello world test", 0)];
     store.persist_session_with_usage(&session, &messages, &[], Some(1)).unwrap();
-    // Session is `pending`: no done/processing sessions, so the enabled path
-    // must return before constructing a provider.
     let mut emitted = Vec::new();
     let result =
         crate::query::query_embedding_with(&store, true, "hello", |m| emitted.push(m.to_string()))
@@ -96,21 +97,4 @@ fn enabled_query_embedding_still_short_circuits_without_indexed_sessions() {
 
     assert!(result.is_none());
     assert!(emitted.is_empty(), "enabled path must stay silent: {emitted:?}");
-}
-
-#[test]
-fn disabled_session_search_stays_full_text() {
-    let store = setup();
-    let session = make_session("s1", "test", "raw1", "Semantic boundary check");
-    let messages = vec![
-        make_message("s1", Role::User, "lexically present keyword", 0),
-        make_message("s1", Role::Assistant, "an answer", 1),
-    ];
-    store.persist_session_with_usage(&session, &messages, &[], Some(1)).unwrap();
-
-    let engine = SearchEngine::new(&store.conn);
-    let results = engine.hybrid_search("lexically present", None, &no_filters(), 10, 3).unwrap();
-
-    assert_eq!(results.len(), 1);
-    assert!(matches!(results[0].match_source, crate::types::MatchSource::Fts));
 }

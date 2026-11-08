@@ -133,6 +133,7 @@ fn text_search_response_keeps_semantic_refinement_pending() {
     let (mut app, store) = app_and_store();
     app.query = "parser".to_string();
     app.active_search_id = 1;
+    app.config.semantic_enabled = true;
     app.semantic_progress.done_sessions = 1;
 
     app.apply_search_response(

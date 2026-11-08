@@ -11,8 +11,6 @@ const SESSION_EMBED_BATCH: usize = 8;
 const BACKGROUND_JOB: &str = "pipeline";
 
 pub(crate) fn ensure_background_worker(sync_first: bool) -> Result<()> {
-    // `sync_first` spawns still run: the release TUI uses the worker process
-    // as its startup-sync vehicle, and the child exits before semantic work.
     if !sync_first && !AppConfig::load()?.semantic_enabled {
         return Ok(());
     }
@@ -68,8 +66,6 @@ where
     )?;
 
     loop {
-        // Re-read config between sessions so disabling stops the drain at the
-        // next job boundary instead of at process exit.
         if !AppConfig::load()?.semantic_enabled {
             break;
         }

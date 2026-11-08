@@ -38,7 +38,7 @@ pub(super) fn render_export_input(f: &mut Frame, app: &App) {
 pub(super) fn render_settings(f: &mut Frame, app: &App) {
     let area = f.area();
     let width = area.width.min(70);
-    let height = (app.all_sources.len() as u16 + 7).min(area.height.saturating_sub(2).max(7));
+    let height = (app.all_sources.len() as u16 + 8).min(area.height.saturating_sub(2).max(7));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -60,16 +60,27 @@ pub(super) fn render_settings(f: &mut Frame, app: &App) {
             if app.settings_selected == 0 { selected_style } else { normal_style },
         ),
     ]));
+    lines.push(Line::from(Span::styled(
+        if app.config.semantic_enabled {
+            " Semantic: On"
+        } else {
+            " Semantic: Off (enable downloads ~465 MiB)"
+        },
+        if app.settings_selected == 1 { selected_style } else { normal_style },
+    )));
     lines.push(Line::from(""));
 
     for (index, (source_id, label)) in app.all_sources.iter().enumerate() {
         let enabled = app.config.is_source_enabled(source_id);
         let prefix = if enabled { "[x]" } else { "[ ]" };
-        let style = if app.settings_selected == index + 1 { selected_style } else { normal_style };
+        let style = if app.settings_selected == index + 2 { selected_style } else { normal_style };
         lines.push(Line::from(Span::styled(format!(" {prefix} {label} ({source_id})"), style)));
     }
 
-    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let visible_lines = height.saturating_sub(2) as usize;
+    let selected_line = app.settings_selected + usize::from(app.settings_selected >= 2);
+    let scroll = selected_line.saturating_sub(visible_lines.saturating_sub(1)) as u16;
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll, 0));
     f.render_widget(Clear, popup);
     f.render_widget(widget, popup);
 }

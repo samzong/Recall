@@ -24,7 +24,8 @@
 - Keep the CLI command implementation in a dedicated `src/session.rs` module.
 - Extend `export::ExportOptions` with explicit session ids so
   `session export --format jsonl` reuses the existing JSONL export path.
-- Reuse `SearchEngine::hybrid_search` for `session list --query`.
+- Reuse `SearchEngine::hybrid_search` for `session list --query`; pass vector
+  embeddings only when semantic search is enabled.
 - Reuse `share::publish_session` for `session share`.
 - Inventory published pages from the managed publish directory; do not add a
   separate share registry or crawl `pages.dev`.
