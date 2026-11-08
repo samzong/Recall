@@ -1,6 +1,38 @@
 # Changelog
 
 
+## [0.7.0](https://github.com/samzong/Recall/compare/v0.6.7...v0.7.0) (2026-11-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* **semantic:** make semantic search opt-in ([#350](https://github.com/samzong/Recall/issues/350))
+
+
+### Features
+
+* **semantic:** allow disabling semantic indexing and search ([#346](https://github.com/samzong/Recall/issues/346))
+
+
+### Fixes
+
+* **search:** keep hyphenated query terms as adjacent phrases ([#341](https://github.com/samzong/Recall/issues/341))
+* **deps:** resolve markdown and zip security advisories ([#342](https://github.com/samzong/Recall/issues/342))
+* **skill:** follow scratch directory rules for share summaries ([#344](https://github.com/samzong/Recall/issues/344))
+
+
+### Refactors
+
+* split oversized modules below size gate ([#349](https://github.com/samzong/Recall/issues/349))
+
+## Upgrade note
+
+Semantic indexing and search now default to off. After upgrading, run
+`recall semantic enable` to restore semantic search and index queued sessions.
+If the model is not cached, the background indexer first downloads about
+465 MiB.
+
+
 ## [0.6.7](https://github.com/samzong/Recall/compare/v0.6.6...v0.6.7) (2026-10-30)
 
 
