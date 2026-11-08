@@ -1766,7 +1766,8 @@ impl App {
     }
 
     fn semantic_ready(&self) -> bool {
-        !self.embedding_unavailable
+        self.config.semantic_enabled
+            && !self.embedding_unavailable
             && (self.semantic_progress.done_sessions > 0
                 || self.semantic_progress.processing_sessions > 0)
     }
@@ -1922,27 +1923,32 @@ impl App {
     }
 
     fn update_setting(&mut self, store: &Store) {
+        // Re-read the file so saving preserves keys edited outside this TUI
+        // (e.g. `recall semantic disable` run while it was open).
+        let mut config = AppConfig::load().unwrap_or_else(|_| self.config.clone());
         if self.settings_selected == 0 {
-            self.config.sync_window = self.config.sync_window.next();
+            config.sync_window = config.sync_window.next();
         } else if let Some((source_id, _)) = self.all_sources.get(self.settings_selected - 1) {
-            if self.config.is_source_enabled(source_id) {
-                let enabled_count = self.enabled_sources().len();
+            if config.is_source_enabled(source_id) {
+                let enabled_count =
+                    self.all_sources.iter().filter(|(id, _)| config.is_source_enabled(id)).count();
                 if enabled_count <= 1 {
                     self.status_message = Some("At least one source must stay enabled".to_string());
                     return;
                 }
-                self.config.disabled_sources.push(source_id.clone());
-                self.config.disabled_sources.sort();
-                self.config.disabled_sources.dedup();
+                config.disabled_sources.push(source_id.clone());
+                config.disabled_sources.sort();
+                config.disabled_sources.dedup();
             } else {
-                self.config.disabled_sources.retain(|id| id != source_id);
+                config.disabled_sources.retain(|id| id != source_id);
             }
         }
 
-        if let Err(e) = self.config.save() {
+        if let Err(e) = config.save() {
             self.status_message = Some(format!("Failed to save settings: {e}"));
             return;
         }
+        self.config = config;
 
         self.reset_search_defaults();
         self.update_scope_metrics(store);

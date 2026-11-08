@@ -78,6 +78,8 @@ pub(super) struct SessionHit {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub(super) struct HitList {
     pub(super) message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) semantic_enabled: Option<bool>,
     pub(super) hits: Vec<SessionHit>,
     pub(super) current_session: CurrentSession,
 }
@@ -89,7 +91,9 @@ pub(super) fn search_ready(
 ) -> std::result::Result<HitList, String> {
     let (scope, sources) = resolve_filters(store, args.project.as_deref(), args.source.as_deref())?;
     let limit = clamp_limit(args.limit, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX);
-    let embedding = query_embedding(store, &args.query, |message| {
+    let semantic_enabled =
+        crate::config::AppConfig::load().map_err(|error| error.to_string())?.semantic_enabled;
+    let embedding = query_embedding_with(store, semantic_enabled, &args.query, |message| {
         tracing::info!("{message}");
     })
     .map_err(|error| error.to_string())?;
@@ -107,12 +111,14 @@ pub(super) fn search_ready(
         let message = if store_is_empty(store) { EMPTY_INDEX } else { SEARCH_EMPTY };
         return Ok(HitList {
             message: Some(message.to_string()),
+            semantic_enabled: Some(semantic_enabled),
             hits: Vec::new(),
             current_session: current_session.clone(),
         });
     }
     Ok(HitList {
         message: None,
+        semantic_enabled: Some(semantic_enabled),
         current_session: current_session.clone(),
         hits: results
             .into_iter()
@@ -141,12 +147,14 @@ pub(super) fn list_ready(
         let message = if store_is_empty(store) { EMPTY_INDEX } else { SEARCH_EMPTY };
         return Ok(HitList {
             message: Some(message.to_string()),
+            semantic_enabled: None,
             hits: Vec::new(),
             current_session: current_session.clone(),
         });
     }
     Ok(HitList {
         message: None,
+        semantic_enabled: None,
         current_session: current_session.clone(),
         hits: sessions
             .into_iter()

@@ -3,6 +3,7 @@ mod export;
 mod parsers;
 mod persistence;
 mod search;
+mod semantic_toggle;
 
 use crate::adapters::copilot::parse_copilot_events;
 use crate::adapters::gemini::parse_gemini_session;

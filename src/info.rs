@@ -57,7 +57,8 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
                             "label": label
                         }))
                         .collect::<Vec<_>>(),
-                    "time_scope": config.sync_window.label()
+                    "time_scope": config.sync_window.label(),
+                    "semantic_enabled": config.semantic_enabled
                 },
                 "semantic_queue": {
                     "indexed_sessions": progress.total_sessions,
@@ -140,9 +141,16 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
             .join(", ")
     );
     println!("  Time scope  {}", config.sync_window.label());
+    println!(
+        "  Semantic    {}",
+        if config.semantic_enabled { "on" } else { "off (full-text search only)" }
+    );
 
     println!();
     println!("Semantic Queue");
+    if !config.semantic_enabled {
+        println!("  Status      disabled — queued sessions backfill when re-enabled");
+    }
     println!("  Indexed DB  {} sessions tracked locally", progress.total_sessions);
     println!(
         "  Progress    {} done, {} pending, {} failed",

@@ -34,7 +34,7 @@ use crate::db::search::{
 };
 use crate::db::store::Store;
 use crate::project_scope::ProjectScope;
-use crate::query::{query_embedding, resolve_source_filter};
+use crate::query::{query_embedding_with, resolve_source_filter};
 use crate::types::{EvidenceVisibility, Message, Session, SessionEventRecord};
 
 const EXCERPT_CHAR_CAP: usize = 200;
@@ -359,13 +359,19 @@ fn to_json(value: impl Serialize) -> Value {
 fn empty_hits(message: impl Into<String>) -> HitList {
     HitList {
         message: Some(message.into()),
+        semantic_enabled: None,
         hits: Vec::new(),
         current_session: CurrentSession::unknown(),
     }
 }
 
 fn empty_hits_with_current(message: impl Into<String>, current_session: CurrentSession) -> HitList {
-    HitList { message: Some(message.into()), hits: Vec::new(), current_session }
+    HitList {
+        message: Some(message.into()),
+        semantic_enabled: None,
+        hits: Vec::new(),
+        current_session,
+    }
 }
 
 #[cfg(test)]

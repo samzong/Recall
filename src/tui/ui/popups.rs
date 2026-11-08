@@ -503,7 +503,9 @@ pub(super) fn render_confirm_resume(f: &mut Frame, app: &App) {
 }
 
 pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    let semantic_span = if app.semantic_progress.total_sessions > 0 {
+    let semantic_span = if !app.config.semantic_enabled {
+        Some(Span::styled(" [semantic off]", Style::default().fg(THEME.text_muted)))
+    } else if app.semantic_progress.total_sessions > 0 {
         let mut text = format!(
             " [semantic {}/{}]",
             app.semantic_progress.done_sessions, app.semantic_progress.total_sessions

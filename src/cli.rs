@@ -45,6 +45,11 @@ enum Commands {
         #[arg(long, requires = "messages", value_parser = clap::value_parser!(u32).range(1..=50), help = "Maximum message matches (default 10, maximum 50)")]
         limit: Option<u32>,
     },
+    #[command(about = "Manage semantic indexing and search")]
+    Semantic {
+        #[command(subcommand)]
+        command: crate::semantic::SemanticCommands,
+    },
     #[command(about = "Operate on indexed sessions")]
     Session {
         #[command(subcommand)]
@@ -339,6 +344,7 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::BackgroundWorker { sync_first }) => {
             crate::sync::run_background_worker(sync_first)?
         }
+        Some(Commands::Semantic { command }) => crate::semantic::run_semantic_command(command)?,
         Some(Commands::BenchSemantic) => crate::bench::run_semantic()?,
         Some(Commands::BenchSearch { query }) => crate::bench::run_search(&query)?,
         Some(Commands::BenchEval { dataset, verbose }) => {

@@ -592,9 +592,11 @@ fn print_session_list_json(
         .iter()
         .map(|row| session_list_row_json(store, row, sources))
         .collect::<Result<Vec<_>>>()?;
+    let semantic_enabled = crate::config::AppConfig::load()?.semantic_enabled;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
+            "semantic_enabled": semantic_enabled,
             "filters": {
                 "query": args.query,
                 "source": args.source,
