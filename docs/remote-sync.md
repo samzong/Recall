@@ -84,7 +84,7 @@ The label is `io.github.samzong.recall.remote-sync`. Its plist is
 `~/Library/LaunchAgents/io.github.samzong.recall.remote-sync.plist`. Its logs are
 `~/Library/Logs/recall/remote-sync.stdout.log` and
 `~/Library/Logs/recall/remote-sync.stderr.log`. The local
-[`recall sync schedule`](session.md#scheduled-sync-macos) retains its existing
+[`recall sync schedule`](session-scope.md#scheduled-sync-macos) retains its existing
 label and paths. Each schedule has its own interval and load state. Installing,
 updating, or uninstalling one does not change the other. Repeat install with
 `--interval` to change an interval. Uninstall retains logs and the remote connection.

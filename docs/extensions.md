@@ -476,7 +476,7 @@ demand.
 ## File History Compatibility Requirements
 
 The MCP file-history workflow is documented in
-[session.md](session.md#file-history-implementation-contract).
+[file-history.md](file-history.md#file-history-implementation-contract).
 `file_history.target_project` selects a target file across session projects;
 it cannot be combined with the older session-scope `project` parameter.
 Existing path matching and head/tail or message-cursor reads keep their meanings
