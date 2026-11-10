@@ -5,6 +5,7 @@
 /.github/CODEOWNERS @samzong
 
 # Official Recall extensions.
+/extensions/recall-calibrate/ @samzong
 /extensions/recall-opendal/ @samzong @delete-cloud
 /extensions/recall-probe/ @samzong
 /extensions/recall-reflect/ @samzong @zhexulong
