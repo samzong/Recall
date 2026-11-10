@@ -21,13 +21,13 @@ pre-release-commit-message = "chore(release): bump to v{{version}}"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-rmcp = { version = "3.1.4", default-features = false, features = [
+rmcp = { version = "3.9", default-features = false, features = [
     "server",
     "macros",
     "schemars",
     "transport-io",
 ] }
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup", "fallible_uint"] }
 tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "time", "process"] }
 sqlite-vec = "0.1"
 hf-hub = { version = "0.5", features = ["ureq"] }

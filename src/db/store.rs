@@ -225,7 +225,7 @@ fn backup_before_remote_migration(conn: &Connection, path: &Path) -> Result<Opti
         .prefix("recall-before-remote-")
         .suffix(".db")
         .tempfile_in(parent)?;
-    conn.backup(rusqlite::DatabaseName::Main, file.path(), None)?;
+    conn.backup(rusqlite::MAIN_DB, file.path(), None::<fn(rusqlite::backup::Progress)>)?;
     file.as_file().sync_all()?;
     let (_, backup) = file.keep()?;
     #[cfg(unix)]
