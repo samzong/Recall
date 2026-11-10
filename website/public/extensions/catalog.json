@@ -1,5 +1,32 @@
 {
   "extensions": {
+    "calibrate": {
+      "description": "Suggest agent settings, such as the auto-compact window, from Recall usage",
+      "versions": {
+        "0.1.0": {
+          "min_recall": "0.5.9",
+          "protocol": 2,
+          "targets": {
+            "aarch64-apple-darwin": {
+              "sha256": "387911f60b6dc1a16888d306d3b320c871056701ea54ad7a0bb81d103a7aa538",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-calibrate-v0.1.0/recall-calibrate-v0.1.0-aarch64-apple-darwin.tar.gz"
+            },
+            "x86_64-apple-darwin": {
+              "sha256": "b1274f76ae8f4883cbc5ed337f65f31e4cb71ce5ffa8af5730bf8b6b8eca199e",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-calibrate-v0.1.0/recall-calibrate-v0.1.0-x86_64-apple-darwin.tar.gz"
+            },
+            "x86_64-pc-windows-msvc": {
+              "sha256": "4a6271dc063aaa8df4d65a4cdf077f9a87fbd0b1e5760923a0406bf43c91ef6a",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-calibrate-v0.1.0/recall-calibrate-v0.1.0-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "bf24d05dcf91c73a00815b1a9a4e15063aa3d4808748a27c1e36962789e9ed1e",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-calibrate-v0.1.0/recall-calibrate-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          }
+        }
+      }
+    },
     "opendal": {
       "description": "Recall remote storage provider powered by Apache OpenDAL",
       "versions": {
