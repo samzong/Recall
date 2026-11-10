@@ -18,7 +18,7 @@ use anyhow::Result;
 use chrono::SecondsFormat;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo, Tool};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig, Tool};
 use rmcp::{
     ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router, transport::stdio,
 };
@@ -53,7 +53,7 @@ pub(crate) enum McpCapabilitiesFormat {
 
 #[derive(Serialize)]
 struct McpCapabilities {
-    server: ServerInfo,
+    server: ServerConfig,
     tools: Vec<Tool>,
 }
 
@@ -283,13 +283,13 @@ impl GetSessionBenchmark {
 
 #[tool_handler]
 impl ServerHandler for RecallMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         mcp_server_info()
     }
 }
 
-fn mcp_server_info() -> ServerInfo {
-    ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+fn mcp_server_info() -> ServerConfig {
+    ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
         .with_server_info(Implementation::new("recall", env!("CARGO_PKG_VERSION")))
         .with_instructions(
             "Read-only memory over the local Recall session index. Search or list past coding sessions, look up which sessions touched a file, then fetch a session when you need the transcript. Discovery tools report whether the current session was resolved and excluded; pass a fresh invocation_nonce when the host provides no session identity. Unknown resolution never guesses or changes results. This server never writes, syncs, waits for transcripts, or mutates the index.",
