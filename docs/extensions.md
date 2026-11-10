@@ -270,6 +270,7 @@ repository:
 extensions/recall-probe/
 extensions/recall-share/
 extensions/recall-reflect/
+extensions/recall-calibrate/
 ```
 
 Each extension owns its Cargo package version. The v0.1 `recall-probe` tests
