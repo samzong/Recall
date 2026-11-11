@@ -1,3 +1,10 @@
+recall-calibrate includes third-party code under the license below.
+
+## yetone/magpie
+
+Source: https://github.com/yetone/magpie, `internal/tune`
+Used in: `src/compact.rs` and the `to_call` function in `src/report.rs`, a Rust port of that package
+
 MIT License
 
 Copyright (c) 2026 yetone
