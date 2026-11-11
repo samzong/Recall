@@ -131,7 +131,7 @@ enum Commands {
     },
     #[command(about = "Export session records as JSON Lines")]
     Export {
-        #[arg(long, help = "Filter by source id or label")]
+        #[arg(long, help = "Filter by comma-separated source ids or labels")]
         source: Option<String>,
         #[arg(long, value_parser = crate::query::parse_time_range_arg, help = "Filter by time range")]
         time: Option<String>,
@@ -147,11 +147,12 @@ enum Commands {
             help = "Maximum sessions to export; 0 means all (default)"
         )]
         limit: usize,
-        #[arg(
-            long,
-            help = "Comma-separated JSONL fields; messages is required: metadata,messages,usage,events"
-        )]
+        #[arg(long, help = "Comma-separated JSONL fields: metadata,messages,usage,events")]
         include: Option<String>,
+        #[arg(long, value_enum, default_value_t = crate::export::MessageMode::All, help = "Export all messages or omit message bodies")]
+        messages: crate::export::MessageMode,
+        #[arg(long, help = "Emit a scope record before session records, including empty results")]
+        with_scope: bool,
     },
     #[command(about = "Import session records from JSON Lines")]
     Import {
@@ -387,17 +388,29 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Usage { json, source, time, card, period }) => {
             crate::usage::run_cli(json, source.as_deref(), time.as_deref(), card, period)?
         }
-        Some(Commands::Export { source, time, project, repo, thread_role, limit, include }) => {
-            crate::export::run_cli(
-                source.as_deref(),
-                time.as_deref(),
-                project.as_deref(),
-                repo.as_deref(),
-                thread_role,
-                limit,
-                include.as_deref(),
-            )?
-        }
+        Some(Commands::Export {
+            source,
+            time,
+            project,
+            repo,
+            thread_role,
+            limit,
+            include,
+            messages,
+            with_scope,
+        }) => crate::export::run_cli(
+            &crate::db::store::Store::open()?,
+            std::io::stdout().lock(),
+            source.as_deref(),
+            time.as_deref(),
+            project.as_deref(),
+            repo.as_deref(),
+            thread_role,
+            limit,
+            include.as_deref(),
+            messages,
+            with_scope,
+        )?,
         Some(Commands::Import { file, dry_run }) => crate::import::run_cli(&file, dry_run)?,
         Some(Commands::Share { command }) => match command {
             ShareCommands::Init { project_name, publish_dir } => {

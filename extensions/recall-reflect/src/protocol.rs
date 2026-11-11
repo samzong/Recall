@@ -31,7 +31,10 @@ impl ReflectArgs {
     pub fn filters(&self) -> ReflectFilters {
         ReflectFilters {
             scope_kind: self.scope_kind,
-            sources: self.source.as_ref().map(|source| vec![source.clone()]),
+            sources: self
+                .source
+                .as_ref()
+                .map(|source| source.split(',').map(|value| value.trim().to_string()).collect()),
             time_range: self.time.clone().unwrap_or_else(|| "All".to_string()),
             directory: self.project.clone(),
             repo: self.repo.clone(),
@@ -52,9 +55,24 @@ impl RecallClient {
         Self { bin }
     }
 
+    pub fn current_scope(&self) -> Result<serde_json::Value> {
+        let args = vec!["info".to_string(), "--format".to_string(), "json".to_string()];
+        let output = self.run(&args)?;
+        let info: serde_json::Value = serde_json::from_str(&ensure_success("info", &args, output)?)
+            .context("Recall info did not return JSON")?;
+        if info["protocol_version"] != 2
+            || !info.get("scope").is_some_and(|scope| scope.is_object() || scope.is_null())
+        {
+            return Err(anyhow!(
+                "Recall info must return a protocol 2 scope; rebuild or upgrade Recall"
+            ));
+        }
+        Ok(info["scope"].clone())
+    }
+
     pub fn sync(&self, args: &ReflectArgs) -> Result<()> {
-        let mut command_args =
-            vec!["sync".to_string(), "--project".to_string(), scope_selector(args).to_string()];
+        let mut command_args = vec!["sync".to_string()];
+        push_optional_arg(&mut command_args, "--project", scope_selector(args));
         push_optional_arg(&mut command_args, "--source", args.source.as_deref());
 
         let output = self.run(&command_args)?;
@@ -69,8 +87,7 @@ impl RecallClient {
             "--include".to_string(),
             "metadata,messages".to_string(),
         ];
-        command_args.push("--project".to_string());
-        command_args.push(scope_selector(args).to_string());
+        push_optional_arg(&mut command_args, "--project", scope_selector(args));
         push_optional_arg(&mut command_args, "--source", args.source.as_deref());
         push_optional_arg(&mut command_args, "--time", args.time.as_deref());
 
@@ -86,12 +103,12 @@ impl RecallClient {
     }
 }
 
-/// Recall infers a project scope from the current directory when no selector
-/// is given, so reflect always passes one — and passes the same one to sync and
-/// export, or it would refresh a different set of sessions than it reports on.
-/// `all` is the explicit global scope that personal reflection needs.
-fn scope_selector(args: &ReflectArgs) -> &str {
-    args.project.as_deref().or(args.repo.as_deref()).unwrap_or("all")
+fn scope_selector(args: &ReflectArgs) -> Option<&str> {
+    if args.scope_kind == ReflectScopeKind::Personal {
+        Some("all")
+    } else {
+        args.project.as_deref().or(args.repo.as_deref())
+    }
 }
 
 fn push_optional_arg(args: &mut Vec<String>, flag: &str, value: Option<&str>) {

@@ -19,12 +19,19 @@ pub struct BackfillOptions {
 }
 
 pub fn run(options: BackfillOptions) -> Result<BackfillReport> {
-    let scope = resolve_scope(&options.cwd)?;
     let time = normalize_time_selector(options.time.as_deref())?;
     if options.stdin && time.is_some() {
         bail!("--time cannot be combined with --stdin; filter with recall export --time");
     }
     let server_url = validate_server_url(&options.server_url)?;
+    let recall = RecallClient::from_env();
+    let core_scope = recall.current_scope(&options.cwd)?;
+    let scope = resolve_scope(&options.cwd, &core_scope)?;
+    let mut export = if options.stdin {
+        None
+    } else {
+        Some(recall.export_sessions(&options.cwd, &scope.project, time.as_deref())?)
+    };
     let client = if options.dry_run {
         None
     } else {
@@ -42,12 +49,7 @@ pub fn run(options: BackfillOptions) -> Result<BackfillReport> {
         if options.stdin {
             visit_stdin_sessions(&mut visit)?;
         } else {
-            RecallClient::from_env().visit_export_sessions(
-                &options.cwd,
-                &scope.project,
-                time.as_deref(),
-                &mut visit,
-            )?;
+            export.as_mut().expect("CLI backfill prepares an export").visit_sessions(&mut visit)?;
         }
     }
     Ok(counts.finish(

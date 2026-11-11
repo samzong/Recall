@@ -1,6 +1,4 @@
-use std::process::Command;
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 
 use recall_reflect::manifest;
@@ -54,9 +52,8 @@ fn main() -> Result<()> {
         project: cli.project,
         repo: cli.repo,
     };
-    apply_default_scope(&mut args)?;
-
     let client = RecallClient::from_env();
+    apply_default_scope(&client, &mut args)?;
     if cli.sync {
         client.sync(&args)?;
     }
@@ -73,7 +70,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn apply_default_scope(args: &mut ReflectArgs) -> Result<()> {
+fn apply_default_scope(client: &RecallClient, args: &mut ReflectArgs) -> Result<()> {
     if args.scope_kind == ReflectScopeKind::Personal {
         if args.project.is_some() || args.repo.is_some() {
             bail!("--personal cannot be combined with --project or --repo");
@@ -91,33 +88,14 @@ fn apply_default_scope(args: &mut ReflectArgs) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(root) = current_git_root()? {
-        args.project = Some(root);
-    } else {
+    let scope = client.current_scope()?;
+    if scope["kind"] == "global" {
         args.scope_kind = ReflectScopeKind::Personal;
         args.time = Some(args.time.clone().unwrap_or_else(|| "30d".to_string()));
+    } else if let Some(directory) = scope["directory"].as_str() {
+        args.project = Some(directory.to_string());
+    } else {
+        bail!("Recall info scope has no local directory boundary");
     }
     Ok(())
-}
-
-fn current_git_root() -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .context("failed to resolve the current git repository")?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let root = String::from_utf8(output.stdout)
-        .context("git repository root was not valid UTF-8; pass --project or --repo")?
-        .trim()
-        .to_string();
-
-    if root.is_empty() {
-        bail!("git did not return a repository root");
-    }
-
-    Ok(Some(root))
 }

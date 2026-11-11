@@ -8,7 +8,9 @@ Read `docs/extensions.md` for the core/extension boundary and CLI protocol.
   `workspace.members`; keep `default-members = ["."]`.
   `recall <name>` dispatches to the managed binary.
 - Consume core through CLI JSON/JSONL, never SQLite or the Recall crate.
-  Pass an explicit project selector; use `--project all` for global results.
+  Pass `--project all` for global results. For current-repository workflows,
+  consume core scope from `info --format json` or `export --with-scope`; do not
+  derive repository identity from Git remotes.
 - `--recall-extension-manifest` must emit JSON with `name`, `version`,
   `protocol`, and `min_recall`. A remote provider also declares
   `transport_version: 1`. Keep this

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -17,6 +18,8 @@ struct Record {
 struct Session {
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -43,18 +46,20 @@ pub struct UsageEvent {
     pub session_id: String,
 }
 
-pub fn export_usage(source: &str, time: &str) -> Result<Vec<UsageEvent>> {
+pub fn export_usage(sources: &str, time: &str) -> Result<BTreeMap<String, Vec<UsageEvent>>> {
     let bin = std::env::var_os("RECALL_BIN").map(PathBuf::from).unwrap_or_else(|| "recall".into());
     let args = [
         "export",
         "--project",
         "all",
         "--source",
-        source,
+        sources,
         "--time",
         time,
         "--include",
         "metadata,messages,usage",
+        "--messages",
+        "none",
         "--limit",
         "0",
     ];
@@ -70,7 +75,7 @@ pub fn export_usage(source: &str, time: &str) -> Result<Vec<UsageEvent>> {
         let _ = stderr.read_to_string(&mut text);
         text
     });
-    let mut events = vec![];
+    let mut events: BTreeMap<String, Vec<UsageEvent>> = BTreeMap::new();
     let stdout = child.stdout.take().context("missing recall stdout")?;
     for line in BufReader::new(stdout).lines() {
         let line = line.context("failed to read recall export output")?;
@@ -79,10 +84,12 @@ pub fn export_usage(source: &str, time: &str) -> Result<Vec<UsageEvent>> {
         }
         let record: Record =
             serde_json::from_str(&line).context("recall export returned invalid JSONL")?;
-        let session_id = record.session.and_then(|s| s.id).unwrap_or_default();
+        let Some(session) = record.session else { continue };
+        let session_id = session.id.unwrap_or_default();
+        let Some(source) = session.source else { continue };
         for mut event in record.usage_events {
             event.session_id = session_id.clone();
-            events.push(event);
+            events.entry(source.clone()).or_default().push(event);
         }
     }
     let status = child.wait().context("failed to wait for recall export")?;

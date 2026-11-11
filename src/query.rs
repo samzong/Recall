@@ -152,7 +152,16 @@ pub(crate) fn resolve_source_filter(
     sources: &[(String, String)],
 ) -> Result<Option<Vec<String>>> {
     source_filter
-        .map(|source| resolve_source_id(source, sources).map(|source| vec![source]))
+        .map(|source| {
+            let mut resolved = Vec::new();
+            for value in source.split(',') {
+                let id = resolve_source_id(value.trim(), sources)?;
+                if !resolved.contains(&id) {
+                    resolved.push(id);
+                }
+            }
+            Ok(resolved)
+        })
         .transpose()
 }
 

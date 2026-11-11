@@ -60,10 +60,9 @@ pub fn fetch_records(
     if selection.sources.is_empty() {
         ingest(client.export_scope(&selection.project, None)?)?;
     } else {
-        for source in &selection.sources {
-            progress.step(&format!("Exporting sessions from `{source}`"));
-            ingest(client.export_scope(&selection.project, Some(source))?)?;
-        }
+        let sources = selection.sources.join(",");
+        progress.step(&format!("Exporting sessions from `{sources}`"));
+        ingest(client.export_scope(&selection.project, Some(&sources))?)?;
     }
     if !selection.include_ids.is_empty() {
         ingest(client.export_ids(&selection.include_ids)?)?;

@@ -92,6 +92,7 @@ fn reflect_cli_syncs_selected_source_before_export() {
     assert_eq!(
         calls,
         [
+            "info --format json".to_string(),
             format!("sync --project {} --source opencode", repo.path().display()),
             format!(
                 "export --limit 0 --include metadata,messages --project {} --source opencode",
@@ -127,11 +128,30 @@ fn reflect_cli_defaults_unscoped_reflection_to_current_git_root() {
     let calls = fake.calls();
     assert_eq!(
         calls,
-        [format!(
-            "export --limit 0 --include metadata,messages --project {}",
-            repo.path().display()
-        )]
+        [
+            "info --format json".to_string(),
+            format!(
+                "export --limit 0 --include metadata,messages --project {}",
+                repo.path().display()
+            )
+        ]
     );
+}
+
+#[test]
+fn null_scope_stops_before_export() {
+    let fake = FakeRecall::new(JSONL_FIXTURE, 0, "");
+    fake.set_scope(serde_json::Value::Null);
+    let repo = TempDir::new("recall-reflect-unknown-scope");
+    let output = Command::new(env!("CARGO_BIN_EXE_recall-reflect"))
+        .env("RECALL_BIN", fake.script_path())
+        .current_dir(repo.path())
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(fake.calls(), ["info --format json"]);
 }
 
 #[test]
@@ -157,7 +177,13 @@ fn reflect_cli_defaults_to_personal_scope_outside_git_worktree() {
     assert_eq!(json["scope"]["time_range"], "30d");
 
     let calls = fake.calls();
-    assert_eq!(calls, ["export --limit 0 --include metadata,messages --project all --time 30d"]);
+    assert_eq!(
+        calls,
+        [
+            "info --format json",
+            "export --limit 0 --include metadata,messages --project all --time 30d"
+        ]
+    );
 }
 
 #[test]
@@ -272,6 +298,19 @@ impl FakeRecall {
         let script_body = format!(
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "{calls}"
+if [ "$1" = "info" ]; then
+  if [ -f "{info_path}" ]; then
+    cat "{info_path}"
+    exit 0
+  fi
+  root=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ -n "$root" ]; then
+    printf '{{"protocol_version":2,"scope":{{"kind":"repository","value":"example.com/owner/repo","repository":{{"remote":"example.com/owner/repo","slug":"owner/repo","name":"repo"}},"directory":"%s"}}}}\n' "$root"
+  else
+    printf '{{"protocol_version":2,"scope":{{"kind":"global","value":null,"directory":null}}}}\n'
+  fi
+  exit 0
+fi
 if [ "$1" = "sync" ]; then
   exit 0
 fi
@@ -284,6 +323,7 @@ echo "unexpected command: $*" >&2
 exit 99
 "#,
             calls = calls.display(),
+            info_path = dir.join("info.json").display(),
             stdout_path = stdout_path.display(),
             stderr_path = stderr_path.display(),
             export_exit_code = export_exit_code,
@@ -292,6 +332,14 @@ exit 99
         make_executable(&script);
 
         Self { dir, script, calls }
+    }
+
+    fn set_scope(&self, scope: serde_json::Value) {
+        fs::write(
+            self.dir.join("info.json"),
+            serde_json::json!({"protocol_version":2,"scope":scope}).to_string(),
+        )
+        .unwrap();
     }
 
     fn script_path(&self) -> &Path {
