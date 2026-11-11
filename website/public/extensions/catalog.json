@@ -225,6 +225,29 @@
               "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.1/recall-r2-v0.1.1-x86_64-unknown-linux-gnu.tar.gz"
             }
           }
+        },
+        "0.1.2": {
+          "min_recall": "0.6.5",
+          "protocol": 2,
+          "targets": {
+            "aarch64-apple-darwin": {
+              "sha256": "440b266e2d8d397cd835752109a1cf552eea52e47d159918fa16115a5299dd07",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.2/recall-r2-v0.1.2-aarch64-apple-darwin.tar.gz"
+            },
+            "x86_64-apple-darwin": {
+              "sha256": "98aa0c077b571220b4ec1dc1da75ad630dfd7bfaee9c01856824d46c6af64f00",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.2/recall-r2-v0.1.2-x86_64-apple-darwin.tar.gz"
+            },
+            "x86_64-pc-windows-msvc": {
+              "sha256": "bd10f5ef2798e85bd933f0252ff5bc1ef747a04b5763b2ee5883b379dba68e68",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.2/recall-r2-v0.1.2-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "e937999a6eafb6e8bf48f8d0949cfe147303ce84cd847a9abbe9fcec46864efc",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.2/recall-r2-v0.1.2-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          },
+          "transport_version": 1
         }
       }
     },
