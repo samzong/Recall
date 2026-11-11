@@ -1,17 +1,7 @@
-//! Single source of truth for "which sessions does this command mean".
-//!
-//! Two entry points share one precedence ladder: an explicit `--project`
-//! selector, and the automatic scope derived from the current directory.
-//! Resolution never yields "unknown" — a directory that has no resolvable repo
-//! identity degrades to a directory boundary, and a directory outside Git
-//! degrades to `Global`, so callers cannot invent their own interpretation.
-
 use std::path::Path;
 
 use crate::db::search::RepoFilter;
-use crate::repo_identity::{
-    RepoIdentity, git_toplevel, normalize_remote_url, normalize_slug, origin_identity,
-};
+use crate::repo_identity::{GitProbe, RepoIdentity, normalize_remote_url, normalize_slug};
 
 const GLOBAL_KEYWORDS: [&str; 2] = ["all", "global"];
 
@@ -38,6 +28,34 @@ impl ProjectScope {
             ProjectScope::Directory(_) => "directory",
             ProjectScope::Repository { .. } => "repository",
         }
+    }
+
+    pub(crate) fn envelope(&self) -> serde_json::Value {
+        let (repository, directory) = match self {
+            Self::Global => (None, None),
+            Self::Directory(directory) => (None, Some(directory.as_str())),
+            Self::Repository { filter, local_root } => {
+                let identity = match filter {
+                    RepoFilter::Remote(remote) => {
+                        remote.split_once('/').map(|(_, slug)| RepoIdentity {
+                            remote: remote.clone(),
+                            slug: slug.to_string(),
+                            name: slug.rsplit('/').next().unwrap_or(slug).to_string(),
+                        })
+                    }
+                    _ => None,
+                };
+                (identity, local_root.as_deref())
+            }
+        };
+        serde_json::json!({
+            "kind": self.kind(),
+            "value": self.value(),
+            "repository": repository.map(|identity| serde_json::json!({
+                "remote": identity.remote, "slug": identity.slug, "name": identity.name,
+            })),
+            "directory": directory,
+        })
     }
 
     pub(crate) fn value(&self) -> Option<&str> {
@@ -146,19 +164,27 @@ pub(crate) fn classify_selector(value: &str) -> SelectorForm {
 }
 
 pub(crate) fn auto_scope_for_dir(dir: &Path) -> anyhow::Result<ProjectScope> {
+    scope_for_dir(dir, GitProbe::Optional)
+}
+
+fn scope_for_dir(dir: &Path, probe: GitProbe) -> anyhow::Result<ProjectScope> {
     let Some(dir) = dir.to_str() else {
         return Ok(ProjectScope::Global);
     };
-    let Some(toplevel) = git_toplevel(dir)? else {
+    let Some(toplevel) = probe.toplevel(dir)? else {
         return Ok(ProjectScope::Global);
     };
-    Ok(match origin_identity(&toplevel)? {
+    Ok(match probe.origin_identity(&toplevel)? {
         Some(identity) => ProjectScope::Repository {
             filter: RepoFilter::Remote(identity.remote),
             local_root: Some(toplevel),
         },
         None => ProjectScope::Directory(toplevel),
     })
+}
+
+pub(crate) fn try_info_scope() -> anyhow::Result<ProjectScope> {
+    scope_for_dir(&std::env::current_dir()?, GitProbe::Required)
 }
 
 pub(crate) fn try_auto_scope() -> anyhow::Result<ProjectScope> {

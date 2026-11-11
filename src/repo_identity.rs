@@ -132,18 +132,35 @@ fn normalize_file_path(path: &Path) -> Option<PathBuf> {
     Some(result)
 }
 
-pub(crate) fn git_toplevel(directory: &str) -> Result<Option<String>> {
-    if !Path::new(directory).is_dir() {
-        return Ok(None);
+#[derive(Clone, Copy)]
+pub(crate) enum GitProbe {
+    Optional,
+    Required,
+}
+
+impl GitProbe {
+    pub(crate) fn toplevel(self, directory: &str) -> Result<Option<String>> {
+        if !Path::new(directory).is_dir() {
+            return Ok(None);
+        }
+        git_output(["-C", directory, "rev-parse", "--show-toplevel"], self).with_context(|| {
+            format!("cannot probe Git repository root for directory {directory:?}")
+        })
     }
-    git_output(["-C", directory, "rev-parse", "--show-toplevel"])
-        .with_context(|| format!("cannot probe Git repository root for directory {directory:?}"))
+
+    pub(crate) fn origin_identity(self, toplevel: &str) -> Result<Option<RepoIdentity>> {
+        Ok(git_output(["-C", toplevel, "remote", "get-url", "origin"], self)
+            .with_context(|| format!("cannot probe Git origin for directory {toplevel:?}"))?
+            .and_then(|url| normalize_remote_url(&url)))
+    }
+}
+
+pub(crate) fn git_toplevel(directory: &str) -> Result<Option<String>> {
+    GitProbe::Optional.toplevel(directory)
 }
 
 pub(crate) fn origin_identity(toplevel: &str) -> Result<Option<RepoIdentity>> {
-    Ok(git_output(["-C", toplevel, "remote", "get-url", "origin"])
-        .with_context(|| format!("cannot probe Git origin for directory {toplevel:?}"))?
-        .and_then(|url| normalize_remote_url(&url)))
+    GitProbe::Optional.origin_identity(toplevel)
 }
 
 /// Parses any Git remote form into a host-qualified identity:
@@ -215,8 +232,8 @@ fn host_looks_like_host(host: &str) -> bool {
 
 pub(crate) const GIT_METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn git_output<const N: usize>(args: [&str; N]) -> Result<Option<String>> {
-    probe_output(Command::new("git").args(args), GIT_METADATA_PROBE_TIMEOUT)
+fn git_output<const N: usize>(args: [&str; N], probe: GitProbe) -> Result<Option<String>> {
+    probe_output(Command::new("git").args(args), GIT_METADATA_PROBE_TIMEOUT, probe)
 }
 
 fn stop_probe(child: &mut Child) -> Result<()> {
@@ -235,7 +252,11 @@ fn stop_probe(child: &mut Child) -> Result<()> {
     killed.context("failed to stop Git metadata probe")
 }
 
-fn probe_output(command: &mut Command, timeout: Duration) -> Result<Option<String>> {
+fn probe_output(
+    command: &mut Command,
+    timeout: Duration,
+    probe: GitProbe,
+) -> Result<Option<String>> {
     let mut output = tempfile::tempfile().context("cannot capture Git metadata probe output")?;
     command.stdin(Stdio::null()).stdout(output.try_clone()?).stderr(Stdio::null());
     #[cfg(unix)]
@@ -246,7 +267,10 @@ fn probe_output(command: &mut Command, timeout: Duration) -> Result<Option<Strin
     let started = Instant::now();
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return Ok(None),
+        Err(error) => match probe {
+            GitProbe::Optional => return Ok(None),
+            GitProbe::Required => return Err(error).context("cannot start Git metadata probe"),
+        },
     };
     let status = loop {
         match child.try_wait() {
@@ -296,6 +320,7 @@ mod tests {
                 .arg(&parent_pid)
                 .arg(&child_pid),
             Duration::from_millis(200),
+            GitProbe::Optional,
         );
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(3));

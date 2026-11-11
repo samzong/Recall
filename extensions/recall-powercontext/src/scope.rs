@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+const UNKNOWN_SCOPE: &str = "Recall could not determine the current repository; make sure Git responds in this directory and retry";
 const MAX_SCOPE_LENGTH: usize = 256;
 const WORKSPACE_STATE_SCHEMA: &str = "powercontext.codex-workspace.v1";
 
@@ -25,20 +26,27 @@ pub struct ResolvedScope {
     pub project: String,
 }
 
-pub fn resolve_scope(cwd: &Path) -> Result<ResolvedScope> {
-    let git_dir = git_value(cwd, &["rev-parse", "--absolute-git-dir"])?
-        .ok_or_else(|| ScopeError("not a git repository; run from a repo with origin".into()))?;
-    let root = git_value(cwd, &["rev-parse", "--show-toplevel"])?
-        .ok_or_else(|| ScopeError("not a git repository; run from a repo with origin".into()))?;
-    let remote = git_value(Path::new(&root), &["config", "--get", "remote.origin.url"])?
-        .ok_or_else(|| {
-            ScopeError("git remote origin is missing; refusing local:sha256 scope".into())
-        })?;
-    let project = normalize_git_remote(&remote)
-        .ok_or_else(|| ScopeError(format!("git remote origin is not a network URL: {remote}")))?;
+pub fn resolve_scope(cwd: &Path, scope: &serde_json::Value) -> Result<ResolvedScope> {
+    if scope.is_null() {
+        return Err(ScopeError(UNKNOWN_SCOPE.into()).into());
+    }
+    if scope["kind"] == "global" {
+        return Err(ScopeError(
+            "not a git repository; run backfill from a Git checkout with a network origin".into(),
+        )
+        .into());
+    }
+    let project = scope.get("repository")
+        .and_then(|repository| repository.get("remote"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ScopeError("git remote origin has no core repository identity; configure origin with a host-qualified network repository URL and retry".into()))?;
+    let git_dir = git_value(cwd, &["rev-parse", "--absolute-git-dir"])
+        .map_err(|_| ScopeError(UNKNOWN_SCOPE.into()))?
+        .ok_or_else(|| ScopeError(UNKNOWN_SCOPE.into()))?;
     let id =
-        read_bound_scope_id(Path::new(&git_dir)).unwrap_or_else(|| bounded_scope("git", &project));
-    Ok(ResolvedScope { id, project })
+        read_bound_scope_id(Path::new(&git_dir)).unwrap_or_else(|| bounded_scope("git", project));
+    Ok(ResolvedScope { id, project: project.to_string() })
 }
 
 fn read_bound_scope_id(git_dir: &Path) -> Option<String> {
@@ -58,62 +66,6 @@ fn read_bound_scope_id(git_dir: &Path) -> Option<String> {
         return None;
     }
     Some(state.scope_id)
-}
-
-pub fn normalize_git_remote(remote: &str) -> Option<String> {
-    let value = remote.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if !value.contains("://") {
-        return normalize_scp_remote(value);
-    }
-    let (scheme, rest) = value.split_once("://")?;
-    if !matches!(scheme, "http" | "https" | "ssh" | "git") {
-        return None;
-    }
-    let rest = rest.trim_start_matches('/');
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let authority = authority.rsplit('@').next()?.trim();
-    if authority.is_empty() {
-        return None;
-    }
-    let host = authority.to_ascii_lowercase();
-    let path = normalize_path(path);
-    if path.is_empty() {
-        return None;
-    }
-    Some(format!("{host}/{path}"))
-}
-
-fn normalize_scp_remote(value: &str) -> Option<String> {
-    let rest = match value.split_once('@') {
-        Some((user, rest)) if !user.is_empty() && !user.contains('/') => rest,
-        None => value,
-        Some(_) => return None,
-    };
-    let (host, path) = rest.split_once(':')?;
-    if host.is_empty() || host.contains('/') {
-        return None;
-    }
-    let path = normalize_path(path);
-    if path.is_empty() {
-        return None;
-    }
-    Some(format!("{}/{path}", host.to_ascii_lowercase()))
-}
-
-fn normalize_path(path: &str) -> String {
-    let mut normalized = path
-        .replace('\\', "/")
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/");
-    if let Some(stripped) = normalized.strip_suffix(".git") {
-        normalized = stripped.to_string();
-    }
-    normalized.trim_end_matches('/').to_string()
 }
 
 fn bounded_scope(prefix: &str, value: &str) -> String {
@@ -143,34 +95,7 @@ pub fn scope_failure(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_scope, normalize_git_remote};
-
-    #[test]
-    fn normalizes_scp_and_https_remotes() {
-        assert_eq!(
-            normalize_git_remote("git@github.com:samzong/Recall.git").as_deref(),
-            Some("github.com/samzong/Recall")
-        );
-        assert_eq!(
-            normalize_git_remote("https://USER:token@GitHub.com/samzong/Recall.git").as_deref(),
-            Some("github.com/samzong/Recall")
-        );
-        assert_eq!(
-            normalize_git_remote("ssh://git@github.com/samzong/Recall.git").as_deref(),
-            Some("github.com/samzong/Recall")
-        );
-        assert_eq!(
-            normalize_git_remote("https://github.com:443/samzong/Recall.git").as_deref(),
-            Some("github.com:443/samzong/Recall")
-        );
-    }
-
-    #[test]
-    fn rejects_file_and_empty_remotes() {
-        assert_eq!(normalize_git_remote("file:///tmp/repo.git"), None);
-        assert_eq!(normalize_git_remote(""), None);
-        assert_eq!(normalize_git_remote("   "), None);
-    }
+    use super::bounded_scope;
 
     #[test]
     fn hashes_overlong_scope_ids() {

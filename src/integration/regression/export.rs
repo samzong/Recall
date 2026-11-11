@@ -343,3 +343,56 @@ fn export_jsonl_applies_repo_filter() {
     assert_eq!(value["session"]["id"], "s1");
     assert_eq!(value["session"]["repo_slug"], "samzong/Recall");
 }
+
+#[test]
+fn export_cli_scope_record_precedes_sessions_and_survives_empty_results() {
+    let store = setup();
+    let mut session = make_session("scope-session", "codex", "raw-scope", "Scoped export");
+    session.repo_remote = Some("example.com/group/repo".into());
+    store.insert_session(&session).unwrap();
+    for (project, expected_sessions) in
+        [("https://example.com/group/repo.git", 1), ("https://example.com/group/empty.git", 0)]
+    {
+        for with_scope in [false, true] {
+            let mut output = Vec::new();
+            crate::export::run_cli(
+                &store,
+                &mut output,
+                Some("codex,CC,codex"),
+                Some("all"),
+                Some(project),
+                None,
+                None,
+                0,
+                Some("metadata,usage"),
+                crate::export::MessageMode::None,
+                with_scope,
+            )
+            .unwrap();
+            let text = String::from_utf8(output).unwrap();
+            let records: Vec<serde_json::Value> =
+                text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(records.len(), expected_sessions + usize::from(with_scope));
+            if with_scope {
+                let header = &records[0];
+                assert_eq!(header["record_type"], "scope");
+                assert_eq!(header["protocol_version"], crate::PROTOCOL_VERSION);
+                let remote =
+                    project.strip_prefix("https://").unwrap().strip_suffix(".git").unwrap();
+                assert_eq!(header["scope"]["repository"]["remote"], remote);
+                assert_eq!(
+                    header["scope"]["repository"]["slug"],
+                    remote.split_once('/').unwrap().1
+                );
+                assert_eq!(header["scope"]["sources"], serde_json::json!(["codex", "claude-code"]));
+                assert_eq!(header["scope"]["time"], "all");
+            }
+            if expected_sessions > 0 {
+                let record = records.last().unwrap();
+                assert_eq!(record["record_type"], "session");
+                assert_eq!(record["session"]["id"], "scope-session");
+                assert_eq!(record["messages"], serde_json::json!([]));
+            }
+        }
+    }
+}

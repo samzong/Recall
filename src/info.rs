@@ -42,6 +42,7 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "protocol_version": crate::PROTOCOL_VERSION,
+                "scope": crate::project_scope::try_info_scope().ok().map(|scope| scope.envelope()),
                 "schemas": {
                     "export_record": crate::export::RECORD_SCHEMA_VERSION,
                     "database": crate::db::schema::current_schema_version()

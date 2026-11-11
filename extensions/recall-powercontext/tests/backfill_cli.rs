@@ -1,3 +1,7 @@
+mod support;
+
+use support::FakeRecall;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -63,7 +67,10 @@ fn dry_run_reports_bound_scope_and_unknown_adapters() {
     let calls = fake.calls();
     assert_eq!(
         calls,
-        ["export --project github.com/samzong/Recall --limit 0 --include metadata,messages"]
+        [
+            "info --format json",
+            "export --with-scope --project github.com/samzong/Recall --limit 0 --include metadata,messages"
+        ]
     );
 }
 
@@ -86,7 +93,8 @@ fn dry_run_forwards_time_window_to_export() {
     assert_eq!(
         fake.calls(),
         [
-            "export --project github.com/samzong/Recall --limit 0 --include metadata,messages --time 30d"
+            "info --format json",
+            "export --with-scope --project github.com/samzong/Recall --limit 0 --include metadata,messages --time 30d"
         ]
     );
 }
@@ -170,7 +178,27 @@ fn stdin_backfill_posts_and_classifies_skip_conflict_and_import() {
 }
 
 #[test]
-fn missing_origin_exits_two_without_export() {
+fn null_scope_stops_before_export() {
+    let fake = FakeRecall::new(&adapter_jsonl(), 0, "");
+    fake.set_scope(serde_json::Value::Null);
+    let repo = temp_dir("recall-pc-unknown-scope");
+    let output = Command::new(env!("CARGO_BIN_EXE_recall-powercontext"))
+        .env("RECALL_BIN", fake.script_path())
+        .current_dir(repo.path())
+        .args(["backfill", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Recall could not determine the current repository")
+    );
+    assert_eq!(fake.calls(), ["info --format json"]);
+}
+
+#[test]
+fn missing_core_repository_identity_exits_two_before_export() {
     let fake = FakeRecall::new("", 0, "");
     let repo = temp_dir("recall-pc-noorigin");
     init_git_repo(repo.path(), "");
@@ -186,7 +214,7 @@ fn missing_origin_exits_two_without_export() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("origin"), "{stderr}");
-    assert!(fake.calls().is_empty());
+    assert_eq!(fake.calls(), ["info --format json"]);
 }
 
 #[test]
@@ -263,7 +291,9 @@ fn invalid_stats_response_stops_before_capture() {
 }
 
 fn run_stdin_backfill(repo: &Path, server_url: &str, jsonl: &str) -> std::process::Output {
+    let fake = FakeRecall::new(&adapter_jsonl(), 0, "");
     let mut child = Command::new(env!("CARGO_BIN_EXE_recall-powercontext"))
+        .env("RECALL_BIN", fake.script_path())
         .current_dir(repo)
         .args(["backfill", "--stdin", "--server-url", server_url, "--format", "json"])
         .stdin(std::process::Stdio::piped())
@@ -273,52 +303,6 @@ fn run_stdin_backfill(repo: &Path, server_url: &str, jsonl: &str) -> std::proces
         .unwrap();
     child.stdin.as_mut().unwrap().write_all(jsonl.as_bytes()).unwrap();
     child.wait_with_output().unwrap()
-}
-
-struct FakeRecall {
-    _dir: TempDir,
-    script: PathBuf,
-    calls: PathBuf,
-}
-
-impl FakeRecall {
-    fn new(export_stdout: &str, export_exit_code: i32, export_stderr: &str) -> Self {
-        let dir = temp_dir("recall-pc-fake");
-        let script = dir.path().join("recall-fake.sh");
-        let calls = dir.path().join("calls.txt");
-        let stdout_path = dir.path().join("export.jsonl");
-        let stderr_path = dir.path().join("export.stderr");
-        fs::write(&stdout_path, export_stdout).unwrap();
-        fs::write(&stderr_path, export_stderr).unwrap();
-        fs::write(&calls, "").unwrap();
-        let script_body = format!(
-            r#"#!/bin/sh
-printf '%s\n' "$*" >> "{calls}"
-if [ "$1" = "export" ]; then
-  cat "{stderr_path}" >&2
-  cat "{stdout_path}"
-  exit {export_exit_code}
-fi
-echo "unexpected command: $*" >&2
-exit 99
-"#,
-            calls = calls.display(),
-            stdout_path = stdout_path.display(),
-            stderr_path = stderr_path.display(),
-            export_exit_code = export_exit_code,
-        );
-        fs::write(&script, script_body).unwrap();
-        make_executable(&script);
-        Self { _dir: dir, script, calls }
-    }
-
-    fn script_path(&self) -> &Path {
-        &self.script
-    }
-
-    fn calls(&self) -> Vec<String> {
-        fs::read_to_string(&self.calls).unwrap().lines().map(str::to_string).collect()
-    }
 }
 
 struct MockServer {
@@ -503,15 +487,3 @@ fn init_git_repo(path: &Path, origin: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
-
-#[cfg(unix)]
-fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) {}

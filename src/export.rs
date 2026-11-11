@@ -29,6 +29,13 @@ impl ExportIncludes {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+pub(crate) enum MessageMode {
+    #[default]
+    All,
+    None,
+}
+
 pub(crate) struct ExportOptions {
     pub(crate) session_ids: Vec<String>,
     pub(crate) sources: Option<Vec<String>>,
@@ -39,7 +46,10 @@ pub(crate) struct ExportOptions {
     pub(crate) includes: ExportIncludes,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_cli(
+    store: &Store,
+    mut writer: impl Write,
     source_filter: Option<&str>,
     time_filter: Option<&str>,
     project_filter: Option<&str>,
@@ -47,9 +57,10 @@ pub(crate) fn run_cli(
     thread_role: Option<ThreadRoleFilter>,
     limit: usize,
     include_filter: Option<&str>,
+    messages: MessageMode,
+    with_scope: bool,
 ) -> Result<()> {
     let time_range = parse_time_range(time_filter)?;
-    let store = Store::open()?;
     let sources = adapters::source_labels();
     let scope = store.resolve_scope(project_filter, repo_filter)?.announce();
     let options = ExportOptions {
@@ -59,11 +70,55 @@ pub(crate) fn run_cli(
         scope,
         thread_role,
         limit: if limit == 0 { None } else { Some(limit) },
-        includes: parse_export_includes(include_filter)?,
+        includes: {
+            let mut includes = if matches!(messages, MessageMode::None) {
+                match include_filter {
+                    Some(include) => apply_include_filter(
+                        ExportIncludes { messages: false, usage: false, events: false },
+                        include,
+                    )?,
+                    None => ExportIncludes::full(),
+                }
+            } else {
+                parse_export_includes(include_filter)?
+            };
+            if matches!(messages, MessageMode::None) {
+                includes.messages = false;
+            }
+            includes
+        },
     };
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    write_jsonl(&store, &options, &mut handle)
+    if with_scope {
+        write_scope_record(&options, &mut writer)?;
+    }
+    write_jsonl(store, &options, &mut writer)
+}
+
+pub(crate) fn scope_envelope(options: &ExportOptions) -> serde_json::Value {
+    let mut scope = options.scope.envelope();
+    scope["sources"] = serde_json::json!(options.sources);
+    scope["time"] = serde_json::json!(match options.time_range {
+        TimeRange::Today => "today",
+        TimeRange::Week => "7d",
+        TimeRange::Month => "30d",
+        TimeRange::All => "all",
+    });
+    scope["thread_role"] = serde_json::json!(options.thread_role.map(|role| role.as_str()));
+    scope["limit"] = serde_json::json!(options.limit);
+    scope
+}
+
+pub(crate) fn write_scope_record<W: Write>(options: &ExportOptions, mut writer: W) -> Result<()> {
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "record_type": "scope",
+            "protocol_version": crate::PROTOCOL_VERSION,
+            "scope": scope_envelope(options),
+        }),
+    )?;
+    writer.write_all(b"\n")?;
+    Ok(())
 }
 
 pub(crate) fn parse_export_includes(include: Option<&str>) -> Result<ExportIncludes> {

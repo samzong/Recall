@@ -125,8 +125,9 @@ Core support in v0.1:
 - `recall session show` supports `--format json|jsonl`;
 - `recall export` emits JSONL, one session record per line, with export record
   schema version 7, and supports `--include metadata,messages,usage,events`
-  for field projection. Export projections must include `messages`; `usage`
-  and `events` are optional add-ons. `recall session list` and `recall export`
+  for field projection. Export projections must include `messages` unless
+  `--messages none` is set; `usage` and `events` are optional add-ons.
+  `recall session list` and `recall export`
   also accept `--thread-role primary|subagent|unknown` to filter by topology;
 - Paged `session show` reads (`--around-seq`, `--max-chars`, or `--cursor`)
   add `truncated`, `next_cursor`, and `first_message_byte_offset`. Message
@@ -143,15 +144,15 @@ Core support in v0.1:
   older records default to empty files or null, which means unknown coverage.
   These additions do not change `protocol_version`.
 
-`protocol_version` is `2`. Version 2 changed the default scope: a command
-without `--project` now resolves its scope from the current directory instead
-of covering every project. Extensions must pass an explicit selector — use
-`--project all` for the previous global behaviour — because the caller's
-working directory would otherwise narrow the result set. `--project` also
-accepts a repository identity (`owner/repo` or a remote URL), so the separate
-`--repo` flag is deprecated. Structured responses carry
-`filters.effective_scope`. `recall sync` follows the same rule, so an extension
-that needs a full sync must pass `recall sync --project all`.
+`protocol_version` is `2`. Without `--project`, commands resolve scope from
+the current directory. For global results, extensions must pass `--project all` because
+the caller's working directory would otherwise narrow the result set.
+`--project` also accepts a repository identity (`owner/repo` or a remote URL).
+The separate `--repo` flag is deprecated. Structured responses carry
+`filters.effective_scope`. For a full sync, pass `recall sync --project all`.
+
+See [Scope and export selection](extension-scope.md) for core-owned scope,
+multi-source filters, and exports without message bodies.
 
 Transcript-only extensions should use `--include metadata,messages` instead of
 reading usage or event records they do not need.

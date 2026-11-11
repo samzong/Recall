@@ -62,13 +62,18 @@ fn main() -> Result<()> {
         return Ok(());
     };
     let mut advice = vec![];
+    let (sources, labels) = match source {
+        Some(Source::ClaudeCode) => ("claude-code", "Claude Code"),
+        Some(Source::Codex) => ("codex", "Codex"),
+        None => ("claude-code,codex", "Claude Code and Codex"),
+    };
+    eprintln!("reading {labels} usage from Recall ({time})");
+    let mut events = recall::export_usage(sources, &time)?;
     if source != Some(Source::Codex) {
-        eprintln!("reading Claude Code usage from Recall ({time})");
-        advice.extend(report::claude(&recall::export_usage("claude-code", &time)?));
+        advice.extend(report::claude(&events.remove("claude-code").unwrap_or_default()));
     }
     if source != Some(Source::ClaudeCode) {
-        eprintln!("reading Codex usage from Recall ({time})");
-        advice.extend(report::codex(&recall::export_usage("codex", &time)?));
+        advice.extend(report::codex(&events.remove("codex").unwrap_or_default()));
     }
     let report = report::Report { time, advice };
     match format {

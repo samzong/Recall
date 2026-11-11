@@ -19,13 +19,31 @@ impl RecallClient {
         Self { bin }
     }
 
-    pub fn visit_export_sessions(
+    pub fn current_scope(&self, cwd: &Path) -> Result<serde_json::Value> {
+        let output = Command::new(&self.bin)
+            .args(["info", "--format", "json"])
+            .current_dir(cwd)
+            .output()
+            .context("failed to run recall info --format json")?;
+        if !output.status.success() {
+            bail!("Recall info failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        let info: serde_json::Value =
+            serde_json::from_slice(&output.stdout).context("Recall info did not return JSON")?;
+        if info["protocol_version"] != 2
+            || !info.get("scope").is_some_and(|scope| scope.is_object() || scope.is_null())
+        {
+            bail!("Recall info must return a protocol 2 scope; rebuild or upgrade Recall");
+        }
+        Ok(info["scope"].clone())
+    }
+
+    pub fn export_sessions(
         &self,
         cwd: &Path,
         project: &str,
         time: Option<&str>,
-        visit: &mut impl FnMut(ExportRecord) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<ScopedExport> {
         let args = export_args(project, time);
         let mut output = tempfile::tempfile().context("failed to create Recall export buffer")?;
         let mut errors = tempfile::tempfile().context("failed to create Recall error buffer")?;
@@ -54,13 +72,35 @@ impl RecallClient {
             eprintln!("{line}");
         }
         output.rewind().context("failed to rewind Recall export buffer")?;
-        visit_export_jsonl(BufReader::new(output), visit)
+        let mut reader = BufReader::new(output);
+        let mut line = String::new();
+        reader.read_line(&mut line).context("failed to read Recall scope record")?;
+        let header: serde_json::Value = serde_json::from_str(&line)
+            .context("failed to parse Recall export scope record on line 1")?;
+        if header["record_type"] != "scope" || header["protocol_version"] != 2 {
+            bail!("Recall export must return a protocol 2 scope record; rebuild or upgrade Recall");
+        }
+        Ok(ScopedExport { reader })
+    }
+}
+
+pub struct ScopedExport {
+    reader: BufReader<std::fs::File>,
+}
+
+impl ScopedExport {
+    pub fn visit_sessions(
+        &mut self,
+        visit: &mut impl FnMut(ExportRecord) -> Result<()>,
+    ) -> Result<()> {
+        visit_export_jsonl(&mut self.reader, visit)
     }
 }
 
 fn export_args(project: &str, time: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "export".to_string(),
+        "--with-scope".to_string(),
         "--project".to_string(),
         project.to_string(),
         "--limit".to_string(),
@@ -99,6 +139,16 @@ fn visit_export_jsonl(
         let line_no = index + 1;
         let line = line.with_context(|| format!("failed to read export JSONL line {line_no}"))?;
         if !line.trim().is_empty() {
+            if index == 0 {
+                let header: serde_json::Value = serde_json::from_str(&line)
+                    .with_context(|| format!("failed to parse export JSONL line {line_no}"))?;
+                if header["record_type"] == "scope" {
+                    if header["protocol_version"] != 2 || !header["scope"].is_object() {
+                        bail!("invalid Recall export scope record on line {line_no}");
+                    }
+                    continue;
+                }
+            }
             visit(parse_export_line(&line, line_no)?)?;
         }
     }
