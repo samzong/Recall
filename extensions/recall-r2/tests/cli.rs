@@ -114,3 +114,17 @@ fn malformed_requests_fail_before_configuration_or_credentials_are_loaded() {
     }
     assert!(!configuration_path(home.path()).exists());
 }
+
+#[test]
+fn manifest_declares_remote_transport_contract() {
+    let home = tempfile::tempdir().unwrap();
+    let output = command(home.path()).arg("--recall-extension-manifest").output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let manifest: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(manifest["name"], "r2");
+    assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(manifest["protocol"], 2);
+    assert_eq!(manifest["min_recall"], "0.6.5");
+    assert_eq!(manifest["transport_version"], 1);
+}

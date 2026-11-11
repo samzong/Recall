@@ -11,7 +11,7 @@ Read `docs/extensions.md` for the core/extension boundary and CLI protocol.
   Pass an explicit project selector; use `--project all` for global results.
 - `--recall-extension-manifest` must emit JSON with `name`, `version`,
   `protocol`, and `min_recall`. A remote provider also declares
-  `transport_version: 1`; only the legacy R2 provider can omit it. Keep this
+  `transport_version: 1`. Keep this
   field independent of CLI `protocol`. Do not add unenforceable `capabilities`
   or `permissions` fields. The managed process is not a security sandbox.
 - Machine-output modes keep stdout free of progress and warnings; send those

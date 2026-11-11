@@ -46,7 +46,8 @@ fn main() -> ExitCode {
                     "name": "r2",
                     "version": env!("CARGO_PKG_VERSION"),
                     "protocol": 2,
-                    "min_recall": "0.6.0"
+                    "min_recall": "0.6.5",
+                    "transport_version": 1
                 })
             );
             ExitCode::SUCCESS

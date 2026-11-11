@@ -120,6 +120,10 @@ jobs:
                   "version": manifest.get("version") == version,
                   "protocol": isinstance(manifest.get("protocol"), int),
                   "min_recall": isinstance(manifest.get("min_recall"), str),
+                  "transport_version": "transport_version" not in manifest or (
+                      type(manifest["transport_version"]) is int
+                      and 0 < manifest["transport_version"] <= 0xFFFFFFFF
+                  ),
               }
               for field, ok in checks.items():
                   if not ok:
@@ -374,6 +378,12 @@ jobs:
           if catalog.get("schema") != 1:
               raise SystemExit("unsupported extension catalog schema")
 
+          if "transport_version" in manifest and (
+              type(manifest["transport_version"]) is not int
+              or not 0 < manifest["transport_version"] <= 0xFFFFFFFF
+          ):
+              raise SystemExit(f"invalid transport_version for {tag}")
+
           extension = manifest["name"]
           entry = catalog.setdefault("extensions", {}).setdefault(extension, {})
           entry["description"] = description
@@ -382,6 +392,8 @@ jobs:
               "protocol": manifest["protocol"],
               "targets": targets,
           }
+          if "transport_version" in manifest:
+              entry["versions"][version]["transport_version"] = manifest["transport_version"]
           path.write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n")
           PY
       - name: Commit catalog

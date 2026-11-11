@@ -88,6 +88,10 @@ fn select_latest_compatible_release_for_current_target() {
         catalog_version(&target, "0.2.10", crate::PROTOCOL_VERSION + 1, "too-new-protocol"),
     );
     versions.insert("0.1.1".to_string(), catalog_version(&target, "0.2.10", 1, "newer-compatible"));
+    let mut future_transport = catalog_version(&target, "0.2.10", 1, "too-new-transport");
+    future_transport.transport_version = Some(super::transport::VERSION + 1);
+    versions.insert("0.4.0".to_string(), future_transport);
+    versions.get_mut("0.1.1").unwrap().transport_version = Some(super::transport::VERSION);
     let mut extensions = BTreeMap::new();
     extensions
         .insert("probe".to_string(), CatalogExtension { description: String::new(), versions });
@@ -96,6 +100,7 @@ fn select_latest_compatible_release_for_current_target() {
     let selected = select_latest("probe", &catalog).unwrap();
 
     assert_eq!(selected.version, "0.1.1");
+    assert_eq!(selected.transport_version, Some(super::transport::VERSION));
     assert!(selected.target.url.ends_with("newer-compatible.tar.gz"));
 }
 
@@ -108,7 +113,12 @@ fn catalog_version(target: &str, min_recall: &str, protocol: u32, slug: &str) ->
             sha256: "00".repeat(32),
         },
     );
-    CatalogVersion { protocol, min_recall: min_recall.to_string(), targets }
+    CatalogVersion {
+        protocol,
+        min_recall: min_recall.to_string(),
+        transport_version: None,
+        targets,
+    }
 }
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -162,7 +172,7 @@ fn remote_provider_requires_matching_identity_and_compatible_transport() {
 
 #[test]
 #[cfg(unix)]
-fn legacy_r2_manifest_remains_a_remote_provider() {
+fn legacy_r2_manifest_requires_upgrade_before_remote_use() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("bin")).unwrap();
     let binary = managed_binary_path(root.path(), "r2");
@@ -175,6 +185,19 @@ printf '%s' '{"name":"r2","version":"0.1.0","protocol":2,"min_recall":"0.6.3"}'
     fs::write(
         root.path().join("installed.json"),
         r#"{"schema":1,"extensions":{"r2":{"version":"0.1.0"}}}"#,
+    )
+    .unwrap();
+    let error = super::remote_binary_with_root("r2", root.path()).unwrap_err().to_string();
+    assert!(error.contains("recall ext upgrade r2"), "{error}");
+    write_executable(
+        &binary,
+        r#"#!/bin/sh
+printf '%s' '{"name":"r2","version":"0.1.2","protocol":2,"min_recall":"0.6.5","transport_version":1}'
+"#,
+    );
+    fs::write(
+        root.path().join("installed.json"),
+        r#"{"schema":1,"extensions":{"r2":{"version":"0.1.2"}}}"#,
     )
     .unwrap();
     assert_eq!(super::remote_binary_with_root("r2", root.path()).unwrap(), binary);
@@ -245,7 +268,12 @@ fn catalog_description_is_not_part_of_manifest_validation() {
     )
     .unwrap();
 
-    validate_manifest("probe", "0.1.0", 1, "0.2.10", &manifest).unwrap();
+    validate_manifest("probe", "0.1.0", 1, "0.2.10", None, &manifest).unwrap();
+    assert!(validate_manifest("probe", "0.1.0", 1, "0.2.10", Some(1), &manifest).is_err());
+    let manifest = ExtensionManifest { transport_version: Some(1), ..manifest };
+    validate_manifest("probe", "0.1.0", 1, "0.2.10", None, &manifest).unwrap();
+    validate_manifest("probe", "0.1.0", 1, "0.2.10", Some(1), &manifest).unwrap();
+    assert!(validate_manifest("probe", "0.1.0", 1, "0.2.10", Some(2), &manifest).is_err());
 }
 
 #[test]
