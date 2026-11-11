@@ -1,201 +1,175 @@
 use super::*;
+use crate::db::search::{SearchEngine, SearchFilters, TimeRange};
 use crate::db::store::Store;
-use crate::types::{Message, Role};
+use crate::project_scope::ProjectScope;
 
-#[test]
-fn init_adds_trigram_fts_even_when_user_version_is_ahead() {
-    register_sqlite_vec();
-    let conn = Connection::open_in_memory().unwrap();
-    migrate_v1(&conn).unwrap();
-    migrate_v2(&conn).unwrap();
-    migrate_v3(&conn).unwrap();
-    migrate_v4(&conn).unwrap();
-    migrate_v5(&conn).unwrap();
-    migrate_v6(&conn).unwrap();
-    migrate_v7(&conn).unwrap();
-    migrate_v8(&conn).unwrap();
-    migrate_v9(&conn).unwrap();
-    migrate_v10(&conn).unwrap();
-    migrate_v11(&conn).unwrap();
-    conn.execute_batch(
-        "INSERT INTO sessions (id, source, source_id, title, started_at)
-         VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);
-         PRAGMA user_version = 13;",
-    )
-    .unwrap();
-    let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
-    let query = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
-    conn.execute(
-        "INSERT INTO messages (session_id, role, content, seq) VALUES ('s1', 'user', ?1, 0)",
-        [content],
-    )
-    .unwrap();
-
-    let before: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
-            [format!("\"{query}\"")],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(before, 0, "unicode61 cannot match a mid-clause CJK substring");
-
-    init(&conn).unwrap();
-
-    let after: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
-            [format!("\"{query}\"")],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(after, 1, "trigram rebuild must re-index existing rows for substring match");
-
-    init(&conn).unwrap();
-    let stable: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
-            [format!("\"{query}\"")],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(stable, 1, "ensure pass must be idempotent on an already-trigram index");
-
-    conn.execute("DELETE FROM sessions WHERE id = 's1'", []).unwrap();
-    let removed: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
-            [format!("\"{query}\"")],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(removed, 0, "trigram index must delete rows with their messages");
+fn filters() -> SearchFilters {
+    SearchFilters {
+        sources: None,
+        time_range: TimeRange::All,
+        scope: ProjectScope::Global,
+        thread_role: None,
+        excluded_session_id: None,
+    }
 }
 
 #[test]
-fn init_recreates_missing_trigram_fts_and_reindexes_existing_messages() {
+fn v20_converges_missing_partial_and_complete_legacy_indexes() {
     register_sqlite_vec();
-    let conn = Connection::open_in_memory().unwrap();
-    init(&conn).unwrap();
-    conn.execute_batch(
-        "INSERT INTO sessions (id, source, source_id, title, started_at)
-         VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);
-         INSERT INTO messages (session_id, role, content, seq)
-         VALUES ('s1', 'assistant', 'context cache', 1);",
-    )
-    .unwrap();
-    let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
-    let query = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
-    conn.execute(
-        "INSERT INTO messages (session_id, role, content, seq) VALUES ('s1', 'user', ?1, 0)",
-        [content],
-    )
-    .unwrap();
-    let old_write_hits: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts_trigram
-             WHERE messages_fts_trigram MATCH ?1",
-            [format!("\"{query}\"")],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(old_write_hits, 1, "pre-v12 inserts must remain trigram searchable");
-    let old_latin_hits: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts_trigram
-             WHERE messages_fts_trigram MATCH 'context'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(old_latin_hits, 1, "pre-v12 Latin inserts must remain trigram searchable");
-    conn.execute_batch("DROP TABLE messages_fts_trigram;").unwrap();
-
-    init(&conn).unwrap();
-
-    let hits: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
-            [format!("\"{query}\"")],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(hits, 1, "a missing FTS table must be recreated and reindexed on open");
-    let latin_hits: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts_trigram
-             WHERE messages_fts_trigram MATCH 'context'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(latin_hits, 0, "rebuild must index only CJK legacy rows");
+    for legacy in ["missing-column", "missing", "partial", "complete"] {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO sessions(id, source, source_id, title, started_at)
+             VALUES ('s', 'test', 's', 'migration', 1);
+             INSERT INTO messages(session_id, role, content, seq, trigram_indexed)
+             VALUES ('s', 'user', '历史消息包含数据库迁移', 0, NULL),
+                    ('s', 'user', '另一条包含数据库迁移', 1, 1),
+                    ('s', 'user', 'ordinary English', 2, 0);
+             PRAGMA user_version=19;",
+            )
+            .unwrap();
+        if legacy.starts_with("missing") {
+            store
+                .conn
+                .execute_batch(
+                    "DROP TRIGGER messages_trigram_ai; DROP TRIGGER messages_trigram_ad;
+                 DROP TABLE messages_fts_trigram;",
+                )
+                .unwrap();
+            if legacy == "missing-column" {
+                store
+                    .conn
+                    .execute_batch("ALTER TABLE messages DROP COLUMN trigram_indexed;")
+                    .unwrap();
+            }
+        } else if legacy == "partial" {
+            store
+                .conn
+                .execute_batch(
+                    "INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content)
+                 SELECT 'delete', id, content FROM messages WHERE seq=1;",
+                )
+                .unwrap();
+        }
+        init(&store.conn).unwrap();
+        assert_eq!(schema_version(&store.conn).unwrap(), 20);
+        let engine = SearchEngine::new(&store.conn);
+        assert!(engine.search_messages("数据库迁移", &filters(), None, 50).is_err());
+        assert!(engine.hybrid_search("数据库迁移", None, &filters(), 20, 3).is_err());
+        assert_eq!(engine.search_messages("ordinary", &filters(), None, 50).unwrap().len(), 1);
+        while store.backfill_trigram_batch().unwrap() {}
+        store.finish_trigram_backfill().unwrap();
+        assert_eq!(engine.search_messages("数据库迁移", &filters(), None, 50).unwrap().len(), 2);
+        init(&store.conn).unwrap();
+        assert!(!store.backfill_trigram_batch().unwrap());
+        store.conn.execute_batch("DELETE FROM messages;").unwrap();
+        assert!(engine.search_messages("数据库迁移", &filters(), None, 50).unwrap().is_empty());
+        store.conn.execute_batch(
+            "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES ('integrity-check');",
+        ).unwrap();
+    }
 }
 
 #[test]
-fn migrate_v12_retries_after_worker_lock_deferral() {
+fn v20_resumes_after_reopen_and_keeps_concurrent_and_legacy_writes_searchable() {
     register_sqlite_vec();
-    let db = tempfile::NamedTempFile::new().unwrap();
-    let conn = Connection::open(db.path()).unwrap();
-    migrate_v1(&conn).unwrap();
-    migrate_v2(&conn).unwrap();
-    migrate_v3(&conn).unwrap();
-    migrate_v4(&conn).unwrap();
-    migrate_v5(&conn).unwrap();
-    migrate_v6(&conn).unwrap();
-    migrate_v7(&conn).unwrap();
-    migrate_v8(&conn).unwrap();
-    migrate_v9(&conn).unwrap();
-    migrate_v10(&conn).unwrap();
-    migrate_v11(&conn).unwrap();
-
-    migrate_v12_with_lock(&conn, true, || Ok::<Option<()>, anyhow::Error>(None)).unwrap();
-    assert_eq!(schema_version(&conn).unwrap(), 11);
-    assert!(!has_trigram_fts(&conn).unwrap());
-
-    migrate_v13(&conn).unwrap();
-    assert_eq!(schema_version(&conn).unwrap(), 11);
-    let structured_columns: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('session_events')
-             WHERE name IN ('tool_call_id', 'is_meta', 'visibility')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(structured_columns, 3);
-
-    conn.execute_batch(
-        "INSERT INTO sessions (id, source, source_id, title, started_at)
-         VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);",
-    )
-    .unwrap();
-    let store = Store { trigram_message_flag: has_trigram_message_flag(&conn).unwrap(), conn };
-    let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
-    let query = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recall.db");
+    let store = Store::open_at(&path).unwrap();
     store
-        .insert_messages(&[Message {
-            session_id: "s1".to_string(),
-            role: Role::User,
-            content: content.to_string(),
-            timestamp: None,
-            seq: 0,
-        }])
-        .unwrap();
-
-    migrate_v12_with_lock(&store.conn, true, || Ok::<Option<()>, anyhow::Error>(Some(()))).unwrap();
-    assert_eq!(schema_version(&store.conn).unwrap(), V12_SCHEMA_VERSION);
-    init(&store.conn).unwrap();
-    assert_eq!(schema_version(&store.conn).unwrap(), SCHEMA_VERSION);
-    assert!(has_trigram_fts(&store.conn).unwrap());
-    let hits: i64 = store
         .conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages_fts_trigram
-             WHERE messages_fts_trigram MATCH ?1",
-            [format!("\"{query}\"")],
-            |row| row.get(0),
+        .execute_batch(
+            "INSERT INTO sessions(id, source, source_id, title, started_at)
+         VALUES ('s', 'test', 's', 'migration', 1);
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<260)
+         INSERT INTO messages(session_id, role, content, seq, trigram_indexed)
+         SELECT 's', 'user', '历史消息包含数据库迁移', i, 1 FROM n;
+         PRAGMA user_version=19;",
         )
         .unwrap();
-    assert_eq!(hits, 1, "messages written during deferral must join the rebuilt index");
+    init(&store.conn).unwrap();
+    assert!(store.backfill_trigram_batch().unwrap());
+    drop(store);
+    let store = Store::open_at(&path).unwrap();
+    let writer = Store::open_at(&path).unwrap();
+    writer
+        .conn
+        .execute_batch(
+            "DELETE FROM messages WHERE id=(
+             SELECT json_extract(detail, '$.cursor') FROM background_job_state WHERE job='trigram'
+         );
+         DELETE FROM messages WHERE seq IN (1, 200);
+         INSERT INTO messages(session_id, role, content, seq)
+         VALUES ('s', 'user', '降级写入数据库迁移', 300);
+         INSERT INTO messages(session_id, role, content, seq, trigram_indexed)
+         VALUES ('s', 'user', '新增消息数据库迁移', 301, 1);
+         DELETE FROM messages WHERE seq=301;",
+        )
+        .unwrap();
+    while store.backfill_trigram_batch().unwrap() {}
+    store.finish_trigram_backfill().unwrap();
+    let count: i64 = store.conn.query_row(
+        "SELECT count(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH '数据库迁移'",
+        [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(count, 258);
+    writer.conn.execute_batch("DELETE FROM messages;").unwrap();
+    store
+        .conn
+        .execute_batch(
+            "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES ('integrity-check');",
+        )
+        .unwrap();
+}
+
+#[test]
+fn v20_missing_or_incomplete_job_state_cannot_corrupt_unindexed_deletions() {
+    register_sqlite_vec();
+    for broken_state in [
+        "DELETE FROM background_job_state WHERE job='trigram';",
+        "UPDATE background_job_state SET detail='{}' WHERE job='trigram';",
+    ] {
+        let store = Store::open_in_memory().unwrap();
+        store.conn.execute_batch(
+            "INSERT INTO sessions(id,source,source_id,title,started_at) VALUES ('s','test','s','state',1);
+             INSERT INTO messages(session_id,role,content,seq,trigram_indexed)
+             VALUES ('s','user','数据库迁移',1,1),('s','user','数据库迁移',2,1);
+             PRAGMA user_version=19;",
+        ).unwrap();
+        init(&store.conn).unwrap();
+        let detail: String = store
+            .conn
+            .query_row("SELECT detail FROM background_job_state WHERE job='trigram'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        store.conn.execute_batch(broken_state).unwrap();
+        assert!(store.backfill_trigram_batch().is_err());
+        store.conn.execute_batch("DELETE FROM messages WHERE seq=2;").unwrap();
+        assert!(
+            SearchEngine::new(&store.conn)
+                .search_messages("数据库迁移", &filters(), None, 50)
+                .is_err()
+        );
+        store.conn.execute(
+            "INSERT INTO background_job_state(job,phase,detail,updated_at) VALUES ('trigram','backfill',?1,0)
+             ON CONFLICT(job) DO UPDATE SET detail=excluded.detail", [detail],
+        ).unwrap();
+        while store.backfill_trigram_batch().unwrap() {}
+        store.finish_trigram_backfill().unwrap();
+        let averages: Vec<u8> = store
+            .conn
+            .query_row("SELECT block FROM messages_fts_trigram_data WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(averages[0], 1);
+        assert_eq!(
+            SearchEngine::new(&store.conn)
+                .search_messages("数据库迁移", &filters(), None, 50)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

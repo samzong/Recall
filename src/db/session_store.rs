@@ -188,7 +188,7 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn insert_messages(&self, messages: &[Message]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        insert_messages_tx(&tx, messages, self.trigram_message_flag)?;
+        insert_messages_tx(&tx, messages)?;
         tx.commit()?;
         Ok(())
     }
@@ -253,7 +253,6 @@ impl Store {
             session_events,
             event_parser_version,
             topology,
-            self.trigram_message_flag,
         )?;
         bind_native_tx(&tx, session)?;
         tx.commit()?;
@@ -320,7 +319,6 @@ impl Store {
             session_events,
             event_parser_version,
             topology,
-            self.trigram_message_flag,
         )?;
         bind_native_tx(&tx, session)?;
         tx.commit()?;
@@ -719,7 +717,6 @@ pub(super) fn persist_session_with_usage_and_events_tx(
     session_events: &[RawSessionEvent],
     event_parser_version: Option<u32>,
     topology: &SessionTopologyWrite<'_>,
-    trigram_message_flag: bool,
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import, thread_role, metadata_parser_version)
@@ -759,7 +756,7 @@ pub(super) fn persist_session_with_usage_and_events_tx(
 
     replace_parent_links_tx(tx, &session.id, topology.parents)?;
 
-    insert_messages_tx(tx, messages, trigram_message_flag)?;
+    insert_messages_tx(tx, messages)?;
 
     super::usage_store::replace_usage_events(
         tx,
@@ -821,22 +818,13 @@ pub(super) fn persist_session_with_usage_and_events_tx(
     Ok(())
 }
 
-fn insert_messages_tx(
-    tx: &rusqlite::Transaction<'_>,
-    messages: &[Message],
-    trigram_message_flag: bool,
-) -> Result<()> {
-    let sql = if trigram_message_flag {
+fn insert_messages_tx(tx: &rusqlite::Transaction<'_>, messages: &[Message]) -> Result<()> {
+    let mut stmt = tx.prepare(
         "INSERT INTO messages (session_id, role, content, timestamp, seq, trigram_indexed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-    } else {
-        "INSERT INTO messages (session_id, role, content, timestamp, seq)
-         VALUES (?1, ?2, ?3, ?4, ?5)"
-    };
-    let mut stmt = tx.prepare(sql)?;
-    let parameter_count = stmt.parameter_count();
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
     for msg in messages {
-        let indexed = trigram_message_flag && crate::utils::text_needs_trigram(&msg.content);
+        let indexed = crate::utils::text_needs_trigram(&msg.content);
         let parameters = rusqlite::params![
             msg.session_id,
             msg.role.as_str(),
@@ -845,7 +833,7 @@ fn insert_messages_tx(
             msg.seq,
             indexed,
         ];
-        stmt.execute(&parameters[..parameter_count])?;
+        stmt.execute(parameters)?;
     }
     Ok(())
 }

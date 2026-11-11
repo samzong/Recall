@@ -2,10 +2,11 @@ use rusqlite::{Connection, OptionalExtension};
 
 mod legacy;
 mod remote_pending;
+mod trigram;
 use legacy::*;
 
 const V12_SCHEMA_VERSION: i64 = 12;
-pub(crate) const SCHEMA_VERSION: i64 = 19;
+pub(crate) const SCHEMA_VERSION: i64 = 20;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -51,9 +52,6 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 11 {
         migrate_v11(conn)?;
     }
-    if version < V12_SCHEMA_VERSION || fts_needs_trigram_rebuild(conn)? {
-        migrate_v12(conn)?;
-    }
     let version = read_schema_version(conn)?;
     if version < 13 {
         migrate_v13(conn)?;
@@ -75,6 +73,9 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     }
     if version < 19 {
         remote_pending::migrate_v19(conn)?;
+    }
+    if version < 20 {
+        trigram::migrate_v20(conn)?;
     }
     Ok(())
 }
@@ -274,6 +275,7 @@ fn migrate_v14(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn fts_needs_trigram_rebuild(conn: &Connection) -> anyhow::Result<bool> {
     let has_messages: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
@@ -295,7 +297,8 @@ fn fts_needs_trigram_rebuild(conn: &Connection) -> anyhow::Result<bool> {
     Ok(!has_flag || trigger_count != 2 || !has_trigram_fts(conn)?)
 }
 
-pub(crate) fn has_trigram_message_flag(conn: &Connection) -> anyhow::Result<bool> {
+#[cfg(test)]
+fn has_trigram_message_flag(conn: &Connection) -> anyhow::Result<bool> {
     let has_flag: i64 = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM pragma_table_info('messages') WHERE name = 'trigram_indexed'
@@ -306,7 +309,8 @@ pub(crate) fn has_trigram_message_flag(conn: &Connection) -> anyhow::Result<bool
     Ok(has_flag != 0)
 }
 
-pub(crate) fn has_trigram_fts(conn: &Connection) -> anyhow::Result<bool> {
+#[cfg(test)]
+fn has_trigram_fts(conn: &Connection) -> anyhow::Result<bool> {
     let fts_sql: Option<String> = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts_trigram'",
@@ -317,11 +321,13 @@ pub(crate) fn has_trigram_fts(conn: &Connection) -> anyhow::Result<bool> {
     Ok(fts_sql.is_some_and(|sql| sql.contains("trigram")))
 }
 
+#[cfg(test)]
 fn migrate_v12(conn: &Connection) -> anyhow::Result<()> {
     let file_backed = conn.path().is_some_and(|path| !path.is_empty());
     migrate_v12_with_lock(conn, file_backed, crate::utils::try_acquire_worker_lock)
 }
 
+#[cfg(test)]
 fn migrate_v12_with_lock<T>(
     conn: &Connection,
     file_backed: bool,
@@ -392,6 +398,7 @@ fn migrate_v13(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn rebuild_trigram_fts(conn: &Connection, version_update: &str) -> anyhow::Result<()> {
     backfill_trigram_flags(conn)?;
     conn.execute_batch(&format!(
@@ -432,6 +439,7 @@ fn rebuild_trigram_fts(conn: &Connection, version_update: &str) -> anyhow::Resul
     Ok(())
 }
 
+#[cfg(test)]
 fn backfill_trigram_flags(conn: &Connection) -> anyhow::Result<()> {
     let flags: Vec<(i64, bool)> = {
         let mut stmt =

@@ -26,8 +26,15 @@ pub(crate) fn run(source: Option<&str>, native_id: &str, format: SessionSyncForm
     )?;
     anyhow::ensure!(config.is_source_enabled(&source), "{source} is disabled");
 
-    let Some(_lock) = utils::try_acquire_sync_lock()? else {
-        bail!("another sync holds the index lock; retry after it finishes");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let _lock = loop {
+        if let Some(lock) = utils::try_acquire_sync_lock()? {
+            break lock;
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("another sync holds the index lock; retry after it finishes");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     };
 
     let available = adapters::all_adapters();

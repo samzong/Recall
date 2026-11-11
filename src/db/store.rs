@@ -40,7 +40,6 @@ pub(crate) fn session_from_row(
 
 pub(crate) struct Store {
     pub(crate) conn: Connection,
-    pub(crate) trigram_message_flag: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,7 +156,11 @@ impl Store {
     }
 
     pub(crate) fn open() -> Result<Self> {
-        Self::open_at(&Self::default_db_path()?)
+        let store = Self::open_at(&Self::default_db_path()?)?;
+        if !cfg!(test) && store.trigram_backfill_pending()? {
+            crate::semantic::ensure_background_worker(false)?;
+        }
+        Ok(store)
     }
 
     pub(crate) fn open_event_preview_at(path: &Path) -> Result<Self> {
@@ -178,7 +181,7 @@ impl Store {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            version >= 17,
+            version >= crate::db::schema::SCHEMA_VERSION,
             "requires_index_upgrade: upgrade this index with current Recall before opening it read-only (run recall info for the default index)"
         );
         conn.execute_batch(
@@ -186,16 +189,14 @@ impl Store {
              PRAGMA busy_timeout=5000;
              PRAGMA foreign_keys=ON;",
         )?;
-        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
-        Ok(Store { conn, trigram_message_flag })
+        Ok(Store { conn })
     }
 
     pub(crate) fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
         crate::db::schema::init(&conn)?;
-        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
-        Ok(Store { conn, trigram_message_flag })
+        Ok(Store { conn })
     }
 
     pub(crate) fn open_at(path: &Path) -> Result<Self> {
@@ -210,8 +211,7 @@ impl Store {
         )?;
         backup_before_remote_migration(&conn, path)?;
         crate::db::schema::init(&conn)?;
-        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
-        Ok(Store { conn, trigram_message_flag })
+        Ok(Store { conn })
     }
 }
 

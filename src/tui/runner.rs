@@ -4,7 +4,6 @@ use crate::adapters;
 use crate::config::AppConfig;
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
-use crate::semantic;
 use crate::tui::search_worker::SearchWorker;
 use crate::tui::sync_worker::SyncWorker;
 use crate::tui::usage_worker::UsageWorker;
@@ -35,9 +34,6 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
     let mut config = AppConfig::load()?;
     config.normalize_sources(&known_sources);
     let store = Store::open()?;
-    if !cfg!(debug_assertions) {
-        semantic::ensure_background_worker(true)?;
-    }
 
     fn restore_terminal() {
         let _ = disable_raw_mode();
@@ -79,6 +75,15 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
     let search_worker = SearchWorker::spawn();
     let sync_worker = SyncWorker::spawn();
     let usage_worker = UsageWorker::spawn();
+    if !cfg!(debug_assertions) {
+        app.sync_in_flight = sync_worker.refresh(crate::tui::sync_worker::SyncRequest {
+            sources: None,
+            scope: crate::project_scope::ProjectScope::Global,
+        });
+        if !app.sync_in_flight {
+            app.fail_sync("Sync worker unavailable");
+        }
+    }
     if let Some((source_filter, time_filter)) = usage_start {
         app.filters.active.sources = source_filter.unwrap_or_default();
         if let Some(time_filter) = time_filter {

@@ -1,6 +1,11 @@
 mod file_history;
+mod query;
 pub(crate) use file_history::{
     FileHistoryCoverage, FileHistoryEvidence, FileHistoryQuery, FileHistoryTarget,
+};
+use query::{
+    apply_filters, apply_target_path_match, qualified_session_columns, token_uses_trigram,
+    tokenize_query, trigram_fts5_query, unicode61_fts5_query,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -8,7 +13,6 @@ use std::collections::{HashMap, HashSet};
 use chrono::{Local, TimeZone};
 use rusqlite::Connection;
 
-use crate::db::project_store::apply_project_scope;
 use crate::db::store::{SESSION_COLUMNS, session_from_row};
 use crate::project_scope::ProjectScope;
 use crate::types::{MatchSource, SearchResult, Session};
@@ -146,6 +150,21 @@ impl<'a> SearchEngine<'a> {
         Self { conn }
     }
 
+    fn ensure_trigram_ready(&self, tokens: &[String]) -> anyhow::Result<()> {
+        if tokens.iter().any(|token| token_uses_trigram(token)) {
+            let ready: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM background_job_state WHERE job='trigram' AND phase IN ('ready', 'done'))",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                ready,
+                "Substring search is unavailable while the search index rebuilds in the background. Retry after indexing finishes."
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn search_messages(
         &self,
         query: &str,
@@ -155,13 +174,10 @@ impl<'a> SearchEngine<'a> {
     ) -> anyhow::Result<Vec<MessageHit>> {
         anyhow::ensure!((1..=50).contains(&limit), "limit must be between 1 and 50");
         let tokens = tokenize_query(query);
-        let trigram = crate::db::schema::has_trigram_fts(self.conn)?;
+        self.ensure_trigram_ready(&tokens)?;
         let queries = [
-            ("messages_fts", unicode61_fts5_query(&tokens, trigram)),
-            (
-                "messages_fts_trigram",
-                if trigram { trigram_fts5_query(&tokens) } else { String::new() },
-            ),
+            ("messages_fts", unicode61_fts5_query(&tokens)),
+            ("messages_fts_trigram", trigram_fts5_query(&tokens)),
         ];
         let mut hits: HashMap<i64, (MessageHit, f64)> = HashMap::new();
         for (table, query) in queries {
@@ -359,14 +375,11 @@ impl<'a> SearchEngine<'a> {
         if tokens.is_empty() {
             return Ok(vec![]);
         }
-        let queries = if crate::db::schema::has_trigram_fts(self.conn)? {
-            vec![
-                ("messages_fts_trigram", trigram_fts5_query(&tokens)),
-                ("messages_fts", unicode61_fts5_query(&tokens, true)),
-            ]
-        } else {
-            vec![("messages_fts", unicode61_fts5_query(&tokens, false))]
-        };
+        self.ensure_trigram_ready(&tokens)?;
+        let queries = [
+            ("messages_fts_trigram", trigram_fts5_query(&tokens)),
+            ("messages_fts", unicode61_fts5_query(&tokens)),
+        ];
         let mut hits = Vec::new();
         let mut seen = HashSet::new();
         for (table, match_query) in queries {
@@ -503,61 +516,6 @@ impl<'a> SearchEngine<'a> {
     }
 }
 
-fn qualified_session_columns() -> String {
-    SESSION_COLUMNS.split(", ").map(|name| format!("s.{name}")).collect::<Vec<_>>().join(", ")
-}
-
-fn apply_target_path_match(
-    sql: &mut String,
-    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
-    param_idx: &mut usize,
-    target: &str,
-) {
-    sql.push_str(&format!(
-        " AND e.target IS NOT NULL AND (
-            e.target = ?{p}
-            OR substr(e.target, -length(?{p}) - 1) IN ('/' || ?{p}, char(92) || ?{p})
-            OR substr(?{p}, -length(e.target) - 1) IN ('/' || e.target, char(92) || e.target)
-         )",
-        p = *param_idx
-    ));
-    params.push(Box::new(target.to_string()));
-    *param_idx += 1;
-}
-
-fn apply_filters(
-    sql: &mut String,
-    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
-    param_idx: &mut usize,
-    filters: &SearchFilters,
-) {
-    if let Some(ref sources) = filters.sources
-        && !sources.is_empty()
-    {
-        let placeholders: Vec<String> =
-            (0..sources.len()).map(|offset| format!("?{}", *param_idx + offset)).collect();
-        sql.push_str(&format!(" AND s.source IN ({})", placeholders.join(", ")));
-        for source in sources {
-            params.push(Box::new(source.clone()));
-        }
-        *param_idx += sources.len();
-    }
-    if let Some(min_ts) = filters.time_range.millis_ago() {
-        sql.push_str(&format!(" AND s.started_at >= ?{}", *param_idx));
-        params.push(Box::new(min_ts));
-        *param_idx += 1;
-    }
-    apply_project_scope(sql, params, param_idx, &filters.scope);
-    if let Some(thread_role) = filters.thread_role {
-        sql.push_str(thread_role.sql_predicate());
-    }
-    if let Some(excluded_session_id) = filters.excluded_session_id.as_deref() {
-        sql.push_str(&format!(" AND s.id != ?{}", *param_idx));
-        params.push(Box::new(excluded_session_id.to_string()));
-        *param_idx += 1;
-    }
-}
-
 fn rrf_merge(fts_hits: &[Hit], vec_hits: &[Hit], k: u32) -> Vec<(String, f64, MatchSource)> {
     let mut scores: HashMap<String, (f64, bool, bool)> = HashMap::new();
 
@@ -590,8 +548,6 @@ fn rrf_merge(fts_hits: &[Hit], vec_hits: &[Hit], k: u32) -> Vec<(String, f64, Ma
     results
 }
 
-const FTS_TRIGRAM_MIN_CHARS: usize = 3;
-
 fn message_excerpt(marked: &str) -> String {
     let hit = marked.find('\u{1}').map_or(0, |position| marked[..position].chars().count());
     let start = hit.saturating_sub(160);
@@ -601,51 +557,6 @@ fn message_excerpt(marked: &str) -> String {
         excerpt.insert(0, '…');
     }
     excerpt
-}
-
-fn tokenize_query(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| c.is_whitespace() || c.is_control())
-        .map(|token| token.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
-        .filter(|token| !token.is_empty())
-        .collect()
-}
-
-fn fts5_term(token: &str, prefix: bool) -> String {
-    let mut term = String::from("\"");
-    term.push_str(&token.replace('"', "\"\""));
-    term.push('"');
-    if prefix {
-        term.push('*');
-    }
-    term
-}
-
-fn trigram_fts5_query(tokens: &[String]) -> String {
-    tokens
-        .iter()
-        .filter(|token| token_uses_trigram(token))
-        .map(|token| fts5_term(token, false))
-        .collect::<Vec<_>>()
-        .join(" OR ")
-}
-
-fn unicode61_fts5_query(tokens: &[String], trigram_available: bool) -> String {
-    let last = tokens.len().saturating_sub(1);
-    tokens
-        .iter()
-        .enumerate()
-        .filter(|(_, token)| !trigram_available || !token_uses_trigram(token))
-        .map(|(index, token)| {
-            let prefix = index == last && token.chars().count() >= 2;
-            fts5_term(token, prefix)
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ")
-}
-
-fn token_uses_trigram(token: &str) -> bool {
-    token.chars().count() >= FTS_TRIGRAM_MIN_CHARS && crate::utils::text_needs_trigram(token)
 }
 
 #[cfg(test)]

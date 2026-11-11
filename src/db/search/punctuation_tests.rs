@@ -136,7 +136,7 @@ fn punctuation_search_handles_identifiers_paths_quotes_and_empty_terms() {
 }
 
 #[test]
-fn punctuation_search_preserves_trigram_substrings_and_unicode61_fallback() {
+fn punctuation_search_preserves_trigram_substrings() {
     let store = seed(&[
         ("hyphen", "claude-code", "统计-不准确"),
         ("joined", "codex", "统计不准确"),
@@ -148,8 +148,5 @@ fn punctuation_search_preserves_trigram_substrings_and_unicode61_fallback() {
     assert_matches(&store, "\"统计-不准确\"", Some("claude-code"), &["hyphen"]);
     assert_matches(&store, "计不准", None, &["joined"]);
     assert_matches(&store, "矩阵", None, &["short"]);
-    assert_matches(&store, "缓存-cache", None, &["mixed"]);
-    store.conn.execute_batch("DROP TABLE messages_fts_trigram;").unwrap();
-    assert_matches(&store, "统计-不准确", None, &["hyphen", "space"]);
     assert_matches(&store, "缓存-cache", None, &["mixed"]);
 }
