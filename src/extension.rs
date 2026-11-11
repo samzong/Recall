@@ -38,11 +38,10 @@ fn remote_binary_with_root(provider: &str, root: &Path) -> Result<PathBuf> {
         );
     }
     validate_compatibility(&manifest)?;
-    match manifest.transport_version {
-        Some(transport::VERSION) => {}
-        None if provider == "r2" => {}
-        None => bail!("extension '{provider}' does not declare a remote transport"),
-        Some(version) => bail!("unsupported remote transport version {version} for '{provider}'"),
+    if manifest.transport_version.is_none() {
+        bail!(
+            "extension '{provider}' does not declare a remote transport. Run recall ext upgrade {provider}, then retry"
+        );
     }
     Ok(path)
 }
@@ -77,6 +76,8 @@ struct CatalogExtension {
 struct CatalogVersion {
     protocol: u32,
     min_recall: String,
+    #[serde(default)]
+    transport_version: Option<u32>,
     targets: BTreeMap<String, CatalogTarget>,
 }
 
@@ -92,6 +93,7 @@ struct SelectedExtension {
     description: String,
     protocol: u32,
     min_recall: String,
+    transport_version: Option<u32>,
     target: CatalogTarget,
 }
 
@@ -278,7 +280,14 @@ fn install_selected(root: &Path, name: &str, selected: &SelectedExtension) -> Re
     let binary_name = binary_name(name);
     let unpacked_binary = find_unpacked_binary(temp.path(), &binary_name)?;
     let manifest = read_manifest(&unpacked_binary)?;
-    validate_manifest(name, &selected.version, selected.protocol, &selected.min_recall, &manifest)?;
+    validate_manifest(
+        name,
+        &selected.version,
+        selected.protocol,
+        &selected.min_recall,
+        selected.transport_version,
+        &manifest,
+    )?;
 
     let package_dir = root.join("packages").join(name).join(&selected.version);
     remove_dir_if_exists(&package_dir)?;
@@ -347,7 +356,9 @@ fn select_latest_from_extension(
     let mut selected: Option<((u64, u64, u64), SelectedExtension)> = None;
 
     for (version, info) in &extension.versions {
-        if info.protocol > crate::PROTOCOL_VERSION {
+        if info.protocol > crate::PROTOCOL_VERSION
+            || info.transport_version.is_some_and(|version| version != transport::VERSION)
+        {
             continue;
         }
         if semver_key(&info.min_recall)? > current_recall {
@@ -362,6 +373,7 @@ fn select_latest_from_extension(
             description: extension.description.clone(),
             protocol: info.protocol,
             min_recall: info.min_recall.clone(),
+            transport_version: info.transport_version,
             target: target.clone(),
         };
         if selected.as_ref().is_none_or(|(selected_key, _)| key > *selected_key) {
@@ -379,6 +391,7 @@ fn validate_manifest(
     version: &str,
     protocol: u32,
     min_recall: &str,
+    transport_version: Option<u32>,
     manifest: &ExtensionManifest,
 ) -> Result<()> {
     if manifest.name != name {
@@ -400,6 +413,11 @@ fn validate_manifest(
             manifest.min_recall,
             min_recall
         );
+    }
+    if let Some(version) = transport_version
+        && manifest.transport_version != Some(version)
+    {
+        bail!("manifest transport_version does not match catalog transport_version {version}");
     }
     validate_compatibility(manifest)
 }

@@ -9,10 +9,15 @@ revisions, and merge behavior.
 Providers must be installed from the official Recall extension catalog.
 Core requires an `installed.json` record matching the manifest version. Manual
 binary copies are rejected. Connect and sync also check manifest `name`, `protocol`,
-`min_recall`, and `transport_version: 1`. Legacy `r2` can omit the transport field.
+`min_recall`, and `transport_version: 1`. If an installed provider lacks the
+transport field, core rejects remote use and names the `recall ext upgrade`
+command. For legacy R2 installations, run `recall ext upgrade r2`.
 Manifest reads have a 2 MiB limit and five-second deadline. Sync checks once
 before scanning and reuses the binary. Saved connections keep their format and
 check provider-name syntax without requiring an installed binary.
+
+New provider catalog entries include `transport_version`. Core skips unsupported versions
+and checks the manifest against declared values. Older entries remain installable.
 
 Before publication, provider `min_recall` must require a compatible released
 core. Every transport version increase must raise `min_recall` to the first

@@ -234,25 +234,24 @@ catalog display metadata, not manifest contract.
 The command name is the extension name: `recall reflect` dispatches to
 `recall-reflect`.
 Remote providers declare `"transport_version": 1`, independently of CLI
-`protocol`. Only legacy R2 and non-provider extensions can omit it.
+`protocol`. Non-provider extensions can omit it. If a provider lacks this field,
+core rejects remote use and names the upgrade command. For R2 versions before
+0.1.2, run `recall ext upgrade r2`. This preserves the provider configuration.
 Core checks provider manifests on connect and sync. See
 [transport details](remote-transport.md).
 
-Only providers installed from the official Recall extension catalog are
-supported. `recall ext install` and `upgrade` verify catalog SHA-256 values and
-write the version to `installed.json`. Before remote use, core requires that
-record and a matching manifest version, then checks the provider name, CLI
-protocol, `min_recall`, and transport version. Schema-1 records without a
-description remain valid. Manual copies into the managed directory are rejected.
+Providers must come from the official Recall extension catalog.
+`recall ext install` and `recall ext upgrade` verify catalog SHA-256 values and
+record the version in `installed.json`. Remote use requires a matching record
+and manifest version, provider name, CLI protocol, `min_recall`, and transport
+version. Schema-1 records without descriptions remain valid. Manual binary
+copies are unsupported.
 
-Tests can seed an isolated HOME with fixture state and a local binary for an
-unreleased provider. This is test setup only. Users install after catalog
-publication. A core allowlist is the strongest alternative. It couples each
-provider to a core release and still accepts a copied binary with the same name.
-The catalog already gates provider availability.
-The record is a product boundary, not a sandbox or tamper defense. Each transport
-version increase must raise `min_recall` to the first supporting core because
-catalog selection uses that field.
+Tests of unpublished providers can seed an isolated HOME with fixture records
+and a local binary. Users install after catalog publication. A core allowlist
+couples providers to core releases and still accepts copies with matching names. Catalog records define availability, not a sandbox or tamper defense.
+Each transport version increase must raise `min_recall` to the first supporting
+core release because catalog selection uses this minimum.
 Extensions that still advertise `min_recall` 0.2.10 may emit a legacy
 `commands` field for host compatibility; it is not part of the current
 manifest contract.
