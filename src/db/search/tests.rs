@@ -5,7 +5,7 @@ use crate::project_scope::ProjectScope;
 use crate::types::{RawSessionEvent, Session};
 
 #[test]
-fn search_keeps_short_mixed_and_deferred_legacy_terms_without_embeddings() {
+fn search_keeps_short_and_mixed_terms_without_embeddings() {
     crate::db::schema::register_sqlite_vec();
     let store = Store::open_in_memory().unwrap();
     store
@@ -53,7 +53,6 @@ fn search_keeps_short_mixed_and_deferred_legacy_terms_without_embeddings() {
     mixed.sort();
     assert_eq!(mixed, vec!["long".to_string(), "short".to_string()]);
 
-    store.conn.execute_batch("DROP TABLE messages_fts_trigram;").unwrap();
     let legacy = engine.hybrid_search("powercon", None, &filters, 10, 3).unwrap();
     assert_eq!(legacy[0].session.id, "long");
 }

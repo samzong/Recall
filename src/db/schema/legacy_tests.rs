@@ -2,22 +2,18 @@ use super::*;
 
 #[test]
 fn migrate_v8_adds_is_import_to_existing_v7_db() {
+    register_sqlite_vec();
     let conn = Connection::open_in_memory().unwrap();
+    for migrate in
+        [migrate_v1, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6, migrate_v7]
+    {
+        migrate(&conn).unwrap();
+    }
     conn.execute_batch(
-        "CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT NOT NULL, source_id TEXT NOT NULL,
-            title TEXT NOT NULL, directory TEXT, started_at INTEGER NOT NULL,
-            updated_at INTEGER, message_count INTEGER NOT NULL DEFAULT 0,
-            entrypoint TEXT, custom_title TEXT, summary TEXT,
-            duration_minutes INTEGER, source_file_path TEXT, UNIQUE(source, source_id)
-        );
-        INSERT INTO sessions (id, source, source_id, title, started_at)
-        VALUES ('s1', 'codex', 'c1', 'existing', 0);
-        PRAGMA user_version = 7;",
+        "INSERT INTO sessions (id, source, source_id, title, started_at)
+         VALUES ('s1', 'codex', 'c1', 'existing', 0);",
     )
     .unwrap();
-    migrate_v5(&conn).unwrap();
-    conn.execute_batch("PRAGMA user_version = 7;").unwrap();
 
     init(&conn).unwrap();
 

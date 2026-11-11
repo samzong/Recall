@@ -55,7 +55,6 @@ impl Store {
                 parents: &data.topology.parents,
                 parser_version: None,
             },
-            self.trigram_message_flag,
         )?;
         let parent_identities: HashMap<_, _> = revision.record["session"]["topology"]["parents"]
             .as_array()

@@ -11,8 +11,17 @@ const SESSION_EMBED_BATCH: usize = 8;
 const BACKGROUND_JOB: &str = "pipeline";
 
 pub(crate) fn ensure_background_worker(sync_first: bool) -> Result<()> {
-    if !sync_first && !AppConfig::load()?.semantic_enabled {
-        return Ok(());
+    if !sync_first {
+        let store = Store::open_at(&Store::default_db_path()?)?;
+        if !store.trigram_backfill_pending()? {
+            if !AppConfig::load()?.semantic_enabled {
+                return Ok(());
+            }
+            let progress = store.semantic_progress()?;
+            if progress.pending_sessions + progress.processing_sessions == 0 {
+                return Ok(());
+            }
+        }
     }
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
@@ -33,7 +42,22 @@ where
         return Ok(());
     };
 
-    let store = Store::open()?;
+    let store = Store::open_at(&Store::default_db_path()?)?;
+
+    loop {
+        let pending = {
+            let _sync_lock = crate::utils::acquire_sync_lock()?;
+            store.backfill_trigram_batch()?
+        };
+        if !pending {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    {
+        let _sync_lock = crate::utils::acquire_sync_lock()?;
+        store.finish_trigram_backfill()?;
+    }
 
     if sync_first {
         store.set_background_job_state(BACKGROUND_JOB, "sync", Some("Incremental sync"))?;

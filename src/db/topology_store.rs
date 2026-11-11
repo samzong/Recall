@@ -222,7 +222,6 @@ mod tests {
             &[],
             Some(1),
             &SessionTopologyWrite::none(),
-            store.trigram_message_flag,
         )
         .unwrap();
         tx.commit().unwrap();
