@@ -53,4 +53,6 @@ Write `apply` to `setting.key` in `setting.file`. If `setting.locked_by` is set,
 
 ## Attribution
 
-The `compact` algorithm is a port of `internal/tune` from [yetone/magpie](https://github.com/yetone/magpie), MIT License, Copyright (c) 2026 yetone. `LICENSE-magpie` has the full notice.
+Thanks to [yetone/magpie](https://github.com/yetone/magpie). The `compact` command started from its compaction tuning.
+`src/compact.rs` and the `to_call` function in `src/report.rs` are a port of `internal/tune` from magpie, MIT License, Copyright (c) 2026 yetone.
+`THIRD_PARTY_NOTICES` has the full notice. It covers only that code. The rest of this extension is under the MIT License of Recall.
