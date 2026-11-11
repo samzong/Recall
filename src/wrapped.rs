@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::db::store::Store;
 use crate::types::UsageEventRecord;
-use crate::usage::{TokenTotals, UsageDedup};
+use crate::usage::TokenTotals;
 
 const INNER: usize = 52;
 const WEEKDAYS: [&str; 7] =
@@ -104,7 +104,6 @@ struct SourceAcc {
 
 #[derive(Default)]
 struct WrappedAcc {
-    dedup: UsageDedup,
     tokens: TokenTotals,
     sessions: BTreeSet<String>,
     days: BTreeSet<NaiveDate>,
@@ -116,12 +115,9 @@ struct WrappedAcc {
 
 impl WrappedAcc {
     fn add(&mut self, event: &UsageEventRecord) {
-        if !self.dedup.accept(event) {
-            return;
-        }
-
-        let added = event_tokens(event);
+        let previous = self.tokens.total_tokens;
         self.tokens.add_event(event);
+        let added = self.tokens.total_tokens - previous;
         self.sessions.insert(event.session_id.clone());
 
         let dt = Local
@@ -224,14 +220,6 @@ fn build_wrapped_report_at(
         acc.by_source.entry(source).or_default().sessions.insert(session_id);
     }
     Ok(acc.finish(period))
-}
-
-fn event_tokens(event: &UsageEventRecord) -> i64 {
-    event.input_tokens.max(0)
-        + event.output_tokens.max(0)
-        + event.cache_read_tokens.max(0)
-        + event.cache_write_tokens.max(0)
-        + event.reasoning_tokens.max(0)
 }
 
 fn longest_streak(days: &BTreeSet<NaiveDate>) -> usize {
@@ -743,12 +731,11 @@ fn aggregate_wrapped_events(
 ) -> WrappedReport {
     let after = period.after_millis_at(now);
     let mut acc = WrappedAcc::default();
-    for event in events {
-        if after.is_some_and(|cutoff| event.timestamp < cutoff) {
-            continue;
+    Store::for_each_deduped_usage_event(events, |event| {
+        if after.is_none_or(|cutoff| event.timestamp >= cutoff) {
+            acc.add(event);
         }
-        acc.add(event);
-    }
+    });
     acc.finish(period)
 }
 

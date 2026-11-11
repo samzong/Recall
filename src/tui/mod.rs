@@ -12,3 +12,4 @@ pub(crate) mod ui;
 pub(crate) mod usage_state;
 pub(crate) mod usage_worker;
 pub(crate) mod viewing_state;
+pub(crate) mod viewing_usage_worker;

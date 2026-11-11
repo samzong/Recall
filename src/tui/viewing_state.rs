@@ -1,10 +1,11 @@
 use crate::db::store::Store;
+use crate::db::usage_store::SessionUsage;
 use crate::tui::layout::MessagePane;
 use crate::tui::text_layout::wrap_visual_rows;
-use crate::types::{
-    Message, ParentRelation, Role, Session, SessionEventRecord, SessionUsageEventRecord, ThreadRole,
+use crate::tui::viewing_usage_worker::{
+    ViewingUsageRequest, ViewingUsageResponse, ViewingUsageWorker,
 };
-use crate::usage::TokenTotals;
+use crate::types::{Message, ParentRelation, Role, Session, SessionEventRecord, ThreadRole};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ViewingFrame {
@@ -53,35 +54,21 @@ pub(crate) struct ViewingSessionSummary {
     pub(crate) total_messages: usize,
     pub(crate) duration_minutes: Option<u32>,
     pub(crate) usage_events: usize,
-    pub(crate) tokens: TokenTotals,
+    pub(crate) usage: Option<Result<SessionUsage, String>>,
 }
 
 impl ViewingSessionSummary {
     pub(crate) fn from_session(
         messages: &[Message],
         duration_minutes: Option<u32>,
-        usage_events: &[SessionUsageEventRecord],
+        usage_events: usize,
     ) -> Self {
-        let mut tokens = TokenTotals::default();
-        for event in usage_events {
-            tokens.input_tokens += event.input_tokens.max(0);
-            tokens.output_tokens += event.output_tokens.max(0);
-            tokens.cache_read_tokens += event.cache_read_tokens.max(0);
-            tokens.cache_write_tokens += event.cache_write_tokens.max(0);
-            tokens.reasoning_tokens += event.reasoning_tokens.max(0);
-        }
-        tokens.total_tokens = tokens.input_tokens
-            + tokens.output_tokens
-            + tokens.cache_read_tokens
-            + tokens.cache_write_tokens
-            + tokens.reasoning_tokens;
-
         Self {
             user_messages: messages.iter().filter(|msg| msg.role == Role::User).count(),
             total_messages: messages.len(),
             duration_minutes: duration_minutes.or_else(|| message_span_minutes(messages)),
-            usage_events: usage_events.len(),
-            tokens,
+            usage_events,
+            usage: (usage_events == 0).then(|| Ok(SessionUsage::default())),
         }
     }
 }
@@ -113,6 +100,8 @@ pub(crate) struct ViewingState {
     pub(crate) lines: Vec<Vec<SanitizedLine>>,
     pub(crate) matches: Vec<usize>,
     pub(crate) local_preview: Option<Result<tempfile::NamedTempFile, String>>,
+    usage_worker: Option<ViewingUsageWorker>,
+    usage_request_id: u64,
 }
 
 impl ViewingState {
@@ -222,8 +211,9 @@ impl ViewingState {
         self.summary = Some(ViewingSessionSummary::from_session(
             &msgs,
             session.duration_minutes,
-            &usage_events,
+            usage_events.len(),
         ));
+        self.request_usage(store, &session.id, usage_events.len());
         let topology = store.session_topology(&session.id).unwrap_or_default();
         let parents = topology
             .parents
@@ -259,13 +249,95 @@ impl ViewingState {
         self.recompute_matches();
         true
     }
+    fn request_usage(&mut self, store: &Store, session_id: &str, events: usize) {
+        self.usage_request_id = self.usage_request_id.wrapping_add(1);
+        if events == 0 {
+            return;
+        }
+        if self.usage_worker.is_none()
+            && let Some(path) = store.conn.path().filter(|path| !path.is_empty())
+        {
+            self.usage_worker = Some(ViewingUsageWorker::spawn(path.into()));
+        }
+        let sent = self.usage_worker.as_ref().is_some_and(|worker| {
+            worker.refresh(ViewingUsageRequest {
+                id: self.usage_request_id,
+                session_id: session_id.to_string(),
+            })
+        });
+        if !sent && let Some(summary) = self.summary.as_mut() {
+            summary.usage = Some(Err("Token totals unavailable".to_string()));
+        }
+    }
+
+    pub(crate) fn poll_usage(&mut self) {
+        while let Some(worker) = self.usage_worker.as_ref() {
+            match worker.try_recv() {
+                Ok(response) => self.apply_usage_response(response),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(summary) = self.summary.as_mut()
+                        && summary.usage.is_none()
+                    {
+                        summary.usage = Some(Err("Token totals unavailable".to_string()));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn apply_usage_response(&mut self, response: ViewingUsageResponse) {
+        if response.id == self.usage_request_id
+            && self.session.as_ref().is_some_and(|session| session.id == response.session_id)
+            && let Some(summary) = self.summary.as_mut()
+        {
+            summary.usage = Some(response.usage);
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         *self = Self {
             local_preview: self.local_preview.take(),
+            usage_worker: self.usage_worker.take(),
+            usage_request_id: self.usage_request_id,
             child_selected: self.child_selected,
             search_input: self.search_input.take(),
             search_cursor: self.search_cursor,
             ..Self::default()
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_response_only_updates_the_requested_session() {
+        let mut state = ViewingState {
+            session: Some(crate::types::test_support::session("b")),
+            summary: Some(ViewingSessionSummary::from_session(&[], None, 1)),
+            usage_request_id: 2,
+            ..Default::default()
+        };
+        let response = |id, session_id: &str| ViewingUsageResponse {
+            id,
+            session_id: session_id.into(),
+            usage: Ok(SessionUsage {
+                tokens: crate::usage::TokenTotals {
+                    input_tokens: 10,
+                    total_tokens: 10,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        };
+        for (id, session_id) in [(1, "a"), (1, "b"), (2, "a")] {
+            state.apply_usage_response(response(id, session_id));
+            assert!(state.summary.as_ref().unwrap().usage.is_none());
+        }
+        state.apply_usage_response(response(2, "b"));
+        assert_eq!(state.summary.unwrap().usage.unwrap().unwrap().tokens.total_tokens, 10);
     }
 }

@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use chrono::{Datelike, Local, TimeZone};
@@ -68,59 +68,16 @@ pub(crate) struct TokenTotals {
 
 impl TokenTotals {
     pub(crate) fn add_event(&mut self, event: &UsageEventRecord) {
-        self.input_tokens += event.input_tokens.max(0);
-        self.output_tokens += event.output_tokens.max(0);
-        self.cache_read_tokens += event.cache_read_tokens.max(0);
-        self.cache_write_tokens += event.cache_write_tokens.max(0);
-        self.reasoning_tokens += event.reasoning_tokens.max(0);
+        self.input_tokens += event.input_tokens;
+        self.output_tokens += event.output_tokens;
+        self.cache_read_tokens += event.cache_read_tokens;
+        self.cache_write_tokens += event.cache_write_tokens;
+        self.reasoning_tokens += event.reasoning_tokens;
         self.total_tokens = self.input_tokens
             + self.output_tokens
             + self.cache_read_tokens
             + self.cache_write_tokens
             + self.reasoning_tokens;
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct UsageDedup {
-    codex_seen: HashSet<String>,
-    claude_seen: HashSet<String>,
-    warp_seen: HashSet<String>,
-    qoder_seen: HashSet<String>,
-}
-
-impl UsageDedup {
-    pub(crate) fn accept(&mut self, event: &UsageEventRecord) -> bool {
-        if event.source == "codex" {
-            let key = format!(
-                "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
-                event.timestamp,
-                event.provider,
-                event.model,
-                event.input_tokens,
-                event.output_tokens,
-                event.cache_read_tokens,
-                event.cache_write_tokens,
-                event.reasoning_tokens
-            );
-            return self.codex_seen.insert(key);
-        }
-        if event.source == "claude-code"
-            && event.event_key.starts_with("assistant:")
-            && !event.event_key.contains(":line:")
-        {
-            return self.claude_seen.insert(event.event_key.clone());
-        }
-        if event.source == "warp" {
-            return self.warp_seen.insert(event.event_key.clone());
-        }
-        if event.source == "qoder"
-            && event.event_key.starts_with("assistant:")
-            && !event.event_key.starts_with("assistant:line:")
-        {
-            return self.qoder_seen.insert(event.event_key.clone());
-        }
-        true
     }
 }
 
@@ -194,15 +151,10 @@ struct UsageReportAccumulator {
     weekly: BTreeMap<String, Accumulator>,
     monthly: BTreeMap<String, Accumulator>,
     token_source_events: BTreeMap<String, usize>,
-    dedup: UsageDedup,
 }
 
 impl UsageReportAccumulator {
     fn add(&mut self, event: &UsageEventRecord) {
-        if !self.dedup.accept(event) {
-            return;
-        }
-
         self.total.add(event);
         *self.token_source_events.entry(event.token_source.clone()).or_insert(0) += 1;
         self.by_source.entry(event.source.clone()).or_default().add(event);
@@ -278,9 +230,7 @@ pub(crate) fn build_usage_report(store: &Store, filters: &UsageFilters) -> Resul
 #[cfg(any(test, feature = "bench"))]
 pub(crate) fn aggregate_usage_events(events: &[UsageEventRecord]) -> UsageReport {
     let mut report = UsageReportAccumulator::default();
-    for event in events {
-        report.add(event);
-    }
+    Store::for_each_deduped_usage_event(events, |event| report.add(event));
     report.finish()
 }
 
