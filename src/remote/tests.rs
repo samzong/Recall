@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod objects;
+mod parents;
 
 fn seed(store: &Store, text: &str, native: bool) -> String {
     let record = serde_json::json!({

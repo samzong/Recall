@@ -197,9 +197,7 @@ pub(crate) fn decode_remote(
             && record.record_type == RECORD_TYPE,
         "unsupported remote session record"
     );
-    let parent_count = record.session.topology.parents.len();
     let data = decode_record(record, session_uuid, 0)?;
-    anyhow::ensure!(data.topology.parents.len() == parent_count, "invalid remote topology");
     let sequences: HashSet<_> = data.messages.iter().map(|message| message.seq).collect();
     anyhow::ensure!(sequences.len() == data.messages.len(), "duplicate remote message sequence");
     Ok(data)
