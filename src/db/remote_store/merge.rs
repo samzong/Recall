@@ -57,7 +57,27 @@ impl Store {
             },
             self.trigram_message_flag,
         )?;
-        for (parent, identity) in data.topology.parents.iter().zip(&revision.parent_sessions) {
+        let parent_identities: HashMap<_, _> = revision.record["session"]["topology"]["parents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(index, parent)| {
+                Some((
+                    (
+                        parent["relation"].as_str()?,
+                        parent["source"].as_str()?,
+                        parent["source_id"].as_str()?,
+                    ),
+                    revision.parent_sessions.get(index).and_then(Option::as_deref),
+                ))
+            })
+            .collect();
+        for parent in &data.topology.parents {
+            let identity = parent_identities
+                .get(&(parent.relation.as_str(), parent.source.as_str(), parent.source_id.as_str()))
+                .copied()
+                .flatten();
             tx.execute("UPDATE session_parent_links SET parent_sync_id = ?5 WHERE session_id = ?1 AND relation = ?2 AND parent_source = ?3 AND parent_source_id = ?4",
                 params![id, parent.relation.as_str(), parent.source, parent.source_id, identity])?;
         }

@@ -285,14 +285,10 @@ impl Store {
             for identity in revision.parent_sessions.iter().flatten() {
                 validate_identity(identity)?;
             }
-            let decoded = crate::import::decode_remote(
+            crate::import::decode_remote(
                 revision.record.clone(),
                 uuid::Uuid::new_v4().to_string(),
             )?;
-            ensure!(
-                revision.parent_sessions.len() == decoded.topology.parents.len(),
-                "invalid portable parent links"
-            );
             self.conn.execute(
                 "INSERT OR IGNORE INTO sync_revisions(digest, sync_id, body, size) VALUES (?1, ?2, ?3, ?4)",
                 params![hash, revision.sync_id, stored, size],
