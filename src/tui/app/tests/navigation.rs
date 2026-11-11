@@ -334,24 +334,17 @@ fn enter_viewing_with_blank_query_starts_at_first_message() {
 }
 
 #[test]
-fn viewing_session_summary_counts_messages_duration_and_tokens() {
+fn viewing_session_summary_counts_messages_and_duration() {
     let messages = vec![
         message(Role::User, Some(0), 0),
         message(Role::Assistant, Some(120_000), 1),
         message(Role::User, None, 2),
     ];
-    let usage_events = vec![usage_event(10, 5), usage_event(-1, 4)];
-
-    let summary = ViewingSessionSummary::from_session(&messages, None, &usage_events);
+    let summary = ViewingSessionSummary::from_session(&messages, None, 2);
 
     assert_eq!(summary.user_messages, 2);
     assert_eq!(summary.total_messages, 3);
     assert_eq!(summary.duration_minutes, Some(2));
     assert_eq!(summary.usage_events, 2);
-    assert_eq!(summary.tokens.input_tokens, 10);
-    assert_eq!(summary.tokens.output_tokens, 9);
-    assert_eq!(summary.tokens.cache_read_tokens, 6);
-    assert_eq!(summary.tokens.cache_write_tokens, 4);
-    assert_eq!(summary.tokens.reasoning_tokens, 2);
-    assert_eq!(summary.tokens.total_tokens, 31);
+    assert!(summary.usage.is_none());
 }

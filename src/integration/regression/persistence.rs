@@ -397,3 +397,82 @@ fn schema_migration_sets_current_version() {
     let store = setup();
     assert_eq!(schema::schema_version(&store.conn).unwrap(), schema::current_schema_version());
 }
+
+#[test]
+fn usage_reports_assign_normalized_duplicates_before_filtering_without_losing_raw_events() {
+    let store = setup();
+    for (id, source, timestamp, output, reasoning, version) in [
+        ("codex-a-owner", "codex", 10, 10, 4, 4),
+        ("codex-b-copy", "codex", 10, 6, 4, 5),
+        ("claude-owner", "claude-code", 1, 3, 0, 1),
+        ("claude-copy", "claude-code", 20, 3, 0, 1),
+    ] {
+        let mut event = crate::types::test_support::usage_event("assistant:shared");
+        event.timestamp = timestamp;
+        event.output_tokens = output;
+        event.reasoning_tokens = reasoning;
+        event.parser_version = version;
+        store
+            .persist_session_with_usage(
+                &make_session(id, source, id, id),
+                &[],
+                &[event],
+                Some(version),
+            )
+            .unwrap();
+    }
+    let totals = store.usage_by_session().unwrap();
+    assert_eq!(totals["codex-a-owner"].tokens.total_tokens, 10);
+    assert_eq!(totals["claude-owner"].tokens.total_tokens, 3);
+    assert_eq!(totals["codex-b-copy"].tokens.total_tokens, 0);
+    assert!(totals["codex-b-copy"].shared_with_other_session);
+    assert_eq!(totals["claude-copy"].tokens.total_tokens, 0);
+    assert!(totals["claude-copy"].shared_with_other_session);
+    let report =
+        build_usage_report(&store, &UsageFilters { sources: None, time_range: TimeRange::All })
+            .unwrap();
+    assert_eq!(report.summary.events, 2);
+    assert_eq!(report.summary.tokens.total_tokens, 13);
+    assert_eq!(
+        report.summary.tokens.total_tokens,
+        totals.values().map(|usage| usage.tokens.total_tokens).sum::<i64>()
+    );
+    let filtered = store
+        .fold_usage_events_after(Some(&["claude-code".to_string()]), Some(10), 0, |count, _| {
+            *count += 1
+        })
+        .unwrap();
+    assert_eq!(filtered, 0);
+    for id in ["codex-a-owner", "codex-b-copy", "claude-owner", "claude-copy"] {
+        assert_eq!(store.list_usage_events_for_session(id).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn usage_ownership_survives_repersisting_the_owner() {
+    let store = setup();
+    for source in ["codex", "claude-code", "warp", "qoder"] {
+        let sessions = ["a", "b"].map(|suffix| {
+            let id = format!("{source}-{suffix}");
+            make_session(&id, source, &id, &id)
+        });
+        let mut event = crate::types::test_support::usage_event("assistant:shared");
+        event.input_tokens = 10;
+        event.parser_version = 5;
+        for session in &sessions {
+            store.persist_session_with_usage(session, &[], &[event.clone()], Some(5)).unwrap();
+        }
+        let before = store.usage_by_session().unwrap();
+        let owner =
+            sessions.iter().find(|session| before[&session.id].tokens.total_tokens > 0).unwrap();
+        store.persist_session_with_usage(owner, &[], &[event], Some(5)).unwrap();
+        let after = store.usage_by_session().unwrap();
+        for session in &sessions {
+            assert_eq!(before[&session.id].tokens, after[&session.id].tokens, "{}", session.id);
+            assert_eq!(
+                before[&session.id].shared_with_other_session,
+                after[&session.id].shared_with_other_session
+            );
+        }
+    }
+}

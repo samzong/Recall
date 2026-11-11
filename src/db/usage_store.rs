@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -7,6 +7,7 @@ use rusqlite::OptionalExtension;
 use super::store::{ParserStateMeta, Store};
 use crate::db::search::TimeRange;
 use crate::types::{RawUsageEvent, SessionUsageEventRecord, UsageEventRecord};
+use crate::usage::TokenTotals;
 
 const CODEX_DISJOINT_REASONING_VERSION: u32 = 5;
 const CACHE_EXCLUSIVE_INPUT_VERSION: u32 = 2;
@@ -19,6 +20,64 @@ struct PersistedUsage {
     cache_write_tokens: i64,
     reasoning_tokens: i64,
     parser_version: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionUsage {
+    pub(crate) tokens: TokenTotals,
+    pub(crate) shared_with_other_session: bool,
+}
+
+#[derive(PartialEq)]
+enum UsageOwnership {
+    Counted,
+    Duplicate,
+    OtherSession,
+}
+
+#[derive(Default)]
+struct UsageDedup {
+    owners: HashMap<(String, String), String>,
+}
+
+impl UsageDedup {
+    fn assign(&mut self, event: &UsageEventRecord) -> UsageOwnership {
+        let key = match event.source.as_str() {
+            "codex" => format!(
+                "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
+                event.timestamp,
+                event.provider,
+                event.model,
+                event.input_tokens,
+                event.output_tokens,
+                event.cache_read_tokens,
+                event.cache_write_tokens,
+                event.reasoning_tokens
+            ),
+            "claude-code"
+                if event.event_key.starts_with("assistant:")
+                    && !event.event_key.contains(":line:") =>
+            {
+                event.event_key.clone()
+            }
+            "warp" => event.event_key.clone(),
+            "qoder"
+                if event.event_key.starts_with("assistant:")
+                    && !event.event_key.starts_with("assistant:line:") =>
+            {
+                event.event_key.clone()
+            }
+            _ => return UsageOwnership::Counted,
+        };
+        match self.owners.entry((event.source.clone(), key)) {
+            Entry::Vacant(entry) => {
+                entry.insert(event.session_id.clone());
+                UsageOwnership::Counted
+            }
+            Entry::Occupied(entry) if entry.get() == &event.session_id => UsageOwnership::Duplicate,
+            Entry::Occupied(_) => UsageOwnership::OtherSession,
+        }
+    }
 }
 
 impl Store {
@@ -84,8 +143,23 @@ impl Store {
         &self,
         sources: Option<&[String]>,
         after_millis: Option<i64>,
-        mut state: T,
+        state: T,
         mut fold: impl FnMut(&mut T, UsageEventRecord),
+    ) -> Result<T> {
+        self.fold_usage_ownership(sources, state, |state, event, ownership| {
+            if ownership == UsageOwnership::Counted
+                && after_millis.is_none_or(|cutoff| event.timestamp >= cutoff)
+            {
+                fold(state, event);
+            }
+        })
+    }
+
+    fn fold_usage_ownership<T>(
+        &self,
+        sources: Option<&[String]>,
+        mut state: T,
+        mut fold: impl FnMut(&mut T, UsageEventRecord, UsageOwnership),
     ) -> Result<T> {
         let mut sql = String::from(
             "SELECT session_id, source, source_id, event_key, timestamp, model, provider,
@@ -97,12 +171,6 @@ impl Store {
 
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
-
-        if let Some(cutoff) = after_millis {
-            sql.push_str(&format!(" AND timestamp >= ?{param_idx}"));
-            params.push(Box::new(cutoff));
-            param_idx += 1;
-        }
 
         if let Some(source_ids) = sources
             && !source_ids.is_empty()
@@ -119,7 +187,9 @@ impl Store {
             sql.push(')');
         }
 
-        sql.push_str(" ORDER BY timestamp ASC, source ASC, event_seq ASC");
+        sql.push_str(
+            " ORDER BY timestamp ASC, source ASC, event_seq ASC, session_id ASC, event_key ASC",
+        );
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
@@ -156,10 +226,37 @@ impl Store {
             })
         })?;
 
+        let mut dedup = UsageDedup::default();
         for row in rows {
-            fold(&mut state, row?);
+            let event = row?;
+            let ownership = dedup.assign(&event);
+            fold(&mut state, event, ownership);
         }
         Ok(state)
+    }
+
+    pub(crate) fn usage_by_session(&self) -> Result<HashMap<String, SessionUsage>> {
+        self.fold_usage_ownership(None, HashMap::new(), |totals, event, ownership| {
+            let usage: &mut SessionUsage = totals.entry(event.session_id.clone()).or_default();
+            match ownership {
+                UsageOwnership::Counted => usage.tokens.add_event(&event),
+                UsageOwnership::OtherSession => usage.shared_with_other_session = true,
+                UsageOwnership::Duplicate => {}
+            }
+        })
+    }
+
+    #[cfg(any(test, feature = "bench"))]
+    pub(crate) fn for_each_deduped_usage_event(
+        events: &[UsageEventRecord],
+        mut visit: impl FnMut(&UsageEventRecord),
+    ) {
+        let mut dedup = UsageDedup::default();
+        for event in events {
+            if dedup.assign(event) == UsageOwnership::Counted {
+                visit(event);
+            }
+        }
     }
 
     pub(crate) fn list_usage_events_for_session(

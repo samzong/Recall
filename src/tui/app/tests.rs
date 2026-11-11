@@ -1,7 +1,7 @@
 use super::*;
 use crate::skill_audit::SkillAuditReport;
 use crate::tui::viewing_state::{ViewingSessionSummary, build_viewing_caches};
-use crate::types::{Role, SessionUsageEventRecord};
+use crate::types::Role;
 
 fn source(id: &str, label: &str) -> (String, String) {
     (id.to_string(), label.to_string())
@@ -78,26 +78,6 @@ fn message_with_lines(role: Role, seq: u32, line_count: u32) -> Message {
     let mut msg = message(role, None, seq);
     msg.content = (0..line_count).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
     msg
-}
-
-fn usage_event(input_tokens: i64, output_tokens: i64) -> SessionUsageEventRecord {
-    SessionUsageEventRecord {
-        event_key: "event1".to_string(),
-        event_seq: 0,
-        message_seq: None,
-        timestamp: 120_000,
-        model: "gpt".to_string(),
-        provider: "openai".to_string(),
-        input_tokens,
-        output_tokens,
-        cache_read_tokens: 3,
-        cache_write_tokens: 2,
-        reasoning_tokens: 1,
-        token_source: "derived".to_string(),
-        parser_version: 1,
-        source_path: None,
-        raw_usage_json: None,
-    }
 }
 
 fn numbered_results(count: usize) -> Vec<SearchResult> {

@@ -76,10 +76,20 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         })
         .unwrap_or_else(|| " Conversation ".to_string());
 
-    let block = Block::default()
+    let mut block = Block::default()
         .title(session_info)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.border_focus));
+    if app
+        .viewing
+        .summary
+        .as_ref()
+        .and_then(|summary| summary.usage.as_ref())
+        .is_some_and(|usage| usage.as_ref().is_ok_and(|usage| usage.shared_with_other_session))
+    {
+        block = block
+            .title_bottom(" Shared usage counts once across sessions. Copies can show 0 tokens. ");
+    }
     f.render_widget(block, layout.content);
 
     let inner_width = layout.messages.width as usize;
@@ -244,7 +254,14 @@ fn viewing_summary_text(app: &App, width: usize) -> String {
         );
     }
 
-    let tokens = &summary.tokens;
+    let usage = match &summary.usage {
+        Some(Ok(usage)) => usage,
+        Some(Err(_)) => return fit_summary_text(vec![" tokens unavailable".to_string()], width),
+        None => return fit_summary_text(vec![" tokens loading...".to_string()], width),
+    };
+    let tokens = &usage.tokens;
+    let shared = if usage.shared_with_other_session { " (shared usage counted once)" } else { "" };
+    let deduped = if usage.shared_with_other_session { " (deduped)" } else { "" };
     let total = format_compact(tokens.total_tokens);
     let input = format_compact(tokens.input_tokens);
     let output = format_compact(tokens.output_tokens);
@@ -255,12 +272,12 @@ fn viewing_summary_text(app: &App, width: usize) -> String {
     fit_summary_text(
         vec![
             format!(
-                " tokens {total} input {input} output {output} cache r/w {cache_read}/{cache_write} reasoning {reasoning} | time {duration} | user msgs {user_messages}"
+                " tokens {total}{shared} input {input} output {output} cache r/w {cache_read}/{cache_write} reasoning {reasoning} | time {duration} | user msgs {user_messages}"
             ),
             format!(
-                " tok {total} in {input} out {output} cache {cache_read}/{cache_write} reason {reasoning} | {duration} | user {user_messages}"
+                " tok {total}{deduped} in {input} out {output} cache {cache_read}/{cache_write} reason {reasoning} | {duration} | user {user_messages}"
             ),
-            format!(" tok {total} | time {duration} | user {user_messages}"),
+            format!(" tok {total}{deduped} | time {duration} | user {user_messages}"),
         ],
         width,
     )
