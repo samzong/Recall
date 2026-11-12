@@ -53,10 +53,12 @@ Pass a fresh high-entropy `invocation_nonce` literal on each MCP search or recen
 
 For `search_messages`, `current_session_excluded` states whether self-exclusion was applied; an explicit `session_id` includes that session even when it is current.
 
+For `search`, `session list`, `usage`, and full `sync`, pass comma-separated source ids or labels in one `--source` value. For example, `--source codex,claude-code` selects either source.
+
 Use the equivalent CLI workflow when needed:
 
 ```bash
-recall session list --project /absolute/project/path --source <source> --limit 20 --sort updated --format json
+recall session list --project /absolute/project/path --source <sources> --limit 20 --sort updated --format json
 recall session list --project owner/repo --query "<keywords>" --time 7d --limit 20 --sort updated --format json
 recall search "<keywords>" --messages --project owner/repo --limit 10 --format json
 recall search "<keywords>" --messages --session-id <session-id> --format json
@@ -134,7 +136,7 @@ An explicit share or refresh request authorizes a real deployment. Use `--dry-ru
 Use an explicit session id when provided. Otherwise sync and list recent sessions for the active project, filtering by source only when known. Select the current conversation only when its identity is unambiguous; inspect the smallest necessary tail or ask the user if several candidates remain.
 
 ```bash
-recall session list --project /absolute/project/path --source <source> --limit 5 --sort updated --sync --format json
+recall session list --project /absolute/project/path --source <sources> --limit 5 --sort updated --sync --format json
 ```
 
 Base the TL;DR on the selected session. For the current conversation, use the existing context without reloading its transcript solely for a summary. For another session, use its retrieved transcript; omit the optional TL;DR if evidence is insufficient. Never substitute the current conversation for a different session.
