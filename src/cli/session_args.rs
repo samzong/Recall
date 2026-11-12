@@ -18,7 +18,7 @@ pub(crate) struct SessionSelector {
 pub(crate) struct SessionListArgs {
     #[arg(long, help = "Search query text")]
     pub(crate) query: Option<String>,
-    #[arg(long, help = "Filter by source id or label")]
+    #[arg(long, help = "Filter by comma-separated source ids or labels")]
     pub(crate) source: Option<String>,
     #[arg(long, value_parser = crate::query::parse_time_range_arg, help = "Filter by time range")]
     pub(crate) time: Option<String>,

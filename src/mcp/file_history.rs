@@ -16,7 +16,9 @@ pub(super) struct FileHistoryArgs {
     )]
     #[serde(default)]
     pub(super) project: Option<String>,
-    #[schemars(description = "Optional tool id or label such as claude-code or CUR.")]
+    #[schemars(
+        description = "Filter by comma-separated source ids or labels, such as claude-code,CUR."
+    )]
     #[serde(default)]
     pub(super) source: Option<String>,
     #[serde(default)]

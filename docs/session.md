@@ -117,7 +117,7 @@ Options:
 - `--query <text>`: use the same search path as `recall search`. When semantic
   search is enabled and embeddings are available, this path combines keyword
   and vector results. Otherwise, it uses keyword results only.
-- `--source <source>`: source id or label, matching existing source filters.
+- `--source <sources>`: filter by comma-separated source ids or labels, such as `codex,claude-code`.
 - `--project <selector>`: scope selector. A path is a directory boundary
   including child paths; `owner/repo` or a remote URL is a repository identity
   spanning every worktree; `all` is every project. Without this flag the scope

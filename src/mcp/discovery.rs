@@ -14,7 +14,9 @@ pub(super) struct SearchSessionsArgs {
     )]
     #[serde(default)]
     pub(super) project: Option<String>,
-    #[schemars(description = "Optional tool id or label such as claude-code or CUR.")]
+    #[schemars(
+        description = "Filter by comma-separated source ids or labels, such as claude-code,CUR."
+    )]
     #[serde(default)]
     pub(super) source: Option<String>,
     #[schemars(description = "Maximum hits to return. Defaults to 10, capped at 50.")]
@@ -46,7 +48,9 @@ pub(super) struct ListRecentSessionsArgs {
     )]
     #[serde(default)]
     pub(super) project: Option<String>,
-    #[schemars(description = "Optional tool id or label such as claude-code or CUR.")]
+    #[schemars(
+        description = "Filter by comma-separated source ids or labels, such as claude-code,CUR."
+    )]
     #[serde(default)]
     pub(super) source: Option<String>,
     #[schemars(description = "Maximum hits to return. Defaults to 10, capped at 50.")]

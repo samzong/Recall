@@ -28,7 +28,7 @@ enum Commands {
     Search {
         #[arg(help = "Search query text")]
         query: String,
-        #[arg(long, help = "Filter by source id or label")]
+        #[arg(long, help = "Filter by comma-separated source ids or labels")]
         source: Option<String>,
         #[arg(long, value_parser = crate::query::parse_time_range_arg, help = "Filter by time range")]
         time: Option<String>,
@@ -66,7 +66,7 @@ enum Commands {
             long,
             conflicts_with_all = ["backfill_events", "dry_run", "force", "project"],
             requires = "source",
-            help = "Sync only this native session id"
+            help = "Sync only this native session id from exactly one --source"
         )]
         session: Option<String>,
         #[arg(
@@ -92,7 +92,10 @@ enum Commands {
         force: bool,
         #[arg(short, long, help = "Show per-source scan progress and settings")]
         verbose: bool,
-        #[arg(long, help = "Sync only this source (id or label, e.g. cursor or CUR)")]
+        #[arg(
+            long,
+            help = "Sync only comma-separated source ids or labels; --session requires exactly one source"
+        )]
         source: Option<String>,
         #[arg(
             long,
@@ -109,7 +112,11 @@ enum Commands {
     Usage {
         #[arg(long, help = "Output usage report as JSON", conflicts_with = "card")]
         json: bool,
-        #[arg(long, help = "Filter by source id or label", conflicts_with = "card")]
+        #[arg(
+            long,
+            help = "Filter by comma-separated source ids or labels",
+            conflicts_with = "card"
+        )]
         source: Option<String>,
         #[arg(
             long,
