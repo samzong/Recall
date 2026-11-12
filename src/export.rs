@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Seek, Write};
 
 use anyhow::{Result, anyhow};
@@ -20,12 +21,13 @@ const EXPORT_IN_MEMORY_DB_LIMIT: usize = 8 * 1024 * 1024;
 pub(crate) struct ExportIncludes {
     pub(crate) messages: bool,
     pub(crate) usage: bool,
+    pub(crate) usage_ownership: bool,
     pub(crate) events: bool,
 }
 
 impl ExportIncludes {
     pub(crate) fn full() -> Self {
-        Self { messages: true, usage: true, events: true }
+        Self { messages: true, usage: true, events: true, usage_ownership: false }
     }
 }
 
@@ -74,7 +76,12 @@ pub(crate) fn run_cli(
             let mut includes = if matches!(messages, MessageMode::None) {
                 match include_filter {
                     Some(include) => apply_include_filter(
-                        ExportIncludes { messages: false, usage: false, events: false },
+                        ExportIncludes {
+                            messages: false,
+                            usage: false,
+                            events: false,
+                            usage_ownership: false,
+                        },
                         include,
                     )?,
                     None => ExportIncludes::full(),
@@ -126,7 +133,7 @@ pub(crate) fn parse_export_includes(include: Option<&str>) -> Result<ExportInclu
         return Ok(ExportIncludes::full());
     };
     let includes = apply_include_filter(
-        ExportIncludes { messages: false, usage: false, events: false },
+        ExportIncludes { messages: false, usage: false, events: false, usage_ownership: false },
         include,
     )?;
     if !includes.messages {
@@ -141,10 +148,19 @@ pub(crate) fn apply_include_filter(
 ) -> Result<ExportIncludes> {
     for part in include.split(',').map(|part| part.trim().to_lowercase()) {
         match part.as_str() {
-            "all" => includes = ExportIncludes::full(),
+            "all" => {
+                includes = ExportIncludes {
+                    usage_ownership: includes.usage_ownership,
+                    ..ExportIncludes::full()
+                }
+            }
             "metadata" | "" => {}
             "messages" => includes.messages = true,
             "usage" => includes.usage = true,
+            "usage-ownership" => {
+                includes.usage = true;
+                includes.usage_ownership = true;
+            }
             "events" => includes.events = true,
             _ => return Err(anyhow!("unknown include field: {part}")),
         }
@@ -158,8 +174,16 @@ struct ExportSessionRecord {
     record_type: &'static str,
     session: ExportSession,
     messages: Vec<ExportMessage>,
-    usage_events: Vec<SessionUsageEventRecord>,
+    usage_events: Vec<ExportUsageEvent>,
     events: Vec<SessionEventRecord>,
+}
+
+#[derive(Serialize)]
+struct ExportUsageEvent {
+    #[serde(flatten)]
+    event: SessionUsageEventRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_counted: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -267,6 +291,13 @@ fn collect_session_records(
         || page_count.saturating_mul(page_size) > EXPORT_IN_MEMORY_DB_LIMIT)
         .then(|| tempfile::tempfile().map(BufWriter::new))
         .transpose()?;
+    let mut counted = if includes.usage_ownership && !sessions.is_empty() {
+        store.counted_usage_event_keys(
+            &sessions.iter().map(|session| session.id.as_str()).collect::<HashSet<_>>(),
+        )?
+    } else {
+        HashMap::new()
+    };
     for session in sessions {
         let topology = store.session_topology(&session.id)?;
         let messages =
@@ -281,7 +312,13 @@ fn collect_session_records(
         } else {
             Vec::new()
         };
-        let record = build_session_record(session, topology, messages, usage_events, events);
+        let keys = counted.remove(&session.id).unwrap_or_default();
+        let mut record = build_session_record(session, topology, messages, usage_events, events);
+        if includes.usage_ownership {
+            for usage in &mut record.usage_events {
+                usage.is_counted = Some(keys.contains(&usage.event.event_key));
+            }
+        }
         if let Some(file) = spool.as_mut() {
             write_session_record(file, &record)?;
         } else {
@@ -309,7 +346,10 @@ fn build_session_record(
         record_type: RECORD_TYPE,
         session: export_session(session, topology),
         messages: messages.into_iter().map(Into::into).collect(),
-        usage_events,
+        usage_events: usage_events
+            .into_iter()
+            .map(|event| ExportUsageEvent { event, is_counted: None })
+            .collect(),
         events,
     }
 }

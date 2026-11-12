@@ -52,7 +52,7 @@ fn main() -> Result<()> {
             "name": "calibrate",
             "version": env!("CARGO_PKG_VERSION"),
             "protocol": 2,
-            "min_recall": "0.5.9"
+            "min_recall": "0.7.1"
         });
         println!("{manifest}");
         return Ok(());

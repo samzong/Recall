@@ -127,6 +127,8 @@ Core support in v0.1:
   schema version 7, and supports `--include metadata,messages,usage,events`
   for field projection. Export projections must include `messages` unless
   `--messages none` is set; `usage` and `events` are optional add-ons.
+  Only `usage-ownership` adds `usage_events[].is_counted`.
+  Defaults and `--include all` omit this field.
   `recall session list` and `recall export`
   also accept `--thread-role primary|subagent|unknown` to filter by topology;
 - Paged `session show` reads (`--around-seq`, `--max-chars`, or `--cursor`)
@@ -152,10 +154,7 @@ The separate `--repo` flag is deprecated. Structured responses carry
 `filters.effective_scope`. For a full sync, pass `recall sync --project all`.
 
 See [Scope and export selection](extension-scope.md) for core-owned scope,
-multi-source filters, and exports without message bodies.
-
-Transcript-only extensions should use `--include metadata,messages` instead of
-reading usage or event records they do not need.
+multi-source filters, usage deduplication, and exports without message bodies.
 
 ### Stability Rules
 

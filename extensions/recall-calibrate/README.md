@@ -2,6 +2,8 @@
 
 Official Recall extension that suggests agent settings from your Recall usage history.
 It reads Recall through `recall export` and does not change any file.
+It requests `usage-ownership` and counts only events that core marks with `is_counted: true`.
+If Recall rejects that selector or omits the field, the extension stops and asks you to rebuild or upgrade Recall.
 
 ## compact
 
@@ -19,6 +21,10 @@ Options:
 - `--source claude-code|codex` limits the report to one agent. Without it, the report covers both.
 - `--time` takes a Recall time window: `today`, `7d`, `week`, `30d`, `month`, or `all`. The default is `7d`.
 - `--format text|json` selects the output. JSON goes to stdout. Progress goes to stderr.
+
+The time window applies to usage event timestamps, including calls from sessions that started before the window.
+The `calls` in each advice item count only calls with a usable prompt and a supported model.
+These advice counts can be lower than `recall usage --json`, which includes all counted usage events.
 
 The report reads the current values from these locations:
 

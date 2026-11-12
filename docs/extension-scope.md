@@ -47,3 +47,23 @@ JSON fields keep their meanings. The new JSONL record requires an explicit flag.
 Extensions that intentionally use the caller's current repository can omit
 `--project` and consume the returned core scope. Global workflows still pass
 `--project all`.
+
+## Usage ownership and time windows
+
+Transcript-only extensions should use `--include metadata,messages` instead of
+reading usage or event records they do not need.
+
+For `recall export` or `recall session export --format jsonl`, request
+`--include metadata,messages,usage,usage-ownership` to add `usage_events[].is_counted`.
+The `usage-ownership` selector includes usage and adds core's boolean deduplication decision.
+The default export, `--include all`, and `--include usage` omit this field and its computation.
+The decision covers the entire local index before session, project, time, or limit filters.
+Duplicate rows stay in the export with `is_counted: false` for backup and import.
+Import ignores this field and core computes ownership again in the destination index.
+`recall session show` and remote snapshots do not include this field.
+This additive field does not change protocol version 2 or export schema version 7.
+
+Export time filters select sessions by their start time, not usage events by their timestamp.
+For totals that match `recall usage --json`, request `usage-ownership` with `--time all` and `--limit 0`.
+Count only events with `is_counted: true` and apply the usage window to each event timestamp.
+Keep the same source selector and use `--project all`, because `recall usage` covers all projects.

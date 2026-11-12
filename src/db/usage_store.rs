@@ -1,4 +1,4 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -242,6 +242,19 @@ impl Store {
                 UsageOwnership::Counted => usage.tokens.add_event(&event),
                 UsageOwnership::OtherSession => usage.shared_with_other_session = true,
                 UsageOwnership::Duplicate => {}
+            }
+        })
+    }
+
+    pub(crate) fn counted_usage_event_keys(
+        &self,
+        session_ids: &HashSet<&str>,
+    ) -> Result<HashMap<String, HashSet<String>>> {
+        self.fold_usage_ownership(None, HashMap::new(), |keys, event, ownership| {
+            if ownership == UsageOwnership::Counted
+                && session_ids.contains(event.session_id.as_str())
+            {
+                keys.entry(event.session_id).or_default().insert(event.event_key);
             }
         })
     }

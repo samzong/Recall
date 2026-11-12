@@ -154,7 +154,10 @@ enum Commands {
             help = "Maximum sessions to export; 0 means all (default)"
         )]
         limit: usize,
-        #[arg(long, help = "Comma-separated JSONL fields: metadata,messages,usage,events")]
+        #[arg(
+            long,
+            help = "Comma-separated JSONL fields: metadata,messages,usage,events,usage-ownership"
+        )]
         include: Option<String>,
         #[arg(long, value_enum, default_value_t = crate::export::MessageMode::All, help = "Export all messages or omit message bodies")]
         messages: crate::export::MessageMode,
