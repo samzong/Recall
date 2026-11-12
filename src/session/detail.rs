@@ -116,10 +116,13 @@ fn parse_session_includes(
     let includes = ExportIncludes {
         messages: matches!(format, SessionDetailFormat::Text) || messages_flag,
         usage: false,
+        usage_ownership: false,
         events: false,
     };
     let Some(include) = include else {
         return Ok(includes);
     };
-    crate::export::apply_include_filter(includes, include)
+    let includes = crate::export::apply_include_filter(includes, include)?;
+    anyhow::ensure!(!includes.usage_ownership, "--include usage-ownership requires export");
+    Ok(includes)
 }

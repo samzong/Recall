@@ -87,7 +87,7 @@ pub(crate) enum SessionCommands {
         format: SessionExportFormat,
         #[arg(
             long,
-            help = "Comma-separated JSONL fields; messages is required: metadata,messages,usage,events"
+            help = "Comma-separated JSONL fields; messages is required: metadata,messages,usage,events,usage-ownership"
         )]
         include: Option<String>,
         #[arg(long, help = "Output path; stdout when omitted")]

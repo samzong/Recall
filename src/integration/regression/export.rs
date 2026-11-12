@@ -164,7 +164,12 @@ fn export_jsonl_reads_every_record_from_one_snapshot() {
         scope: ProjectScope::Global,
         thread_role: None,
         limit: None,
-        includes: ExportIncludes { messages: true, usage: false, events: false },
+        includes: ExportIncludes {
+            messages: true,
+            usage: false,
+            events: false,
+            usage_ownership: false,
+        },
     };
 
     write_jsonl(&store, &options, &mut writer).unwrap();
@@ -205,7 +210,12 @@ fn export_jsonl_applies_include_projection() {
         scope: ProjectScope::Global,
         thread_role: None,
         limit: None,
-        includes: ExportIncludes { messages: true, usage: false, events: false },
+        includes: ExportIncludes {
+            messages: true,
+            usage: false,
+            events: false,
+            usage_ownership: false,
+        },
     };
     let mut out = Vec::new();
     write_jsonl(&store, &options, &mut out).unwrap();
