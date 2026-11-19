@@ -4,12 +4,7 @@ use std::process::Command;
 use serde_json::Value;
 
 fn binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("recall-publish")
+    PathBuf::from(env!("CARGO_BIN_EXE_recall-publish"))
 }
 
 fn fake_recall(dir: &Path) -> PathBuf {

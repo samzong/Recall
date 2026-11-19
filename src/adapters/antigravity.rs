@@ -124,7 +124,18 @@ fn scan_for_sync_impl(
             ..Default::default()
         },
         entries,
-        antigravity_snapshot,
+        |entry| {
+            antigravity_snapshot(entry).map(|snapshot| {
+                let directory_changed = matches!(adapter, AntigravityAdapter::Desktop)
+                    && entry.directory.as_ref().is_some_and(|directory| {
+                        context
+                            .session_meta()
+                            .get(&entry.session_id)
+                            .is_some_and(|old| old.directory.as_ref() != Some(directory))
+                    });
+                snapshot.requiring_parse(directory_changed)
+            })
+        },
         |entry, mtime| parse_antigravity_session_for_entry(entry, mtime, include_events),
     )
 }
