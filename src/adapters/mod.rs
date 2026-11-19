@@ -430,7 +430,8 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(pi::PiAdapter),
         Box::new(omp::OmpAdapter),
         Box::new(rx_agent::RxAgentAdapter),
-        Box::new(antigravity::AntigravityAdapter),
+        Box::new(antigravity::AntigravityAdapter::Cli),
+        Box::new(antigravity::AntigravityAdapter::Desktop),
         Box::new(gemini::GeminiAdapter),
         Box::new(grok::GrokAdapter),
         Box::new(kiro::KiroAdapter),
@@ -496,6 +497,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "droid"
             | "deepseek-harness"
             | "antigravity-cli"
+            | "antigravity"
             | "kiro-cli"
             | "cline"
             | "roo"

@@ -42,6 +42,12 @@ recall skill install # auto detect agents and install skills
 
 ## Support
 
+Antigravity desktop sessions use source `antigravity` (`AGYD`) and come from `~/.gemini/antigravity/brain/`.
+CLI sessions keep source `antigravity-cli` (`AGY`). Desktop resume and usage are not supported.
+Run `recall sync --source antigravity --project all`, then `recall session list --source antigravity --project all`.
+Desktop project filters use the first local workspace URI in `conversation_summaries.db`.
+If that database is missing or unreadable, global search still includes the transcripts without project paths.
+
 One index across every AI coding CLI. Sync once, search everywhere, resume right where you left off.
 
 | Adapter         | Discovery | Full-index | Incremental-sync | Semantic-search | Export | Resume | Usage |
@@ -52,7 +58,8 @@ One index across every AI coding CLI. Sync once, search everywhere, resume right
 | Pi              |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | OMP             |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | rx-agent        |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
-| Antigravity |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
+| Antigravity CLI |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
+| Antigravity desktop |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |      |
 | Gemini          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Kiro            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
 | Copilot     |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
