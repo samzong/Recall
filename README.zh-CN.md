@@ -37,6 +37,12 @@ recall skill install # 自动检测 agent 并安装 skills
 
 ## 支持
 
+Antigravity 桌面端使用来源 `antigravity`（`AGYD`），会话来自 `~/.gemini/antigravity/brain/`。
+CLI 保留来源 `antigravity-cli`（`AGY`）。桌面端暂不支持恢复和用量统计。
+运行 `recall sync --source antigravity --project all`，再运行 `recall session list --source antigravity --project all`。
+桌面端项目筛选使用 `conversation_summaries.db` 中的第一个本地工作区 URI。
+数据库缺失或无法读取时，全局搜索仍可查到会话，但会话没有项目路径。
+
 一个索引覆盖所有 AI 编程 CLI。同步一次，处处搜索，从上次停下的地方继续。
 
 | 适配器          | 发现 | 全量索引 | 增量同步 | 语义搜索 | 导出 | 恢复 | 用量 |
@@ -46,7 +52,8 @@ recall skill install # 自动检测 agent 并安装 skills
 | Codex           |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Pi              |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | OMP             |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
-| Antigravity     |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |      |
+| Antigravity CLI |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |      |
+| Antigravity 桌面端 |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |      |
 | Gemini          |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Kiro            |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |      |
 | Copilot         |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
