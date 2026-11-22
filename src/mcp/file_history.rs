@@ -1,3 +1,5 @@
+use crate::db::message_store::json_escaped_str_bytes;
+
 use super::*;
 
 pub(super) const EVENT_LIMIT_DEFAULT: u32 = 20;
@@ -10,37 +12,40 @@ pub(super) struct FileHistoryArgs {
     #[schemars(
         description = "File path, relative or absolute. Matches an event when the shorter of\nthe two is a whole path suffix of the other, so an absolute path also\nfinds events indexed under a project-relative path and vice versa."
     )]
+    #[serde(deserialize_with = "deserialize_required_string")]
     pub(super) path: String,
     #[schemars(
         description = "Optional absolute indexed directory path, or a repo name/owner-repo\nslug/remote URL derived from git identity. A worktree's own directory\nname alone (e.g. \"myrepo--feature\") does not match."
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
     pub(super) project: Option<String>,
     #[schemars(
         description = "Filter by comma-separated source ids or labels, such as claude-code,CUR."
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_source")]
     pub(super) source: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
     #[schemars(
         description = "Optional event kind. Defaults to file_write/file_read in legacy mode, or all event kinds with target_project."
     )]
     pub(super) kind: Option<String>,
-    #[schemars(description = "Maximum events to return. Defaults to 20, capped at 50.")]
+    #[schemars(
+        description = "Maximum events to return. Defaults to 20, capped at 50. When omitted with target_project, pages also shrink to fit an 8800-byte UTF-8 response budget."
+    )]
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(range(min = 1, max = 50))]
     pub(super) limit: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
     #[schemars(
         description = "Enable structured file evidence for this target repository or directory, independently of the session project. Accepts a local directory, remote URL, or unique indexed target repository name/slug. Mutually exclusive with project."
     )]
     pub(super) target_project: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_bool")]
     #[schemars(
         description = "Include command evidence matched by target identity or native absolute path. Inspect match_basis; commands do not prove a modification succeeded. Only valid with target_project."
     )]
     pub(super) include_command_candidates: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_cursor")]
     #[schemars(
         description = "Opaque next_cursor from structured file history. Repeat the same path, target_project, source, kind and candidate selection; target-relevant index changes invalidate it. Only valid with target_project."
     )]
@@ -118,27 +123,96 @@ pub(super) fn file_history_ready(
             .map_err(|error| error.to_string())?;
         let events = page
             .events
-            .into_iter()
-            .map(|mut hit| {
-                hit.hit.target =
-                    hit.hit.target.map(|target| truncate_chars(&target, EXCERPT_CHAR_CAP).0);
-                let mut event = event_hit(hit.hit);
-                event.evidence = Some(hit.evidence);
+            .iter()
+            .map(|hit| {
+                let mut cloned = hit.hit.clone();
+                cloned.target =
+                    cloned.target.map(|target| truncate_chars(&target, EXCERPT_CHAR_CAP).0);
+                let mut event = event_hit(cloned);
+                event.evidence = Some(hit.evidence.clone());
                 event
             })
             .collect::<Vec<_>>();
-        return Ok(EventList {
-            message: events.is_empty().then(|| "No matching file evidence.".to_string()),
-            events,
-            target_file: Some(target),
-            has_more: Some(page.next_cursor.is_some()),
-            next_cursor: page.next_cursor,
-            ordering: Some(
-                "known_event_timestamp_desc_then_indexed_event_id_desc; unknown_timestamps_last"
-                    .to_string(),
-            ),
-            coverage: page.coverage,
-        });
+        let ordering = Some(
+            "known_event_timestamp_desc_then_indexed_event_id_desc; unknown_timestamps_last"
+                .to_string(),
+        );
+        if args.limit.is_some() || events.is_empty() {
+            return Ok(EventList {
+                message: events.is_empty().then(|| "No matching file evidence.".to_string()),
+                events,
+                target_file: Some(target),
+                has_more: Some(page.next_cursor.is_some()),
+                next_cursor: page.next_cursor,
+                ordering,
+                coverage: page.coverage,
+            });
+        }
+        let total = events.len();
+        for kept in (1..=total).rev() {
+            let trimmed = kept < total;
+            let has_more = trimmed || page.next_cursor.is_some();
+            let next_cursor = if trimmed {
+                Some(page.cursor_at(kept - 1).map_err(|error| error.to_string())?)
+            } else {
+                page.next_cursor.clone()
+            };
+            let mut candidate = EventList {
+                message: None,
+                events: events[..kept].to_vec(),
+                target_file: Some(target.clone()),
+                has_more: Some(has_more),
+                next_cursor,
+                ordering: ordering.clone(),
+                coverage: page.coverage.clone(),
+            };
+            if serde_json::to_vec(&candidate).map_or(0, |bytes| bytes.len()) <= MCP_INLINE_MAX_BYTES
+            {
+                return Ok(candidate);
+            }
+            let min_floor: usize = candidate
+                .events
+                .iter()
+                .filter_map(|event| event.summary.as_deref())
+                .map(|summary| json_escaped_str_bytes(summary).min(96))
+                .sum();
+            let mut summaries: Vec<Option<String>> = candidate
+                .events
+                .iter_mut()
+                .map(|event| event.summary.as_mut().map(std::mem::take))
+                .collect();
+            let mut skeleton = serde_json::to_vec(&candidate)
+                .map_or(MCP_INLINE_MAX_BYTES + 1, |bytes| bytes.len());
+            if skeleton.saturating_add(min_floor) > MCP_INLINE_MAX_BYTES {
+                for event in &mut candidate.events {
+                    event.title = truncate_json_bytes(&sanitize_lossy_text(&event.title), 120);
+                }
+                skeleton = serde_json::to_vec(&candidate)
+                    .map_or(MCP_INLINE_MAX_BYTES + 1, |bytes| bytes.len());
+            }
+            if kept > 1 && skeleton.saturating_add(min_floor) > MCP_INLINE_MAX_BYTES {
+                continue;
+            }
+            if skeleton < MCP_INLINE_MAX_BYTES {
+                water_fill_optional(&mut summaries, MCP_INLINE_MAX_BYTES - skeleton);
+                for (event, summary) in candidate.events.iter_mut().zip(summaries) {
+                    event.summary = summary;
+                }
+                if kept == 1
+                    || serde_json::to_vec(&candidate).map_or(0, |bytes| bytes.len())
+                        <= MCP_INLINE_MAX_BYTES
+                {
+                    return Ok(candidate);
+                }
+            } else if kept == 1 {
+                water_fill_optional(&mut summaries, 96);
+                for (event, summary) in candidate.events.iter_mut().zip(summaries) {
+                    event.summary = summary;
+                }
+                return Ok(candidate);
+            }
+        }
+        unreachable!()
     }
     if args.include_command_candidates.is_some() || args.cursor.is_some() {
         return Err("include_command_candidates and cursor require target_project".to_string());
@@ -165,11 +239,12 @@ pub(super) fn file_history_ready(
             ..Default::default()
         });
     }
-    Ok(EventList {
+    let list = EventList {
         message: None,
         events: hits.into_iter().map(event_hit).collect(),
         ..Default::default()
-    })
+    };
+    Ok(fit_event_list(list, inline_page_budget(args.limit, EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MAX)))
 }
 
 pub(super) fn event_hit(hit: crate::db::search::SessionEventHit) -> EventHit {
@@ -183,9 +258,43 @@ pub(super) fn event_hit(hit: crate::db::search::SessionEventHit) -> EventHit {
         name: hit.name,
         target: hit.target,
         event_seq: hit.event_seq,
-        summary: hit.summary.map(|text| truncate_chars(&text, EXCERPT_CHAR_CAP).0),
+        summary: hit
+            .summary
+            .map(|text| truncate_chars(&sanitize_lossy_text(&text), EXCERPT_CHAR_CAP).0),
         evidence: None,
         visibility: hit.visibility,
         is_meta: hit.is_meta,
     }
+}
+
+fn fit_event_list(mut list: EventList, budget: usize) -> EventList {
+    if serde_json::to_vec(&list).map_or(0, |bytes| bytes.len()) <= budget {
+        return list;
+    }
+    let mut summaries: Vec<Option<String>> =
+        list.events.iter_mut().map(|event| event.summary.as_mut().map(std::mem::take)).collect();
+    let mut skeleton = serde_json::to_vec(&list).map_or(budget, |bytes| bytes.len());
+    if skeleton.saturating_add(2_400) > budget {
+        for event in &mut list.events {
+            event.title = truncate_json_bytes(&sanitize_lossy_text(&event.title), 120);
+        }
+        skeleton = serde_json::to_vec(&list).map_or(budget, |bytes| bytes.len());
+    }
+    if skeleton > budget {
+        for event in &mut list.events {
+            event.title = truncate_json_bytes(&event.title, 36);
+            if let Some(project) = event.project.as_mut() {
+                *project = truncate_json_bytes(project, 64);
+            }
+            if let Some(target) = event.target.as_mut() {
+                *target = truncate_json_bytes(target, 96);
+            }
+        }
+        skeleton = serde_json::to_vec(&list).map_or(budget, |bytes| bytes.len());
+    }
+    water_fill_optional(&mut summaries, budget.saturating_sub(skeleton));
+    for (event, summary) in list.events.iter_mut().zip(summaries) {
+        event.summary = summary;
+    }
+    list
 }

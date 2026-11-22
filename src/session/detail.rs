@@ -35,6 +35,7 @@ pub(super) fn cmd_session_show(
                 role,
                 max_messages: 1000,
                 max_chars: max_chars.unwrap_or(6000) as usize,
+                max_rendered_bytes: None,
                 cursor,
             },
         )?;

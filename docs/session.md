@@ -266,10 +266,12 @@ full-content output. Bounds and role filtering are applied in SQLite.
 
 MCP exposes the same message search as `search_messages`. Pass `around_seq`,
 `before`, and `after` to `get_session`, or use `from_seq` / `to_seq`. Selected
-MCP reads default to at most 50 messages and 6,000 content characters;
-`max_chars` may lower this budget. `next_cursor` continues the selected window.
-Selectors and cursor cannot be combined with `tail`. Legacy `get_session`
-head/tail calls retain their existing text format and limits.
+MCP reads return at most 50 messages and 6,000 content characters within an
+8,800-byte UTF-8 response budget. Set `max_chars` to lower the character
+budget. `next_cursor` continues the selected window. Default discovery and
+message-search calls also fit within 8,800 UTF-8 bytes. Selectors and cursor
+cannot be combined with `tail`. Legacy `get_session` head/tail calls retain
+their existing text format and limits.
 
 ### `recall session export`
 

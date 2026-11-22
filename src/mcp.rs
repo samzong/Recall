@@ -1,11 +1,15 @@
+mod budget;
 mod current_session;
 mod discovery;
 mod file_history;
+mod input;
 mod read_session;
 
+use budget::*;
 use current_session::*;
 use discovery::*;
 use file_history::*;
+use input::*;
 use read_session::*;
 
 #[cfg(test)]
@@ -22,15 +26,14 @@ use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConf
 use rmcp::{
     ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router, transport::stdio,
 };
-use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::adapters;
 use crate::db::message_store::{MessageRead, MessageWindow};
 use crate::db::search::{
-    FileHistoryCoverage, FileHistoryEvidence, FileHistoryQuery, FileHistoryTarget, SearchEngine,
-    SearchFilters, SessionEventQuery, TimeRange,
+    FileHistoryCoverage, FileHistoryEvidence, FileHistoryQuery, FileHistoryTarget, MessageHit,
+    SearchEngine, SearchFilters, SessionEventQuery, TimeRange,
 };
 use crate::db::store::Store;
 use crate::project_scope::ProjectScope;
@@ -145,7 +148,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Search past AI coding sessions across Claude Code, Codex, OpenCode, Cursor, and other indexed tools. Use when the user asks whether they have seen an error, made a decision, or solved a similar problem before. Pass a fresh invocation_nonce when the host does not expose a session ID. current_session.resolution is resolved only after exact Store verification; only then is that session excluded before ranking and limit. Unknown leaves results unchanged. Returns Recall session_id, source-native source_session_id, source, project, title, matched excerpt, and ISO-8601 timestamp.",
+        description = "Search past AI coding sessions across Claude Code, Codex, OpenCode, Cursor, and other indexed tools. Use when the user asks whether they have seen an error, made a decision, or solved a similar problem before. Pass a fresh invocation_nonce when the host does not expose a session ID. current_session.resolution is resolved only after exact Store verification; only then is that session excluded before ranking and limit. Unknown leaves results unchanged. Default calls fit within an 8800-byte UTF-8 response budget. Returns Recall session_id, source-native source_session_id, source, project, title, matched excerpt, and ISO-8601 timestamp.",
         annotations(
             title = "Search sessions",
             read_only_hint = true,
@@ -165,7 +168,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Search message text by keywords and return individual matches with session_id, source_session_id, source, title, seq, role, timestamp (Unix milliseconds), and an excerpt around the match. This uses full-text search, not embeddings. Prefer this for specific historical evidence; use get_session with around_seq set to a returned seq for context. Limit defaults to 10, maximum 50. Pass project for project-scoped discovery and a fresh invocation_nonce for self-exclusion. Explicit session_id searches include that session even when it is the invoking session. Sequence anchors refer to the current index, not permanent source identities.",
+        description = "Search message text by keywords and return individual matches with session_id, source_session_id, source, title, seq, role, timestamp (Unix milliseconds), and an excerpt around the match. This uses full-text search, not embeddings. Prefer this for specific historical evidence; use get_session with around_seq set to a returned seq for context. Limit defaults to 10, maximum 50, and default calls fit within an 8800-byte UTF-8 response budget. Pass project for project-scoped discovery and a fresh invocation_nonce for self-exclusion. Explicit session_id searches include that session even when it is the invoking session. Sequence anchors refer to the current index, not permanent source identities.",
         annotations(
             title = "Search messages",
             read_only_hint = true,
@@ -184,7 +187,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Read indexed evidence with event_ref copied from file_history: returns lossless UTF-8 chunks, a continuation cursor, and a content digest. Default evidence_part=payload includes full indexed attrs and same-session related refs; concatenate data before parsing its JSON. For native Cursor before/after content, first read payload.related_event_refs and select the result event holding beforeContentId/afterContentId; content is opt-in and hash-verified. max_bytes defaults to 16384, maximum 65536; each call has a 64 MiB read budget. Copy event_ref, evidence_part, session_id and cursor to continue. Read the returned discussion window separately. Without event_ref, Load one indexed session by Recall session_id. After search_messages, pass around_seq to read the matched message and its neighbors (default three before and after). Alternatively use inclusive from_seq/to_seq. These selectors cannot be combined with tail. Selected reads return up to 50 messages and 6000 Unicode content characters, with first_message_byte_offset and next_cursor for lossless continuation. Resume using session_id and cursor without selectors; reindexing invalidates cursors. Without selectors, cursor, or max_chars, the legacy head/tail behavior follows. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 bytes. Set include_events only when structured evidence is needed; it returns at most 50 events anchored to the returned message range plus unanchored events, caps each event string field at 200 characters and all event string fields at 10000 characters total, and never returns raw arguments, results, source paths, or parser internals. Returns metadata, including source-native source_session_id and the first_message_seq and last_message_seq represented by the response, plus messages as plain text in sequence order.",
+        description = "Read indexed evidence with event_ref copied from file_history: returns lossless UTF-8 chunks, a continuation cursor, and a content digest. Default evidence_part=payload includes full indexed attrs and same-session related refs; concatenate data before parsing its JSON. For native Cursor before/after content, first read payload.related_event_refs and select the result event holding beforeContentId/afterContentId; content is opt-in and hash-verified. max_bytes defaults to 8800, maximum 65536. Each call has a 64 MiB read budget. Copy event_ref, evidence_part, session_id and cursor to continue. Read the returned discussion window separately. Without event_ref, Load one indexed session by Recall session_id. After search_messages, pass around_seq to read the matched message and its neighbors (default three before and after). Alternatively use inclusive from_seq/to_seq. These selectors cannot be combined with tail. Selected reads return up to 50 messages and 6000 Unicode content characters within an 8800-byte UTF-8 response budget, with first_message_byte_offset and next_cursor for lossless continuation. Resume using session_id and cursor without selectors; reindexing invalidates cursors. Without selectors, cursor, or max_chars, the legacy head/tail behavior follows. Use after search_sessions or list_recent_sessions when you need the conversation itself. Each message is truncated at 2000 characters; the combined message text is capped at 32000 bytes. Set include_events only when structured evidence is needed; it returns at most 50 events anchored to the returned message range plus unanchored events, caps each event string field at 200 characters and all event string fields at 10000 characters total, and never returns raw arguments, results, source paths, or parser internals. Returns metadata, including source-native source_session_id and the first_message_seq and last_message_seq represented by the response, plus messages as plain text in sequence order.",
         annotations(
             title = "Get session",
             read_only_hint = true,
@@ -209,7 +212,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "List the most recently active indexed sessions, newest first. Use to browse what the user has been working on when there is no search query. Pass a fresh invocation_nonce when the host does not expose a session ID. current_session.resolution is resolved only after exact Store verification; only then is that session excluded before ordering and limit. Unknown leaves results unchanged. Each hit has the same shape as search_sessions: Recall session_id, source-native source_session_id, source, project, title, excerpt (summary when present), and ISO-8601 timestamp.",
+        description = "List the most recently active indexed sessions, newest first. Use to browse what the user has been working on when there is no search query. Pass a fresh invocation_nonce when the host does not expose a session ID. current_session.resolution is resolved only after exact Store verification; only then is that session excluded before ordering and limit. Unknown leaves results unchanged. Default calls fit within an 8800-byte UTF-8 response budget. Each hit has the same shape as search_sessions: Recall session_id, source-native source_session_id, source, project, title, excerpt (summary when present), and ISO-8601 timestamp.",
         annotations(
             title = "List recent sessions",
             read_only_hint = true,
@@ -229,7 +232,7 @@ impl RecallMcp {
     }
 
     #[tool(
-        description = "Which indexed sessions touched a file. An event matches when its target equals the given path, or when either one ends with `/` or `\\` followed by the other, so relative and absolute forms of the same path find each other. Defaults to file_write and file_read events. Returns session id, source, project, title, kind, name, target, event_seq, truncated summary, event timestamp, and optional visibility and is_meta flags. Set target_project to explicitly use structured target-file evidence across session projects; it is mutually exclusive with project. This mode matches exact file identities, includes all evidence kinds by default, and returns evidence classifications, event_ref, coverage on the first page, and continuation. include_command_candidates and cursor require this mode. Command evidence and approval do not prove a write succeeded. Unknown event timestamps sort after known timestamps; ties use indexed event identity. Target-relevant changes invalidate continuation. No sync or native source-file read is performed.",
+        description = "Which indexed sessions touched a file. An event matches when its target equals the given path, or when either one ends with `/` or `\\` followed by the other, so relative and absolute forms of the same path find each other. Defaults to file_write and file_read events. Returns session id, source, project, title, kind, name, target, event_seq, truncated summary, event timestamp, and optional visibility and is_meta flags. Set target_project to explicitly use structured target-file evidence across session projects; it is mutually exclusive with project. This mode matches exact file identities, includes all evidence kinds by default, and returns evidence classifications, event_ref, coverage on the first page, and continuation. Default calls fit within an 8800-byte UTF-8 response budget and set has_more and next_cursor when target_project trims events to fit. include_command_candidates and cursor require this mode. Command evidence and approval do not prove a write succeeded. Unknown event timestamps sort after known timestamps; ties use indexed event identity. Target-relevant changes invalidate continuation. No sync or native source-file read is performed.",
         annotations(
             title = "File history",
             read_only_hint = true,
@@ -397,6 +400,13 @@ fn search_sessions_with_context(
     }
 }
 
+#[derive(Serialize)]
+struct MessageMatchList<'a> {
+    matches: Vec<MessageHit>,
+    current_session: &'a CurrentSession,
+    current_session_excluded: bool,
+}
+
 fn search_message_matches(
     index: &IndexState,
     args: &SearchMessagesArgs,
@@ -425,7 +435,7 @@ fn search_message_matches(
             None
         },
     };
-    let matches = SearchEngine::new(&store.conn)
+    let mut matches = SearchEngine::new(&store.conn)
         .search_messages(
             &args.search.query,
             &filters,
@@ -433,8 +443,37 @@ fn search_message_matches(
             clamp_limit(args.search.limit, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX),
         )
         .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({"matches": matches, "current_session": current,
-        "current_session_excluded": filters.excluded_session_id.is_some()}))
+    for hit in &mut matches {
+        hit.excerpt = sanitize_lossy_text(&hit.excerpt);
+    }
+    let budget = inline_page_budget(args.search.limit, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX);
+    let mut payload = MessageMatchList {
+        matches,
+        current_session: &current,
+        current_session_excluded: filters.excluded_session_id.is_some(),
+    };
+    if serde_json::to_vec(&payload).map_or(0, |bytes| bytes.len()) > budget {
+        let mut excerpts: Vec<String> =
+            payload.matches.iter_mut().map(|hit| std::mem::take(&mut hit.excerpt)).collect();
+        let mut skeleton = serde_json::to_vec(&payload).map_or(budget, |bytes| bytes.len());
+        if skeleton.saturating_add(4_400) > budget {
+            for hit in &mut payload.matches {
+                hit.title = truncate_json_bytes(&sanitize_lossy_text(&hit.title), 160);
+            }
+            skeleton = serde_json::to_vec(&payload).map_or(budget, |bytes| bytes.len());
+        }
+        if skeleton > budget {
+            for hit in &mut payload.matches {
+                hit.title = truncate_json_bytes(&hit.title, 48);
+            }
+            skeleton = serde_json::to_vec(&payload).map_or(budget, |bytes| bytes.len());
+        }
+        water_fill_strings(&mut excerpts, budget.saturating_sub(skeleton));
+        for (hit, excerpt) in payload.matches.iter_mut().zip(excerpts) {
+            hit.excerpt = excerpt;
+        }
+    }
+    serde_json::to_value(&payload).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -514,7 +553,7 @@ fn get_event_evidence(
         args.event_ref.as_deref().ok_or_else(|| "event_ref is required".to_string())?,
         args.evidence_part.unwrap_or_default(),
         args.cursor.as_deref(),
-        args.max_bytes.unwrap_or(16384) as usize,
+        args.max_bytes.unwrap_or(MCP_INLINE_MAX_BYTES as u32) as usize,
     )
     .map_err(|error| error.to_string())
 }
@@ -587,30 +626,5 @@ fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
         let mut trimmed: String = kept.chars().take(max_chars - 1).collect();
         trimmed.push('…');
         (trimmed, true)
-    }
-}
-
-fn deserialize_opt_u32<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum NumberOrString {
-        U(u32),
-        I(i64),
-        S(String),
-        Null,
-    }
-
-    match Option::<NumberOrString>::deserialize(deserializer)? {
-        None | Some(NumberOrString::Null) => Ok(None),
-        Some(NumberOrString::U(value)) => Ok(Some(value)),
-        Some(NumberOrString::I(value)) if value >= 0 => {
-            u32::try_from(value).map(Some).map_err(de::Error::custom)
-        }
-        Some(NumberOrString::S(value)) if value.trim().is_empty() => Ok(None),
-        Some(NumberOrString::S(value)) => value.parse().map(Some).map_err(de::Error::custom),
-        Some(NumberOrString::I(_)) => Err(de::Error::custom("expected a non-negative integer")),
     }
 }

@@ -9,56 +9,60 @@ pub(super) const GET_EVENT_TEXT_CHAR_CAP: usize = 10_000;
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(super) struct GetSessionArgs {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_event_ref")]
     pub(super) event_ref: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_evidence_part")]
     pub(super) evidence_part: Option<crate::event_evidence::EvidencePart>,
-    #[serde(default)]
-    #[schemars(range(min = 1024, max = 65536))]
+    #[serde(default, deserialize_with = "deserialize_opt_u32")]
+    #[schemars(
+        description = "UTF-8 byte budget for each event_ref evidence page. Defaults to 8800, range 1024 to 65536.",
+        range(min = 1024, max = 65536)
+    )]
     pub(super) max_bytes: Option<u32>,
     #[schemars(description = "Recall session id from search_sessions or list_recent_sessions.")]
+    #[serde(deserialize_with = "deserialize_required_string")]
     pub(super) session_id: String,
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(
         description = "Maximum messages to return. Defaults to 50. Reads from the start unless tail is true."
     )]
     pub(super) max_messages: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     #[schemars(
         description = "Return the newest messages instead of the oldest, preserving sequence order."
     )]
     pub(super) tail: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     #[schemars(
         description = "Include up to 50 structured events anchored to the returned message range, plus unanchored events. Each event string field is capped at 200 characters and all event string fields at 10000 characters total. Defaults to false."
     )]
     pub(super) include_events: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(
         description = "First message sequence to read; incompatible with around_seq and cursor."
     )]
     pub(super) from_seq: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(description = "Last message sequence to read, inclusive.")]
     pub(super) to_seq: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(
         description = "Read this message and its neighbors. Missing or ambiguous sequences are errors. Defaults to three messages before and after."
     )]
     pub(super) around_seq: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(description = "Actual messages before around_seq, excluding the anchor.")]
     pub(super) before: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(description = "Actual messages after around_seq, excluding the anchor.")]
     pub(super) after: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(
-        description = "Unicode character budget for paged message content, default 6000, maximum 6000. Also enables paging without a sequence selector.",
+        description = "Unicode character budget for paged message content, default 6000, maximum 6000. Paged responses also stay within an 8800-byte UTF-8 budget. Setting max_chars enables paging without a sequence selector.",
         range(min = 1, max = 6000)
     )]
     pub(super) max_chars: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_cursor")]
     #[schemars(
         description = "Opaque next_cursor copied from the previous page. Use with session_id, without sequence selectors or tail. Reindexing invalidates cursors."
     )]
@@ -140,6 +144,13 @@ pub(super) fn get_ready(
     };
     window.validate().map_err(|e| e.to_string())?;
     let paging = window.is_selected() || args.cursor.is_some() || args.max_chars.is_some();
+    let mut title = session_title(&session);
+    let summary = session
+        .summary
+        .as_deref()
+        .map(|text| truncate_chars(&sanitize_lossy_text(text), EXCERPT_CHAR_CAP).0);
+    let timestamp = iso8601(session.started_at);
+    let mut preloaded_events = None;
     let mut next_cursor = None;
     let mut first_message_byte_offset = None;
     let (text, returned, truncated, first_message_seq, last_message_seq) = if paging {
@@ -150,6 +161,21 @@ pub(super) fn get_ready(
         if !(1..=6000).contains(&max_chars) {
             return Err("max_chars must be between 1 and 6000".to_string());
         }
+        if args.include_events {
+            preloaded_events = Some(
+                store
+                    .list_session_events_for_session(&session.id)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let msg_budget = paged_message_byte_budget(
+            &session,
+            &mut title,
+            summary.as_deref(),
+            &timestamp,
+            preloaded_events.as_ref().is_some_and(|records| !records.is_empty()),
+            args.include_events,
+        );
         let page = store
             .read_message_page(
                 &session.id,
@@ -158,6 +184,7 @@ pub(super) fn get_ready(
                     role: None,
                     max_messages: clamp_limit(args.max_messages, GET_MAX_MESSAGES_DEFAULT, 50),
                     max_chars: max_chars as usize,
+                    max_rendered_bytes: Some(msg_budget),
                     cursor: args.cursor.as_deref(),
                 },
             )
@@ -198,9 +225,12 @@ pub(super) fn get_ready(
         (text, returned, truncated || total > messages.len(), first, last)
     };
     let (events, returned_events, events_truncated) = if args.include_events {
-        let records = store
-            .list_session_events_for_session(&session.id)
-            .map_err(|error| error.to_string())?;
+        let records = match preloaded_events {
+            Some(records) => records,
+            None => store
+                .list_session_events_for_session(&session.id)
+                .map_err(|error| error.to_string())?,
+        };
         let (events, truncated) =
             render_session_events(records, first_message_seq, last_message_seq, args.tail);
         let returned = events.len();
@@ -208,15 +238,15 @@ pub(super) fn get_ready(
     } else {
         (None, None, None)
     };
-    Ok(SessionDetail {
+    let mut detail = SessionDetail {
         message: None,
         session_id: Some(session.id.clone()),
         source_session_id: Some(session.source_id.clone()),
         source: Some(session.source.clone()),
         project: session.directory.clone(),
-        title: Some(session_title(&session)),
-        summary: session.summary.clone(),
-        timestamp: Some(iso8601(session.started_at)),
+        title: Some(title),
+        summary,
+        timestamp: Some(timestamp),
         message_count: Some(session.message_count),
         locations: session.locations.clone(),
         alternative_versions: session.alternative_versions,
@@ -230,7 +260,73 @@ pub(super) fn get_ready(
         events,
         returned_events,
         events_truncated,
+    };
+    if paging && detail.events.is_some() {
+        while serde_json::to_vec(&detail).map_or(0, |bytes| bytes.len()) > MCP_INLINE_MAX_BYTES {
+            let Some(events) = detail.events.as_mut() else {
+                break;
+            };
+            if events.pop().is_none() {
+                break;
+            }
+            detail.returned_events = Some(events.len());
+            detail.events_truncated = Some(true);
+        }
+    }
+    Ok(detail)
+}
+
+fn paged_message_byte_budget(
+    session: &Session,
+    title: &mut String,
+    summary: Option<&str>,
+    timestamp: &str,
+    has_events: bool,
+    include_events: bool,
+) -> usize {
+    let worst_cursor = serde_json::json!({
+        "version": 1,
+        "session_id": session.id,
+        "snapshot": [i64::MAX, u64::MAX],
+        "from_seq": u32::MAX,
+        "to_seq": u32::MAX,
+        "role": "assistant",
+        "next_seq": u32::MAX,
+        "next_id": i64::MAX,
+        "byte_offset": usize::MAX,
     })
+    .to_string();
+    let mut dummy = SessionDetail {
+        message: None,
+        session_id: Some(session.id.clone()),
+        source_session_id: Some(session.source_id.clone()),
+        source: Some(session.source.clone()),
+        project: session.directory.clone(),
+        title: Some(title.clone()),
+        summary: summary.map(str::to_string),
+        timestamp: Some(timestamp.to_string()),
+        message_count: Some(session.message_count),
+        locations: session.locations.clone(),
+        alternative_versions: session.alternative_versions,
+        returned_messages: 50,
+        first_message_seq: Some(u32::MAX),
+        last_message_seq: Some(u32::MAX),
+        truncated: false,
+        messages: String::new(),
+        next_cursor: Some(worst_cursor),
+        first_message_byte_offset: Some(usize::MAX),
+        events: include_events.then(Vec::new),
+        returned_events: include_events.then_some(GET_EVENT_LIMIT),
+        events_truncated: include_events.then_some(false),
+    };
+    let mut skeleton = serde_json::to_vec(&dummy).map_or(MCP_INLINE_MAX_BYTES, |bytes| bytes.len());
+    if skeleton > MCP_INLINE_MAX_BYTES / 2 {
+        *title = truncate_json_bytes(&sanitize_lossy_text(title), 180);
+        dummy.title = Some(title.clone());
+        skeleton = serde_json::to_vec(&dummy).map_or(MCP_INLINE_MAX_BYTES, |bytes| bytes.len());
+    }
+    let available = MCP_INLINE_MAX_BYTES.saturating_sub(skeleton);
+    if has_events { available.saturating_sub((available / 3).min(2_400)) } else { available }
 }
 
 pub(super) fn empty_detail(message: Option<String>) -> SessionDetail {
@@ -303,7 +399,10 @@ pub(super) fn session_event_detail(record: &SessionEventRecord) -> (SessionEvent
         tool_call_id: record.tool_call_id.as_deref().map(&mut field),
         is_meta: record.is_meta,
         visibility: record.visibility,
-        summary: record.summary.as_deref().map(&mut field),
+        summary: record.summary.as_deref().map(|value| {
+            let clean = sanitize_lossy_text(value);
+            field(&clean)
+        }),
     };
     (detail, truncated)
 }

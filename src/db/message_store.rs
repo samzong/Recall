@@ -92,7 +92,33 @@ pub(crate) struct MessageRead<'a> {
     pub(crate) role: Option<&'a str>,
     pub(crate) max_messages: usize,
     pub(crate) max_chars: usize,
+    pub(crate) max_rendered_bytes: Option<usize>,
     pub(crate) cursor: Option<&'a str>,
+}
+
+pub(crate) fn json_escaped_char_bytes(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\x08' | '\x0c' | '\n' | '\r' | '\t' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+pub(crate) fn json_escaped_str_bytes(text: &str) -> usize {
+    text.chars().map(json_escaped_char_bytes).sum()
+}
+
+fn decimal_digits(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn rendered_prefix_bytes(seq: u32, role: &Role) -> usize {
+    decimal_digits(seq as usize) + role.as_str().len() + 5
 }
 
 impl Store {
@@ -191,6 +217,7 @@ impl Store {
         let mut messages = Vec::new();
         let first_message_byte_offset = cursor.byte_offset;
         let mut remaining = read.max_chars;
+        let mut remaining_bytes = read.max_rendered_bytes;
         let mut stmt = tx.prepare(
             "SELECT id, seq, role, timestamp, length(CAST(content AS BLOB)),
                     COALESCE(substr(CAST(content AS BLOB), ?7 + 1, ?8), X'')
@@ -200,6 +227,8 @@ impl Store {
              ORDER BY seq, id LIMIT 1",
         )?;
         let has_more = loop {
+            let fetch_bytes = (remaining.max(1) * 4)
+                .min(remaining_bytes.map_or(usize::MAX, |budget| budget.saturating_add(4)));
             let row = stmt
                 .query_row(
                     params![
@@ -210,7 +239,7 @@ impl Store {
                         cursor.next_seq,
                         cursor.next_id,
                         cursor.byte_offset as i64,
-                        (remaining.max(1) * 4) as i64
+                        fetch_bytes as i64
                     ],
                     |row| {
                         Ok((
@@ -240,8 +269,39 @@ impl Store {
                 }
                 Err(_) => bail!("invalid message cursor offset or message encoding"),
             };
-            let content: String = text.chars().take(remaining).collect();
-            remaining -= content.chars().count();
+            let content = if let Some(rem_bytes) = remaining_bytes {
+                let sep_bytes = if messages.is_empty() { 0 } else { 4 };
+                let header_bytes = sep_bytes + rendered_prefix_bytes(seq, &role);
+                if !messages.is_empty() {
+                    let min_needed =
+                        header_bytes + text.chars().next().map_or(0, json_escaped_char_bytes);
+                    if min_needed > rem_bytes {
+                        break true;
+                    }
+                }
+                let mut msg_budget = rem_bytes.saturating_sub(header_bytes);
+                let mut kept_chars = 0;
+                let mut kept_utf8 = 0;
+                for ch in text.chars().take(remaining) {
+                    let cost = json_escaped_char_bytes(ch);
+                    if kept_chars == 0 && messages.is_empty() {
+                        msg_budget = msg_budget.saturating_sub(cost);
+                    } else if cost <= msg_budget {
+                        msg_budget -= cost;
+                    } else {
+                        break;
+                    }
+                    kept_chars += 1;
+                    kept_utf8 += ch.len_utf8();
+                }
+                remaining -= kept_chars;
+                remaining_bytes = Some(msg_budget);
+                text[..kept_utf8].to_string()
+            } else {
+                let content: String = text.chars().take(remaining).collect();
+                remaining -= content.chars().count();
+                content
+            };
             cursor.byte_offset += content.len();
             messages.push(Message {
                 session_id: session_id.to_string(),
@@ -266,133 +326,4 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn store_with_messages(messages: &[(u32, &str)]) -> Store {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        store.conn.execute("INSERT INTO sessions (id, source, source_id, title, started_at) VALUES ('s', 'test', 's', 'Test', 0)", []).unwrap();
-        for (seq, content) in messages {
-            store.conn.execute("INSERT INTO messages (session_id, seq, role, content) VALUES ('s', ?1, 'assistant', ?2)", params![seq, content]).unwrap();
-        }
-        store
-    }
-
-    #[test]
-    fn around_counts_messages_across_gaps_and_stops_at_edges() {
-        let store = store_with_messages(&[(0, "a"), (10, "b"), (40, "c"), (90, "d"), (100, "e")]);
-        let window = MessageWindow {
-            around_seq: Some(40),
-            before: Some(1),
-            after: Some(1),
-            ..Default::default()
-        };
-        let messages = store.get_messages_in_window("s", &window, None, 100, false).unwrap();
-        assert_eq!(messages.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![10, 40, 90]);
-        let window = MessageWindow {
-            around_seq: Some(0),
-            before: Some(3),
-            after: Some(0),
-            ..Default::default()
-        };
-        assert_eq!(store.get_messages_in_window("s", &window, None, 100, false).unwrap().len(), 1);
-        let missing = MessageWindow { around_seq: Some(11), ..Default::default() };
-        assert!(store.get_messages_in_window("s", &missing, None, 100, false).is_err());
-        let conflict =
-            MessageWindow { around_seq: Some(40), from_seq: Some(0), ..Default::default() };
-        assert!(store.get_messages_in_window("s", &conflict, None, 100, false).is_err());
-        store.conn.execute("INSERT INTO messages (session_id, seq, role, content) VALUES ('s', 40, 'user', 'duplicate')", []).unwrap();
-        assert!(
-            store
-                .get_messages_in_window(
-                    "s",
-                    &MessageWindow { around_seq: Some(40), ..Default::default() },
-                    None,
-                    100,
-                    false
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn pages_preserve_unicode_nul_empty_and_duplicate_sequence_messages() {
-        let input = [
-            (2, "\u{4f60}\u{597d}🦀e\u{301}\0end"),
-            (2, "second"),
-            (9, ""),
-            (100, "\u{6700}\u{540e}"),
-        ];
-        let store = store_with_messages(&input);
-        for budget in 1..=12 {
-            let mut cursor = None;
-            let mut text = String::new();
-            let mut pages = 0;
-            loop {
-                let page = store
-                    .read_message_page(
-                        "s",
-                        &MessageRead {
-                            window: &MessageWindow::default(),
-                            role: None,
-                            max_messages: 2,
-                            max_chars: budget,
-                            cursor: cursor.as_deref(),
-                        },
-                    )
-                    .unwrap();
-                assert!(page.messages.len() <= 2);
-                assert!(
-                    page.messages.iter().map(|m| m.content.chars().count()).sum::<usize>()
-                        <= budget
-                );
-                for message in page.messages {
-                    text.push_str(&message.content);
-                }
-                pages += 1;
-                assert!(pages < 100);
-                cursor = page.next_cursor;
-                if cursor.is_none() {
-                    break;
-                }
-            }
-            assert_eq!(text, input.iter().map(|(_, s)| *s).collect::<String>());
-        }
-    }
-
-    #[test]
-    fn cursor_keeps_selection_and_rejects_reindexed_messages() {
-        let store = store_with_messages(&[(0, "outside"), (5, "abcdefghij"), (10, "outside")]);
-        let window = MessageWindow { from_seq: Some(5), to_seq: Some(5), ..Default::default() };
-        let page = store
-            .read_message_page(
-                "s",
-                &MessageRead {
-                    window: &window,
-                    role: None,
-                    max_messages: 2,
-                    max_chars: 3,
-                    cursor: None,
-                },
-            )
-            .unwrap();
-        assert_eq!(page.messages[0].content, "abc");
-        let read = MessageRead {
-            window: &MessageWindow::default(),
-            role: None,
-            max_messages: 2,
-            max_chars: 32,
-            cursor: page.next_cursor.as_deref(),
-        };
-        let rest = store.read_message_page("s", &read).unwrap();
-        assert_eq!(rest.first_message_byte_offset, 3);
-        assert_eq!(rest.messages.len(), 1);
-        assert_eq!(rest.messages[0].content, "defghij");
-        assert!(rest.next_cursor.is_none());
-        assert!(store.read_message_page("other", &read).is_err());
-        store.conn.execute("DELETE FROM messages WHERE session_id = 's' AND seq = 5", []).unwrap();
-        store.conn.execute("INSERT INTO messages (session_id, seq, role, content) VALUES ('s', 5, 'assistant', 'abcdefghij')", []).unwrap();
-        assert!(store.read_message_page("s", &read).is_err());
-    }
-}
+mod tests;
