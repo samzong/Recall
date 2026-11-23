@@ -27,7 +27,8 @@ is limited to 50 events and does not establish complete coverage.
 
 Structured target mode includes all event kinds by default, with command
 candidates excluded unless `include_command_candidates` is true. An explicit
-`kind` filters the event kind. The default page holds 20 events, at most 50.
+`kind` filters the event kind. The default page holds up to 20 events within an
+8,800-byte UTF-8 response budget, and an explicit `limit` accepts 1 to 50.
 Repeat the same target, path, source, kind, and candidate selection with
 `next_cursor` until `has_more` is false. Target-relevant index changes invalidate
 the cursor; restart the query rather than joining incompatible pages. Known
@@ -63,13 +64,13 @@ Copy `events[].evidence.event_ref` and the hit's `session_id` into MCP
 `get_session`:
 
 ```json
-{"session_id":"<session-id>","event_ref":"<opaque-event-ref>","evidence_part":"payload","max_bytes":16384}
+{"session_id":"<session-id>","event_ref":"<opaque-event-ref>","evidence_part":"payload","max_bytes":8800}
 ```
 
 Concatenate each page's UTF-8 `data` in byte-offset order before parsing the
 payload JSON. Continue with the same `session_id`, `event_ref`, `evidence_part`,
 and the returned `next_cursor` as `cursor`. `max_bytes` bounds each evidence
-response, defaults to 16,384, and accepts 1,024–65,536. Each read has a 64 MiB
+response, defaults to 8,800, and accepts 1,024 to 65,536. Each read has a 64 MiB
 budget; oversized evidence fails explicitly instead of returning a complete
 prefix. References identify an immutable event within one index. Any rebuild
 of that event invalidates its reference, even if its content is identical;

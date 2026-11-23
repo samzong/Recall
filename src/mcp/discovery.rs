@@ -8,22 +8,23 @@ pub(super) const LIST_LIMIT_MAX: u32 = 50;
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(super) struct SearchSessionsArgs {
     #[schemars(description = "Required free-text query.")]
+    #[serde(deserialize_with = "deserialize_required_string")]
     pub(super) query: String,
     #[schemars(
         description = "Optional absolute indexed directory path, or a repo name/owner-repo\nslug/remote URL derived from git identity. A worktree's own directory\nname alone (e.g. \"myrepo--feature\") does not match."
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
     pub(super) project: Option<String>,
     #[schemars(
         description = "Filter by comma-separated source ids or labels, such as claude-code,CUR."
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_source")]
     pub(super) source: Option<String>,
     #[schemars(description = "Maximum hits to return. Defaults to 10, capped at 50.")]
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(range(min = 1, max = 50))]
     pub(super) limit: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
     #[schemars(
         description = "Optional unique literal copied into this tool call so Recall can verify and exclude the invoking session when no host identity is available. It never affects relevance."
     )]
@@ -34,7 +35,7 @@ pub(super) struct SearchSessionsArgs {
 pub(super) struct SearchMessagesArgs {
     #[serde(flatten)]
     pub(super) search: SearchSessionsArgs,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
     #[schemars(
         description = "Optional Recall session_id to search exactly this session, including the invoking session."
     )]
@@ -46,18 +47,18 @@ pub(super) struct ListRecentSessionsArgs {
     #[schemars(
         description = "Optional absolute indexed directory path, or a repo name/owner-repo\nslug/remote URL derived from git identity. A worktree's own directory\nname alone (e.g. \"myrepo--feature\") does not match."
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
     pub(super) project: Option<String>,
     #[schemars(
         description = "Filter by comma-separated source ids or labels, such as claude-code,CUR."
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_source")]
     pub(super) source: Option<String>,
     #[schemars(description = "Maximum hits to return. Defaults to 10, capped at 50.")]
     #[serde(default, deserialize_with = "deserialize_opt_u32")]
     #[schemars(range(min = 1, max = 50))]
     pub(super) limit: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
     #[schemars(
         description = "Optional unique literal copied into this tool call so Recall can verify and exclude the invoking session when no host identity is available."
     )]
@@ -119,15 +120,22 @@ pub(super) fn search_ready(
             current_session: current_session.clone(),
         });
     }
-    Ok(HitList {
+    let list = HitList {
         message: None,
         semantic_enabled: Some(semantic_enabled),
         current_session: current_session.clone(),
         hits: results
             .into_iter()
-            .map(|result| session_hit(&result.session, result.snippet))
+            .map(|result| {
+                let excerpt = result
+                    .snippet
+                    .as_deref()
+                    .map(|text| truncate_chars(&sanitize_lossy_text(text), EXCERPT_CHAR_CAP).0);
+                session_hit(&result.session, excerpt)
+            })
             .collect(),
-    })
+    };
+    Ok(fit_hit_list(list, inline_page_budget(args.limit, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX)))
 }
 
 pub(super) fn list_ready(
@@ -155,17 +163,49 @@ pub(super) fn list_ready(
             current_session: current_session.clone(),
         });
     }
-    Ok(HitList {
+    let list = HitList {
         message: None,
         semantic_enabled: None,
         current_session: current_session.clone(),
         hits: sessions
             .into_iter()
             .map(|session| {
-                let excerpt =
-                    session.summary.as_deref().map(|text| truncate_chars(text, EXCERPT_CHAR_CAP).0);
+                let excerpt = session
+                    .summary
+                    .as_deref()
+                    .map(|text| truncate_chars(&sanitize_lossy_text(text), EXCERPT_CHAR_CAP).0);
                 session_hit(&session, excerpt)
             })
             .collect(),
-    })
+    };
+    Ok(fit_hit_list(list, inline_page_budget(args.limit, LIST_LIMIT_DEFAULT, LIST_LIMIT_MAX)))
+}
+
+fn fit_hit_list(mut list: HitList, budget: usize) -> HitList {
+    if serde_json::to_vec(&list).map_or(0, |bytes| bytes.len()) <= budget {
+        return list;
+    }
+    let mut excerpts: Vec<Option<String>> =
+        list.hits.iter_mut().map(|hit| hit.excerpt.as_mut().map(std::mem::take)).collect();
+    let mut skeleton = serde_json::to_vec(&list).map_or(budget, |bytes| bytes.len());
+    if skeleton.saturating_add(3_200) > budget {
+        for hit in &mut list.hits {
+            hit.title = truncate_json_bytes(&sanitize_lossy_text(&hit.title), 160);
+        }
+        skeleton = serde_json::to_vec(&list).map_or(budget, |bytes| bytes.len());
+    }
+    if skeleton > budget {
+        for hit in &mut list.hits {
+            hit.title = truncate_json_bytes(&hit.title, 48);
+            if let Some(project) = hit.project.as_mut() {
+                *project = truncate_json_bytes(project, 96);
+            }
+        }
+        skeleton = serde_json::to_vec(&list).map_or(budget, |bytes| bytes.len());
+    }
+    water_fill_optional(&mut excerpts, budget.saturating_sub(skeleton));
+    for (hit, excerpt) in list.hits.iter_mut().zip(excerpts) {
+        hit.excerpt = excerpt;
+    }
+    list
 }

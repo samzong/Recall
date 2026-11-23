@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::event_store::EventReference;
+use crate::db::message_store::json_escaped_char_bytes;
 use crate::db::store::Store;
 
 const READ_BUDGET: usize = 64 * 1024 * 1024;
@@ -211,16 +212,45 @@ pub(crate) fn read(
             byte_offset,
         })
     };
+    if data.len() - offset <= max_bytes {
+        page.data = data[offset..].to_string();
+        page.next_cursor = None;
+        if serde_json::to_vec(&page)?.len() <= max_bytes {
+            return Ok(page);
+        }
+        page.data.clear();
+    }
     page.next_cursor = Some(next(data.len())?);
     let overhead = serde_json::to_vec(&page)?.len();
     ensure!(overhead + 24 <= max_bytes, "max_bytes is too small for this event_ref");
-    let mut end = data.len().min(offset.saturating_add((max_bytes - overhead) / 6));
-    while !data.is_char_boundary(end) {
-        end -= 1;
+    page.next_cursor = Some(next(0)?);
+    let base_overhead = serde_json::to_vec(&page)?.len();
+    let mut escaped = 0usize;
+    let mut end = offset;
+    for (rel, ch) in data[offset..].char_indices() {
+        let candidate = offset + rel + ch.len_utf8();
+        if candidate >= data.len() {
+            break;
+        }
+        escaped += json_escaped_char_bytes(ch);
+        let digits = candidate.checked_ilog10().map_or(1, |log| log as usize + 1);
+        if base_overhead + (digits - 1) + escaped > max_bytes {
+            break;
+        }
+        end = candidate;
     }
     ensure!(end > offset || offset == data.len(), "max_bytes is too small for a UTF-8 character");
     page.data = data[offset..end].to_string();
     page.next_cursor = (end < data.len()).then(|| next(end)).transpose()?;
+    while serde_json::to_vec(&page)?.len() > max_bytes && end > offset {
+        end -= 1;
+        while !data.is_char_boundary(end) {
+            end -= 1;
+        }
+        ensure!(end > offset, "max_bytes is too small for a UTF-8 character");
+        page.data = data[offset..end].to_string();
+        page.next_cursor = Some(next(end)?);
+    }
     ensure!(serde_json::to_vec(&page)?.len() <= max_bytes, "evidence response budget exceeded");
     Ok(page)
 }
