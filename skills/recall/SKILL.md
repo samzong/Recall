@@ -18,6 +18,21 @@ If neither MCP nor the installed CLI is available, stop and offer `brew install 
 - `all` covers every indexed project.
 - The CLI derives an omitted `--project` from its working directory. Recall MCP treats an omitted `project` as global, so pass the current project unless the user explicitly requests all projects.
 
+## MCP Tool Calls
+
+When the host mounts `recall` MCP as lazy, call `call_mcp_tool` with `ServerName: "recall"` and the signatures below. Do not call `read_file` on `mcp/recall/*.json` before calling a tool. If a tool call returns a schema or argument error, read `mcp/recall/<tool>.json` for that tool. If `call_mcp_tool` turns nested arguments into `[]`, `boolean`, or `null`, do not retry the same payload. Pass flat string scalars instead, or use the installed `recall` CLI.
+
+Use these tool signatures with `ServerName: "recall"`:
+
+- `search_messages`: `{ query: string, project?: string, source?: string, limit?: 1..50, invocation_nonce?: string, session_id?: string }`. `limit` defaults to `10`. If you pass `session_id`, the search includes that session even when it is current.
+- `search_sessions`: `{ query: string, project?: string, source?: string, limit?: 1..50, invocation_nonce?: string }`. `limit` defaults to `10`.
+- `list_recent_sessions`: `{ project?: string, source?: string, limit?: 1..50, invocation_nonce?: string }`. All fields are optional, and `limit` defaults to `10`.
+- `get_session`: `{ session_id: string, around_seq?: u32, before?: u32, after?: u32, from_seq?: u32, to_seq?: u32, max_chars?: 1..6000, cursor?: string, max_messages?: u32, tail?: bool, include_events?: bool, event_ref?: string, evidence_part?: "payload"|"before"|"after", max_bytes?: 1024..65536 }`. Keep these three read modes separate:
+  - Selected or paged message reads: Do not combine `around_seq` with `from_seq` or `to_seq`. Optional `before` and `after` require `around_seq` and default to `3` each. For continuation, pass `cursor` with `session_id` alone, without selectors or `tail`. One page returns up to `50` messages within `6,000` Unicode characters and an `8,800` UTF-8 byte response budget.
+  - Head or tail reads (without selectors, `cursor`, or `max_chars`): `tail` defaults to `false`. Do not combine `tail: true` with message selectors, `cursor`, or `max_chars`.
+  - Event evidence reads: Pass `event_ref` with optional `evidence_part` (default `"payload"`), `max_bytes` (default `8,800`, maximum `65,536`), and continuation `cursor`. Do not combine `event_ref` with message selectors, `tail`, `include_events`, `max_messages`, or `max_chars`. Do not pass `evidence_part` or `max_bytes` without `event_ref`.
+- `file_history`: `{ path: string, target_project?: string, include_command_candidates?: bool, cursor?: string, project?: string, source?: string, kind?: string, limit?: 1..50 }`. Do not combine `target_project` with legacy session-scoped `project`. Pass `include_command_candidates` and `cursor` only with `target_project`.
+
 ## Scheduled Sync
 
 - `recall sync schedule install --interval 30m`
@@ -43,11 +58,13 @@ For a specific historical question, use MCP `search_messages` with keywords and 
 
 When a message excerpt needs context, call `get_session` with the returned `session_id` and `around_seq: <seq>`. It reads the anchor and up to three actual messages on each side. Adjust `before` and `after` independently; zero reads only the requested side or anchor. Use `from_seq` / `to_seq` instead when the exact inclusive range is known. Do not combine around and range selectors, or use either with `tail`.
 
-Selected MCP reads return up to 50 messages and 6,000 Unicode content characters. Pages follow conversation order; if preceding content fills the budget before the anchor, use `before: 0, after: 0` to read the anchor itself. For a truncated page, copy `next_cursor` into the next `get_session` call with the same `session_id`, without selectors or `tail`. `first_message_byte_offset` locates a partial first message in its UTF-8 content. A stale cursor requires a fresh search or selection. Sequence numbers locate the current index and are not permanent source-message identities.
+Selected and paged MCP reads return up to 50 messages within 6,000 Unicode content characters and an 8,800 UTF-8 byte response budget. Pages follow conversation order. If preceding content fills the budget before the anchor, pass `before: 0, after: 0` to read the anchor itself. For a truncated page, copy `next_cursor` into the next `get_session` call with the same `session_id`, without selectors or `tail`.
+
+`first_message_byte_offset` locates a partial first message in its UTF-8 content. A stale cursor requires a fresh search or selection. Sequence numbers locate the current index and are not permanent source-message identities.
 
 Use `session_id` as Recall's index identity and `source_session_id` as the native tool's identity. `get_session` reports the returned message range with `first_message_seq` and `last_message_seq`.
 
-Set `include_events: true` only when structured evidence is needed. Events cover the returned message range plus unanchored events; both count and text are bounded. Check returned counts and truncation flags before treating messages or events as complete. Consult the active tool schema for limits. This event-summary mode omits raw arguments, results, and source paths; use explicit `event_ref` evidence reads below for the preserved payload.
+Set `include_events: true` only when structured evidence is needed. Events cover the returned message range plus unanchored events, and both count and text are bounded. Inspect returned counts and truncation flags before treating messages or events as complete. This event-summary mode omits raw arguments, results, and source paths. Use explicit `event_ref` evidence reads below for the preserved payload.
 
 Pass a fresh high-entropy `invocation_nonce` literal on each MCP search or recent-list call. For `search_sessions` and `list_recent_sessions`, only `current_session.resolution: resolved` proves self-exclusion before ranking and limit. If resolution is `unknown`, report that self-exclusion is unverified; never infer identity from time, project, source, or result order.
 
@@ -88,13 +105,17 @@ These are recently active sessions in the index, not live peers. Attribute work 
 
 Use MCP `file_history` with `target_project` and an exact repository-relative or absolute `path` to find operations on a file across session projects. Prefer a repository remote/unique `owner/repo` for all its worktrees, or an absolute directory for a local target. Check returned `target_file` and `match_basis`. Do not pass `project` with `target_project`: the old `project` filters where a session started and can miss writes from another repository. Add `source` only when requested.
 
-Start with `{"target_project":"owner/repo","path":"src/main.rs","include_command_candidates":true,"limit":20}`. Omit `kind` to include all event kinds in this mode. Without `include_command_candidates`, commands are excluded. Follow `next_cursor` with the same selectors until `has_more` is false; restart after a stale cursor. Check per-hit truncation flags and retain `coverage` from the first page; continuation pages omit it. Coverage is for all indexed sessions of the selected sources, with no native source scan; it does not prove complete history or current parsers.
+Start with `{"target_project":"owner/repo","path":"src/main.rs","include_command_candidates":true}` and omit `limit` to use the default inline byte budget per page. Omit `kind` to include all event kinds in this mode. Without `include_command_candidates`, commands are excluded. Follow `next_cursor` with the same selectors until `has_more` is false, and restart after a stale cursor.
+
+Inspect per-hit truncation flags and retain `coverage` from the first page because continuation pages omit it. Coverage applies to all indexed sessions of the selected sources, with no native source scan. It does not prove complete history or current parsers.
 
 When a historical worktree is gone and target identity is unresolved, a path-only legacy query can reveal a recorded absolute path. Retry target mode with that exact path to obtain an evidence reference. Treat suffix matches as candidates; legacy discovery has a 50-event cap and is not exhaustive.
 
 Keep calls, native results, observations, and command candidates distinct. Command scan status `complete` means the bounded scan completed, not that a command ran or succeeded; `unsupported`, `limit_exceeded`, or null leaves a coverage gap. Unknown timestamps and unresolved paths remain unknown. Do not count event rows, identical before/after content, or Git commits as independent modifications.
 
-To inspect an operation, copy the hit's `session_id` and `evidence.event_ref` into `get_session` with `evidence_part: "payload"`. Concatenate paged `data` before parsing its JSON; continue with the same session, reference, part, and returned cursor. `max_bytes` defaults to 16,384, at most 65,536; an oversized read fails explicitly. The payload preserves native attrs and file associations and provides same-session `related_event_refs`. For Cursor before/after text, read related payloads and select the result reference containing `beforeContentId`/`afterContentId`, then request that part. `content_reference_not_recorded` on a call means to inspect related results. Missing, changed, imported, or unverifiable native sources cannot be treated as verified content.
+To inspect an operation, copy `session_id` and `evidence.event_ref` from the hit into `get_session` with `evidence_part: "payload"`. Concatenate paged `data` before parsing its JSON, and continue with the same session, reference, part, and returned cursor. `max_bytes` defaults to 8,800 and is at most 65,536. An oversized read fails explicitly.
+
+The payload preserves native attrs and file associations and provides same-session `related_event_refs`. For Cursor before/after text, read related payloads, select the result reference with `beforeContentId` or `afterContentId`, and request that part. `content_reference_not_recorded` on a call means to inspect related results. Do not treat missing, changed, imported, or unverifiable native sources as verified content.
 
 Read the payload's optional `discussion` selector in a separate `get_session` call, without `event_ref`. It uses `around_seq` and the existing message paging rules. Explain why only from supporting recorded discussion, distinguishing the user's request, the agent's explanation, and your inference. Do not invent a discussion anchor when it is absent.
 
