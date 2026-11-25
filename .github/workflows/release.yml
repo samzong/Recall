@@ -26,6 +26,7 @@ jobs:
       RUSTFLAGS: -Dwarnings
     outputs:
       sha: ${{ steps.release.outputs.sha }}
+      is_prerelease: ${{ steps.release.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -35,25 +36,35 @@ jobs:
         id: release
         shell: bash
         run: |
-          set -eu
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
-          if [ -z "$version" ] || [ "$RELEASE_TAG" != "v$version" ]; then
-            echo "::error::release tag $RELEASE_TAG does not match Cargo.toml version ${version:-missing}"
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((alpha|beta|rc)\.[1-9][0-9]*))?$ ]]; then
+            echo "::error::invalid SemVer release tag: $RELEASE_TAG"
             exit 1
           fi
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" ]; then
+          version="${RELEASE_TAG#v}"
+          manifest_version="$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.toml","rb")); v=d.get("package",{}).get("version"); print(v if isinstance(v, str) else d.get("workspace",{}).get("package",{}).get("version",""))')"
+          if [[ -z "$manifest_version" || "$manifest_version" != "$version" ]]; then
+            echo "::error::release tag $RELEASE_TAG does not match Cargo.toml version ${manifest_version:-missing}"
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" ]]; then
             echo "::error::checked out commit does not match release tag $RELEASE_TAG"
             exit 1
           fi
           if git cat-file -e HEAD:.githooks/commit-msg 2>/dev/null; then
             subject="$(git log -1 --format=%s)"
             expected_subject="chore(release): bump to v$version"
-            if [ "$subject" != "$expected_subject" ]; then
+            if [[ "$subject" != "$expected_subject" ]]; then
               echo "::error::release commit subject '$subject' does not match '$expected_subject'"
               exit 1
             fi
           fi
+          is_prerelease="false"
+          if [[ "$RELEASE_TAG" =~ -(alpha|beta|rc)\.[1-9][0-9]*$ ]]; then
+            is_prerelease="true"
+          fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -102,29 +113,29 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ needs.check.outputs.is_prerelease }}
         run: |
+          set -euo pipefail
           tag="$RELEASE_TAG"
           version="${tag#v}"
-          # The tag already carries its changelog entry, written into the
-          # release commit by the pre-release hook.
           awk -v version="$version" '
-            $0 ~ "^## \\[" version "\\]" { capture = 1; next }
+            index($0, "## [" version "]") == 1 { capture = 1; next }
             capture && /^## \[/ { exit }
             capture { print }
           ' CHANGELOG.md > release-notes.md
-          # Creating the release and uploading its assets are separate calls, so
-          # a run can leave the release in place with assets missing. Manual
-          # dispatch is also documented as the way to reattach binaries to an
-          # existing release, and both paths reach this step.
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release $tag exists; attaching binaries to it"
             gh release upload "$tag" --clobber recall-*.tar.gz recall-*.zip
             exit 0
           fi
-          if [ -s release-notes.md ]; then
+          if [[ -s release-notes.md ]]; then
             notes_args=(--notes-file release-notes.md)
           else
             notes_args=(--generate-notes)
           fi
-          gh release create "$tag" --title "$tag" "${notes_args[@]}" \
+          release_args=(--verify-tag --title "$tag" "${notes_args[@]}")
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "$tag" "${release_args[@]}" \
             recall-*.tar.gz recall-*.zip
