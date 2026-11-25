@@ -2,6 +2,35 @@ use super::*;
 use crate::db::store::Store;
 
 #[test]
+fn future_schema_is_rejected_without_changing_the_database() {
+    register_sqlite_vec();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("future.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE future_data(value TEXT); INSERT INTO future_data VALUES ('keep');",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+    assert!(init(&conn).is_err());
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+    assert!(Store::open_at(&path).is_err());
+    assert!(Store::open_read_only_at(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION + 1);
+    assert_eq!(
+        conn.query_row("SELECT value FROM future_data", [], |row| row.get::<_, String>(0)).unwrap(),
+        "keep"
+    );
+    assert_eq!(
+        conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0)).unwrap(),
+        "delete"
+    );
+}
+
+#[test]
 fn remote_identity_migration_preserves_v16_data_and_a_restorable_backup() {
     register_sqlite_vec();
     let root = tempfile::tempdir().unwrap();

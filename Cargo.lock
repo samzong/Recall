@@ -3764,7 +3764,7 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "recall"
-version = "0.7.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3786,6 +3786,7 @@ dependencies = [
  "ratatui",
  "rmcp",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",

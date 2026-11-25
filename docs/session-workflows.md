@@ -109,27 +109,11 @@ recall session export --id <id-1> --id <id-2> --output migration-sessions.jsonl
 
 ## Error Handling
 
-Every command must:
-
-- return exit code `0` only on success;
-- return exit code `2` for invalid CLI arguments;
-- return exit code `3` for a session lookup miss;
-- return exit code `4` for unsupported source actions such as resume/open;
-- return exit code `5` for share provider or deploy failures;
-- write human-readable errors to stderr;
-- write machine-readable errors when `--format json` is selected.
-
-Example JSON error:
-
-```json
-{
-  "error": {
-    "code": "session_not_found",
-    "message": "No session matched source=codex source_id=missing",
-    "hint": "Run recall session list --source codex --format json"
-  }
-}
-```
+Commands return exit code `0` on success and a nonzero exit code on failure.
+Invalid CLI arguments return exit code `2`.
+Session lookup failures and other runtime errors return exit code `1` and human-readable errors on stderr.
+The `--format json` option controls successful output. It does not select a JSON error envelope.
+Callers must test the exit status before parsing stdout.
 
 ## Privacy And Safety
 

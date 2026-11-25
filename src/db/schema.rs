@@ -18,6 +18,7 @@ pub(crate) fn register_sqlite_vec() {
 }
 
 pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
+    ensure_supported_version(conn)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 {
         migrate_v1(conn)?;
@@ -77,6 +78,15 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 20 {
         trigram::migrate_v20(conn)?;
     }
+    Ok(())
+}
+
+pub(crate) fn ensure_supported_version(conn: &Connection) -> anyhow::Result<()> {
+    let version = read_schema_version(conn)?;
+    anyhow::ensure!(
+        version <= SCHEMA_VERSION,
+        "index schema {version} is newer than supported schema {SCHEMA_VERSION}; upgrade Recall before opening this index"
+    );
     Ok(())
 }
 

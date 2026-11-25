@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import queue
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import tomllib
+
+
+ROOT = Path(__file__).resolve().parent.parent
+ID = "019a0000-0000-7000-8000-000000000001"
+TOOLS = {
+    "search_sessions": ({"query"}, {"query", "project", "source", "limit", "invocation_nonce"}),
+    "search_messages": ({"query"}, {"query", "project", "source", "limit", "invocation_nonce", "session_id"}),
+    "list_recent_sessions": (set(), {"project", "source", "limit", "invocation_nonce"}),
+    "get_session": ({"session_id"}, {"session_id", "event_ref", "evidence_part", "max_bytes", "max_messages", "tail", "include_events", "from_seq", "to_seq", "around_seq", "before", "after", "max_chars", "cursor"}),
+    "file_history": ({"path"}, {"path", "project", "source", "kind", "limit", "target_project", "include_command_candidates", "cursor"}),
+}
+
+
+def mcp(binary, env, cwd, session_id, future=False):
+    process = subprocess.Popen([str(binary), "mcp"], env=env, cwd=cwd, text=True,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    lines = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(line) for line in process.stdout], daemon=True).start()
+
+    def send(method, params, request_id=None):
+        request = {"jsonrpc": "2.0", "method": method, "params": params}
+        if request_id is not None:
+            request["id"] = request_id
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        if request_id is not None:
+            while True:
+                response = json.loads(lines.get(timeout=30))
+                if response.get("id") == request_id:
+                    assert "error" not in response, response
+                    return response["result"]
+
+    try:
+        initialized = send("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                         "clientInfo": {"name": "recall-contract", "version": "1"}}, 1)
+        assert initialized["capabilities"]["tools"] is not None
+        send("notifications/initialized", {})
+        tools = send("tools/list", {}, 2)["tools"]
+        assert TOOLS.keys() <= {tool["name"] for tool in tools}, tools
+        for tool in tools:
+            if tool["name"] not in TOOLS:
+                continue
+            required, fields = TOOLS[tool["name"]]
+            schema = tool["inputSchema"]
+            assert set(schema.get("required", [])) == required, tool
+            assert fields <= schema["properties"].keys(), tool
+            assert tool["annotations"]["readOnlyHint"] is True, tool
+        result = send("tools/call", {"name": "get_session", "arguments": {"session_id": session_id}}, 3)
+        if future:
+            assert result.get("isError") is True and "newer than supported" in json.dumps(result), result
+            return
+        assert not result.get("isError", False), result
+        assert "rx-agent" in json.dumps(result), result
+        result = send("tools/call", {"name": "search_sessions", "arguments": {"query": "adapter", "source": "rx-agent"}}, 4)
+        assert not result.get("isError", False), result
+        assert session_id in json.dumps(result), result
+    finally:
+        process.stdin.close()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+        process.stderr.close()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("--extensions", action="store_true")
+    args = parser.parse_args()
+    binary = args.binary.resolve()
+    version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+    scratch = Path("/Volumes/git/scratch")
+    with tempfile.TemporaryDirectory(prefix="recall-contract-", dir=scratch if scratch.is_dir() else None) as temp:
+        home = Path(temp)
+        env = {**os.environ, "HOME": str(home), "XDG_DATA_HOME": str(home / "data"),
+               "XDG_CONFIG_HOME": str(home / "config"), "XDG_CACHE_HOME": str(home / "cache"),
+               "RX_HOME": str(home / "rx")}
+        sessions = home / "rx" / "sessions"
+        sessions.mkdir(parents=True)
+        shutil.copyfile(ROOT / "tests" / "fixtures" / "rx-agent" / f"{ID}.jsonl", sessions / f"{ID}.jsonl")
+
+        def run(*arguments, success=True):
+            result = subprocess.run([str(binary), *arguments], env=env, cwd=home,
+                                    capture_output=True, text=True, timeout=30)
+            assert (result.returncode == 0) == success, (arguments, result.returncode, result.stderr)
+            return result
+
+        assert run("--version").stdout.strip() == f"recall {version}"
+        run("sync", "--source", "rx-agent", "--project", "all")
+        info = json.loads(run("info", "--format", "json").stdout)
+        assert info["protocol_version"] == 2, info
+        assert info["schemas"] == {"export_record": 7, "database": 20}, info
+        assert next(source for source in info["sources"] if source["id"] == "rx-agent")["sessions"] == 1
+        listed = json.loads(run("session", "list", "--source", "rx-agent", "--project", "all", "--format", "json").stdout)
+        assert len(listed["sessions"]) == 1, listed
+        session_id = listed["sessions"][0]["id"]
+        assert listed["sessions"][0]["source_id"] == ID, listed
+        hits = json.loads(run("search", "adapter", "--source", "rx-agent", "--project", "all", "--format", "json").stdout)
+        assert hits["sessions"][0]["id"] == session_id, hits
+        for with_scope in [False, True]:
+            records = [json.loads(line) for line in run("export", "--source", "rx-agent", "--project", "all", *(["--with-scope"] if with_scope else [])).stdout.splitlines()]
+            if with_scope:
+                assert records.pop(0)["record_type"] == "scope"
+            assert len(records) == 1, records
+            record = records[0]
+            assert record["schema_version"] == 7 and record["record_type"] == "session", record
+            assert record["session"]["source_id"] == ID, record
+            assert len(record["messages"]) == 4 and len(record["usage_events"]) == 3, record
+        missing = run("session", "show", "--id", "missing-contract-session", "--format", "json", success=False)
+        assert not missing.stdout and missing.stderr, missing
+        mcp(binary, env, home, session_id)
+        database, = home.rglob("recall.db")
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA user_version = 21")
+        before = database.read_bytes()
+        rejected = run("info", "--format", "json", success=False)
+        assert not rejected.stdout and "newer than supported" in rejected.stderr, rejected
+        mcp(binary, env, home, session_id, future=True)
+        assert database.read_bytes() == before
+        if args.extensions:
+            for manifest_path in sorted((ROOT / "extensions").glob("recall-*/Cargo.toml")):
+                package = tomllib.loads(manifest_path.read_text())["package"]
+                output = subprocess.check_output([str(binary.parent / package["name"]), "--recall-extension-manifest"], env=env, cwd=home, text=True, timeout=30)
+                manifest = json.loads(output)
+                assert manifest["name"] == package["name"].removeprefix("recall-")
+                assert manifest["version"] == package["version"]
+                assert type(manifest["protocol"]) is int and 0 < manifest["protocol"] <= 2
+                assert isinstance(manifest["min_recall"], str) and manifest["min_recall"]
+                if "transport_version" in manifest:
+                    assert manifest["transport_version"] == 1
+        print(f"PASS: Recall {version}; rx-agent sync/search; CLI JSON/JSONL; MCP initialize/tools/list/tools/call; future schema rejection" + ("; extension manifests" if args.extensions else ""))
+
+
+if __name__ == "__main__":
+    main()

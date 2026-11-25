@@ -121,6 +121,51 @@ fn catalog_version(target: &str, min_recall: &str, protocol: u32, slug: &str) ->
     }
 }
 
+#[test]
+fn catalog_selection_preserves_semver_precedence() {
+    let target = super::target_triple().unwrap();
+    let ordered = ["0.1.0-alpha.1", "0.1.0-beta.1", "0.1.0-rc.2", "0.1.0-rc.10", "0.1.0"];
+    let mut extension = CatalogExtension { description: String::new(), versions: BTreeMap::new() };
+    for version in ordered {
+        extension.versions.insert(version.into(), catalog_version(&target, "0.2.10", 1, version));
+    }
+    for version in ordered.into_iter().rev() {
+        assert_eq!(
+            super::select_latest_from_extension("probe", &extension).unwrap().version,
+            version
+        );
+        extension.versions.remove(version);
+    }
+}
+
+#[test]
+fn extension_minimum_distinguishes_candidate_from_final_core() {
+    let target = super::target_triple().unwrap();
+    let current = env!("CARGO_PKG_VERSION");
+    let final_core = current.split('-').next().unwrap();
+    let minimum = format!("{final_core}-rc.1");
+    assert!(super::semver_key(&minimum).unwrap() < super::semver_key(final_core).unwrap());
+    assert_eq!(
+        super::semver_key("0.1.0+build.1").unwrap(),
+        super::semver_key("0.1.0+build.2").unwrap()
+    );
+    let mut manifest = ExtensionManifest {
+        name: "probe".into(),
+        version: "0.1.0".into(),
+        protocol: 1,
+        min_recall: final_core.into(),
+        transport_version: None,
+    };
+    assert_eq!(super::validate_compatibility(&manifest).is_err(), current.contains('-'));
+    manifest.min_recall = current.into();
+    super::validate_compatibility(&manifest).unwrap();
+    let mut extension = CatalogExtension { description: String::new(), versions: BTreeMap::new() };
+    extension.versions.insert("0.1.0".into(), catalog_version(&target, current, 1, "candidate"));
+    extension.versions.insert("0.2.0".into(), catalog_version(&target, final_core, 1, "final"));
+    let expected = if current.contains('-') { "0.1.0" } else { "0.2.0" };
+    assert_eq!(super::select_latest_from_extension("probe", &extension).unwrap().version, expected);
+}
+
 fn temp_dir(label: &str) -> PathBuf {
     let dir =
         std::env::temp_dir().join(format!("recall-extension-{label}-{}", uuid::Uuid::new_v4()));
