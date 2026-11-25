@@ -179,6 +179,7 @@ impl Store {
 
     pub(crate) fn open_read_only_at(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        crate::db::schema::ensure_supported_version(&conn)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
             version >= crate::db::schema::SCHEMA_VERSION,
@@ -204,6 +205,7 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        crate::db::schema::ensure_supported_version(&conn)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;

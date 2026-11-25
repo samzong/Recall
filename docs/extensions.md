@@ -294,6 +294,8 @@ does not release it. Changing the package version is the release intent.
 
 ### Current Binary Releases
 
+[Contract checks](contracts.md).
+
 The current release workflow for packages in this repository:
 
 1. A pull request changes `extensions/recall-<name>/`.

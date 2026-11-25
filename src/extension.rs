@@ -353,7 +353,7 @@ fn select_latest_from_extension(
 ) -> Result<SelectedExtension> {
     let target_triple = target_triple()?;
     let current_recall = semver_key(env!("CARGO_PKG_VERSION"))?;
-    let mut selected: Option<((u64, u64, u64), SelectedExtension)> = None;
+    let mut selected: Option<(semver::Version, SelectedExtension)> = None;
 
     for (version, info) in &extension.versions {
         if info.protocol > crate::PROTOCOL_VERSION
@@ -513,13 +513,10 @@ fn target_triple() -> Result<String> {
     }
 }
 
-fn semver_key(version: &str) -> Result<(u64, u64, u64)> {
-    let core = version.split_once('-').map(|(core, _)| core).unwrap_or(version);
-    let parts = core.split('.').collect::<Vec<_>>();
-    if parts.len() != 3 {
-        bail!("invalid semver: {version}");
-    }
-    Ok((parts[0].parse()?, parts[1].parse()?, parts[2].parse()?))
+fn semver_key(version: &str) -> Result<semver::Version> {
+    let mut version = semver::Version::parse(version)?;
+    version.build = semver::BuildMetadata::EMPTY;
+    Ok(version)
 }
 
 pub(crate) fn validate_extension_name(name: &str) -> Result<()> {

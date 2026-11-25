@@ -1,6 +1,46 @@
 # Changelog
 
 
+## [1.0.0-rc.1](https://github.com/samzong/Recall/compare/v0.7.0...v1.0.0-rc.1) (2026-11-25)
+
+
+### Features
+
+* **calibrate:** add compaction window advice extension ([#352](https://github.com/samzong/Recall/issues/352))
+* **export:** expose core scope and multi-source selection ([#357](https://github.com/samzong/Recall/issues/357))
+* **adapters:** index antigravity desktop sessions ([#362](https://github.com/samzong/Recall/issues/362))
+* **mcp:** bound inline response bytes and harden input parsing ([#364](https://github.com/samzong/Recall/issues/364))
+
+
+### Fixes
+
+* **extensions:** preserve prerelease precedence and reject unmet minimum core versions.
+* **db:** reject newer index schemas before changing the database.
+* **release:** accept the default squash title and check CLI, MCP, and extension contracts.
+
+* **extensions:** declare r2 transport version in catalog ([#356](https://github.com/samzong/Recall/issues/356))
+* **usage:** centralize deduplication in store ([#358](https://github.com/samzong/Recall/issues/358))
+* **db:** migrate trigram schema before background backfill ([#359](https://github.com/samzong/Recall/issues/359))
+* **calibrate:** use opt-in core usage ownership ([#361](https://github.com/samzong/Recall/issues/361))
+
+
+### Refactors
+
+* **remote:** match parent links by stable keys ([#355](https://github.com/samzong/Recall/issues/355))
+
+
+### Documentation
+
+* **calibrate:** scope magpie notice to ported code ([#354](https://github.com/samzong/Recall/issues/354))
+* **cli:** document multi-source filters ([#360](https://github.com/samzong/Recall/issues/360))
+* **skill:** inline recall mcp signatures and 8.8 kb budgets ([#363](https://github.com/samzong/Recall/issues/363))
+
+
+### Known limitations
+
+* Share and export do not scan session content for secrets ([#190](https://github.com/samzong/Recall/issues/190)). Review content before publishing it.
+* Space-free Chinese and mixed Chinese/Latin search still have open recall limitations ([#347](https://github.com/samzong/Recall/issues/347), [#348](https://github.com/samzong/Recall/issues/348)).
+
 ## [0.7.0](https://github.com/samzong/Recall/compare/v0.6.7...v0.7.0) (2026-11-08)
 
 

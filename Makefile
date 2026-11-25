@@ -28,6 +28,8 @@ check: audit ## Full quality gate — dependency audit, format, lint, test
 	$(CARGO) clippy --workspace --all-targets --features bench -- -D warnings
 	@printf '\n$(BOLD)[4/4] Running tests$(RESET)\n'
 	$(CARGO) test --workspace
+	$(CARGO) build --workspace
+	python3 scripts/check-contracts target/debug/recall --extensions
 	@printf '\n$(GREEN)  ✓ All checks passed$(RESET)\n\n'
 
 audit: ## Check locked Rust dependencies for known vulnerabilities
