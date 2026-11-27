@@ -2,8 +2,8 @@ use super::*;
 
 impl App {
     pub(crate) fn take_usage_request(&mut self, sync: bool) -> Option<UsageRequest> {
-        let (id, time_range) = self.usage.take_refresh()?;
-        Some(UsageRequest { id, sources: self.source_filter_ids(), time_range, sync })
+        let (id, time_range, target) = self.usage.take_refresh()?;
+        Some(UsageRequest { id, sources: self.source_filter_ids(), time_range, target, sync })
     }
 
     pub(crate) fn take_sync_request(&mut self) -> Option<SyncRequest> {

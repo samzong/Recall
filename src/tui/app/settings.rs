@@ -68,6 +68,45 @@ impl App {
         self.filters.active.sources = enabled.get(next_index).cloned().into_iter().collect();
     }
 
+    pub(super) fn enter_project_drilldown(&mut self) {
+        let Some(entry) = self.usage.selected_project() else {
+            return;
+        };
+        let key = entry.key.clone();
+        let label = entry.project.clone();
+        self.usage.selected_project_key = Some(key.clone());
+        self.usage.drilldown = Some((key, label));
+        self.usage.tab = UsageTab::Tokens;
+        self.usage.breakdown_scroll = 0;
+        self.usage.skill_selected = 0;
+        if !self.usage.try_apply_cached(self.source_filter_ids()) {
+            self.usage.request_refresh();
+        }
+    }
+
+    pub(super) fn exit_project_drilldown(&mut self) {
+        if self.usage.drilldown.is_none() {
+            return;
+        }
+        self.usage.drilldown = None;
+        self.usage.tab = UsageTab::Projects;
+        self.usage.breakdown_scroll = 0;
+        self.usage.skill_selected = 0;
+        self.usage.reanchor_project_selection();
+        if !self.usage.try_apply_cached(self.source_filter_ids()) {
+            self.usage.request_refresh();
+        }
+    }
+
+    pub(super) fn usage_page_size(&self) -> usize {
+        let height = self.terminal_area.height as usize;
+        match self.usage.tab {
+            UsageTab::Tokens => height.saturating_sub(19).max(1),
+            UsageTab::Projects => height.saturating_sub(10).max(1),
+            UsageTab::Skills => height.saturating_sub(11).max(1),
+        }
+    }
+
     pub(super) fn settings_row_count(&self) -> usize {
         2 + self.all_sources.len()
     }

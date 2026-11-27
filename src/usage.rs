@@ -1,16 +1,35 @@
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+pub(crate) mod project;
 
-use anyhow::Result;
-use chrono::{Datelike, Local, TimeZone};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use anyhow::{Result, bail};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use serde::Serialize;
 
 use crate::adapters;
+use crate::cli::usage_args::UsageArgs;
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
+use crate::project_scope::ProjectScope;
 use crate::query::{parse_time_range, resolve_source_filter};
 use crate::sync::run_usage_sync_job;
 use crate::types::UsageEventRecord;
+
+pub(crate) use project::{
+    ProjectPartitionKey, ProjectUsageEntry, ProjectUsageReport, UsageTarget,
+    build_dashboard_bundle, build_project_usage_report, matches_target, session_partition_key,
+};
+#[cfg(test)]
+pub(crate) use project::{ProjectUsageSummary, build_dashboard_bundle_at};
+
+#[derive(Debug, Clone)]
+pub(crate) struct UsageStart {
+    pub(crate) sources: Option<Vec<String>>,
+    pub(crate) time_range: Option<TimeRange>,
+    pub(crate) initial_scope: ProjectScope,
+    pub(crate) open_projects_tab: bool,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct UsageFilters {
@@ -18,31 +37,60 @@ pub(crate) struct UsageFilters {
     pub(crate) time_range: TimeRange,
 }
 
-pub(crate) fn run_cli(
-    json: bool,
-    source_filter: Option<&str>,
-    time_filter: Option<&str>,
-    card: bool,
-    period: crate::wrapped::WrappedPeriod,
-) -> Result<()> {
-    if card {
-        return crate::wrapped::run_card(period);
+pub(crate) fn run_cli(args: UsageArgs) -> Result<()> {
+    if args.card {
+        return crate::wrapped::run_card(args.period, args.project.as_deref());
     }
 
-    let time_range = parse_time_range(time_filter)?;
-    let sources = usage_source_labels();
+    if let Some(project) = args.project.as_deref()
+        && project.trim().is_empty()
+    {
+        bail!("project filter cannot be empty");
+    }
 
-    if !json {
-        let usage_source_filter = resolve_source_filter(source_filter, &sources)?;
-        let usage_time_filter = time_filter.map(|_| time_range);
-        return crate::tui::runner::run(Some((usage_source_filter, usage_time_filter)));
+    let time_range = parse_time_range(args.time.as_deref())?;
+    let sources = usage_source_labels();
+    let resolved_sources = resolve_source_filter(args.source.as_deref(), &sources)?;
+
+    if !args.json {
+        let initial_scope = match args.project.as_deref() {
+            Some(project) => Store::open()?.resolve_cli_project_selector(project)?,
+            None => ProjectScope::Global,
+        };
+        return crate::tui::runner::run(Some(UsageStart {
+            sources: resolved_sources,
+            time_range: args.time.map(|_| time_range),
+            initial_scope,
+            open_projects_tab: args.projects,
+        }));
     }
 
     run_usage_sync_job()?;
     let store = Store::open()?;
-    let filters =
-        UsageFilters { sources: resolve_source_filter(source_filter, &sources)?, time_range };
-    let report = build_usage_report(&store, &filters)?;
+
+    if args.projects {
+        let report = build_project_usage_report(&store, resolved_sources.as_deref(), time_range)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    let report = match args.project.as_deref() {
+        Some(project) => {
+            let scope = store.resolve_cli_project_selector(project)?;
+            let envelope = scope.envelope();
+            let mut report = build_usage_report_for_target(
+                &store,
+                resolved_sources.as_deref(),
+                time_range,
+                &UsageTarget::Scope(scope),
+            )?;
+            report.scope = Some(envelope);
+            report
+        }
+        None => {
+            build_usage_report(&store, &UsageFilters { sources: resolved_sources, time_range })?
+        }
+    };
 
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -79,6 +127,14 @@ impl TokenTotals {
             + self.cache_write_tokens
             + self.reasoning_tokens;
     }
+}
+
+pub(crate) fn event_total_tokens(event: &UsageEventRecord) -> i64 {
+    event.input_tokens
+        + event.output_tokens
+        + event.cache_read_tokens
+        + event.cache_write_tokens
+        + event.reasoning_tokens
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,12 +175,22 @@ pub(crate) struct PeriodUsage {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct UsageReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scope: Option<serde_json::Value>,
     pub(crate) summary: UsageSummary,
     pub(crate) by_source: Vec<SourceUsage>,
     pub(crate) by_model: Vec<ModelUsage>,
     pub(crate) daily: Vec<PeriodUsage>,
     pub(crate) weekly: Vec<PeriodUsage>,
     pub(crate) monthly: Vec<PeriodUsage>,
+    #[serde(skip)]
+    pub(crate) hourly_today_tokens: [i64; 24],
+    #[serde(skip)]
+    pub(crate) hourly_today_sessions: [usize; 24],
+    #[serde(skip)]
+    pub(crate) daily_all_sessions: BTreeMap<String, usize>,
+    #[serde(skip)]
+    pub(crate) weekly_all_sessions: BTreeMap<String, usize>,
 }
 
 #[derive(Default)]
@@ -142,8 +208,8 @@ impl Accumulator {
     }
 }
 
-#[derive(Default)]
-struct UsageReportAccumulator {
+pub(super) struct UsageReportAccumulator {
+    today: NaiveDate,
     total: Accumulator,
     by_source: BTreeMap<String, Accumulator>,
     by_model: BTreeMap<(String, String, String), Accumulator>,
@@ -151,10 +217,31 @@ struct UsageReportAccumulator {
     weekly: BTreeMap<String, Accumulator>,
     monthly: BTreeMap<String, Accumulator>,
     token_source_events: BTreeMap<String, usize>,
+    hourly_today_tokens: [i64; 24],
+    hourly_today_sessions: [HashSet<String>; 24],
+    daily_all_sessions: BTreeMap<String, HashSet<String>>,
+    weekly_all_sessions: BTreeMap<String, HashSet<String>>,
 }
 
 impl UsageReportAccumulator {
-    fn add(&mut self, event: &UsageEventRecord) {
+    pub(super) fn new(today: NaiveDate) -> Self {
+        Self {
+            today,
+            total: Accumulator::default(),
+            by_source: BTreeMap::new(),
+            by_model: BTreeMap::new(),
+            daily: BTreeMap::new(),
+            weekly: BTreeMap::new(),
+            monthly: BTreeMap::new(),
+            token_source_events: BTreeMap::new(),
+            hourly_today_tokens: [0; 24],
+            hourly_today_sessions: std::array::from_fn(|_| HashSet::new()),
+            daily_all_sessions: BTreeMap::new(),
+            weekly_all_sessions: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn add(&mut self, event: &UsageEventRecord) {
         self.total.add(event);
         *self.token_source_events.entry(event.token_source.clone()).or_insert(0) += 1;
         self.by_source.entry(event.source.clone()).or_default().add(event);
@@ -163,13 +250,36 @@ impl UsageReportAccumulator {
             .or_default()
             .add(event);
 
-        let (day, week, month) = period_keys(event.timestamp);
-        self.daily.entry(day).or_default().add(event);
-        self.weekly.entry(week).or_default().add(event);
+        let dt = local_datetime(event.timestamp);
+        let (day, week, month) = period_keys_from_date(dt.date_naive());
+        self.daily.entry(day.clone()).or_default().add(event);
+        self.weekly.entry(week.clone()).or_default().add(event);
         self.monthly.entry(month).or_default().add(event);
+
+        self.daily_all_sessions.entry(day).or_default().insert(event.session_id.clone());
+        self.weekly_all_sessions.entry(week).or_default().insert(event.session_id.clone());
+        if dt.date_naive() == self.today {
+            let hour = dt.hour() as usize;
+            self.hourly_today_tokens[hour] += event_total_tokens(event);
+            self.hourly_today_sessions[hour].insert(event.session_id.clone());
+        }
     }
 
-    fn finish(self) -> UsageReport {
+    pub(super) fn add_zero_event_session(&mut self, session_id: &str, active_ts: i64) {
+        if self.total.sessions.contains(session_id) {
+            return;
+        }
+        let dt = local_datetime(active_ts);
+        let (day, week, _) = period_keys_from_date(dt.date_naive());
+        self.daily_all_sessions.entry(day).or_default().insert(session_id.to_string());
+        self.weekly_all_sessions.entry(week).or_default().insert(session_id.to_string());
+        if dt.date_naive() == self.today {
+            let hour = dt.hour() as usize;
+            self.hourly_today_sessions[hour].insert(session_id.to_string());
+        }
+    }
+
+    pub(super) fn finish(self) -> UsageReport {
         let source_count = self.by_source.len();
         let model_count = self.by_model.len();
 
@@ -200,6 +310,7 @@ impl UsageReportAccumulator {
         by_model.sort_by_key(|model| Reverse(model.tokens.total_tokens));
 
         UsageReport {
+            scope: None,
             summary: UsageSummary {
                 events: self.total.events,
                 sessions: self.total.sessions.len(),
@@ -213,23 +324,68 @@ impl UsageReportAccumulator {
             daily: period_vec(self.daily),
             weekly: period_vec(self.weekly),
             monthly: period_vec(self.monthly),
+            hourly_today_tokens: self.hourly_today_tokens,
+            hourly_today_sessions: self.hourly_today_sessions.map(|sessions| sessions.len()),
+            daily_all_sessions: self
+                .daily_all_sessions
+                .into_iter()
+                .map(|(day, sessions)| (day, sessions.len()))
+                .collect(),
+            weekly_all_sessions: self
+                .weekly_all_sessions
+                .into_iter()
+                .map(|(week, sessions)| (week, sessions.len()))
+                .collect(),
         }
     }
 }
 
 pub(crate) fn build_usage_report(store: &Store, filters: &UsageFilters) -> Result<UsageReport> {
-    let report = store.fold_usage_events(
+    build_usage_report_for_target(
+        store,
         filters.sources.as_deref(),
         filters.time_range,
-        UsageReportAccumulator::default(),
-        |report, event| report.add(&event),
-    )?;
-    Ok(report.finish())
+        &UsageTarget::Scope(ProjectScope::Global),
+    )
+}
+
+pub(crate) fn build_usage_report_for_target(
+    store: &Store,
+    sources: Option<&[String]>,
+    time_range: TimeRange,
+    target: &UsageTarget,
+) -> Result<UsageReport> {
+    let now = Local::now();
+    let scope_ids = match target {
+        UsageTarget::Scope(ProjectScope::Global) => None,
+        UsageTarget::Scope(scope) => Some(store.session_ids_in_scope(scope)?),
+        UsageTarget::Partition { .. } => None,
+    };
+    let session_meta = store.session_usage_meta_map(sources)?;
+    let cutoff = time_range.cutoff_millis_at(now);
+    let mut acc = UsageReportAccumulator::new(now.date_naive());
+
+    store.fold_usage_events(sources, time_range, (), |(), event| {
+        if matches_target(target, scope_ids.as_ref(), &session_meta, &event.session_id) {
+            acc.add(&event);
+        }
+    })?;
+
+    for (session_id, meta) in &session_meta {
+        let active_ts = meta.updated_at.unwrap_or(meta.started_at);
+        if cutoff.is_none_or(|c| active_ts >= c)
+            && matches_target(target, scope_ids.as_ref(), &session_meta, session_id)
+        {
+            acc.add_zero_event_session(session_id, active_ts);
+        }
+    }
+
+    Ok(acc.finish())
 }
 
 #[cfg(any(test, feature = "bench"))]
 pub(crate) fn aggregate_usage_events(events: &[UsageEventRecord]) -> UsageReport {
-    let mut report = UsageReportAccumulator::default();
+    let mut report = UsageReportAccumulator::new(Local::now().date_naive());
     Store::for_each_deduped_usage_event(events, |event| report.add(event));
     report.finish()
 }
@@ -245,16 +401,18 @@ fn period_vec(map: BTreeMap<String, Accumulator>) -> Vec<PeriodUsage> {
         .collect()
 }
 
-fn period_keys(timestamp_ms: i64) -> (String, String, String) {
-    let dt = Local
+pub(crate) fn local_datetime(timestamp_ms: i64) -> DateTime<Local> {
+    Local
         .timestamp_millis_opt(timestamp_ms)
         .single()
-        .unwrap_or_else(|| Local.timestamp_millis_opt(0).single().expect("epoch is valid"));
-    let date = dt.date_naive();
+        .unwrap_or_else(|| Local.timestamp_millis_opt(0).single().expect("epoch is valid"))
+}
+
+fn period_keys_from_date(date: NaiveDate) -> (String, String, String) {
     let iso = date.iso_week();
     (
         date.format("%Y-%m-%d").to_string(),
-        format!("{}-W{:02}", iso.year(), iso.week()),
+        format!("{:04}-W{:02}", iso.year(), iso.week()),
         date.format("%Y-%m").to_string(),
     )
 }

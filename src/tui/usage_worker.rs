@@ -5,13 +5,14 @@ use crate::db::search::TimeRange;
 use crate::db::store::Store;
 use crate::skill_audit::{self, SkillAuditFilters, SkillAuditReport};
 use crate::sync::run_dashboard_sync_job;
-use crate::usage::{self, UsageFilters, UsageReport};
+use crate::usage::{self, ProjectUsageReport, UsageReport, UsageTarget};
 
 #[derive(Debug)]
 pub(crate) struct UsageRequest {
     pub(crate) id: u64,
     pub(crate) sources: Option<Vec<String>>,
     pub(crate) time_range: TimeRange,
+    pub(crate) target: UsageTarget,
     pub(crate) sync: bool,
 }
 
@@ -19,8 +20,10 @@ pub(crate) struct UsageResponse {
     pub(crate) id: u64,
     pub(crate) sources: Option<Vec<String>>,
     pub(crate) time_range: TimeRange,
+    pub(crate) target: UsageTarget,
     pub(crate) current_report: Result<UsageReport, String>,
     pub(crate) all_time_report: Result<UsageReport, String>,
+    pub(crate) projects_report: Result<ProjectUsageReport, String>,
     pub(crate) skill_audit_report: Result<SkillAuditReport, String>,
 }
 
@@ -101,10 +104,26 @@ fn run_sync(
 }
 
 fn run_request(store: &Store, request: UsageRequest) -> UsageResponse {
-    let (current_report, all_time_report) =
-        build_usage_reports(&request, |filters| usage::build_usage_report(store, filters));
-    let skill_filters =
-        SkillAuditFilters { sources: request.sources.clone(), time_range: request.time_range };
+    let bundle = usage::build_dashboard_bundle(
+        store,
+        request.sources.as_deref(),
+        request.time_range,
+        &request.target,
+    );
+    let (current_report, all_time_report, projects_report) = match bundle {
+        Ok(bundle) => {
+            (Ok(bundle.current_report), Ok(bundle.all_time_report), Ok(bundle.projects_report))
+        }
+        Err(error) => {
+            let message = error.to_string();
+            (Err(message.clone()), Err(message.clone()), Err(message))
+        }
+    };
+    let skill_filters = SkillAuditFilters {
+        sources: request.sources.clone(),
+        time_range: request.time_range,
+        target: request.target.clone(),
+    };
     let skill_audit_report = skill_audit::build_skill_audit_report(store, &skill_filters)
         .map_err(|error| error.to_string());
 
@@ -112,29 +131,12 @@ fn run_request(store: &Store, request: UsageRequest) -> UsageResponse {
         id: request.id,
         sources: request.sources,
         time_range: request.time_range,
+        target: request.target,
         current_report,
         all_time_report,
+        projects_report,
         skill_audit_report,
     }
-}
-
-fn build_usage_reports(
-    request: &UsageRequest,
-    mut build: impl FnMut(&UsageFilters) -> anyhow::Result<UsageReport>,
-) -> (Result<UsageReport, String>, Result<UsageReport, String>) {
-    let current_filters =
-        UsageFilters { sources: request.sources.clone(), time_range: request.time_range };
-    let current_report = build(&current_filters).map_err(|error| error.to_string());
-
-    let all_time_report = if request.time_range == TimeRange::All {
-        current_report.clone()
-    } else {
-        let all_time_filters =
-            UsageFilters { sources: request.sources.clone(), time_range: TimeRange::All };
-        build(&all_time_filters).map_err(|error| error.to_string())
-    };
-
-    (current_report, all_time_report)
 }
 
 fn failed_response(request: UsageRequest, error: String) -> UsageResponse {
@@ -142,8 +144,10 @@ fn failed_response(request: UsageRequest, error: String) -> UsageResponse {
         id: request.id,
         sources: request.sources,
         time_range: request.time_range,
+        target: request.target,
         current_report: Err(error.clone()),
         all_time_report: Err(error.clone()),
+        projects_report: Err(error.clone()),
         skill_audit_report: Err(error),
     }
 }
@@ -153,23 +157,18 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    use crate::project_scope::ProjectScope;
+
     use super::*;
 
     fn request(time_range: TimeRange) -> UsageRequest {
-        UsageRequest { id: 1, sources: None, time_range, sync: false }
-    }
-
-    #[test]
-    fn different_filters_keep_current_and_all_time_ranges() {
-        let mut ranges = Vec::new();
-        let (current, all_time) = build_usage_reports(&request(TimeRange::Month), |filters| {
-            ranges.push(filters.time_range);
-            Ok(usage::aggregate_usage_events(&[]))
-        });
-
-        assert_eq!(ranges, vec![TimeRange::Month, TimeRange::All]);
-        assert!(current.is_ok());
-        assert!(all_time.is_ok());
+        UsageRequest {
+            id: 1,
+            sources: None,
+            time_range,
+            target: UsageTarget::Scope(ProjectScope::Global),
+            sync: false,
+        }
     }
 
     #[test]

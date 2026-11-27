@@ -346,7 +346,7 @@ fn connect(
     };
     ensure!(!project.trim().is_empty(), "choose an explicit upload scope");
     let store = Store::open()?;
-    let mut scope = store.resolve_project_selector(&project)?;
+    let mut scope = store.resolve_cli_project_selector(&project)?;
     if let ProjectScope::Directory(path) = &mut scope {
         *path = std::path::absolute(&*path)?.to_string_lossy().into_owned();
     }

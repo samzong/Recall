@@ -198,7 +198,9 @@ Route requests about workflow friction, handoffs, repeated corrections, or calib
 ## Avoid In Tool Calls
 
 - `recall` with no subcommand launches the TUI.
-- `recall usage` without `--json` launches an interactive dashboard.
+- `recall usage` without `--json` or `--card` launches an interactive dashboard.
+- `recall usage --json`, `recall usage --project <selector> --json`, and `recall usage --projects --json` output usage JSON.
+- `recall usage --card --period <week|month|year|all>` accepts `--project <selector>` for one project card.
 - `recall sync --force` unless the user asks for a rebuild or incremental sync provably cannot repair the index.
 - Hidden `__bench-*` and `__background-worker` commands.
 - Raw source transcript paths unless the user explicitly asks for source-level forensics.
