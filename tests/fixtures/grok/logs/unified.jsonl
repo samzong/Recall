@@ -1,0 +1,6 @@
+{"ts":"2026-11-20T10:01:59.900Z","src":"shell","pid":1001,"ver":"1.0.92","lvl":"info","msg":"startup timing","ctx":{"total_ms":42}}
+{"ts":"2026-11-20T10:02:00.100Z","src":"shell","pid":1001,"ver":"1.0.92","lvl":"info","sid":"019e9003-1ed9-70e3-803b-1e7f96a072eb","msg":"model changed","ctx":{"model":"grok-4.7"}}
+{"ts":"2026-11-20T10:02:05.000Z","src":"shell","pid":1002,"ver":"1.0.92","lvl":"info","sid":"119e9003-1ed9-70e3-803b-1e7f96a072eb","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"elapsed_since_turn_start_ms":1000,"prompt_tokens":500,"cached_prompt_tokens":100,"completion_tokens":50,"reasoning_tokens":10}}
+not-valid-json
+{"ts":"2026-11-20T10:02:10.595Z","src":"shell","pid":1001,"ver":"1.0.92","lvl":"info","sid":"019e9003-1ed9-70e3-803b-1e7f96a072eb","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"model_elapsed_ms":12453,"elapsed_since_turn_start_ms":10500,"attempts":1,"prompt_tokens":106894,"cached_prompt_tokens":105600,"completion_tokens":724,"reasoning_tokens":471}}
+{"ts":"2026-11-20T10:02:18.502Z","src":"shell","pid":1001,"ver":"1.0.92","lvl":"info","sid":"019e9003-1ed9-70e3-803b-1e7f96a072eb","msg":"shell.turn.inference_done","ctx":{"loop_index":2,"model_elapsed_ms":3447,"elapsed_since_turn_start_ms":18407,"attempts":1,"prompt_tokens":107680,"cached_prompt_tokens":106880,"completion_tokens":148,"reasoning_tokens":46}}
