@@ -169,7 +169,18 @@ fn scan_for_sync_skips_unchanged_session() {
         conversation_id,
         r#"{"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-20T06:03:19Z","content":"hello"}"#,
     );
-    let mtime = file_scan::stat_mtime_ms(&transcript).unwrap();
+    let conversations = root.join("conversations");
+    fs::create_dir_all(&conversations).unwrap();
+    Connection::open(conversations.join(format!("{conversation_id}.db")))
+        .unwrap()
+        .execute_batch("CREATE TABLE gen_metadata (idx integer, data blob)")
+        .unwrap();
+    let mtime = antigravity_snapshot(
+        &collect_antigravity_scan_data(&root).unwrap().entries[0],
+        Some(&conversations.join(format!("{conversation_id}.db"))),
+    )
+    .unwrap()
+    .effective_mtime_ms();
     let store = setup_store();
 
     let fresh = scan_for_sync_impl(
@@ -643,6 +654,8 @@ fn parse_antigravity_db_extracts_disjoint_tokens_steps_and_acp_requests() {
     )
     .unwrap();
 
+    conn.execute_batch("INSERT INTO gen_metadata (idx, data, size) VALUES (-1, NULL, 0)").unwrap();
+
     let row_claude = build_gen_row(
         Some("claude-opus-5-5-high"),
         Some("Claude Opus 5.5 (High)"),
@@ -876,7 +889,7 @@ fn antigravity_branch_skips_live_parent_prefix_and_dedups_orphan_siblings() {
 }
 
 #[test]
-fn empty_wal_is_ignored_and_broken_db_returns_none_without_clobbering() {
+fn empty_wal_is_ignored_and_broken_db_preserves_transcript() {
     let root = temp_antigravity_root("wal-and-err");
     let conv_dir = root.join("conversations");
     fs::create_dir_all(&conv_dir).unwrap();
@@ -948,7 +961,10 @@ fn empty_wal_is_ignored_and_broken_db_returns_none_without_clobbering() {
         "antigravity-cli",
     )
     .unwrap();
-    assert!(broken.is_none());
+    let broken = broken.unwrap();
+    assert_eq!(broken.messages[0].content, "hello");
+    assert_eq!(broken.usage_parser_version, None);
+    assert!(broken.usage_events.is_empty());
     let _ = transcript;
     let _ = fs::remove_dir_all(&root);
 }
@@ -1020,4 +1036,173 @@ fn usage_only_shell_keeps_source_path_and_recovers_acp_meta_cwd() {
     assert_eq!(session.usage_events[0].reasoning_tokens, 10);
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn antigravity_usage_db_availability_preserves_transcript_and_shell_state() {
+    let root = tempfile::tempdir().unwrap();
+    let cid = "11111111-1111-4111-8111-111111111111";
+    let transcript = write_transcript(
+        root.path(),
+        cid,
+        r#"{"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-27T08:00:00Z","content":"keep this transcript"}"#,
+    );
+    let db = root.path().join("usage.db");
+    let entry = FileScanEntry { session_id: cid.into(), stat_target: transcript, directory: None };
+    let store = setup_store();
+    store.insert_session(&make_existing_session(cid, 1, 1)).unwrap();
+    let context = AdapterSyncContext::from_store_for_test(&store, "antigravity-cli").unwrap();
+    let meta = context.session_meta().get(cid).unwrap();
+    for case in
+        ["missing", "zero", "corrupt", "missing-table", "unreadable", "empty", "null", "zero-usage"]
+    {
+        if db.exists() {
+            if db.is_dir() {
+                fs::remove_dir(&db).unwrap();
+            } else {
+                fs::remove_file(&db).unwrap();
+            }
+        }
+        match case {
+            "missing" => {}
+            "zero" => fs::write(&db, b"").unwrap(),
+            "corrupt" => fs::write(&db, b"not sqlite").unwrap(),
+            "unreadable" => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    Connection::open(&db)
+                        .unwrap()
+                        .execute_batch("CREATE TABLE gen_metadata (idx integer, data blob)")
+                        .unwrap();
+                    fs::set_permissions(&db, fs::Permissions::from_mode(0o0)).unwrap();
+                }
+                #[cfg(not(unix))]
+                fs::create_dir(&db).unwrap();
+                assert!(usage::parse_antigravity_db(&db, cid, &HashSet::new(), None).is_err());
+            }
+            _ => {
+                let conn = Connection::open(&db).unwrap();
+                if case == "missing-table" {
+                    conn.execute_batch("CREATE TABLE other (data blob)").unwrap();
+                } else {
+                    conn.execute_batch("CREATE TABLE gen_metadata (idx integer, data blob)")
+                        .unwrap();
+                    if case == "null" {
+                        conn.execute_batch("INSERT INTO gen_metadata VALUES (0, NULL)").unwrap();
+                    } else if case == "zero-usage" {
+                        conn.execute(
+                            "INSERT INTO gen_metadata VALUES (0, ?1)",
+                            params![build_gen_row(
+                                None,
+                                None,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                None,
+                                &[],
+                                None
+                            )],
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+        let available = matches!(case, "empty" | "null" | "zero-usage");
+        for db_path in [Some(db.as_path()), None] {
+            let available = available && db_path.is_some();
+            let raw = parse_antigravity_session_for_entry(
+                entry.clone(),
+                db_path,
+                &HashSet::new(),
+                1,
+                false,
+                None,
+                "antigravity-cli",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(raw.messages[0].content, "keep this transcript", "{case}");
+            assert_eq!(
+                raw.usage_parser_version,
+                available.then_some(usage::USAGE_PARSER_VERSION),
+                "{case}"
+            );
+            assert!(raw.usage_events.is_empty(), "{case}");
+            let shell = parse_antigravity_session_for_entry(
+                entry.clone(),
+                db_path,
+                &HashSet::new(),
+                1,
+                false,
+                Some(meta),
+                "antigravity-cli",
+            )
+            .unwrap();
+            if let Some(shell) = shell {
+                assert_eq!(
+                    shell.usage_parser_version,
+                    available.then_some(usage::USAGE_PARSER_VERSION),
+                    "{case}"
+                );
+                assert!(shell.usage_events.is_empty(), "{case}");
+            } else {
+                assert!(!available, "{case}");
+            }
+        }
+    }
+}
+
+#[test]
+fn antigravity_unknown_labels_keep_concrete_models() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("usage.db");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE gen_metadata (idx integer, data blob)").unwrap();
+    let row = build_gen_row(
+        Some("gemini-default"),
+        Some("Claude Sonnet 4.5 (Thinking)"),
+        26,
+        10,
+        5,
+        2,
+        3,
+        1,
+        4,
+        None,
+        &[],
+        None,
+    );
+    conn.execute("INSERT INTO gen_metadata VALUES (1, ?1)", params![row]).unwrap();
+    let parsed = usage::parse_antigravity_db(&db, "session", &HashSet::new(), Some(1)).unwrap();
+    assert_eq!(parsed.usage_events.len(), 1);
+    assert_eq!(parsed.usage_events[0].model, "unknown");
+    for (models, expected) in [
+        (vec![("claude-sonnet-4-5", Some("Known label"))], "claude-sonnet-4-5"),
+        (vec![("model-a", Some("First")), ("model-b", Some("Second"))], "unknown"),
+        (vec![("gemini-2.5-pro", None)], "gemini-2.5-pro"),
+        (vec![("model-a", Some("First")), ("model-b", None)], "unknown"),
+        (
+            vec![
+                ("gemini-2.5-pro", Some("Shared")),
+                ("gemini-2.5-flash", Some("Shared")),
+                ("gemini-3-pro", Some("Solo")),
+            ],
+            "unknown",
+        ),
+    ] {
+        conn.execute("DELETE FROM gen_metadata WHERE idx > 1", []).unwrap();
+        for (idx, (model, label)) in models.iter().enumerate() {
+            let row = build_gen_row(Some(model), *label, 0, 1, 1, 0, 0, 0, 1, None, &[], None);
+            conn.execute("INSERT INTO gen_metadata VALUES (?1, ?2)", params![idx as i64 + 2, row])
+                .unwrap();
+        }
+        let parsed = usage::parse_antigravity_db(&db, "session", &HashSet::new(), Some(1)).unwrap();
+        assert_eq!(parsed.usage_events[0].model, expected);
+    }
 }
