@@ -93,12 +93,29 @@ pub(crate) enum SessionCommands {
         #[arg(long, help = "Output path; stdout when omitted")]
         output: Option<PathBuf>,
     },
-    #[command(about = "Share one selected session")]
+    #[command(about = "Share one or more selected sessions")]
     Share {
-        #[command(flatten)]
-        selector: SessionSelector,
+        #[arg(long = "id", help = "Recall session id. Repeat this flag to include more sessions")]
+        ids: Vec<String>,
+        #[arg(long, help = "Source id or label")]
+        source: Option<String>,
+        #[arg(long, help = "Source-native session id")]
+        source_id: Option<String>,
+        #[arg(long, help = "Include related sessions from the session tree")]
+        include_related: bool,
+        #[arg(
+            long = "exclude-id",
+            help = "Recall session id to exclude. Repeat this flag to exclude more sessions"
+        )]
+        exclude_ids: Vec<String>,
         #[arg(long, help = "Validate and render metadata without deploying")]
         dry_run: bool,
+        #[arg(
+            long,
+            requires = "dry_run",
+            help = "Write rendered HTML to this path during a dry run"
+        )]
+        output: Option<PathBuf>,
         #[arg(long, help = "Open the resulting URL")]
         open: bool,
         #[arg(long, help = "Copy the resulting URL to clipboard")]

@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::OptionalExtension;
 
 use super::store::{SessionTopologyWrite, Store};
-use crate::types::{ParentLink, Session, SessionTopology, ThreadRole};
+use crate::types::{ParentLink, ParentRelation, Session, SessionTopology, ThreadRole};
 
 impl Store {
     pub(crate) fn persist_topology_for_existing_session(
@@ -94,34 +94,45 @@ impl Store {
         parent_id.map(|id| self.get_session_by_id(&id)).transpose().map(Option::flatten)
     }
 
-    pub(crate) fn child_subagents(&self, parent_id: &str) -> Result<Vec<Session>> {
+    pub(crate) fn child_subagent_links(
+        &self,
+        parent_id: &str,
+    ) -> Result<Vec<(ParentRelation, Session)>> {
         let Some(parent) = self.get_session_by_id(parent_id)? else {
             return Ok(Vec::new());
         };
         let mut stmt = self.conn.prepare(
-            "SELECT s.id FROM sessions s JOIN session_parent_links l ON l.session_id = s.id
-             WHERE l.parent_source = ?1 AND l.parent_source_id = ?2 AND l.relation = 'spawn'
+            "SELECT l.relation, s.id FROM sessions s JOIN session_parent_links l ON l.session_id = s.id
+             WHERE l.parent_source = ?1 AND l.parent_source_id = ?2
+               AND (l.relation = 'spawn' OR (l.relation = 'fork' AND s.thread_role = 'subagent'))
              ORDER BY s.started_at, s.id",
         )?;
-        let ids = stmt
+        let rows = stmt
             .query_map(rusqlite::params![parent.source, parent.source_id], |row| {
-                row.get::<_, String>(0)
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let link = ParentLink {
-            relation: crate::types::ParentRelation::Spawn,
-            source: parent.source,
-            source_id: parent.source_id,
-        };
         let mut children = Vec::new();
-        for id in ids {
+        for (relation_str, id) in rows {
+            let Ok(relation) = relation_str.parse::<ParentRelation>() else {
+                continue;
+            };
+            let link = ParentLink {
+                relation,
+                source: parent.source.clone(),
+                source_id: parent.source_id.clone(),
+            };
             if self.resolve_parent(&id, &link)?.is_some_and(|resolved| resolved.id == parent_id)
                 && let Some(child) = self.get_session_by_id(&id)?
             {
-                children.push(child);
+                children.push((relation, child));
             }
         }
         Ok(children)
+    }
+
+    pub(crate) fn child_subagents(&self, parent_id: &str) -> Result<Vec<Session>> {
+        Ok(self.child_subagent_links(parent_id)?.into_iter().map(|(_, session)| session).collect())
     }
 }
 
@@ -587,5 +598,88 @@ mod tests {
             vec!["child".to_string()],
             "subagent stays visible when its parent is out of the active scope"
         );
+    }
+
+    #[test]
+    fn child_subagent_links_includes_spawn_and_subagent_fork_only() {
+        let store = store();
+        let parent = sess("parent");
+        persist(
+            &store,
+            &parent,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Primary),
+                parents: &[],
+                parser_version: Some(1),
+            },
+        );
+        let spawn_link = ParentLink {
+            relation: ParentRelation::Spawn,
+            source: "codex".to_string(),
+            source_id: "parent".to_string(),
+        };
+        let fork_link = ParentLink {
+            relation: ParentRelation::Fork,
+            source: "codex".to_string(),
+            source_id: "parent".to_string(),
+        };
+        let mut c_spawn = sess("c-spawn");
+        c_spawn.started_at = 10;
+        let mut c_fork_sub = sess("c-fork-sub");
+        c_fork_sub.started_at = 20;
+        let mut c_fork_primary = sess("c-fork-primary");
+        c_fork_primary.started_at = 30;
+        let mut c_fork_none = sess("c-fork-none");
+        c_fork_none.started_at = 40;
+        persist(
+            &store,
+            &c_spawn,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Subagent),
+                parents: &[spawn_link],
+                parser_version: Some(1),
+            },
+        );
+        persist(
+            &store,
+            &c_fork_sub,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Subagent),
+                parents: std::slice::from_ref(&fork_link),
+                parser_version: Some(1),
+            },
+        );
+        persist(
+            &store,
+            &c_fork_primary,
+            &SessionTopologyWrite {
+                thread_role: Some(ThreadRole::Primary),
+                parents: std::slice::from_ref(&fork_link),
+                parser_version: Some(1),
+            },
+        );
+        persist(
+            &store,
+            &c_fork_none,
+            &SessionTopologyWrite {
+                thread_role: None,
+                parents: std::slice::from_ref(&fork_link),
+                parser_version: Some(1),
+            },
+        );
+
+        let links = store.child_subagent_links(&parent.id).unwrap();
+        let summary: Vec<(ParentRelation, String)> =
+            links.into_iter().map(|(rel, s)| (rel, s.source_id)).collect();
+        assert_eq!(
+            summary,
+            vec![
+                (ParentRelation::Spawn, "c-spawn".to_string()),
+                (ParentRelation::Fork, "c-fork-sub".to_string()),
+            ]
+        );
+        let subagents: Vec<String> =
+            store.child_subagents(&parent.id).unwrap().into_iter().map(|s| s.source_id).collect();
+        assert_eq!(subagents, vec!["c-spawn", "c-fork-sub"]);
     }
 }

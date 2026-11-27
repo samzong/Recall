@@ -24,6 +24,7 @@ mod actions;
 mod detail;
 mod export;
 mod list;
+pub(crate) mod related;
 
 use actions::*;
 use detail::*;
@@ -67,9 +68,31 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
                 output,
             )
         }
-        SessionCommands::Share { selector, dry_run, open, copy_url, tldr_file, format } => {
-            cmd_session_share(&selector, dry_run, open, copy_url, tldr_file.as_deref(), format)
-        }
+        SessionCommands::Share {
+            ids,
+            source,
+            source_id,
+            include_related,
+            exclude_ids,
+            dry_run,
+            output,
+            open,
+            copy_url,
+            tldr_file,
+            format,
+        } => cmd_session_share(
+            ids,
+            source.as_deref(),
+            source_id.as_deref(),
+            include_related,
+            exclude_ids,
+            dry_run,
+            output.as_deref(),
+            open,
+            copy_url,
+            tldr_file.as_deref(),
+            format,
+        ),
         SessionCommands::Resume { selector, print_command, format } => {
             cmd_session_command(&selector, print_command, format, SessionAction::Resume)
         }

@@ -283,3 +283,98 @@ pub(super) fn render_filter_picker(f: &mut Frame, app: &App) {
         f.set_cursor_position((cursor_x.min(popup.right().saturating_sub(2)), popup.y + 1));
     }
 }
+
+pub(super) fn render_share_picker(f: &mut Frame, app: &App) {
+    let Some(picker) = app.share_picker.as_ref() else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(52, 100).min(area.width);
+    let count = picker.items.len();
+    let desired_height = count as u16 + 5;
+    let height = desired_height.clamp(9, area.height.saturating_sub(2).max(9));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .title(format!(" Share sessions ({}/{}) ", picker.checked_count(), count))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME.accent))
+        .style(Style::default().bg(THEME.popup_bg));
+
+    let inner = (width as usize).saturating_sub(2);
+    let visible_rows = (height as usize).saturating_sub(5).max(1);
+    let start = if picker.selected < visible_rows { 0 } else { picker.selected + 1 - visible_rows };
+    let end = (start + visible_rows).min(count);
+
+    let mut lines = vec![Line::from("")];
+    for (offset, item) in picker.items[start..end].iter().enumerate() {
+        let index = start + offset;
+        let selected = index == picker.selected;
+        let marker = if selected { ">" } else { " " };
+        let check = if item.checked { "[x]" } else { "[ ]" };
+        let empty = !item.is_root && item.session.message_count == 0;
+        let style = if selected {
+            Style::default()
+                .fg(THEME.selected_fg)
+                .bg(THEME.selected_bg)
+                .add_modifier(Modifier::BOLD)
+        } else if empty {
+            Style::default().fg(THEME.text_muted)
+        } else {
+            Style::default().fg(THEME.text)
+        };
+        let indent = "  ".repeat(item.depth.min(4));
+        let rel_tag = if item.is_root {
+            String::new()
+        } else if item.via.as_deref() == Some("confer") {
+            match item.role_label.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(role) => format!("[confer:{role}] "),
+                None => "[confer] ".to_string(),
+            }
+        } else if let Some(rel) = item.relation {
+            format!("[{}] ", rel.as_str())
+        } else {
+            String::new()
+        };
+        let meta = format!(
+            "{} · {} msgs",
+            app.source_label_for(&item.session.source),
+            item.session.message_count
+        );
+        let prefix = format!(" {marker} {check} {indent}{rel_tag}");
+        let prefix_w = UnicodeWidthStr::width(prefix.as_str());
+        let meta_w = UnicodeWidthStr::width(meta.as_str());
+        let title_budget = inner.saturating_sub(prefix_w + meta_w + 2);
+        let title = truncate_to_width(&item.display_title, title_budget);
+        let gap =
+            inner.saturating_sub(prefix_w + UnicodeWidthStr::width(title.as_str()) + meta_w).max(1);
+        lines.push(Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(title, style),
+            Span::styled(" ".repeat(gap), style),
+            Span::styled(
+                meta,
+                if selected { style } else { Style::default().fg(THEME.text_muted) },
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" [Space] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("toggle  ", Style::default().fg(THEME.text)),
+        Span::styled("[a] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("all/root  ", Style::default().fg(THEME.text)),
+        Span::styled("[v] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("preview  ", Style::default().fg(THEME.text)),
+        Span::styled("[Enter] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("share  ", Style::default().fg(THEME.text)),
+        Span::styled("[Esc] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("back", Style::default().fg(THEME.text)),
+    ]));
+
+    let widget = Paragraph::new(lines).block(block);
+    f.render_widget(Clear, rect);
+    f.render_widget(widget, rect);
+}

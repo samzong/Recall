@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,9 +10,10 @@ use crate::config::{AppConfig, ShareConfig};
 use crate::types::{Message, Session, SessionEventRecord, SessionUsageEventRecord};
 
 use super::assets::{HEADERS, ROBOTS};
+use super::inventory::parse_bundle_sessions_meta;
 use super::meta::collect_session_display_meta;
 use super::render::{
-    ShareRenderOptions, render_session_html_with_tldr, render_session_preview_html,
+    BundledSessionInput, ShareRenderOptions, render_bundle_html, render_session_preview_html,
     share_id_for_session,
 };
 
@@ -29,6 +31,19 @@ const SHARE_HTML_SIGNATURES: [&str; 3] = [
     "--page-bg:#FAF9F6;--surface:#FFFFFF;--user-surface:#FFFFFF;",
 ];
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct BundleDiff {
+    pub(crate) added: Vec<String>,
+    pub(crate) removed: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PublishBundleResult {
+    pub(crate) url: String,
+    pub(crate) session_count: usize,
+    pub(crate) bundle_diff: Option<BundleDiff>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SharePreview {
     pub(crate) provider: String,
@@ -39,6 +54,7 @@ pub(crate) struct SharePreview {
     pub(crate) share_id: String,
     pub(crate) url: String,
     pub(crate) html_bytes: usize,
+    pub(crate) bundle_diff: Option<BundleDiff>,
 }
 
 pub(crate) fn default_project_name() -> String {
@@ -101,6 +117,17 @@ pub(crate) fn create_session_preview(
 ) -> Result<tempfile::NamedTempFile> {
     let display_meta = collect_session_display_meta(session, usage_events);
     let html = render_session_preview_html(session, messages, events, &display_meta);
+    write_temp_preview_html(&html)
+}
+
+pub(crate) fn create_bundle_preview(
+    sessions: &[BundledSessionInput],
+) -> Result<tempfile::NamedTempFile> {
+    let html = render_bundle_html(sessions, None, false)?;
+    write_temp_preview_html(&html)
+}
+
+fn write_temp_preview_html(html: &str) -> Result<tempfile::NamedTempFile> {
     let mut file = tempfile::Builder::new()
         .prefix("recall-preview-")
         .suffix(".html")
@@ -128,54 +155,96 @@ pub(crate) fn open_preview_file(path: &Path) -> Result<()> {
     }
 }
 
-pub(crate) fn preview_session_with_options(
+pub(crate) fn preview_bundle_with_options(
     config: &AppConfig,
-    session: &Session,
-    messages: &[Message],
-    events: &[SessionEventRecord],
-    usage_events: &[SessionUsageEventRecord],
+    sessions: &[BundledSessionInput],
     options: &ShareRenderOptions,
 ) -> Result<SharePreview> {
-    let (preview, _) =
-        build_publish_preview(config, session, messages, events, usage_events, options)?;
+    let (preview, _) = build_bundle_publish_preview(config, sessions, options)?;
     Ok(preview)
 }
 
-pub(crate) fn publish_session(
+pub(crate) fn dry_run_bundle_to_output(
     config: &AppConfig,
-    session: &Session,
-    messages: &[Message],
-    events: &[SessionEventRecord],
-    usage_events: &[SessionUsageEventRecord],
-) -> Result<String> {
-    publish_session_with_options(
-        config,
-        session,
-        messages,
-        events,
-        usage_events,
-        &ShareRenderOptions::default(),
-    )
+    sessions: &[BundledSessionInput],
+    options: &ShareRenderOptions,
+    output: &Path,
+) -> Result<SharePreview> {
+    let tldr = options.tldr_markdown.as_deref().map(str::trim).filter(|tldr| !tldr.is_empty());
+    let html = render_bundle_html(sessions, tldr, true)?;
+    if html.len() > MAX_PAGES_ASSET_BYTES {
+        bail!(
+            "session page is {} bytes ({} sessions), which exceeds Cloudflare Pages' {} byte (25 MiB) asset limit",
+            html.len(),
+            sessions.len(),
+            MAX_PAGES_ASSET_BYTES
+        );
+    }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(output, html.as_bytes())
+        .with_context(|| format!("failed to write {}", output.display()))?;
+
+    let primary = &sessions[0].session;
+    let share_id = share_id_for_session(primary);
+    if let Some(share) = config.share.as_ref()
+        && share.provider == PROVIDER_CLOUDFLARE_PAGES
+        && validate_project_name(&share.project_name).is_ok()
+    {
+        let project_domain = configured_project_domain(share).unwrap_or_default();
+        let publish_dir = expand_path(&share.publish_dir);
+        let existing_file = publish_dir.join(format!("{share_id}.html"));
+        let bundle_diff = compute_bundle_diff(&existing_file, primary, sessions);
+        let url = if project_domain.is_empty() {
+            String::new()
+        } else {
+            share_page_url(&project_domain, &share_id)
+        };
+        return Ok(SharePreview {
+            provider: share.provider.clone(),
+            project_name: share.project_name.clone(),
+            project_domain,
+            publish_dir,
+            file_path: output.to_path_buf(),
+            share_id,
+            url,
+            html_bytes: html.len(),
+            bundle_diff,
+        });
+    }
+
+    Ok(SharePreview {
+        provider: PROVIDER_CLOUDFLARE_PAGES.to_string(),
+        project_name: String::new(),
+        project_domain: String::new(),
+        publish_dir: PathBuf::new(),
+        file_path: output.to_path_buf(),
+        share_id,
+        url: String::new(),
+        html_bytes: html.len(),
+        bundle_diff: None,
+    })
 }
 
-pub(crate) fn publish_session_with_options(
+pub(crate) fn publish_bundle_with_options(
     config: &AppConfig,
-    session: &Session,
-    messages: &[Message],
-    events: &[SessionEventRecord],
-    usage_events: &[SessionUsageEventRecord],
+    sessions: &[BundledSessionInput],
     options: &ShareRenderOptions,
-) -> Result<String> {
-    let (preview, html) =
-        build_publish_preview(config, session, messages, events, usage_events, options)?;
-
+) -> Result<PublishBundleResult> {
+    let (preview, html) = build_bundle_publish_preview(config, sessions, options)?;
     init_publish_dir(&preview.publish_dir)?;
-
     fs::write(&preview.file_path, html)
         .with_context(|| format!("failed to write {}", preview.file_path.display()))?;
-
     deploy_pages(&preview.publish_dir, &preview.project_name)?;
-    Ok(preview.url)
+    Ok(PublishBundleResult {
+        url: preview.url,
+        session_count: sessions.len(),
+        bundle_diff: preview.bundle_diff,
+    })
 }
 
 pub(super) fn require_share_config(config: &AppConfig) -> Result<&ShareConfig> {
@@ -200,6 +269,70 @@ fn html_is_recall_share_page(html: &str) -> bool {
         && html.ends_with("</body></html>")
 }
 
+fn compute_bundle_diff(
+    existing_path: &Path,
+    primary: &Session,
+    sessions: &[BundledSessionInput],
+) -> Option<BundleDiff> {
+    if !existing_path.is_file() {
+        return None;
+    }
+    let existing_html = fs::read_to_string(existing_path).ok()?;
+    if !html_is_recall_share_page(&existing_html) {
+        return None;
+    }
+    let prior_keys: Vec<String> = parse_bundle_sessions_meta(&existing_html)
+        .unwrap_or_else(|| vec![format!("{}:{}", primary.source, primary.source_id)]);
+    let next_keys: Vec<String> =
+        sessions.iter().map(|s| format!("{}:{}", s.session.source, s.session.source_id)).collect();
+    let prior_set: HashSet<&str> = prior_keys.iter().map(String::as_str).collect();
+    let next_set: HashSet<&str> = next_keys.iter().map(String::as_str).collect();
+    let added: Vec<String> =
+        next_keys.iter().filter(|k| !prior_set.contains(k.as_str())).cloned().collect();
+    let removed: Vec<String> =
+        prior_keys.iter().filter(|k| !next_set.contains(k.as_str())).cloned().collect();
+    if added.is_empty() && removed.is_empty() { None } else { Some(BundleDiff { added, removed }) }
+}
+
+fn build_bundle_publish_preview(
+    config: &AppConfig,
+    sessions: &[BundledSessionInput],
+    options: &ShareRenderOptions,
+) -> Result<(SharePreview, String)> {
+    let share = require_share_config(config)?;
+    let project_domain = configured_project_domain(share)?;
+    let publish_dir = expand_path(&share.publish_dir);
+    let primary = &sessions[0].session;
+    let share_id = share_id_for_session(primary);
+    let tldr = options.tldr_markdown.as_deref().map(str::trim).filter(|tldr| !tldr.is_empty());
+    let html = render_bundle_html(sessions, tldr, true)?;
+    if html.len() > MAX_PAGES_ASSET_BYTES {
+        bail!(
+            "session page is {} bytes ({} sessions), which exceeds Cloudflare Pages' {} byte (25 MiB) asset limit",
+            html.len(),
+            sessions.len(),
+            MAX_PAGES_ASSET_BYTES
+        );
+    }
+    let file_path = publish_dir.join(format!("{share_id}.html"));
+    let bundle_diff = compute_bundle_diff(&file_path, primary, sessions);
+    Ok((
+        SharePreview {
+            provider: share.provider.clone(),
+            project_name: share.project_name.clone(),
+            project_domain: project_domain.clone(),
+            publish_dir,
+            file_path,
+            share_id: share_id.clone(),
+            url: share_page_url(&project_domain, &share_id),
+            html_bytes: html.len(),
+            bundle_diff,
+        },
+        html,
+    ))
+}
+
+#[cfg(test)]
 fn build_publish_preview(
     config: &AppConfig,
     session: &Session,
@@ -216,9 +349,19 @@ fn build_publish_preview(
     let share_id = share_id_for_session(session);
     let display_meta = collect_session_display_meta(session, usage_events);
     let tldr = options.tldr_markdown.as_deref().map(str::trim).filter(|tldr| !tldr.is_empty());
-    let html = render_session_html_with_tldr(session, messages, events, &display_meta, tldr);
+    let html = super::render::render_session_html_with_tldr(
+        session,
+        messages,
+        events,
+        &display_meta,
+        tldr,
+    );
     if html.len() > MAX_PAGES_ASSET_BYTES {
-        bail!("session page is larger than Cloudflare Pages' 25 MiB asset limit");
+        bail!(
+            "session page is {} bytes, which exceeds Cloudflare Pages' {} byte (25 MiB) asset limit",
+            html.len(),
+            MAX_PAGES_ASSET_BYTES
+        );
     }
 
     let file_path = publish_dir.join(format!("{share_id}.html"));
@@ -232,6 +375,7 @@ fn build_publish_preview(
             share_id: share_id.clone(),
             url: share_page_url(&project_domain, &share_id),
             html_bytes: html.len(),
+            bundle_diff: None,
         },
         html,
     ))
@@ -584,6 +728,84 @@ mod tests {
         init_publish_dir(legacy.path()).unwrap();
         assert!(legacy.path().join(PUBLISH_DIR_MARKER).is_file());
         init_publish_dir(legacy.path()).unwrap();
+    }
+
+    #[test]
+    fn dry_run_output_and_overwrite_diff_work_with_multi_session_bundle() {
+        use crate::session::related::RelatedRelation;
+        use crate::share::meta::SessionDisplayMeta;
+        use crate::types::{Message, Role};
+
+        let publish_dir = tempfile::tempdir().unwrap();
+        init_publish_dir(publish_dir.path()).unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let out_path = output_dir.path().join("nested/share.html");
+
+        let mut config = AppConfig::default();
+        config.share = Some(ShareConfig {
+            provider: PROVIDER_CLOUDFLARE_PAGES.to_string(),
+            project_name: "recall-share-test".to_string(),
+            project_domain: "recall-share-test.pages.dev".to_string(),
+            publish_dir: publish_dir.path().to_string_lossy().to_string(),
+        });
+
+        let mut s1 = session("root-src");
+        s1.id = "r1".into();
+        s1.source = "codex".into();
+        let mut s2 = session("child-a");
+        s2.id = "c1".into();
+        s2.source = "claude-code".into();
+        let mut s3 = session("child-b");
+        s3.id = "c2".into();
+        s3.source = "codex".into();
+
+        let make_input = |s: Session, parent: Option<&str>, depth: usize| BundledSessionInput {
+            messages: vec![Message {
+                session_id: s.id.clone(),
+                role: Role::User,
+                content: "hi".into(),
+                timestamp: None,
+                seq: 0,
+            }],
+            events: vec![],
+            display_meta: SessionDisplayMeta::default(),
+            parent_id: parent.map(String::from),
+            depth,
+            relation: parent.map(|_| RelatedRelation::Spawn),
+            via: None,
+            role_label: None,
+            display_title: s.title.clone(),
+            spawn_anchor: None,
+            session: s,
+        };
+
+        let prior_bundle = vec![make_input(s1.clone(), None, 0), make_input(s2, Some("r1"), 1)];
+        let prior_html = render_bundle_html(&prior_bundle, None, true).unwrap();
+        fs::write(publish_dir.path().join("root-src.html"), &prior_html).unwrap();
+        init_publish_dir(publish_dir.path()).unwrap();
+
+        let next_bundle = vec![make_input(s1, None, 0), make_input(s3, Some("r1"), 1)];
+        let preview = dry_run_bundle_to_output(
+            &config,
+            &next_bundle,
+            &ShareRenderOptions::default(),
+            &out_path,
+        )
+        .unwrap();
+        assert!(out_path.is_file());
+        let written = fs::read_to_string(&out_path).unwrap();
+        assert!(written.contains("codex:child-b"));
+        assert_eq!(
+            fs::read_to_string(publish_dir.path().join("root-src.html")).unwrap(),
+            prior_html
+        );
+        assert_eq!(
+            preview.bundle_diff,
+            Some(BundleDiff {
+                added: vec!["codex:child-b".to_string()],
+                removed: vec!["claude-code:child-a".to_string()],
+            })
+        );
     }
 
     fn session_event(event_seq: u32, kind: &str) -> SessionEventRecord {

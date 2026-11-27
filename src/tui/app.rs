@@ -23,7 +23,8 @@ use crate::tui::search_state::{
 };
 use crate::tui::search_worker::{SearchPhase, SearchRequest, SearchResponse, SearchWorker};
 use crate::tui::share_state::{
-    AppMode, PendingCommandAction, PendingResume, ResumeOrigin, SharePopup,
+    AppMode, PendingCommandAction, PendingResume, ResumeOrigin, SharePickerState, SharePopup,
+    SharePublishResponse,
 };
 use crate::tui::sync_worker::SyncRequest;
 use crate::tui::text_layout::wrap_visual_rows;
@@ -79,8 +80,10 @@ pub(crate) struct App {
     pub(crate) pending_resume: Option<PendingResume>,
     pub(crate) handoff_targets: Vec<handoff::HandoffTarget>,
     pub(crate) handoff_target_selected: usize,
+    pub(crate) share_picker: Option<SharePickerState>,
     pub(crate) share_popup: Option<SharePopup>,
-    pub(crate) share_publish_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    pub(crate) share_request_id: u64,
+    pub(crate) share_publish_rx: Option<mpsc::Receiver<SharePublishResponse>>,
     pub(crate) exec_on_exit: Option<(ResumeCommand, Option<String>)>,
     pub(crate) project_directories: Vec<ProjectDirectory>,
     pub(crate) usage: UsageState,
@@ -158,7 +161,9 @@ impl App {
             pending_resume: None,
             handoff_targets: Vec::new(),
             handoff_target_selected: 0,
+            share_picker: None,
             share_popup: None,
+            share_request_id: 0,
             share_publish_rx: None,
             exec_on_exit: None,
             project_directories: Vec::new(),

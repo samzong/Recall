@@ -27,6 +27,8 @@ pub(crate) struct SharePage {
     pub(crate) title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_count: Option<usize>,
     pub(crate) file_path: PathBuf,
     pub(crate) html_bytes: usize,
 }
@@ -164,21 +166,33 @@ fn load_share_page(
     let html = fs::read_to_string(&file_path)
         .with_context(|| format!("failed to read {}", file_path.display()))?;
     let html_bytes = html.len();
-    let (title, source) = parse_share_page_meta(&html);
+    let (title, source, session_count) = parse_share_page_meta(&html);
     Ok(Some(SharePage {
         share_id: share_id.to_string(),
         url: share_page_url(project_domain, share_id),
         title,
         source,
+        session_count,
         file_path,
         html_bytes,
     }))
 }
 
-fn parse_share_page_meta(html: &str) -> (Option<String>, Option<String>) {
+fn parse_share_page_meta(html: &str) -> (Option<String>, Option<String>, Option<usize>) {
     let title = extract_between(html, "<title>", "</title>").map(unescape_html);
     let source = source_from_meta_items(html).or_else(|| source_from_legacy_meta(html));
-    (title.filter(|value| !value.is_empty()), source)
+    let session_count =
+        extract_between(html, "<meta name=\"recall-session-count\" content=\"", "\"")
+            .and_then(|raw| raw.trim().parse::<usize>().ok());
+    (title.filter(|value| !value.is_empty()), source, session_count)
+}
+
+pub(super) fn parse_bundle_sessions_meta(html: &str) -> Option<Vec<String>> {
+    let raw = extract_between(html, "<meta name=\"recall-bundle-sessions\" content=\"", "\"")?;
+    let decoded = unescape_html(raw);
+    let items: Vec<String> =
+        decoded.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+    if items.is_empty() { None } else { Some(items) }
 }
 
 fn source_from_meta_items(html: &str) -> Option<String> {
@@ -483,7 +497,7 @@ mod tests {
         );
         assert_eq!(
             parse_share_page_meta(current),
-            (Some("Now".to_string()), Some("Goose".to_string()))
+            (Some("Now".to_string()), Some("Goose".to_string()), None)
         );
         let legacy = concat!(
             "<title>Old</title>",
@@ -491,8 +505,86 @@ mod tests {
         );
         assert_eq!(
             parse_share_page_meta(legacy),
-            (Some("Old".to_string()), Some("Cursor".to_string()))
+            (Some("Old".to_string()), Some("Cursor".to_string()), None)
         );
+    }
+
+    #[test]
+    fn resolve_share_id_accepts_bundle_panel_query_and_scoped_hash() {
+        let domain = "recall-share-abc.pages.dev";
+        assert_eq!(
+            resolve_share_id("https://recall-share-abc.pages.dev/root-1?s=s1", domain).unwrap(),
+            "root-1"
+        );
+        assert_eq!(
+            resolve_share_id("https://recall-share-abc.pages.dev/root-1?s=s2#s2-user-3", domain)
+                .unwrap(),
+            "root-1"
+        );
+    }
+
+    #[test]
+    fn list_reads_multi_session_bundle_count_and_meta() {
+        use crate::session::related::RelatedRelation;
+        use crate::share::meta::SessionDisplayMeta;
+        use crate::share::render::{BundledSessionInput, render_bundle_html};
+        use crate::types::{Message, Role};
+
+        let dir = tempfile::tempdir().unwrap();
+        init_publish_dir(dir.path()).unwrap();
+        let mut s1 = session("bundle-root");
+        s1.id = "r1".into();
+        s1.source = "codex".into();
+        let mut s2 = session("bundle-child");
+        s2.id = "c1".into();
+        s2.source = "claude-code".into();
+        let inputs = vec![
+            BundledSessionInput {
+                session: s1,
+                messages: vec![Message {
+                    session_id: "r1".into(),
+                    role: Role::User,
+                    content: "Hi".into(),
+                    timestamp: None,
+                    seq: 0,
+                }],
+                events: vec![],
+                display_meta: SessionDisplayMeta::default(),
+                parent_id: None,
+                depth: 0,
+                relation: None,
+                via: None,
+                role_label: None,
+                display_title: "Root".into(),
+                spawn_anchor: None,
+            },
+            BundledSessionInput {
+                session: s2,
+                messages: vec![Message {
+                    session_id: "c1".into(),
+                    role: Role::User,
+                    content: "Sub".into(),
+                    timestamp: None,
+                    seq: 0,
+                }],
+                events: vec![],
+                display_meta: SessionDisplayMeta::default(),
+                parent_id: Some("r1".into()),
+                depth: 1,
+                relation: Some(RelatedRelation::Spawn),
+                via: None,
+                role_label: None,
+                display_title: "Child".into(),
+                spawn_anchor: None,
+            },
+        ];
+        let html = render_bundle_html(&inputs, None, false).unwrap();
+        fs::write(dir.path().join("bundle-root.html"), html).unwrap();
+
+        let inventory = list_share_pages(&config_for(dir.path())).unwrap();
+        assert_eq!(inventory.shares.len(), 1);
+        assert_eq!(inventory.shares[0].session_count, Some(2));
+        assert_eq!(inventory.shares[0].source.as_deref(), Some("Codex + Claude · 2 sessions"));
     }
 
     #[test]
@@ -577,6 +669,7 @@ mod tests {
                     url: "https://recall-share-test.pages.dev/abc".to_string(),
                     title: Some("[.local/note.md](/Users/x/git/note.md) leftover".to_string()),
                     source: Some("Grok".to_string()),
+                    session_count: None,
                     file_path: PathBuf::from("/tmp/share/abc.html"),
                     html_bytes: 12,
                 },
@@ -585,6 +678,7 @@ mod tests {
                     url: "https://recall-share-test.pages.dev/def".to_string(),
                     title: Some("[.local/note.md](/Users/x/git/sam...".to_string()),
                     source: None,
+                    session_count: None,
                     file_path: PathBuf::from("/tmp/share/def.html"),
                     html_bytes: 8,
                 },
