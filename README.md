@@ -32,6 +32,13 @@ recall share unpublish <share-id> --yes  # take down one public page
 recall info  # index stats and worker status
 ```
 
+Usage reporting rules:
+
+- The `--time` flag uses local midnight for `today` and rolling `7 * 24` hour or `30 * 24` hour windows for `7d` and `30d`.
+- The `--card --period` flag uses local calendar day boundaries starting at local midnight, and `--json` rollups use local calendar day, week, and month boundaries.
+- `recall usage --projects` and the TUI `Projects` tab aggregate all indexed sessions globally, while `--project <dir>` scopes local directories via `native_bindings`.
+- Recall reports only observed provider and client token buckets without synthetic USD cost estimation or unverified token guessing.
+
 With Skill use **Recall** is the best way.
 
 ```bash

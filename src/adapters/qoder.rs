@@ -19,7 +19,7 @@ use crate::types::{
     ParentRelation, RawUsageEvent, Role, ThreadRole,
 };
 
-const USAGE_PARSER_VERSION: u32 = 2;
+const USAGE_PARSER_VERSION: u32 = 3;
 const EVENT_PARSER_VERSION: u32 = 2;
 const METADATA_PARSER_VERSION: u32 = 3;
 
@@ -483,9 +483,12 @@ fn usage_event(
     let input_tokens =
         input_tokens.saturating_sub(cache_read_tokens).saturating_sub(cache_write_tokens).max(0);
     let id = nonempty(record.pointer("/message/id")).unwrap_or_else(|| format!("line:{seq}"));
+    let model = nonempty(record.pointer("/message/model")).unwrap_or_else(|| "unknown".to_string());
+    let provider = infer_provider(&model);
     Some(RawUsageEvent {
         message_seq,
-        model: nonempty(record.pointer("/message/model")).unwrap_or_else(|| "unknown".to_string()),
+        model,
+        provider,
         input_tokens,
         output_tokens,
         cache_read_tokens,
@@ -494,6 +497,35 @@ fn usage_event(
         raw_usage_json: Some(usage.to_string()),
         ..RawUsageEvent::observed(format!("assistant:{id}"), seq, timestamp, USAGE_PARSER_VERSION)
     })
+}
+
+fn infer_provider(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    let lower = lower.rsplit('/').next().unwrap_or(&lower);
+    if lower.starts_with("claude") {
+        "anthropic"
+    } else if lower.starts_with("gpt")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+    {
+        "openai"
+    } else if lower.starts_with("gemini") {
+        "google"
+    } else if lower.starts_with("qwen") {
+        "qwen"
+    } else if lower.starts_with("kimi") || lower.starts_with("moonshot") {
+        "moonshot"
+    } else if lower.starts_with("minimax") {
+        "minimax"
+    } else if lower.starts_with("grok") {
+        "xai"
+    } else if lower.starts_with("deepseek") {
+        "deepseek"
+    } else {
+        "qoder"
+    }
+    .to_string()
 }
 
 #[cfg(test)]
@@ -824,5 +856,48 @@ mod tests {
         let raw = parse_transcript(&entry, 10, true).unwrap().unwrap();
         assert_eq!(raw.directory.as_deref(), Some("/tmp/new"));
         assert_eq!(raw.events[0].files[0].cwd.as_deref(), Some("/tmp/new"));
+    }
+
+    #[test]
+    fn infers_provider_from_model_and_uses_bumped_usage_parser_version() {
+        assert_eq!(QoderAdapter.usage_parser_version(), Some(3));
+        for (model, expected) in [
+            ("claude-sonnet-4-5", "anthropic"),
+            ("anthropic/claude-opus-4", "anthropic"),
+            ("gpt-5", "openai"),
+            ("o3-mini", "openai"),
+            ("o4-mini", "openai"),
+            ("gemini-2.5-pro", "google"),
+            ("qwen3-coder-plus", "qwen"),
+            ("kimi-k2", "moonshot"),
+            ("moonshot-v1-8k", "moonshot"),
+            ("minimax-m2", "minimax"),
+            ("grok-4", "xai"),
+            ("deepseek-r1", "deepseek"),
+            ("qfmodel", "qoder"),
+            ("fixture-model", "qoder"),
+        ] {
+            let record = json!({
+                "type": "assistant",
+                "message": {
+                    "id": format!("msg-{model}"),
+                    "model": model,
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }
+            });
+            let event = usage_event(&record, 0, 1, "qoder.jsonl", None).unwrap();
+            assert_eq!(event.provider, expected, "model={model}");
+            assert_eq!(event.parser_version, 3);
+        }
+        let missing_model = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-missing",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        });
+        let event = usage_event(&missing_model, 0, 1, "qoder.jsonl", None).unwrap();
+        assert_eq!(event.model, "unknown");
+        assert_eq!(event.provider, "qoder");
     }
 }

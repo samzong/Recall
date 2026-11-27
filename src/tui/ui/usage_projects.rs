@@ -44,10 +44,6 @@ pub(super) fn render_projects_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" tab ", muted),
         Span::styled(format!("[{}]", app.usage.tab_label()), chip),
     ];
-    if let Some(scope_label) = app.usage.scope_chip_label() {
-        control.push(Span::styled(" scope ", muted));
-        control.push(Span::styled(format!("[{}]", truncate_label(&scope_label, 20)), chip));
-    }
     if app.sync_in_flight {
         control.push(Span::styled("  syncing...", muted));
     }
@@ -366,5 +362,25 @@ mod tests {
         assert!(rendered.contains("owner/repo-17"));
         assert!(!rendered.contains("owner/repo-01"));
         assert!(rendered.contains("▌"));
+    }
+
+    #[test]
+    fn projects_tab_header_omits_scope_chip_when_scope_or_drilldown_is_set() {
+        let mut app = test_app();
+        app.mode = AppMode::Usage;
+        app.usage.tab = UsageTab::Projects;
+        app.usage.initial_scope =
+            crate::project_scope::ProjectScope::Directory("/repo/scoped".into());
+        app.usage.drilldown =
+            Some((ProjectPartitionKey::Directory("/repo/drill".into()), "scoped-drill".into()));
+        app.usage.projects_report = Some(sample_projects_report(2));
+
+        let rendered = render_projects(&app, 120, 16);
+        assert!(rendered.contains("Recall Project Usage"));
+        assert!(rendered.contains("range [All day]"));
+        assert!(rendered.contains("source [ALL]"));
+        assert!(rendered.contains("metric [tokens]"));
+        assert!(rendered.contains("tab [projects]"));
+        assert!(!rendered.contains("scope ["));
     }
 }
