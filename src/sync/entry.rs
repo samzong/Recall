@@ -121,8 +121,9 @@ pub(crate) fn run_usage_sync_job_with_progress(on_source: &mut dyn FnMut(&str)) 
     run_with_sync_lock(|| run_sync_job_with(usage_sync_options(), Some(on_source)))
 }
 
-pub(crate) fn run_dashboard_sync_job() -> Result<()> {
-    run_sync_job_inner(SyncRunOptions { backfill_events: true, ..usage_sync_options() })
+pub(crate) fn run_dashboard_sync_job_quiet() -> Result<()> {
+    let _lock = utils::acquire_sync_lock_quiet()?;
+    run_sync_job_with(SyncRunOptions { backfill_events: true, ..usage_sync_options() }, None)
 }
 
 pub(crate) fn run_background_worker(sync_first: bool) -> Result<()> {

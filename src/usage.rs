@@ -11,9 +11,11 @@ use crate::adapters;
 use crate::cli::usage_args::UsageArgs;
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
+use crate::db::usage_store::UsageSlice;
 use crate::project_scope::ProjectScope;
 use crate::query::{parse_time_range, resolve_source_filter};
 use crate::sync::run_usage_sync_job;
+#[cfg(any(test, feature = "bench"))]
 use crate::types::UsageEventRecord;
 
 pub(crate) use project::{
@@ -115,12 +117,29 @@ pub(crate) struct TokenTotals {
 }
 
 impl TokenTotals {
-    pub(crate) fn add_event(&mut self, event: &UsageEventRecord) {
-        self.input_tokens += event.input_tokens;
-        self.output_tokens += event.output_tokens;
-        self.cache_read_tokens += event.cache_read_tokens;
-        self.cache_write_tokens += event.cache_write_tokens;
-        self.reasoning_tokens += event.reasoning_tokens;
+    pub(crate) fn add_slice(&mut self, slice: &UsageSlice) {
+        self.add_amounts(
+            slice.input_tokens,
+            slice.output_tokens,
+            slice.cache_read_tokens,
+            slice.cache_write_tokens,
+            slice.reasoning_tokens,
+        );
+    }
+
+    pub(crate) fn add_amounts(
+        &mut self,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+        reasoning_tokens: i64,
+    ) {
+        self.input_tokens += input_tokens;
+        self.output_tokens += output_tokens;
+        self.cache_read_tokens += cache_read_tokens;
+        self.cache_write_tokens += cache_write_tokens;
+        self.reasoning_tokens += reasoning_tokens;
         self.total_tokens = self.input_tokens
             + self.output_tokens
             + self.cache_read_tokens
@@ -129,12 +148,8 @@ impl TokenTotals {
     }
 }
 
-pub(crate) fn event_total_tokens(event: &UsageEventRecord) -> i64 {
-    event.input_tokens
-        + event.output_tokens
-        + event.cache_read_tokens
-        + event.cache_write_tokens
-        + event.reasoning_tokens
+pub(crate) fn slice_total_tokens(slice: &UsageSlice) -> i64 {
+    slice.total_tokens()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,10 +216,10 @@ struct Accumulator {
 }
 
 impl Accumulator {
-    fn add(&mut self, event: &UsageEventRecord) {
-        self.tokens.add_event(event);
-        self.sessions.insert(event.session_id.clone());
-        self.events += 1;
+    fn add_slice(&mut self, slice: &UsageSlice) {
+        self.tokens.add_slice(slice);
+        self.sessions.insert(slice.session_id.clone());
+        self.events += slice.events;
     }
 }
 
@@ -241,27 +256,27 @@ impl UsageReportAccumulator {
         }
     }
 
-    pub(super) fn add(&mut self, event: &UsageEventRecord) {
-        self.total.add(event);
-        *self.token_source_events.entry(event.token_source.clone()).or_insert(0) += 1;
-        self.by_source.entry(event.source.clone()).or_default().add(event);
+    pub(super) fn add_slice(&mut self, slice: &UsageSlice) {
+        self.total.add_slice(slice);
+        *self.token_source_events.entry(slice.token_source.clone()).or_insert(0) += slice.events;
+        self.by_source.entry(slice.source.clone()).or_default().add_slice(slice);
         self.by_model
-            .entry((event.source.clone(), event.provider.clone(), event.model.clone()))
+            .entry((slice.source.clone(), slice.provider.clone(), slice.model.clone()))
             .or_default()
-            .add(event);
+            .add_slice(slice);
 
-        let dt = local_datetime(event.timestamp);
+        let dt = local_datetime(slice.timestamp);
         let (day, week, month) = period_keys_from_date(dt.date_naive());
-        self.daily.entry(day.clone()).or_default().add(event);
-        self.weekly.entry(week.clone()).or_default().add(event);
-        self.monthly.entry(month).or_default().add(event);
+        self.daily.entry(day.clone()).or_default().add_slice(slice);
+        self.weekly.entry(week.clone()).or_default().add_slice(slice);
+        self.monthly.entry(month).or_default().add_slice(slice);
 
-        self.daily_all_sessions.entry(day).or_default().insert(event.session_id.clone());
-        self.weekly_all_sessions.entry(week).or_default().insert(event.session_id.clone());
+        self.daily_all_sessions.entry(day).or_default().insert(slice.session_id.clone());
+        self.weekly_all_sessions.entry(week).or_default().insert(slice.session_id.clone());
         if dt.date_naive() == self.today {
             let hour = dt.hour() as usize;
-            self.hourly_today_tokens[hour] += event_total_tokens(event);
-            self.hourly_today_sessions[hour].insert(event.session_id.clone());
+            self.hourly_today_tokens[hour] += slice_total_tokens(slice);
+            self.hourly_today_sessions[hour].insert(slice.session_id.clone());
         }
     }
 
@@ -365,9 +380,9 @@ pub(crate) fn build_usage_report_for_target(
     let cutoff = time_range.cutoff_millis_at(now);
     let mut acc = UsageReportAccumulator::new(now.date_naive());
 
-    store.fold_usage_events(sources, time_range, (), |(), event| {
-        if matches_target(target, scope_ids.as_ref(), &session_meta, &event.session_id) {
-            acc.add(&event);
+    store.fold_usage_slices_after(sources, cutoff, (), |(), slice| {
+        if matches_target(target, scope_ids.as_ref(), &session_meta, &slice.session_id) {
+            acc.add_slice(&slice);
         }
     })?;
 
@@ -386,7 +401,9 @@ pub(crate) fn build_usage_report_for_target(
 #[cfg(any(test, feature = "bench"))]
 pub(crate) fn aggregate_usage_events(events: &[UsageEventRecord]) -> UsageReport {
     let mut report = UsageReportAccumulator::new(Local::now().date_naive());
-    Store::for_each_deduped_usage_event(events, |event| report.add(event));
+    Store::for_each_deduped_usage_event(events, |event| {
+        report.add_slice(&UsageSlice::from_event(event.clone()));
+    });
     report.finish()
 }
 

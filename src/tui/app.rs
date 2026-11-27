@@ -32,6 +32,7 @@ use crate::tui::usage_state::{UsageState, UsageTab};
 use crate::tui::usage_worker::{UsageRequest, UsageResponse};
 use crate::tui::viewing_state::ViewingState;
 use crate::types::{MatchSource, Message, SearchResult, SemanticProgress};
+use crate::usage::UsageStart;
 
 const SEARCH_DEBOUNCE_MS: u64 = 250;
 
@@ -86,6 +87,7 @@ pub(crate) struct App {
     pub(crate) share_publish_rx: Option<mpsc::Receiver<SharePublishResponse>>,
     pub(crate) exec_on_exit: Option<(ResumeCommand, Option<String>)>,
     pub(crate) project_directories: Vec<ProjectDirectory>,
+    pub(crate) search_initialized: bool,
     pub(crate) usage: UsageState,
 }
 
@@ -112,6 +114,7 @@ impl App {
         let scope = crate::project_scope::auto_scope();
 
         let mut app = Self::empty(all_sources, config, scope);
+        app.search_initialized = true;
         app.total_sessions = total_sessions;
         app.total_messages = total_messages;
         app.semantic_progress = semantic_progress;
@@ -120,6 +123,44 @@ impl App {
         app.update_scope_metrics(store);
         app.load_recent(store);
         app
+    }
+
+    pub(crate) fn new_for_usage(
+        all_sources: Vec<(String, String)>,
+        config: AppConfig,
+        start: UsageStart,
+    ) -> Self {
+        let mut app = Self::empty(all_sources, config, ProjectScope::Global);
+        app.search_initialized = false;
+        app.filters.active.sources = start.sources.unwrap_or_default();
+        if let Some(time_filter) = start.time_range {
+            app.usage.time_filter = time_filter;
+        }
+        app.usage.initial_scope = start.initial_scope;
+        if start.open_projects_tab {
+            app.usage.tab = UsageTab::Projects;
+        }
+        app.mode = AppMode::Usage;
+        app.usage.request_refresh();
+        app
+    }
+
+    pub(crate) fn ensure_search_initialized(&mut self, store: &Store) {
+        if self.search_initialized {
+            return;
+        }
+        self.search_initialized = true;
+        let active_sources = std::mem::take(&mut self.filters.active.sources);
+        let (total_sessions, total_messages) = store.stats().unwrap_or((0, 0));
+        let semantic_progress = store.semantic_progress().unwrap_or_default();
+        self.total_sessions = total_sessions;
+        self.total_messages = total_messages;
+        self.semantic_progress = semantic_progress;
+        self.project_directories = store.list_project_directories().unwrap_or_default();
+        self.reset_search_defaults();
+        self.filters.active.sources = active_sources;
+        self.filters.draft.sources = self.filters.active.sources.clone();
+        self.update_scope_metrics(store);
     }
 
     fn empty(all_sources: Vec<(String, String)>, config: AppConfig, scope: ProjectScope) -> Self {
@@ -167,6 +208,7 @@ impl App {
             share_publish_rx: None,
             exec_on_exit: None,
             project_directories: Vec::new(),
+            search_initialized: true,
             usage: UsageState::default(),
         }
     }

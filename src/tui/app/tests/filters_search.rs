@@ -202,7 +202,7 @@ fn filter_commit_invalidates_in_flight_search_response() {
 
 #[test]
 fn stale_usage_response_does_not_replace_latest_filter_state() {
-    use crate::tui::usage_worker::UsageResponse;
+    use crate::tui::usage_worker::{DashboardReports, UsagePayload, UsageResponse};
     use crate::usage::UsageTarget;
 
     let mut app = app_with_sources();
@@ -216,10 +216,18 @@ fn stale_usage_response_does_not_replace_latest_filter_state() {
         sources: Some(vec!["codex".to_string()]),
         time_range: TimeRange::Month,
         target: UsageTarget::Scope(ProjectScope::Global),
-        current_report: Err("stale current report".to_string()),
-        all_time_report: Err("stale all-time report".to_string()),
-        projects_report: Err("stale projects report".to_string()),
-        skill_audit_report: Err("stale skill audit".to_string()),
+        payload: UsagePayload::Dashboard(Box::new(DashboardReports {
+            current_report: Err("stale current report".to_string()),
+            all_time_report: Err("stale all-time report".to_string()),
+            projects_report: Err("stale projects report".to_string()),
+        })),
+    });
+    app.apply_usage_response(UsageResponse {
+        id: 1,
+        sources: Some(vec!["codex".to_string()]),
+        time_range: TimeRange::Month,
+        target: UsageTarget::Scope(ProjectScope::Global),
+        payload: UsagePayload::Skills(Err("stale skill audit".to_string())),
     });
 
     assert_eq!(app.usage.request_id, 2);
@@ -231,7 +239,7 @@ fn stale_usage_response_does_not_replace_latest_filter_state() {
 
 #[test]
 fn stale_usage_response_rejects_mismatched_target() {
-    use crate::tui::usage_worker::UsageResponse;
+    use crate::tui::usage_worker::{DashboardReports, UsagePayload, UsageResponse};
     use crate::usage::{ProjectPartitionKey, UsageTarget};
 
     let mut app = app_with_sources();
@@ -247,10 +255,11 @@ fn stale_usage_response_rejects_mismatched_target() {
         sources: None,
         time_range: TimeRange::All,
         target: UsageTarget::Scope(ProjectScope::Global),
-        current_report: Err("wrong target".to_string()),
-        all_time_report: Err("wrong target".to_string()),
-        projects_report: Err("wrong target".to_string()),
-        skill_audit_report: Err("wrong target".to_string()),
+        payload: UsagePayload::Dashboard(Box::new(DashboardReports {
+            current_report: Err("wrong target".to_string()),
+            all_time_report: Err("wrong target".to_string()),
+            projects_report: Err("wrong target".to_string()),
+        })),
     });
 
     assert!(app.usage.in_flight);
@@ -294,7 +303,7 @@ fn usage_v_and_g_toggles_and_reset_keep_initial_scope_without_refresh() {
 fn projects_drilldown_and_esc_reanchors_by_selected_project_key() {
     use std::collections::BTreeMap;
 
-    use crate::tui::usage_worker::UsageResponse;
+    use crate::tui::usage_worker::{DashboardReports, UsagePayload, UsageResponse};
     use crate::usage::{
         ProjectPartitionKey, ProjectUsageEntry, ProjectUsageReport, ProjectUsageSummary,
         TokenTotals, UsageReport, UsageSummary, UsageTarget,
@@ -383,10 +392,18 @@ fn projects_drilldown_and_esc_reanchors_by_selected_project_key() {
         sources: None,
         time_range: TimeRange::All,
         target: UsageTarget::Partition { key: key_b.clone(), label: "b/two".to_string() },
-        current_report: Ok(empty_usage_report()),
-        all_time_report: Ok(empty_usage_report()),
-        projects_report: Ok(projects_report(vec![entry("b/two", 500), entry("a/one", 200)])),
-        skill_audit_report: Ok(SkillAuditReport {
+        payload: UsagePayload::Dashboard(Box::new(DashboardReports {
+            current_report: Ok(empty_usage_report()),
+            all_time_report: Ok(empty_usage_report()),
+            projects_report: Ok(projects_report(vec![entry("b/two", 500), entry("a/one", 200)])),
+        })),
+    });
+    app.apply_usage_response(UsageResponse {
+        id: req_id,
+        sources: None,
+        time_range: TimeRange::All,
+        target: UsageTarget::Partition { key: key_b.clone(), label: "b/two".to_string() },
+        payload: UsagePayload::Skills(Ok(SkillAuditReport {
             summary: crate::skill_audit::SkillAuditSummary {
                 installed: 0,
                 core: 0,
@@ -397,7 +414,7 @@ fn projects_drilldown_and_esc_reanchors_by_selected_project_key() {
             occasional: Vec::new(),
             dormant: Vec::new(),
             coverage_note: None,
-        }),
+        })),
     });
 
     app.handle_usage_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);

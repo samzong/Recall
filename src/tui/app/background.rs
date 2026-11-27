@@ -1,9 +1,9 @@
 use super::*;
 
 impl App {
-    pub(crate) fn take_usage_request(&mut self, sync: bool) -> Option<UsageRequest> {
+    pub(crate) fn take_usage_request(&mut self) -> Option<UsageRequest> {
         let (id, time_range, target) = self.usage.take_refresh()?;
-        Some(UsageRequest { id, sources: self.source_filter_ids(), time_range, target, sync })
+        Some(UsageRequest { id, sources: self.source_filter_ids(), time_range, target })
     }
 
     pub(crate) fn take_sync_request(&mut self) -> Option<SyncRequest> {
@@ -13,7 +13,7 @@ impl App {
 
         self.sync_requested = false;
         self.sync_in_flight = true;
-        Some(SyncRequest {
+        Some(SyncRequest::Full {
             sources: self.source_filter_ids(),
             scope: self.filters.active.scope.clone(),
         })
@@ -33,7 +33,13 @@ impl App {
         self.sync_in_flight = false;
         match result {
             Ok(()) => {
-                self.reload_after_sync(store);
+                if self.search_initialized {
+                    self.reload_after_sync(store);
+                }
+                if matches!(self.mode, AppMode::Usage) {
+                    self.usage.clear_cache();
+                    self.usage.request_silent_refresh();
+                }
                 if !self.sync_requested {
                     self.status_message = Some("Synced".to_string());
                 }

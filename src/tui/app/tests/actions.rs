@@ -53,8 +53,15 @@ fn ctrl_s_from_search_requests_sync_instead_of_settings() {
 
     assert!(matches!(app.mode, AppMode::Search));
     let request = app.take_sync_request().expect("sync request");
-    assert_eq!(request.scope, ProjectScope::Global);
-    assert!(request.sources.is_none());
+    match request {
+        crate::tui::sync_worker::SyncRequest::Full { sources, scope } => {
+            assert_eq!(scope, ProjectScope::Global);
+            assert!(sources.is_none());
+        }
+        crate::tui::sync_worker::SyncRequest::Dashboard => {
+            panic!("expected full sync request from search");
+        }
+    }
     assert!(app.sync_in_flight);
     assert!(app.take_sync_request().is_none());
 }

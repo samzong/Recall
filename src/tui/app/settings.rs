@@ -32,6 +32,7 @@ impl App {
                     Some(format!("Sessions for '{skill_id}' are no longer in index"));
             }
             Ok(sessions) => {
+                self.ensure_search_initialized(store);
                 let count = sessions.len();
                 self.results = sessions
                     .into_iter()

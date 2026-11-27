@@ -13,7 +13,7 @@ const BACKGROUND_JOB: &str = "pipeline";
 pub(crate) fn ensure_background_worker(sync_first: bool) -> Result<()> {
     if !sync_first {
         let store = Store::open_at(&Store::default_db_path()?)?;
-        if !store.trigram_backfill_pending()? {
+        if !store.background_maintenance_pending()? {
             if !AppConfig::load()?.semantic_enabled {
                 return Ok(());
             }
@@ -43,20 +43,63 @@ where
     };
 
     let store = Store::open_at(&Store::default_db_path()?)?;
+    let mut did_maintenance = false;
 
     loop {
         let pending = {
-            let _sync_lock = crate::utils::acquire_sync_lock()?;
+            let _sync_lock = crate::utils::acquire_sync_lock_quiet()?;
+            store.backfill_usage_index_batch()?
+        };
+        if !pending {
+            break;
+        }
+        did_maintenance = true;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    loop {
+        let pending = {
+            let _sync_lock = crate::utils::acquire_sync_lock_quiet()?;
+            store.backfill_skill_usage_batch()?
+        };
+        if !pending {
+            break;
+        }
+        did_maintenance = true;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    loop {
+        let pending = {
+            let _sync_lock = crate::utils::acquire_sync_lock_quiet()?;
             store.backfill_trigram_batch()?
         };
         if !pending {
             break;
         }
+        did_maintenance = true;
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     {
-        let _sync_lock = crate::utils::acquire_sync_lock()?;
+        let _sync_lock = crate::utils::acquire_sync_lock_quiet()?;
         store.finish_trigram_backfill()?;
+    }
+
+    loop {
+        let pending = {
+            let _sync_lock = crate::utils::acquire_sync_lock_quiet()?;
+            store.backfill_revision_compression_batch()?
+        };
+        if !pending {
+            break;
+        }
+        did_maintenance = true;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    if did_maintenance {
+        let _sync_lock = crate::utils::acquire_sync_lock_quiet()?;
+        let _ = store.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
     if sync_first {

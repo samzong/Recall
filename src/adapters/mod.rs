@@ -99,6 +99,7 @@ pub(crate) struct AdapterSyncContext<'a> {
     usage_state: HashMap<String, ParserStateMeta>,
     event_state: HashMap<String, ParserStateMeta>,
     metadata_state: HashMap<String, ParserStateMeta>,
+    usage_only: bool,
     session_sink: Option<RefCell<&'a mut SessionSink<'a>>>,
 }
 
@@ -130,8 +131,18 @@ impl<'a> AdapterSyncContext<'a> {
             usage_state,
             event_state,
             metadata_state,
+            usage_only: false,
             session_sink: None,
         }
+    }
+
+    pub(crate) fn with_usage_only(mut self, usage_only: bool) -> Self {
+        self.usage_only = usage_only;
+        self
+    }
+
+    pub(crate) fn is_usage_only(&self) -> bool {
+        self.usage_only
     }
 
     pub(crate) fn with_session_sink(mut self, sink: &'a mut SessionSink<'a>) -> Self {
@@ -197,6 +208,17 @@ impl<'a> AdapterSyncContext<'a> {
             usage_state: self.usage_state,
             event_state: self.event_state,
             metadata_state: self.metadata_state,
+        }
+    }
+
+    pub(crate) fn clone_parts(&self) -> AdapterSyncContextParts {
+        AdapterSyncContextParts {
+            session_meta: self.session_meta.clone(),
+            session_paths: self.session_paths.clone(),
+            imported_ids: self.imported_ids.clone(),
+            usage_state: self.usage_state.clone(),
+            event_state: self.event_state.clone(),
+            metadata_state: self.metadata_state.clone(),
         }
     }
 

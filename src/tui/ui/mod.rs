@@ -4,6 +4,7 @@ mod search;
 mod usage;
 mod usage_chart;
 mod usage_projects;
+mod usage_skills;
 mod viewing;
 
 use ratatui::Frame;

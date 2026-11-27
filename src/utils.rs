@@ -60,24 +60,31 @@ pub(crate) fn try_acquire_worker_lock() -> anyhow::Result<Option<File>> {
 }
 
 pub(crate) fn acquire_sync_lock() -> anyhow::Result<File> {
-    acquire_lock(&recall_lock_path("sync.lock")?)
+    acquire_lock(&recall_lock_path("sync.lock")?, true)
+}
+
+pub(crate) fn acquire_sync_lock_quiet() -> anyhow::Result<File> {
+    acquire_lock(&recall_lock_path("sync.lock")?, false)
 }
 
 pub(crate) fn try_acquire_sync_lock() -> anyhow::Result<Option<File>> {
     try_acquire_lock(&recall_lock_path("sync.lock")?)
 }
 
-fn acquire_lock(path: &Path) -> anyhow::Result<File> {
+fn acquire_lock(path: &Path, announce: bool) -> anyhow::Result<File> {
     let mut file = open_lock_file(path)?;
     match file.try_lock_exclusive() {
         Ok(()) => {}
         Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-            let owner =
-                std::fs::read_to_string(path).ok().and_then(|pid| pid.trim().parse::<u32>().ok());
-            if let Some(pid) = owner {
-                eprintln!("Waiting for another Recall sync (pid {pid})");
-            } else {
-                eprintln!("Waiting for another Recall sync");
+            if announce {
+                let owner = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<u32>().ok());
+                if let Some(pid) = owner {
+                    eprintln!("Waiting for another Recall sync (pid {pid})");
+                } else {
+                    eprintln!("Waiting for another Recall sync");
+                }
             }
             file.lock_exclusive()?;
         }

@@ -265,6 +265,7 @@ fn probe_output(
         command.process_group(0);
     }
     let started = Instant::now();
+    let mut poll_delay = Duration::from_micros(200);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => match probe {
@@ -276,7 +277,8 @@ fn probe_output(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(poll_delay);
+                poll_delay = (poll_delay * 2).min(Duration::from_millis(5));
             }
             Ok(None) => {
                 stop_probe(&mut child)?;
