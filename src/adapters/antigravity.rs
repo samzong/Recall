@@ -15,9 +15,10 @@ use crate::adapters::events::{
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::paths::{file_uri_to_path, resolve_home_dir};
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
-use crate::types::{FileEvidence, FileOperation, Role};
+use crate::types::{FileEvidence, FileOperation, ParentLink, ParentRelation, Role, ThreadRole};
 
-const EVENT_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 2;
+const METADATA_PARSER_VERSION: u32 = 1;
 
 const TRANSCRIPT_RELATIVE_PATH: &[&str] = &[".system_generated", "logs", "transcript.jsonl"];
 
@@ -73,6 +74,7 @@ impl SourceAdapter for AntigravityAdapter {
                 entry.clone(),
                 snapshot.effective_mtime_ms(),
                 true,
+                self.id(),
             )? && antigravity_snapshot(&entry).as_ref() == Some(&snapshot)
             {
                 sessions.push(raw);
@@ -121,6 +123,7 @@ fn scan_for_sync_impl(
         file_scan::FileScanOptions {
             stream_sessions: true,
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+            metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
             ..Default::default()
         },
         entries,
@@ -136,7 +139,9 @@ fn scan_for_sync_impl(
                 snapshot.requiring_parse(directory_changed)
             })
         },
-        |entry, mtime| parse_antigravity_session_for_entry(entry, mtime, include_events),
+        |entry, mtime| {
+            parse_antigravity_session_for_entry(entry, mtime, include_events, adapter.id())
+        },
     )
 }
 
@@ -257,6 +262,7 @@ fn parse_antigravity_session_for_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
     include_events: bool,
+    adapter_id: &str,
 ) -> anyhow::Result<Option<RawSession>> {
     let source_file_path = entry.stat_target.to_str().map(str::to_string);
     let mut raw = match parse_antigravity_transcript(
@@ -264,6 +270,7 @@ fn parse_antigravity_session_for_entry(
         &entry.session_id,
         entry.directory.as_deref(),
         include_events,
+        adapter_id,
     ) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
@@ -283,10 +290,18 @@ fn parse_antigravity_transcript(
     fallback_id: &str,
     cwd: Option<&str>,
     include_events: bool,
+    adapter_id: &str,
 ) -> anyhow::Result<Option<RawSession>> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
-    parse_antigravity_transcript_reader(reader, fallback_id, path.to_str(), cwd, include_events)
+    parse_antigravity_transcript_reader(
+        reader,
+        fallback_id,
+        path.to_str(),
+        cwd,
+        include_events,
+        adapter_id,
+    )
 }
 
 fn parse_antigravity_transcript_reader<R: BufRead>(
@@ -295,9 +310,12 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
     source_path: Option<&str>,
     cwd: Option<&str>,
     include_events: bool,
+    adapter_id: &str,
 ) -> anyhow::Result<Option<RawSession>> {
     let mut messages = Vec::new();
     let mut events = Vec::new();
+    let mut subagent_parent_id: Option<String> = None;
+    let mut saw_user_input = false;
 
     for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -401,6 +419,22 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
                 events.push(event);
             }
         }
+        if event_type == "USER_INPUT" {
+            saw_user_input = true;
+        }
+        let system_message = if source == "SYSTEM" && event_type == "SYSTEM_MESSAGE" {
+            v.get("content").and_then(Value::as_str).and_then(parse_antigravity_system_message)
+        } else {
+            None
+        };
+        if let Some((sender, _)) = system_message
+            && subagent_parent_id.is_none()
+            && !saw_user_input
+            && sender != fallback_id
+            && uuid::Uuid::try_parse(sender).is_ok()
+        {
+            subagent_parent_id = Some(sender.to_string());
+        }
         if v.get("status").and_then(Value::as_str) != Some("DONE") {
             continue;
         }
@@ -413,6 +447,16 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
                     messages.push(RawMessage { role: Role::User, content, timestamp });
                 }
             }
+            ("SYSTEM", "SYSTEM_MESSAGE") => {
+                if let Some((sender, body)) = system_message
+                    && subagent_parent_id.as_deref() == Some(sender)
+                {
+                    let content = extract_antigravity_system_body(body);
+                    if !content.is_empty() {
+                        messages.push(RawMessage { role: Role::User, content, timestamp });
+                    }
+                }
+            }
             ("MODEL", "PLANNER_RESPONSE") => {
                 let content =
                     v.get("content").and_then(|content| content.as_str()).unwrap_or("").trim();
@@ -422,6 +466,9 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
                         content: content.to_string(),
                         timestamp,
                     });
+                }
+                if let Some(parent_id) = subagent_parent_id.as_deref() {
+                    collect_send_message_reports(&v, parent_id, content, timestamp, &mut messages);
                 }
             }
             _ => {}
@@ -433,6 +480,17 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
     }
 
     let started_at = crate::adapters::first_timestamp(None, &messages, &[], &events).unwrap_or(0);
+    let (thread_role, parent_links) = match subagent_parent_id {
+        Some(parent_id) => (
+            Some(ThreadRole::Subagent),
+            vec![ParentLink {
+                relation: ParentRelation::Spawn,
+                source: adapter_id.to_string(),
+                source_id: parent_id,
+            }],
+        ),
+        None => (Some(ThreadRole::Primary), Vec::new()),
+    };
 
     let mut session = RawSession::search_only(
         fallback_id.to_string(),
@@ -442,6 +500,10 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
         None,
         messages,
     );
+    session.thread_role = thread_role;
+    session.parent_links = parent_links;
+    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    session.refresh_session_on_metadata_backfill = true;
     if include_events {
         session = session.with_events(events, EVENT_PARSER_VERSION);
     }
@@ -466,5 +528,10 @@ fn parse_created_at(v: &Value) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
+mod subagent;
 #[cfg(test)]
 mod tests;
+
+use subagent::{
+    collect_send_message_reports, extract_antigravity_system_body, parse_antigravity_system_message,
+};

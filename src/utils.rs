@@ -285,9 +285,11 @@ const NOISE_FIRST_MESSAGE_PREFIXES: &[&str] = &[
     "<local-command-caveat>",
     "<system-reminder>",
     "<tool_use_error>",
+    "[Lody] This message was sent by another agent",
     "[Request interrupted",
     "# New session -",
     "Base directory for this skill:",
+    "Do not call Confer MCP tools.",
     "This session is being continued from",
 ];
 
@@ -323,5 +325,17 @@ mod tests {
     #[test]
     fn title_single_plain_message_returned_verbatim() {
         assert_eq!(title_from_user_messages(&["fix the parser bug"]), "fix the parser bug");
+    }
+
+    #[test]
+    fn title_skips_confer_and_lody_noise_prefixes() {
+        assert_eq!(
+            title_from_user_messages(&[
+                "Do not call Confer MCP tools.\nRead the plan first.",
+                "  [Lody] This message was sent by another agent: please verify.",
+                "investigate subagent indexing",
+            ]),
+            "investigate subagent indexing"
+        );
     }
 }

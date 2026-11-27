@@ -29,7 +29,7 @@ pub(crate) struct CodexAdapter;
 
 pub(crate) const USAGE_PARSER_VERSION: u32 = 6;
 const EVENT_PARSER_VERSION: u32 = 6;
-const METADATA_PARSER_VERSION: u32 = 1;
+const METADATA_PARSER_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RolloutDialect {
@@ -411,11 +411,32 @@ fn extract_session_id_from_filename(stem: &str) -> Option<String> {
     uuid::Uuid::try_parse(tail).ok().map(|_| tail.to_string())
 }
 
-/// Keyed by payload id so forked rollouts pick the child's meta, not an inherited parent's.
 struct CodexMetaTopology {
     meta_id: Option<String>,
     thread_role: Option<ThreadRole>,
     parent_links: Vec<ParentLink>,
+    subagent_title: Option<String>,
+}
+
+fn trimmed_json_str(value: Option<&Value>) -> Option<&str> {
+    value.and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty())
+}
+
+fn codex_subagent_title(payload: &Value) -> Option<String> {
+    let path_tail = trimmed_json_str(payload.get("agent_path"))
+        .or_else(|| trimmed_json_str(payload.pointer("/source/subagent/thread_spawn/agent_path")))
+        .map(|raw| raw.strip_prefix("/root/").or_else(|| raw.strip_prefix('/')).unwrap_or(raw))
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let nickname = trimmed_json_str(payload.get("agent_nickname")).or_else(|| {
+        trimmed_json_str(payload.pointer("/source/subagent/thread_spawn/agent_nickname"))
+    });
+    match (path_tail, nickname) {
+        (Some(path), Some(nick)) => Some(format!("{path} ({nick})")),
+        (Some(path), None) => Some(path.to_string()),
+        (None, Some(nick)) => Some(nick.to_string()),
+        (None, None) => None,
+    }
 }
 
 fn codex_thread_role(payload: &Value) -> Option<ThreadRole> {
@@ -562,6 +583,7 @@ pub(crate) fn parse_rollout(
                         meta_id: meta_id.clone(),
                         thread_role: codex_thread_role(payload),
                         parent_links: codex_parent_links(payload, dialect.source()),
+                        subagent_title: codex_subagent_title(payload),
                     });
                     if payload.get("forked_from_id").and_then(|s| s.as_str()).is_some() {
                         forked_child_waiting_for_turn_context = true;
@@ -895,18 +917,19 @@ pub(crate) fn parse_rollout(
     let started_at =
         first_timestamp(meta_timestamp, &messages, &usage_events, &events).unwrap_or(0);
 
-    // Prefer the metadata record whose payload id matches the source id derived
-    // from the rollout filename so inherited parent metadata in forked rollouts
-    // never overwrites the child identity; fall back to the last processed
-    // record (the child's own, since inherited parent metadata is skipped).
     let filename_id =
         path.file_stem().and_then(|s| s.to_str()).and_then(extract_session_id_from_filename);
-    let (thread_role, parent_links) = meta_topologies
+    let (thread_role, parent_links, subagent_title) = meta_topologies
         .iter()
         .find(|topo| topo.meta_id.is_some() && topo.meta_id.as_deref() == filename_id.as_deref())
         .or_else(|| meta_topologies.last())
-        .map(|topo| (topo.thread_role, topo.parent_links.clone()))
-        .unwrap_or((None, Vec::new()));
+        .map(|topo| (topo.thread_role, topo.parent_links.clone(), topo.subagent_title.clone()))
+        .unwrap_or((None, Vec::new(), None));
+    let mut custom_title: Option<String> = None;
+    if thread_role == Some(ThreadRole::Subagent) && custom_title.is_none() {
+        custom_title = subagent_title;
+    }
+    let refresh_session_on_metadata_backfill = custom_title.is_some();
 
     Ok(Some(RawSession {
         source_id,
@@ -920,14 +943,14 @@ pub(crate) fn parse_rollout(
         events,
         event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
         source_file_path: None,
-        custom_title: None,
+        custom_title,
         summary: None,
         duration_minutes: None,
         thread_role,
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
         refresh_session_metadata: false,
-        refresh_session_on_metadata_backfill: false,
+        refresh_session_on_metadata_backfill,
     }))
 }
 
@@ -2441,6 +2464,200 @@ mod tests {
         assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));
         assert!(raw.parent_links.is_empty());
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_extracts_subagent_title_from_path_and_nickname() {
+        let root = temp_codex_root("subagent-title");
+        let sessions_dir = root.join("sessions");
+
+        let both_uuid = "019a4c01-e8f4-7270-bdab-7f19273b2404";
+        let both_path = write_codex_topology_rollout(
+            &sessions_dir,
+            both_uuid,
+            serde_json::json!({
+                "id": both_uuid,
+                "agent_path": "/root/snp1263_final_review",
+                "agent_nickname": "Chandrasekhar",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "parent-1"
+                        }
+                    }
+                },
+                "cwd": "/repo"
+            }),
+        );
+        let both = parse_codex_session(&both_path).unwrap().unwrap();
+        assert_eq!(both.thread_role, Some(ThreadRole::Subagent));
+        assert_eq!(both.custom_title.as_deref(), Some("snp1263_final_review (Chandrasekhar)"));
+        assert!(both.refresh_session_on_metadata_backfill);
+        assert_eq!(both.metadata_parser_version, Some(METADATA_PARSER_VERSION));
+
+        let nested_uuid = "019a4c01-e8f4-7270-bdab-7f19273b2405";
+        let nested_path = write_codex_topology_rollout(
+            &sessions_dir,
+            nested_uuid,
+            serde_json::json!({
+                "id": nested_uuid,
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "parent-1",
+                            "agent_path": "/workers/explorer",
+                            "agent_nickname": "Feynman"
+                        }
+                    }
+                },
+                "cwd": "/repo"
+            }),
+        );
+        let nested = parse_codex_session(&nested_path).unwrap().unwrap();
+        assert_eq!(nested.custom_title.as_deref(), Some("workers/explorer (Feynman)"));
+        assert!(nested.refresh_session_on_metadata_backfill);
+
+        let path_only_uuid = "019a4c01-e8f4-7270-bdab-7f19273b2406";
+        let path_only = parse_codex_session(&write_codex_topology_rollout(
+            &sessions_dir,
+            path_only_uuid,
+            serde_json::json!({
+                "id": path_only_uuid,
+                "thread_source": "subagent",
+                "agent_path": "/root/verifier",
+                "cwd": "/repo"
+            }),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(path_only.custom_title.as_deref(), Some("verifier"));
+        assert!(path_only.refresh_session_on_metadata_backfill);
+
+        let nick_only_uuid = "019a4c01-e8f4-7270-bdab-7f19273b2407";
+        let nick_only = parse_codex_session(&write_codex_topology_rollout(
+            &sessions_dir,
+            nick_only_uuid,
+            serde_json::json!({
+                "id": nick_only_uuid,
+                "thread_source": "subagent",
+                "agent_nickname": "Curie",
+                "cwd": "/repo"
+            }),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(nick_only.custom_title.as_deref(), Some("Curie"));
+        assert!(nick_only.refresh_session_on_metadata_backfill);
+
+        let primary_uuid = "019a4c01-e8f4-7270-bdab-7f19273b2408";
+        let primary = parse_codex_session(&write_codex_topology_rollout(
+            &sessions_dir,
+            primary_uuid,
+            serde_json::json!({
+                "id": primary_uuid,
+                "thread_source": "user",
+                "agent_path": "/root/ignored",
+                "agent_nickname": "Ignored",
+                "cwd": "/repo"
+            }),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(primary.thread_role, Some(ThreadRole::Primary));
+        assert_eq!(primary.custom_title, None);
+        assert!(!primary.refresh_session_on_metadata_backfill);
+
+        let null_top_uuid = "019a4c01-e8f4-7270-bdab-7f19273b2409";
+        let null_top_path = write_codex_topology_rollout(
+            &sessions_dir,
+            null_top_uuid,
+            serde_json::json!({
+                "id": null_top_uuid,
+                "agent_path": null,
+                "agent_nickname": "  ",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "parent-1",
+                            "agent_path": "/root/fallback_worker",
+                            "agent_nickname": "Noether"
+                        }
+                    }
+                },
+                "cwd": "/repo"
+            }),
+        );
+        let null_top = parse_codex_session(&null_top_path).unwrap().unwrap();
+        assert_eq!(null_top.custom_title.as_deref(), Some("fallback_worker (Noether)"));
+        assert!(null_top.refresh_session_on_metadata_backfill);
+
+        let backfill_root = temp_codex_root("subagent-backfill");
+        let backfill_path = write_codex_topology_rollout(
+            &backfill_root.join("sessions"),
+            null_top_uuid,
+            serde_json::json!({
+                "id": null_top_uuid,
+                "agent_path": null,
+                "agent_nickname": "  ",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "parent-1",
+                            "agent_path": "/root/fallback_worker",
+                            "agent_nickname": "Noether"
+                        }
+                    }
+                },
+                "cwd": "/repo"
+            }),
+        );
+        let store = crate::adapters::test_support::store();
+        let mtime = file_scan::stat_mtime_ms(&backfill_path).unwrap();
+        store
+            .insert_session(&crate::types::Session {
+                source: "codex".to_string(),
+                source_id: null_top_uuid.to_string(),
+                title: "old fallback title".to_string(),
+                updated_at: Some(mtime),
+                message_count: 1,
+                ..crate::types::test_support::session("codex-subagent-backfill")
+            })
+            .unwrap();
+        crate::adapters::test_support::seed_empty_usage_state(
+            &store,
+            "codex",
+            null_top_uuid,
+            USAGE_PARSER_VERSION,
+            Some(mtime),
+        );
+        crate::adapters::test_support::seed_empty_event_state(
+            &store,
+            "codex",
+            null_top_uuid,
+            EVENT_PARSER_VERSION,
+            Some(mtime),
+        );
+        crate::adapters::test_support::seed_empty_metadata_state(
+            &store,
+            "codex",
+            null_top_uuid,
+            METADATA_PARSER_VERSION - 1,
+        );
+        let backfill = scan_rollouts_for_sync(
+            &backfill_root,
+            RolloutDialect::Codex,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(backfill.sessions.len(), 1);
+        assert_eq!(backfill.sessions[0].source_id, null_top_uuid);
+        assert_eq!(backfill.sessions[0].custom_title.as_deref(), Some("fallback_worker (Noether)"));
+        assert!(backfill.sessions[0].refresh_session_on_metadata_backfill);
+
+        let _ = fs::remove_dir_all(&backfill_root);
         let _ = fs::remove_dir_all(&root);
     }
 
