@@ -1183,12 +1183,22 @@ fn antigravity_unknown_labels_keep_concrete_models() {
     assert_eq!(parsed.usage_events.len(), 1);
     assert_eq!(parsed.usage_events[0].model, "unknown");
     for (models, expected) in [
-        (vec![("claude-sonnet-4-5", "Known label")], "claude-sonnet-4-5"),
-        (vec![("model-a", "First"), ("model-b", "Second")], "unknown"),
+        (vec![("claude-sonnet-4-5", Some("Known label"))], "claude-sonnet-4-5"),
+        (vec![("model-a", Some("First")), ("model-b", Some("Second"))], "unknown"),
+        (vec![("gemini-2.5-pro", None)], "gemini-2.5-pro"),
+        (vec![("model-a", Some("First")), ("model-b", None)], "unknown"),
+        (
+            vec![
+                ("gemini-2.5-pro", Some("Shared")),
+                ("gemini-2.5-flash", Some("Shared")),
+                ("gemini-3-pro", Some("Solo")),
+            ],
+            "unknown",
+        ),
     ] {
         conn.execute("DELETE FROM gen_metadata WHERE idx > 1", []).unwrap();
         for (idx, (model, label)) in models.iter().enumerate() {
-            let row = build_gen_row(Some(model), Some(label), 0, 1, 1, 0, 0, 0, 1, None, &[], None);
+            let row = build_gen_row(Some(model), *label, 0, 1, 1, 0, 0, 0, 1, None, &[], None);
             conn.execute("INSERT INTO gen_metadata VALUES (?1, ?2)", params![idx as i64 + 2, row])
                 .unwrap();
         }

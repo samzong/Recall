@@ -79,7 +79,7 @@ pub(super) fn parse_antigravity_db(
         return Ok(ParsedAntigravityDb { usage_events: Vec::new(), created_at_ms, workspace_dir });
     }
 
-    let label_models = collect_label_model_map(&rows);
+    let (label_models, sole_model) = collect_model_ids(&rows);
     let mut seen_keys = HashSet::new();
     let mut candidates = Vec::new();
 
@@ -141,8 +141,12 @@ pub(super) fn parse_antigravity_db(
 
         let raw_response_model = non_empty_string_field(chat_model, 19);
         let display_label = non_empty_string_field(chat_model, 21).map(str::to_string);
-        let model_raw =
-            resolve_model_id(raw_response_model, display_label.as_deref(), &label_models);
+        let model_raw = resolve_model_id(
+            raw_response_model,
+            display_label.as_deref(),
+            &label_models,
+            sole_model.as_deref(),
+        );
         let used_claude = kv.get("used_claude").map(String::as_str) == Some("true");
         let provider = infer_provider(provider_enum, used_claude, &model_raw).to_string();
         let inline_ts = message_field(chat_model, 9)
@@ -331,18 +335,20 @@ fn is_concrete_response_model(model: &str) -> bool {
     !trimmed.to_ascii_lowercase().starts_with("model_placeholder_")
 }
 
-fn collect_label_model_map(rows: &[(Option<i64>, Vec<u8>)]) -> HashMap<String, String> {
+fn collect_model_ids(rows: &[(Option<i64>, Vec<u8>)]) -> (HashMap<String, String>, Option<String>) {
     let mut map: HashMap<String, Option<String>> = HashMap::new();
+    let mut concrete_models = HashSet::new();
     for (_, blob) in rows {
         let Some(chat_model) = message_field(blob, 1) else {
-            continue;
-        };
-        let Some(label) = non_empty_string_field(chat_model, 21) else {
             continue;
         };
         let Some(model) =
             non_empty_string_field(chat_model, 19).filter(|m| is_concrete_response_model(m))
         else {
+            continue;
+        };
+        concrete_models.insert(model.to_string());
+        let Some(label) = non_empty_string_field(chat_model, 21) else {
             continue;
         };
         map.entry(label.to_string())
@@ -355,13 +361,16 @@ fn collect_label_model_map(rows: &[(Option<i64>, Vec<u8>)]) -> HashMap<String, S
             })
             .or_insert_with(|| Some(model.to_string()));
     }
-    map.into_iter().filter_map(|(k, v)| Some((k, v?))).collect()
+    let sole_model =
+        if concrete_models.len() == 1 { concrete_models.into_iter().next() } else { None };
+    (map.into_iter().filter_map(|(k, v)| Some((k, v?))).collect(), sole_model)
 }
 
 fn resolve_model_id(
     raw_response_model: Option<&str>,
     display_label: Option<&str>,
     label_models: &HashMap<String, String>,
+    sole_model: Option<&str>,
 ) -> String {
     if let Some(model) = raw_response_model.filter(|m| is_concrete_response_model(m)) {
         return model.trim().to_string();
@@ -371,13 +380,7 @@ fn resolve_model_id(
     {
         return recovered.clone();
     }
-    let mut concrete_models = label_models.values();
-    if let Some(model) = concrete_models.next()
-        && concrete_models.all(|other| other == model)
-    {
-        return model.clone();
-    }
-    "unknown".to_string()
+    sole_model.unwrap_or("unknown").to_string()
 }
 
 fn infer_provider(provider_enum: Option<u64>, used_claude: bool, model: &str) -> &'static str {
