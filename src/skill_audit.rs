@@ -79,10 +79,15 @@ pub(crate) fn build_skill_audit_report(
     store: &Store,
     filters: &SkillAuditFilters,
 ) -> Result<SkillAuditReport> {
-    let installed = scan_installed_skills();
+    build_skill_audit_report_with_installed(store, filters, scan_installed_skills())
+}
+
+fn build_skill_audit_report_with_installed(
+    store: &Store,
+    filters: &SkillAuditFilters,
+    installed: Vec<InstalledSkill>,
+) -> Result<SkillAuditReport> {
     let installed_ids: HashSet<String> = installed.iter().map(|skill| skill.id.clone()).collect();
-    let events = store.list_skill_audit_events(filters.sources.as_deref(), filters.time_range)?;
-    let has_any_events = !events.is_empty();
     let scope_ids = match &filters.target {
         UsageTarget::Scope(ProjectScope::Global) => None,
         UsageTarget::Scope(scope) => Some(store.session_ids_in_scope(scope)?),
@@ -94,36 +99,80 @@ pub(crate) fn build_skill_audit_report(
         }
         UsageTarget::Scope(_) => None,
     };
-    let mut usage: HashMap<String, SkillAccumulator> = HashMap::new();
-    for event in &events {
-        let in_target = match &filters.target {
+    let in_target = |session_id: &str| -> bool {
+        match &filters.target {
             UsageTarget::Scope(ProjectScope::Global) => true,
-            UsageTarget::Scope(_) => {
-                scope_ids.as_ref().is_some_and(|ids| ids.contains(&event.session_id))
-            }
+            UsageTarget::Scope(_) => scope_ids.as_ref().is_some_and(|ids| ids.contains(session_id)),
             UsageTarget::Partition { key, .. } => {
-                session_partition_key(
-                    session_meta.as_ref().and_then(|map| map.get(&event.session_id)),
-                ) == *key
+                session_partition_key(session_meta.as_ref().and_then(|map| map.get(session_id)))
+                    == *key
             }
-        };
-        if !in_target {
-            continue;
         }
-        let Some((skill_id, signal)) = extract_skill_from_event(event, &installed_ids) else {
-            continue;
-        };
-        let entry = usage.entry(skill_id).or_default();
-        let first_in_session = entry.sessions.insert(event.session_id.clone());
-        if first_in_session {
-            entry.invocations += 1;
+    };
+
+    let mut usage: HashMap<String, SkillAccumulator> = HashMap::new();
+    let has_any_events = if store.skill_usage_index_ready()? {
+        let cutoff = filters.time_range.millis_ago();
+        let rows = store.list_indexed_skill_usage(filters.sources.as_deref())?;
+        let mut any_events = false;
+        for row in rows {
+            let t_nonnull = row.max_timestamp.filter(|t| cutoff.is_none_or(|c| *t >= c));
+            let t_null = if row.has_null_timestamp && cutoff.is_none_or(|c| row.session_ts >= c) {
+                Some(row.session_ts)
+            } else {
+                None
+            };
+            let effective_ts = match (t_nonnull, t_null) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            let Some(timestamp) = effective_ts else {
+                continue;
+            };
+            any_events = true;
+            if !in_target(&row.session_id) {
+                continue;
+            }
+            let signal = match row.signal.as_str() {
+                "skill_tool" => SkillSignal::SkillTool,
+                "read_file" => SkillSignal::ReadSkillFile,
+                _ => continue,
+            };
+            let skill_id = resolve_skill_id(&row.raw_skill, &installed_ids);
+            let entry = usage.entry(skill_id).or_default();
+            if entry.sessions.insert(row.session_id) {
+                entry.invocations += 1;
+            }
+            entry.signals.insert(signal);
+            entry.last_used = Some(entry.last_used.map_or(timestamp, |cur| cur.max(timestamp)));
         }
-        entry.signals.insert(signal);
-        if let Some(timestamp) = event.timestamp {
-            entry.last_used =
-                Some(entry.last_used.map_or(timestamp, |current| current.max(timestamp)));
+        any_events
+    } else {
+        let events =
+            store.list_skill_audit_events(filters.sources.as_deref(), filters.time_range)?;
+        let any_events = !events.is_empty();
+        for event in &events {
+            if !in_target(&event.session_id) {
+                continue;
+            }
+            let Some((skill_id, signal)) = extract_skill_from_event(event, &installed_ids) else {
+                continue;
+            };
+            let entry = usage.entry(skill_id).or_default();
+            let first_in_session = entry.sessions.insert(event.session_id.clone());
+            if first_in_session {
+                entry.invocations += 1;
+            }
+            entry.signals.insert(signal);
+            if let Some(timestamp) = event.timestamp {
+                entry.last_used =
+                    Some(entry.last_used.map_or(timestamp, |current| current.max(timestamp)));
+            }
         }
-    }
+        any_events
+    };
 
     let mut core = Vec::new();
     let mut occasional = Vec::new();
@@ -235,6 +284,44 @@ fn shorten_home_path(path: &Path) -> String {
         return format!("~/{}", stripped.display());
     }
     path.display().to_string()
+}
+
+pub(crate) fn classify_skill_event(
+    kind: &str,
+    name: Option<&str>,
+    target: Option<&str>,
+    attrs_json: Option<&str>,
+) -> Option<(String, &'static str)> {
+    if kind == "tool_result" {
+        return None;
+    }
+    let is_tool = name.is_some_and(is_skill_tool_name);
+    let is_target_candidate = target.is_some_and(is_skill_target_candidate);
+    if !is_tool && !is_target_candidate {
+        return None;
+    }
+    if is_tool && let Some(raw) = skill_from_attrs(attrs_json) {
+        return Some((raw, "skill_tool"));
+    }
+    if let Some(target) = target
+        && let Some(raw) = skill_id_from_path(target)
+    {
+        return Some((raw, "read_file"));
+    }
+    Some((String::new(), "candidate_only"))
+}
+
+fn is_skill_target_candidate(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(idx) = rest.find("/skills/") {
+        let after = &rest[idx + "/skills/".len()..];
+        if after.contains("/skill.md") || after.contains("/references/") {
+            return true;
+        }
+        rest = after;
+    }
+    false
 }
 
 fn extract_skill_from_event(
@@ -372,196 +459,4 @@ pub(crate) fn format_signals(signals: &[SkillSignal]) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn installed(ids: &[&str]) -> HashSet<String> {
-        ids.iter().map(|id| (*id).to_string()).collect()
-    }
-
-    #[test]
-    fn extract_skill_from_skill_tool_attrs() {
-        let mut event = SkillAuditEventRow {
-            session_id: "s1".to_string(),
-            timestamp: Some(1),
-            name: Some("Skill".to_string()),
-            target: None,
-            attrs_json: Some(r#"{"skill":"commit"}"#.to_string()),
-        };
-        let (id, signal) = extract_skill_from_event(&event, &installed(&["commit"])).unwrap();
-        assert_eq!(id, "commit");
-        assert_eq!(signal, SkillSignal::SkillTool);
-        for attrs in [
-            r#"{"type":"tool_use","name":"Skill","input":{"skill":"commit"}}"#,
-            r#"{"type":"tool-call","toolName":"Skill","args":{"skill":"commit"}}"#,
-            r#"{"type":"function_call","name":"Skill","arguments":"{\"skill\":\"commit\"}"}"#,
-            r#"{"type":"custom_tool_call","name":"Skill","input":{"skill":"commit"}}"#,
-        ] {
-            event.attrs_json = Some(attrs.into());
-            assert_eq!(
-                extract_skill_from_event(&event, &installed(&["commit"])).unwrap().0,
-                "commit"
-            );
-        }
-        event.attrs_json =
-            Some(r#"{"type":"tool-result","toolName":"Skill","result":{"name":"result"}}"#.into());
-        assert!(extract_skill_from_event(&event, &installed(&["commit"])).is_none());
-    }
-
-    #[test]
-    fn extract_skill_from_opencode_native_skill_tool() {
-        let event = SkillAuditEventRow {
-            session_id: "s1".to_string(),
-            timestamp: Some(1),
-            name: Some("skill".to_string()),
-            target: None,
-            attrs_json: Some(
-                r#"{"part_id":"part","message_id":"message","part":{"type":"tool","state":{"input":{"name":"commit"}}}}"#.to_string(),
-            ),
-        };
-        let (id, signal) = extract_skill_from_event(&event, &installed(&["commit"])).unwrap();
-        assert_eq!(id, "commit");
-        assert_eq!(signal, SkillSignal::SkillTool);
-    }
-
-    #[test]
-    fn list_skill_audit_events_includes_command_wrapped_skill_md_reads() {
-        use crate::db::schema;
-        use crate::db::search::TimeRange;
-        use crate::db::store::Store;
-        use crate::types::{RawSessionEvent, Session};
-
-        schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let now = chrono::Utc::now().timestamp_millis();
-        let session = Session {
-            id: "session-1".to_string(),
-            source: "codex".to_string(),
-            source_id: "codex-1".to_string(),
-            title: "Codex session".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: now,
-            updated_at: Some(now),
-            message_count: 0,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
-        };
-        let event = RawSessionEvent {
-            command_evidence_status: None,
-            files: Vec::new(),
-            event_seq: 0,
-            timestamp: Some(now),
-            kind: "command".to_string(),
-            actor: "assistant".to_string(),
-            name: Some("bash".to_string()),
-            status: None,
-            target: Some(
-                r#"cat "/Users/x/.agents/skills/pre-ship/SKILL.md" && echo ok"#.to_string(),
-            ),
-            message_seq: None,
-            summary: None,
-            source_path: None,
-            source_event_id: None,
-            tool_call_id: None,
-            is_meta: None,
-            visibility: None,
-            attrs_json: None,
-            parser_version: 1,
-        };
-        let result = RawSessionEvent {
-            event_seq: 1,
-            kind: "tool_result".into(),
-            actor: "tool".into(),
-            name: Some("Skill".into()),
-            target: None,
-            attrs_json: Some(r#"{"skill":"commit"}"#.into()),
-            ..event.clone()
-        };
-        store
-            .persist_session_with_usage_and_events(
-                &session,
-                &[],
-                &[],
-                None,
-                &[event, result],
-                Some(1),
-            )
-            .unwrap();
-
-        let events = store.list_skill_audit_events(None, TimeRange::All).unwrap();
-        assert_eq!(events.len(), 1);
-        let (id, signal) = extract_skill_from_event(&events[0], &installed(&["pre-ship"])).unwrap();
-        assert_eq!(id, "pre-ship");
-        assert_eq!(signal, SkillSignal::ReadSkillFile);
-    }
-
-    #[test]
-    fn list_skill_audit_events_uses_session_timestamp_when_event_timestamp_missing() {
-        use crate::db::schema;
-        use crate::db::search::TimeRange;
-        use crate::db::store::Store;
-        use crate::types::{RawSessionEvent, Session};
-
-        schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let now = chrono::Utc::now().timestamp_millis();
-        let session = Session {
-            id: "session-1".to_string(),
-            source: "cursor".to_string(),
-            source_id: "cursor-1".to_string(),
-            title: "Cursor session".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: now,
-            updated_at: Some(now),
-            message_count: 0,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-            locations: Vec::new(),
-            alternative_versions: 0,
-        };
-        let event = RawSessionEvent {
-            command_evidence_status: None,
-            files: Vec::new(),
-            event_seq: 0,
-            timestamp: None,
-            kind: "tool_call".to_string(),
-            actor: "assistant".to_string(),
-            name: Some("Skill".to_string()),
-            status: None,
-            target: None,
-            message_seq: None,
-            summary: None,
-            source_path: None,
-            source_event_id: None,
-            tool_call_id: None,
-            is_meta: None,
-            visibility: None,
-            attrs_json: Some(r#"{"skill":"commit"}"#.to_string()),
-            parser_version: 1,
-        };
-        store
-            .persist_session_with_usage_and_events(&session, &[], &[], None, &[event], Some(1))
-            .unwrap();
-
-        assert_eq!(store.list_skill_audit_events(None, TimeRange::All).unwrap().len(), 1);
-        let ranged = store.list_skill_audit_events(None, TimeRange::Month).unwrap();
-        assert_eq!(ranged.len(), 1);
-        assert_eq!(ranged[0].timestamp, Some(now));
-    }
-}
+mod tests;

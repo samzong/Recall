@@ -54,7 +54,7 @@ fn v20_converges_missing_partial_and_complete_legacy_indexes() {
                 .unwrap();
         }
         init(&store.conn).unwrap();
-        assert_eq!(schema_version(&store.conn).unwrap(), 20);
+        assert_eq!(schema_version(&store.conn).unwrap(), current_schema_version());
         let engine = SearchEngine::new(&store.conn);
         assert!(engine.search_messages("数据库迁移", &filters(), None, 50).is_err());
         assert!(engine.hybrid_search("数据库迁移", None, &filters(), 20, 3).is_err());

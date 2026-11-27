@@ -28,7 +28,7 @@ pub(super) fn render_activity_map(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.success));
 
-    if app.usage.is_loading() {
+    if app.usage.is_dashboard_loading() {
         f.render_widget(
             Paragraph::new("Loading usage data...")
                 .style(Style::default().fg(THEME.accent))
@@ -106,7 +106,7 @@ pub(super) fn render_over_time_chart(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.border_focus));
 
-    if app.usage.is_loading() {
+    if app.usage.is_dashboard_loading() {
         f.render_widget(
             Paragraph::new("Loading usage data...")
                 .style(Style::default().fg(THEME.accent))

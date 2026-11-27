@@ -4,7 +4,6 @@ use std::thread;
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
 use crate::skill_audit::{self, SkillAuditFilters, SkillAuditReport};
-use crate::sync::run_dashboard_sync_job;
 use crate::usage::{self, ProjectUsageReport, UsageReport, UsageTarget};
 
 #[derive(Debug)]
@@ -13,7 +12,17 @@ pub(crate) struct UsageRequest {
     pub(crate) sources: Option<Vec<String>>,
     pub(crate) time_range: TimeRange,
     pub(crate) target: UsageTarget,
-    pub(crate) sync: bool,
+}
+
+pub(crate) struct DashboardReports {
+    pub(crate) current_report: Result<UsageReport, String>,
+    pub(crate) all_time_report: Result<UsageReport, String>,
+    pub(crate) projects_report: Result<ProjectUsageReport, String>,
+}
+
+pub(crate) enum UsagePayload {
+    Dashboard(Box<DashboardReports>),
+    Skills(Result<SkillAuditReport, String>),
 }
 
 pub(crate) struct UsageResponse {
@@ -21,10 +30,7 @@ pub(crate) struct UsageResponse {
     pub(crate) sources: Option<Vec<String>>,
     pub(crate) time_range: TimeRange,
     pub(crate) target: UsageTarget,
-    pub(crate) current_report: Result<UsageReport, String>,
-    pub(crate) all_time_report: Result<UsageReport, String>,
-    pub(crate) projects_report: Result<ProjectUsageReport, String>,
-    pub(crate) skill_audit_report: Result<SkillAuditReport, String>,
+    pub(crate) payload: UsagePayload,
 }
 
 pub(crate) struct UsageWorker {
@@ -58,52 +64,93 @@ impl UsageWorker {
 fn run_worker(request_rx: Receiver<UsageRequest>, response_tx: Sender<UsageResponse>) {
     crate::db::schema::register_sqlite_vec();
 
-    let store = match Store::open() {
+    let path = match Store::default_db_path() {
+        Ok(path) => path,
+        Err(error) => {
+            send_unavailable(request_rx, response_tx, error.to_string());
+            return;
+        }
+    };
+    let store = match Store::open_read_only_at(&path) {
         Ok(store) => store,
         Err(error) => {
-            while let Ok(request) = request_rx.recv() {
-                let _ = response_tx
-                    .send(failed_response(request, format!("Database unavailable: {error}")));
-            }
+            send_unavailable(request_rx, response_tx, format!("Database unavailable: {error}"));
             return;
         }
     };
 
-    let mut sync_pending = false;
-    while let Ok(mut request) = request_rx.recv() {
+    run_worker_with_store(&store, request_rx, response_tx);
+}
+
+fn run_worker_with_store(
+    store: &Store,
+    request_rx: Receiver<UsageRequest>,
+    response_tx: Sender<UsageResponse>,
+) {
+    let mut next_request = None;
+    loop {
+        let mut request = match next_request.take() {
+            Some(request) => request,
+            None => match request_rx.recv() {
+                Ok(request) => request,
+                Err(_) => return,
+            },
+        };
         while let Ok(next) = request_rx.try_recv() {
-            let sync = request.sync || next.sync;
-            request = UsageRequest { sync, ..next };
+            request = next;
         }
 
-        if let Err(error) = run_sync(&mut sync_pending, request.sync, run_dashboard_sync_job) {
-            if response_tx.send(failed_response(request, error)).is_err() {
-                return;
-            }
+        let dashboard = build_dashboard_response(store, &request);
+        if response_tx.send(dashboard).is_err() {
+            return;
+        }
+
+        if let Ok(next) = request_rx.try_recv() {
+            next_request = Some(next);
             continue;
         }
 
-        let response = run_request(&store, request);
-        if response_tx.send(response).is_err() {
+        let skills = build_skills_response(store, request);
+        if response_tx.send(skills).is_err() {
             return;
         }
     }
 }
 
-fn run_sync(
-    pending: &mut bool,
-    requested: bool,
-    sync: impl FnOnce() -> anyhow::Result<()>,
-) -> Result<(), String> {
-    *pending |= requested;
-    if *pending {
-        sync().map_err(|error| format!("Sync failed: {error}"))?;
-        *pending = false;
+fn send_unavailable(
+    request_rx: Receiver<UsageRequest>,
+    response_tx: Sender<UsageResponse>,
+    error: String,
+) {
+    while let Ok(request) = request_rx.recv() {
+        let dashboard = UsageResponse {
+            id: request.id,
+            sources: request.sources.clone(),
+            time_range: request.time_range,
+            target: request.target.clone(),
+            payload: UsagePayload::Dashboard(Box::new(DashboardReports {
+                current_report: Err(error.clone()),
+                all_time_report: Err(error.clone()),
+                projects_report: Err(error.clone()),
+            })),
+        };
+        if response_tx.send(dashboard).is_err() {
+            return;
+        }
+        let skills = UsageResponse {
+            id: request.id,
+            sources: request.sources,
+            time_range: request.time_range,
+            target: request.target,
+            payload: UsagePayload::Skills(Err(error.clone())),
+        };
+        if response_tx.send(skills).is_err() {
+            return;
+        }
     }
-    Ok(())
 }
 
-fn run_request(store: &Store, request: UsageRequest) -> UsageResponse {
+fn build_dashboard_response(store: &Store, request: &UsageRequest) -> UsageResponse {
     let bundle = usage::build_dashboard_bundle(
         store,
         request.sources.as_deref(),
@@ -119,6 +166,21 @@ fn run_request(store: &Store, request: UsageRequest) -> UsageResponse {
             (Err(message.clone()), Err(message.clone()), Err(message))
         }
     };
+
+    UsageResponse {
+        id: request.id,
+        sources: request.sources.clone(),
+        time_range: request.time_range,
+        target: request.target.clone(),
+        payload: UsagePayload::Dashboard(Box::new(DashboardReports {
+            current_report,
+            all_time_report,
+            projects_report,
+        })),
+    }
+}
+
+fn build_skills_response(store: &Store, request: UsageRequest) -> UsageResponse {
     let skill_filters = SkillAuditFilters {
         sources: request.sources.clone(),
         time_range: request.time_range,
@@ -132,23 +194,7 @@ fn run_request(store: &Store, request: UsageRequest) -> UsageResponse {
         sources: request.sources,
         time_range: request.time_range,
         target: request.target,
-        current_report,
-        all_time_report,
-        projects_report,
-        skill_audit_report,
-    }
-}
-
-fn failed_response(request: UsageRequest, error: String) -> UsageResponse {
-    UsageResponse {
-        id: request.id,
-        sources: request.sources,
-        time_range: request.time_range,
-        target: request.target,
-        current_report: Err(error.clone()),
-        all_time_report: Err(error.clone()),
-        projects_report: Err(error.clone()),
-        skill_audit_report: Err(error),
+        payload: UsagePayload::Skills(skill_audit_report),
     }
 }
 
@@ -167,7 +213,6 @@ mod tests {
             sources: None,
             time_range,
             target: UsageTarget::Scope(ProjectScope::Global),
-            sync: false,
         }
     }
 
@@ -188,12 +233,17 @@ mod tests {
     }
 
     #[test]
-    fn failed_initial_sync_is_retried_by_the_next_request() {
-        let mut pending = false;
+    fn worker_emits_dashboard_before_skills_for_request() {
+        let worker = UsageWorker::spawn_with(|request_rx, response_tx| {
+            crate::db::schema::register_sqlite_vec();
+            let store = Store::open_in_memory().unwrap();
+            run_worker_with_store(&store, request_rx, response_tx);
+        });
 
-        assert!(run_sync(&mut pending, true, || anyhow::bail!("offline")).is_err());
-        assert!(pending);
-        assert!(run_sync(&mut pending, false, || Ok(())).is_ok());
-        assert!(!pending);
+        assert!(worker.refresh(request(TimeRange::All)));
+        let first = worker.response_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(first.payload, UsagePayload::Dashboard(_)));
+        let second = worker.response_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(second.payload, UsagePayload::Skills(_)));
     }
 }

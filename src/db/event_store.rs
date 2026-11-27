@@ -55,6 +55,7 @@ impl Store {
                 source_updated_at,
             )?;
         }
+        super::skill_audit_store::flush_dirty_skill_tx(&tx)?;
         tx.commit()?;
         Ok(true)
     }
@@ -215,6 +216,13 @@ pub(crate) fn replace_session_events(
             ],
         )?;
     }
+
+    super::skill_audit_store::rebuild_session_skill_usage_from_raw_tx(
+        tx,
+        session_id,
+        source,
+        session_events,
+    )?;
 
     Ok(())
 }

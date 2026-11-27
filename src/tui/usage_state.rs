@@ -3,7 +3,7 @@ use std::time::Instant;
 use crate::db::search::TimeRange;
 use crate::project_scope::ProjectScope;
 use crate::skill_audit::{SkillAuditReport, SkillUsageEntry};
-use crate::tui::usage_worker::UsageResponse;
+use crate::tui::usage_worker::{DashboardReports, UsagePayload, UsageResponse};
 use crate::usage::{
     ProjectPartitionKey, ProjectUsageEntry, ProjectUsageReport, UsageReport, UsageTarget,
 };
@@ -56,6 +56,8 @@ pub(crate) struct UsageState {
     pub(crate) drilldown: Option<(ProjectPartitionKey, String)>,
     pub(crate) refresh_requested_at: Option<Instant>,
     pub(crate) in_flight: bool,
+    pub(crate) skill_in_flight: bool,
+    pub(crate) silent_refresh: bool,
     pub(crate) request_id: u64,
     pub(crate) breakdown_scroll: u16,
     pub(crate) tab: UsageTab,
@@ -82,6 +84,8 @@ impl Default for UsageState {
             drilldown: None,
             refresh_requested_at: None,
             in_flight: false,
+            skill_in_flight: false,
+            silent_refresh: false,
             request_id: 0,
             breakdown_scroll: 0,
             tab: UsageTab::Tokens,
@@ -109,27 +113,56 @@ impl UsageState {
         self.error = None;
         self.projects_error = None;
         self.skill_error = None;
+        self.silent_refresh = false;
         self.request_id = self.request_id.saturating_add(1);
         self.refresh_requested_at = Some(Instant::now());
         self.reset_selection();
     }
 
+    pub(crate) fn request_silent_refresh(&mut self) {
+        self.silent_refresh = true;
+        self.request_id = self.request_id.saturating_add(1);
+        self.refresh_requested_at = Some(Instant::now());
+    }
+
+    pub(crate) fn clear_cache(&mut self) {
+        self.cache.clear();
+    }
+
+    pub(crate) fn is_dashboard_loading(&self) -> bool {
+        !self.silent_refresh && (self.refresh_requested_at.is_some() || self.in_flight)
+    }
+
+    pub(crate) fn is_skill_loading(&self) -> bool {
+        !self.silent_refresh
+            && (self.refresh_requested_at.is_some() || self.skill_in_flight || self.in_flight)
+    }
+
     pub(crate) fn is_loading(&self) -> bool {
-        self.refresh_requested_at.is_some() || self.in_flight
+        self.is_dashboard_loading() || (self.tab == UsageTab::Skills && self.is_skill_loading())
     }
 
     pub(crate) fn take_refresh(&mut self) -> Option<(u64, TimeRange, UsageTarget)> {
-        if self.refresh_requested_at?.elapsed().as_millis() < USAGE_LOADING_MIN_MS {
+        let requested_at = self.refresh_requested_at?;
+        let has_content =
+            self.report.is_some() || self.projects_report.is_some() || self.skill_report.is_some();
+        if has_content
+            && !self.silent_refresh
+            && requested_at.elapsed().as_millis() < USAGE_LOADING_MIN_MS
+        {
             return None;
         }
         self.refresh_requested_at = None;
         self.in_flight = true;
+        self.skill_in_flight = true;
         Some((self.request_id, self.time_filter, self.effective_target()))
     }
 
     pub(crate) fn fail_refresh(&mut self, error: impl std::fmt::Display) {
         self.refresh_requested_at = None;
         self.in_flight = false;
+        self.skill_in_flight = false;
+        self.silent_refresh = false;
         self.report = None;
         self.year_report = None;
         self.projects_report = None;
@@ -148,55 +181,85 @@ impl UsageState {
             return;
         }
 
-        self.in_flight = false;
-        self.report = response
-            .current_report
-            .inspect_err(|error| {
-                self.error = Some(format!("Usage unavailable: {error}"));
-            })
-            .ok();
-        self.year_report = response
-            .all_time_report
-            .inspect_err(|error| {
-                self.error.get_or_insert_with(|| format!("Usage unavailable: {error}"));
-            })
-            .ok();
-        self.projects_report = response
-            .projects_report
-            .inspect_err(|error| {
-                self.projects_error = Some(format!("Project usage unavailable: {error}"));
-            })
-            .ok();
-        self.skill_report = response
-            .skill_audit_report
-            .inspect_err(|error| {
-                self.skill_error = Some(format!("Skill audit unavailable: {error}"));
-            })
-            .ok();
-
-        if let (Some(report), Some(year_report), Some(projects_report), Some(skill_report)) = (
-            self.report.as_ref(),
-            self.year_report.as_ref(),
-            self.projects_report.as_ref(),
-            self.skill_report.as_ref(),
-        ) {
-            self.store_cache(
-                UsageCacheKey { sources, time_range: response.time_range, target: response.target },
-                CachedUsageBundle {
-                    report: report.clone(),
-                    year_report: year_report.clone(),
-                    projects_report: projects_report.clone(),
-                    skill_report: skill_report.clone(),
-                },
-            );
+        match response.payload {
+            UsagePayload::Dashboard(reports) => {
+                let DashboardReports { current_report, all_time_report, projects_report } =
+                    *reports;
+                self.in_flight = false;
+                match current_report {
+                    Ok(report) => {
+                        self.error = None;
+                        self.report = Some(report);
+                    }
+                    Err(error) => {
+                        self.report = None;
+                        self.error = Some(format!("Usage unavailable: {error}"));
+                    }
+                }
+                match all_time_report {
+                    Ok(report) => {
+                        self.year_report = Some(report);
+                    }
+                    Err(error) => {
+                        self.year_report = None;
+                        self.error.get_or_insert_with(|| format!("Usage unavailable: {error}"));
+                    }
+                }
+                match projects_report {
+                    Ok(report) => {
+                        self.projects_error = None;
+                        self.projects_report = Some(report);
+                    }
+                    Err(error) => {
+                        self.projects_report = None;
+                        self.projects_error = Some(format!("Project usage unavailable: {error}"));
+                    }
+                }
+                self.reanchor_project_selection();
+            }
+            UsagePayload::Skills(skill_audit_report) => {
+                self.skill_in_flight = false;
+                match skill_audit_report {
+                    Ok(report) => {
+                        self.skill_error = None;
+                        self.skill_report = Some(report);
+                    }
+                    Err(error) => {
+                        self.skill_report = None;
+                        self.skill_error = Some(format!("Skill audit unavailable: {error}"));
+                    }
+                }
+                let skill_count = self.skill_entry_count();
+                if skill_count == 0 {
+                    self.skill_selected = 0;
+                } else {
+                    self.skill_selected = self.skill_selected.min(skill_count - 1);
+                }
+            }
         }
 
-        self.reanchor_project_selection();
-        let skill_count = self.skill_entry_count();
-        if skill_count == 0 {
-            self.skill_selected = 0;
-        } else {
-            self.skill_selected = self.skill_selected.min(skill_count - 1);
+        if !self.in_flight && !self.skill_in_flight {
+            self.silent_refresh = false;
+            if let (Some(report), Some(year_report), Some(projects_report), Some(skill_report)) = (
+                self.report.as_ref(),
+                self.year_report.as_ref(),
+                self.projects_report.as_ref(),
+                self.skill_report.as_ref(),
+            ) {
+                self.store_cache(
+                    UsageCacheKey {
+                        sources,
+                        time_range: response.time_range,
+                        target: response.target,
+                    },
+                    CachedUsageBundle {
+                        report: report.clone(),
+                        year_report: year_report.clone(),
+                        projects_report: projects_report.clone(),
+                        skill_report: skill_report.clone(),
+                    },
+                );
+            }
         }
     }
 
@@ -212,6 +275,8 @@ impl UsageState {
         self.request_id = self.request_id.saturating_add(1);
         self.refresh_requested_at = None;
         self.in_flight = false;
+        self.skill_in_flight = false;
+        self.silent_refresh = false;
         self.error = None;
         self.projects_error = None;
         self.skill_error = None;

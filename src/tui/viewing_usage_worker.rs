@@ -69,11 +69,17 @@ fn tokens_for_request(
         .conn
         .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
         .map_err(|error| error.to_string())?;
-    if cache.as_ref().is_none_or(|(cached_version, _)| *cached_version != version) {
-        let totals = store.usage_by_session().map_err(|error| error.to_string())?;
-        *cache = Some((version, totals));
+    let reset = cache.as_ref().is_none_or(|(cached_version, _)| *cached_version != version);
+    if reset {
+        *cache = Some((version, std::collections::HashMap::new()));
     }
-    Ok(cache.as_ref().and_then(|(_, totals)| totals.get(session_id)).cloned().unwrap_or_default())
+    let (_, map) = cache.as_mut().expect("cache initialized above");
+    if let Some(existing) = map.get(session_id) {
+        return Ok(existing.clone());
+    }
+    let usage = store.session_usage(session_id).map_err(|error| error.to_string())?;
+    map.insert(session_id.to_string(), usage.clone());
+    Ok(usage)
 }
 
 #[cfg(test)]

@@ -1,25 +1,76 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+mod backfill;
+mod dirty;
+mod queries;
+mod rollups;
+pub(super) use dirty::flush_dirty_usage_tx;
+
+use std::collections::{HashMap, hash_map::Entry};
 
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::OptionalExtension;
 
-use super::store::{ParserStateMeta, Store};
-use crate::db::search::TimeRange;
-use crate::types::{RawUsageEvent, SessionUsageEventRecord, UsageEventRecord};
+use crate::types::{RawUsageEvent, UsageEventRecord};
 use crate::usage::TokenTotals;
 
 const CODEX_DISJOINT_REASONING_VERSION: u32 = 5;
 const CACHE_EXCLUSIVE_INPUT_VERSION: u32 = 2;
 const FLEXIBLE_REASONING_VERSION: u32 = 2;
+pub(super) const BUCKET_MILLIS: i64 = 900_000;
+pub(super) const USAGE_SCAN_BATCH: i64 = 5_000;
+pub(super) const USAGE_DEDUP_BATCH: usize = 2_000;
+pub(super) const USAGE_FINALIZE_SESSION_BATCH: usize = 200;
+pub(super) const USAGE_FINALIZE_GROUP_BATCH: usize = 500;
 
-struct PersistedUsage {
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_tokens: i64,
-    cache_write_tokens: i64,
-    reasoning_tokens: i64,
-    parser_version: u32,
+pub(super) struct PersistedUsage {
+    pub(super) input_tokens: i64,
+    pub(super) output_tokens: i64,
+    pub(super) cache_read_tokens: i64,
+    pub(super) cache_write_tokens: i64,
+    pub(super) reasoning_tokens: i64,
+    pub(super) parser_version: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UsageSlice {
+    pub(crate) session_id: String,
+    pub(crate) source: String,
+    pub(crate) timestamp: i64,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) cache_write_tokens: i64,
+    pub(crate) reasoning_tokens: i64,
+    pub(crate) token_source: String,
+    pub(crate) events: usize,
+}
+
+impl UsageSlice {
+    pub(crate) fn from_event(event: UsageEventRecord) -> Self {
+        Self {
+            session_id: event.session_id,
+            source: event.source,
+            timestamp: event.timestamp,
+            model: event.model,
+            provider: event.provider,
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            cache_read_tokens: event.cache_read_tokens,
+            cache_write_tokens: event.cache_write_tokens,
+            reasoning_tokens: event.reasoning_tokens,
+            token_source: event.token_source,
+            events: 1,
+        }
+    }
+
+    pub(crate) fn total_tokens(&self) -> i64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+            + self.reasoning_tokens
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -29,47 +80,65 @@ pub(crate) struct SessionUsage {
 }
 
 #[derive(PartialEq)]
-enum UsageOwnership {
+pub(super) enum UsageOwnership {
     Counted,
     Duplicate,
     OtherSession,
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dedup_group_key_from_parts(
+    source: &str,
+    event_key: &str,
+    timestamp: i64,
+    provider: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    reasoning_tokens: i64,
+) -> Option<String> {
+    let key = match source {
+        "codex" => format!(
+            "codex:token_count:{timestamp}:{provider}:{model}:{input_tokens}:{output_tokens}:{cache_read_tokens}:{cache_write_tokens}:{reasoning_tokens}"
+        ),
+        "claude-code" if event_key.starts_with("assistant:") && !event_key.contains(":line:") => {
+            event_key.to_string()
+        }
+        "warp" => event_key.to_string(),
+        "qoder"
+            if event_key.starts_with("assistant:") && !event_key.starts_with("assistant:line:") =>
+        {
+            event_key.to_string()
+        }
+        _ => return None,
+    };
+    Some(format!("{source}\0{key}"))
+}
+
 #[derive(Default)]
-struct UsageDedup {
-    owners: HashMap<(String, String), String>,
+pub(super) struct UsageDedup {
+    owners: HashMap<String, String>,
 }
 
 impl UsageDedup {
-    fn assign(&mut self, event: &UsageEventRecord) -> UsageOwnership {
-        let key = match event.source.as_str() {
-            "codex" => format!(
-                "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
-                event.timestamp,
-                event.provider,
-                event.model,
-                event.input_tokens,
-                event.output_tokens,
-                event.cache_read_tokens,
-                event.cache_write_tokens,
-                event.reasoning_tokens
-            ),
-            "claude-code"
-                if event.event_key.starts_with("assistant:")
-                    && !event.event_key.contains(":line:") =>
-            {
-                event.event_key.clone()
-            }
-            "warp" => event.event_key.clone(),
-            "qoder"
-                if event.event_key.starts_with("assistant:")
-                    && !event.event_key.starts_with("assistant:line:") =>
-            {
-                event.event_key.clone()
-            }
-            _ => return UsageOwnership::Counted,
+    pub(super) fn assign(&mut self, event: &UsageEventRecord) -> UsageOwnership {
+        let Some(group) = dedup_group_key_from_parts(
+            &event.source,
+            &event.event_key,
+            event.timestamp,
+            &event.provider,
+            &event.model,
+            event.input_tokens,
+            event.output_tokens,
+            event.cache_read_tokens,
+            event.cache_write_tokens,
+            event.reasoning_tokens,
+        ) else {
+            return UsageOwnership::Counted;
         };
-        match self.owners.entry((event.source.clone(), key)) {
+        match self.owners.entry(group) {
             Entry::Vacant(entry) => {
                 entry.insert(event.session_id.clone());
                 UsageOwnership::Counted
@@ -80,248 +149,43 @@ impl UsageDedup {
     }
 }
 
-impl Store {
-    pub(crate) fn usage_state_meta_map(
-        &self,
-        source: &str,
-    ) -> Result<HashMap<String, ParserStateMeta>> {
-        self.parser_state_map(
-            "SELECT source_id, parser_version, source_updated_at
-             FROM usage_session_state
-             WHERE source = ?1 AND session_id IN (SELECT session_id FROM native_bindings)",
-            source,
-        )
-    }
-
-    pub(crate) fn persist_usage_events_for_existing_session(
-        &self,
-        source: &str,
-        source_id: &str,
-        usage_events: &[RawUsageEvent],
-        usage_parser_version: u32,
-        source_updated_at: Option<i64>,
-    ) -> Result<bool> {
-        let session_id = self
-            .conn
-            .query_row(
-                "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2",
-                rusqlite::params![source, source_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-
-        let Some(session_id) = session_id else {
-            return Ok(false);
-        };
-
-        let tx = self.conn.unchecked_transaction()?;
-        replace_usage_events(
-            &tx,
-            &session_id,
-            source,
-            source_id,
-            usage_events,
-            Some(usage_parser_version),
-            source_updated_at,
-            UsageConflict::Reject,
-        )?;
-        tx.commit()?;
-        Ok(true)
-    }
-
-    pub(crate) fn fold_usage_events<T>(
-        &self,
-        sources: Option<&[String]>,
-        time_range: TimeRange,
-        state: T,
-        fold: impl FnMut(&mut T, UsageEventRecord),
-    ) -> Result<T> {
-        self.fold_usage_events_after(sources, time_range.millis_ago(), state, fold)
-    }
-
-    pub(crate) fn fold_usage_events_after<T>(
-        &self,
-        sources: Option<&[String]>,
-        after_millis: Option<i64>,
-        state: T,
-        mut fold: impl FnMut(&mut T, UsageEventRecord),
-    ) -> Result<T> {
-        self.fold_usage_ownership(sources, state, |state, event, ownership| {
-            if ownership == UsageOwnership::Counted
-                && after_millis.is_none_or(|cutoff| event.timestamp >= cutoff)
-            {
-                fold(state, event);
-            }
-        })
-    }
-
-    fn fold_usage_ownership<T>(
-        &self,
-        sources: Option<&[String]>,
-        mut state: T,
-        mut fold: impl FnMut(&mut T, UsageEventRecord, UsageOwnership),
-    ) -> Result<T> {
-        let mut sql = String::from(
-            "SELECT session_id, source, source_id, event_key, timestamp, model, provider,
-                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    reasoning_tokens, token_source, parser_version, raw_usage_json
-             FROM usage_events
-             WHERE 1 = 1",
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut param_idx = 1;
-
-        if let Some(source_ids) = sources
-            && !source_ids.is_empty()
-        {
-            sql.push_str(" AND source IN (");
-            for (i, source_id) in source_ids.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&format!("?{param_idx}"));
-                params.push(Box::new(source_id.clone()));
-                param_idx += 1;
-            }
-            sql.push(')');
-        }
-
-        sql.push_str(
-            " ORDER BY timestamp ASC, source ASC, event_seq ASC, session_id ASC, event_key ASC",
-        );
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            let source = row.get::<_, String>(1)?;
-            let raw_usage_json = row.get::<_, Option<String>>(14)?;
-            let usage = normalize_persisted_usage(
-                &source,
-                PersistedUsage {
-                    input_tokens: row.get(7)?,
-                    output_tokens: row.get(8)?,
-                    cache_read_tokens: row.get(9)?,
-                    cache_write_tokens: row.get(10)?,
-                    reasoning_tokens: row.get(11)?,
-                    parser_version: row.get(13)?,
-                },
-                raw_usage_json.as_deref(),
-            );
-            Ok(UsageEventRecord {
-                session_id: row.get(0)?,
-                source,
-                source_id: row.get(2)?,
-                event_key: row.get(3)?,
-                timestamp: row.get(4)?,
-                model: row.get(5)?,
-                provider: row.get(6)?,
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_read_tokens: usage.cache_read_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                reasoning_tokens: usage.reasoning_tokens,
-                token_source: row.get(12)?,
-            })
-        })?;
-
-        let mut dedup = UsageDedup::default();
-        for row in rows {
-            let event = row?;
-            let ownership = dedup.assign(&event);
-            fold(&mut state, event, ownership);
-        }
-        Ok(state)
-    }
-
-    pub(crate) fn usage_by_session(&self) -> Result<HashMap<String, SessionUsage>> {
-        self.fold_usage_ownership(None, HashMap::new(), |totals, event, ownership| {
-            let usage: &mut SessionUsage = totals.entry(event.session_id.clone()).or_default();
-            match ownership {
-                UsageOwnership::Counted => usage.tokens.add_event(&event),
-                UsageOwnership::OtherSession => usage.shared_with_other_session = true,
-                UsageOwnership::Duplicate => {}
-            }
-        })
-    }
-
-    pub(crate) fn counted_usage_event_keys(
-        &self,
-        session_ids: &HashSet<&str>,
-    ) -> Result<HashMap<String, HashSet<String>>> {
-        self.fold_usage_ownership(None, HashMap::new(), |keys, event, ownership| {
-            if ownership == UsageOwnership::Counted
-                && session_ids.contains(event.session_id.as_str())
-            {
-                keys.entry(event.session_id).or_default().insert(event.event_key);
-            }
-        })
-    }
-
-    #[cfg(any(test, feature = "bench"))]
-    pub(crate) fn for_each_deduped_usage_event(
-        events: &[UsageEventRecord],
-        mut visit: impl FnMut(&UsageEventRecord),
-    ) {
-        let mut dedup = UsageDedup::default();
-        for event in events {
-            if dedup.assign(event) == UsageOwnership::Counted {
-                visit(event);
-            }
-        }
-    }
-
-    pub(crate) fn list_usage_events_for_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<SessionUsageEventRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT event_key, event_seq, message_seq, timestamp, model, provider,
-                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    reasoning_tokens, token_source, parser_version, source_path, raw_usage_json,
-                    source
-             FROM usage_events
-             WHERE session_id = ?1
-             ORDER BY event_seq ASC, event_key ASC",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
-            let raw_usage_json = row.get::<_, Option<String>>(14)?;
-            let usage = normalize_persisted_usage(
-                &row.get::<_, String>(15)?,
-                PersistedUsage {
-                    input_tokens: row.get(6)?,
-                    output_tokens: row.get(7)?,
-                    cache_read_tokens: row.get(8)?,
-                    cache_write_tokens: row.get(9)?,
-                    reasoning_tokens: row.get(10)?,
-                    parser_version: row.get(12)?,
-                },
-                raw_usage_json.as_deref(),
-            );
-            Ok(SessionUsageEventRecord {
-                event_key: row.get(0)?,
-                event_seq: row.get(1)?,
-                message_seq: row.get(2)?,
-                timestamp: row.get(3)?,
-                model: row.get(4)?,
-                provider: row.get(5)?,
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_read_tokens: usage.cache_read_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                reasoning_tokens: usage.reasoning_tokens,
-                token_source: row.get(11)?,
-                parser_version: usage.parser_version,
-                source_path: row.get(13)?,
-                raw_usage_json,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
+pub(super) struct OwnershipSourceRow {
+    pub(super) event_id: i64,
+    pub(super) source: String,
+    pub(super) event_seq: i64,
+    pub(super) timestamp: i64,
+    pub(super) event_key: String,
+    pub(super) model: String,
+    pub(super) provider: String,
+    pub(super) input_tokens: i64,
+    pub(super) output_tokens: i64,
+    pub(super) cache_read_tokens: i64,
+    pub(super) cache_write_tokens: i64,
+    pub(super) reasoning_tokens: i64,
+    pub(super) parser_version: u32,
+    pub(super) raw_usage_json: Option<String>,
 }
 
-fn normalize_persisted_usage(
+pub(super) struct UsageScanRow {
+    pub(super) event_id: i64,
+    pub(super) session_id: String,
+    pub(super) source: String,
+    pub(super) event_seq: i64,
+    pub(super) timestamp: i64,
+    pub(super) event_key: String,
+    pub(super) model: String,
+    pub(super) provider: String,
+    pub(super) input_tokens: i64,
+    pub(super) output_tokens: i64,
+    pub(super) cache_read_tokens: i64,
+    pub(super) cache_write_tokens: i64,
+    pub(super) reasoning_tokens: i64,
+    pub(super) token_source: String,
+    pub(super) parser_version: u32,
+    pub(super) raw_usage_json: Option<String>,
+}
+
+pub(super) fn normalize_persisted_usage(
     source: &str,
     mut usage: PersistedUsage,
     raw_usage_json: Option<&str>,
@@ -475,4 +339,58 @@ pub(super) fn replace_usage_events(
     }
 
     Ok(())
+}
+
+pub(super) fn push_source_filter(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    start_idx: usize,
+    column: &str,
+    sources: Option<&[String]>,
+) {
+    if let Some(source_ids) = sources
+        && !source_ids.is_empty()
+    {
+        sql.push_str(&format!(" AND {column} IN ("));
+        for (i, source_id) in source_ids.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("?{}", start_idx + i));
+            params.push(Box::new(source_id.clone()));
+        }
+        sql.push(')');
+    }
+}
+
+pub(super) fn map_usage_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageEventRecord> {
+    let source = row.get::<_, String>(1)?;
+    let raw_usage_json = row.get::<_, Option<String>>(14)?;
+    let usage = normalize_persisted_usage(
+        &source,
+        PersistedUsage {
+            input_tokens: row.get(7)?,
+            output_tokens: row.get(8)?,
+            cache_read_tokens: row.get(9)?,
+            cache_write_tokens: row.get(10)?,
+            reasoning_tokens: row.get(11)?,
+            parser_version: row.get(13)?,
+        },
+        raw_usage_json.as_deref(),
+    );
+    Ok(UsageEventRecord {
+        session_id: row.get(0)?,
+        source,
+        source_id: row.get(2)?,
+        event_key: row.get(3)?,
+        timestamp: row.get(4)?,
+        model: row.get(5)?,
+        provider: row.get(6)?,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        token_source: row.get(12)?,
+    })
 }

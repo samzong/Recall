@@ -48,10 +48,13 @@ pub(super) fn render_projects_header(f: &mut Frame, app: &App, area: Rect) {
         control.push(Span::styled(" scope ", muted));
         control.push(Span::styled(format!("[{}]", truncate_label(&scope_label, 20)), chip));
     }
+    if app.sync_in_flight {
+        control.push(Span::styled("  syncing...", muted));
+    }
 
     let mut lines = vec![Line::from(control)];
 
-    if app.usage.is_loading() {
+    if app.usage.is_dashboard_loading() {
         lines.push(Line::from(Span::styled(
             " Loading project usage...",
             Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
@@ -105,7 +108,7 @@ pub(super) fn render_projects_table(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.accent));
 
-    if app.usage.is_loading() {
+    if app.usage.is_dashboard_loading() {
         f.render_widget(
             Paragraph::new("Loading project usage...")
                 .style(Style::default().fg(THEME.accent))

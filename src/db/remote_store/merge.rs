@@ -223,6 +223,8 @@ impl Store {
             tx.query_row("SELECT COUNT(*) FROM session_sync WHERE head_count > 1", [], |row| {
                 row.get(0)
             })?;
+        crate::db::usage_store::flush_dirty_usage_tx(&tx)?;
+        crate::db::skill_audit_store::flush_dirty_skill_tx(&tx)?;
         tx.commit()?;
         Ok(conflicts)
     }

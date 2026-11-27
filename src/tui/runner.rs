@@ -4,8 +4,7 @@ use crate::adapters;
 use crate::config::AppConfig;
 use crate::db::store::Store;
 use crate::tui::search_worker::SearchWorker;
-use crate::tui::sync_worker::SyncWorker;
-use crate::tui::usage_state::UsageTab;
+use crate::tui::sync_worker::{SyncRequest, SyncWorker};
 use crate::tui::usage_worker::UsageWorker;
 use crate::usage::UsageStart;
 
@@ -22,7 +21,6 @@ pub(crate) fn run(usage_start: Option<UsageStart>) -> Result<()> {
 
     use crate::tui::app::App;
     use crate::tui::event::{AppEvent, poll_event};
-    use crate::tui::share_state::AppMode;
     use crate::tui::ui;
 
     let usage_mode = usage_start.is_some();
@@ -68,7 +66,10 @@ pub(crate) fn run(usage_start: Option<UsageStart>) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut app = App::new(&store, sources, config);
+    let mut app = match usage_start {
+        Some(start) => App::new_for_usage(sources, config, start),
+        None => App::new(&store, sources, config),
+    };
     if cfg!(debug_assertions) {
         app.status_message =
             Some("Debug builds do not start semantic indexing; run cargo run -- sync first".into());
@@ -77,27 +78,21 @@ pub(crate) fn run(usage_start: Option<UsageStart>) -> Result<()> {
     let sync_worker = SyncWorker::spawn();
     let usage_worker = UsageWorker::spawn();
     if !cfg!(debug_assertions) {
-        app.sync_in_flight = sync_worker.refresh(crate::tui::sync_worker::SyncRequest {
-            sources: None,
-            scope: crate::project_scope::ProjectScope::Global,
-        });
+        let initial_sync = if usage_mode {
+            SyncRequest::Dashboard
+        } else {
+            SyncRequest::Full { sources: None, scope: crate::project_scope::ProjectScope::Global }
+        };
+        app.sync_in_flight = sync_worker.refresh(initial_sync);
         if !app.sync_in_flight {
             app.fail_sync("Sync worker unavailable");
         }
     }
-    if let Some(start) = usage_start {
-        app.filters.active.sources = start.sources.unwrap_or_default();
-        if let Some(time_filter) = start.time_range {
-            app.usage.time_filter = time_filter;
-        }
-        app.usage.initial_scope = start.initial_scope;
-        if start.open_projects_tab {
-            app.usage.tab = UsageTab::Projects;
-        }
-        app.mode = AppMode::Usage;
-        app.usage.request_refresh();
+    if let Some(request) = app.take_usage_request()
+        && !usage_worker.refresh(request)
+    {
+        app.usage.fail_refresh("Usage worker unavailable");
     }
-    let mut usage_sync_pending = usage_mode;
     let tick_rate = Duration::from_millis(50);
 
     loop {
@@ -137,11 +132,10 @@ pub(crate) fn run(usage_start: Option<UsageStart>) -> Result<()> {
         {
             app.fail_sync("Sync worker unavailable");
         }
-        if let Some(request) = app.take_usage_request(usage_sync_pending) {
-            usage_sync_pending = false;
-            if !usage_worker.refresh(request) {
-                app.usage.fail_refresh("Usage worker unavailable");
-            }
+        if let Some(request) = app.take_usage_request()
+            && !usage_worker.refresh(request)
+        {
+            app.usage.fail_refresh("Usage worker unavailable");
         }
         app.try_search(&store, &search_worker);
         while let Some(response) = search_worker.try_recv() {

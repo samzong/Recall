@@ -107,9 +107,22 @@ pub(crate) struct SkillAuditEventRow {
 
 const COMPACT_MIN_FREE_BYTES: u64 = 1 << 30;
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CompactionPlan {
     pub(crate) reclaimable_bytes: u64,
     pub(crate) required_disk_bytes: u64,
+}
+
+pub(crate) fn compaction_plan_from_pages(
+    page_size: u64,
+    page_count: u64,
+    freelist: u64,
+) -> Option<CompactionPlan> {
+    let reclaimable_bytes = freelist * page_size;
+    if reclaimable_bytes < COMPACT_MIN_FREE_BYTES || freelist * 4 < page_count {
+        return None;
+    }
+    Some(CompactionPlan { reclaimable_bytes, required_disk_bytes: page_count * page_size })
 }
 
 impl Store {
@@ -136,11 +149,7 @@ impl Store {
         let page_size = self.pragma_u64("page_size")?;
         let page_count = self.pragma_u64("page_count")?;
         let freelist = self.pragma_u64("freelist_count")?;
-        let reclaimable_bytes = freelist * page_size;
-        if reclaimable_bytes < COMPACT_MIN_FREE_BYTES || freelist * 2 < page_count {
-            return Ok(None);
-        }
-        Ok(Some(CompactionPlan { reclaimable_bytes, required_disk_bytes: page_count * page_size }))
+        Ok(compaction_plan_from_pages(page_size, page_count, freelist))
     }
 
     pub(crate) fn vacuum(&self) -> Result<()> {
@@ -155,9 +164,16 @@ impl Store {
         Ok(data_dir.join("recall.db"))
     }
 
+    pub(crate) fn background_maintenance_pending(&self) -> Result<bool> {
+        Ok(self.trigram_backfill_pending()?
+            || self.usage_index_backfill_pending()?
+            || self.skill_usage_backfill_pending()?
+            || self.revision_compression_pending()?)
+    }
+
     pub(crate) fn open() -> Result<Self> {
         let store = Self::open_at(&Self::default_db_path()?)?;
-        if !cfg!(test) && store.trigram_backfill_pending()? {
+        if !cfg!(test) && store.background_maintenance_pending()? {
             crate::semantic::ensure_background_worker(false)?;
         }
         Ok(store)
@@ -208,6 +224,7 @@ impl Store {
         crate::db::schema::ensure_supported_version(&conn)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA journal_size_limit=67108864;
              PRAGMA busy_timeout=5000;
              PRAGMA foreign_keys=ON;",
         )?;
@@ -336,5 +353,22 @@ mod exclusion_tests {
                 .is_empty()
         );
         assert!(!absent.exists());
+    }
+
+    #[test]
+    fn compaction_plan_triggers_at_twenty_five_percent_when_at_least_one_gib() {
+        let page_size = 4096;
+        let one_gib_pages = COMPACT_MIN_FREE_BYTES / page_size;
+        assert_eq!(
+            compaction_plan_from_pages(page_size, one_gib_pages * 4, one_gib_pages - 1),
+            None
+        );
+        assert_eq!(
+            compaction_plan_from_pages(page_size, one_gib_pages * 4 + 4, one_gib_pages),
+            None
+        );
+        let plan = compaction_plan_from_pages(page_size, one_gib_pages * 4, one_gib_pages).unwrap();
+        assert_eq!(plan.reclaimable_bytes, COMPACT_MIN_FREE_BYTES);
+        assert_eq!(plan.required_disk_bytes, COMPACT_MIN_FREE_BYTES * 4);
     }
 }

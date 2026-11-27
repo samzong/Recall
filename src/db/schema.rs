@@ -3,10 +3,12 @@ use rusqlite::{Connection, OptionalExtension};
 mod legacy;
 mod remote_pending;
 mod trigram;
+mod usage_index;
 use legacy::*;
+pub(crate) use usage_index::{REVISION_COMPRESSION_JOB, SKILL_USAGE_JOB, USAGE_INDEX_JOB};
 
 const V12_SCHEMA_VERSION: i64 = 12;
-pub(crate) const SCHEMA_VERSION: i64 = 20;
+pub(crate) const SCHEMA_VERSION: i64 = 21;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -77,6 +79,9 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     }
     if version < 20 {
         trigram::migrate_v20(conn)?;
+    }
+    if version < 21 {
+        usage_index::migrate_v21(conn)?;
     }
     Ok(())
 }

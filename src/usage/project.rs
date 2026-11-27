@@ -7,11 +7,11 @@ use serde::Serialize;
 use crate::db::project_store::SessionUsageMeta;
 use crate::db::search::TimeRange;
 use crate::db::store::Store;
+use crate::db::usage_store::UsageSlice;
 use crate::project_scope::ProjectScope;
-use crate::types::UsageEventRecord;
 use crate::usage::{
-    ModelUsage, TokenTotals, UsageReport, UsageReportAccumulator, event_total_tokens,
-    local_datetime,
+    ModelUsage, TokenTotals, UsageReport, UsageReportAccumulator, local_datetime,
+    slice_total_tokens,
 };
 
 #[derive(Debug, Clone)]
@@ -182,10 +182,10 @@ struct ModelAcc {
 }
 
 impl ModelAcc {
-    fn add(&mut self, event: &UsageEventRecord) {
-        self.tokens.add_event(event);
-        self.sessions.insert(event.session_id.clone());
-        self.events += 1;
+    fn add_slice(&mut self, slice: &UsageSlice) {
+        self.tokens.add_slice(slice);
+        self.sessions.insert(slice.session_id.clone());
+        self.events += slice.events;
     }
 }
 
@@ -240,27 +240,27 @@ impl ProjectEntryAcc {
         }
     }
 
-    fn add_event(
+    fn add_slice(
         &mut self,
         meta: Option<&SessionUsageMeta>,
-        event: &UsageEventRecord,
+        slice: &UsageSlice,
         trend: &TrendWindow,
     ) {
         if let Some(meta) = meta {
             self.observe_meta(meta);
         }
-        self.tokens.add_event(event);
-        self.sessions.insert(event.session_id.clone());
-        self.events += 1;
+        self.tokens.add_slice(slice);
+        self.sessions.insert(slice.session_id.clone());
+        self.events += slice.events;
         self.by_model
-            .entry((event.source.clone(), event.provider.clone(), event.model.clone()))
+            .entry((slice.source.clone(), slice.provider.clone(), slice.model.clone()))
             .or_default()
-            .add(event);
-        let model_name = if event.model.is_empty() { "unknown" } else { event.model.as_str() };
-        *self.model_totals.entry(model_name.to_string()).or_insert(0) += event_total_tokens(event);
-        if let Some(bucket) = trend.bucket(event.timestamp) {
-            self.trend_tokens[bucket] += event_total_tokens(event);
-            self.trend_sessions[bucket].insert(event.session_id.clone());
+            .add_slice(slice);
+        let model_name = if slice.model.is_empty() { "unknown" } else { slice.model.as_str() };
+        *self.model_totals.entry(model_name.to_string()).or_insert(0) += slice_total_tokens(slice);
+        if let Some(bucket) = trend.bucket(slice.timestamp) {
+            self.trend_tokens[bucket] += slice_total_tokens(slice);
+            self.trend_sessions[bucket].insert(slice.session_id.clone());
         }
     }
 
@@ -374,19 +374,19 @@ impl ProjectsAccumulator {
         }
     }
 
-    pub(crate) fn add_event(&mut self, meta: Option<&SessionUsageMeta>, event: &UsageEventRecord) {
+    pub(crate) fn add_slice(&mut self, meta: Option<&SessionUsageMeta>, slice: &UsageSlice) {
         let key = session_partition_key(meta);
         let len = self.trend.len;
-        self.entries.entry(key).or_insert_with(|| ProjectEntryAcc::new(len)).add_event(
+        self.entries.entry(key).or_insert_with(|| ProjectEntryAcc::new(len)).add_slice(
             meta,
-            event,
+            slice,
             &self.trend,
         );
-        self.events += 1;
-        self.sessions.insert(event.session_id.clone());
-        self.sources.insert(event.source.clone());
-        self.models.insert((event.source.clone(), event.provider.clone(), event.model.clone()));
-        self.tokens.add_event(event);
+        self.events += slice.events;
+        self.sessions.insert(slice.session_id.clone());
+        self.sources.insert(slice.source.clone());
+        self.models.insert((slice.source.clone(), slice.provider.clone(), slice.model.clone()));
+        self.tokens.add_slice(slice);
     }
 
     pub(crate) fn finish_with_sessions(
@@ -499,18 +499,17 @@ pub(crate) fn build_dashboard_bundle_at(
         (time_range != TimeRange::All).then(|| UsageReportAccumulator::new(today));
     let mut projects_acc = ProjectsAccumulator::new(time_range, now);
 
-    store.fold_usage_events_after(sources, None, (), |(), event| {
-        let in_window = cutoff.is_none_or(|c| event.timestamp >= c);
-        if matches_target(target, scope_ids.as_ref(), &session_meta, &event.session_id) {
+    store.fold_dashboard_usage_slices(sources, cutoff, (), |(), slice, in_window| {
+        if matches_target(target, scope_ids.as_ref(), &session_meta, &slice.session_id) {
             if let Some(all_time) = all_time_acc.as_mut() {
-                all_time.add(&event);
+                all_time.add_slice(&slice);
             }
             if in_window {
-                current_acc.add(&event);
+                current_acc.add_slice(&slice);
             }
         }
         if in_window {
-            projects_acc.add_event(session_meta.get(&event.session_id), &event);
+            projects_acc.add_slice(session_meta.get(&slice.session_id), &slice);
         }
     })?;
 

@@ -190,7 +190,7 @@ where
 
         if let Some(old) = existing.get(&entry.session_id)
             && !snapshot.requires_parse
-            && old.updated_at == Some(mtime_ms)
+            && (context.is_usage_only() || old.updated_at == Some(mtime_ms))
             && parser_state_is_current_for_mtime(
                 options.usage_parser_version,
                 usage_state.get(&entry.session_id).copied(),
@@ -201,11 +201,12 @@ where
                 event_state.get(&entry.session_id).copied(),
                 mtime_ms,
             )
-            && parser_state_is_current_for_mtime(
-                options.metadata_parser_version,
-                metadata_state.get(&entry.session_id).copied(),
-                mtime_ms,
-            )
+            && (context.is_usage_only()
+                || parser_state_is_current_for_mtime(
+                    options.metadata_parser_version,
+                    metadata_state.get(&entry.session_id).copied(),
+                    mtime_ms,
+                ))
         {
             observations.extend(observation);
             stats.skipped_sessions += 1;
@@ -513,5 +514,56 @@ mod tests {
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 0);
         assert_eq!(result.stats.filtered_sessions, 0);
+    }
+
+    #[test]
+    fn usage_only_scan_skips_stale_session_metadata_when_usage_state_matches() {
+        let store = setup_store();
+        let path = temp_file_with_mtime("usage-only");
+        let mtime_ms = stat_mtime_ms(&path).unwrap();
+        store
+            .insert_session(&make_session("s-usage-only", "sess-u1", Some(mtime_ms - 5000), 1))
+            .unwrap();
+        seed_empty_usage_state(&store, "test-source", "sess-u1", 1, Some(mtime_ms));
+
+        let entry = FileScanEntry {
+            session_id: "sess-u1".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+        let usage_ctx = sync_context(&store).with_usage_only(true);
+        let usage_result = run_file_scan_with_options(
+            &usage_ctx,
+            None,
+            FileScanOptions {
+                stream_sessions: false,
+                usage_parser_version: Some(1),
+                event_parser_version: None,
+                metadata_parser_version: Some(1),
+            },
+            vec![entry.clone()],
+            |_, _| panic!("usage-only scan must skip parsing when usage state matches mtime"),
+        )
+        .unwrap();
+        assert_eq!(usage_result.stats.skipped_sessions, 1);
+        assert_eq!(usage_result.sessions.len(), 0);
+
+        let full_ctx = sync_context(&store).with_usage_only(false);
+        let full_result = run_file_scan_with_options(
+            &full_ctx,
+            None,
+            FileScanOptions {
+                stream_sessions: false,
+                usage_parser_version: Some(1),
+                event_parser_version: None,
+                metadata_parser_version: Some(1),
+            },
+            vec![entry],
+            |entry, mtime| Ok(Some(stub_raw_session(&entry.session_id, mtime))),
+        )
+        .unwrap();
+        assert_eq!(full_result.stats.skipped_sessions, 0);
+        assert_eq!(full_result.sessions.len(), 1);
+        let _ = fs::remove_file(&path);
     }
 }
