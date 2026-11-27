@@ -153,6 +153,10 @@ mod tests {
             ("assistant".to_string(), "Renamed it to LoadConfig.".to_string()),
         ];
         assert_eq!(conversation(&path, RolloutDialect::Trae), expected);
+        let archive = path.with_extension("jsonl.zst");
+        let bytes = fs::read(&path).unwrap();
+        fs::write(&archive, zstd::stream::encode_all(&bytes[..], 0).unwrap()).unwrap();
+        assert_eq!(conversation(&archive, RolloutDialect::Trae), expected);
         assert!(
             conversation(&path, RolloutDialect::Codex)
                 .iter()

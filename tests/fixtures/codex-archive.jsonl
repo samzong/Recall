@@ -1,0 +1,7 @@
+{"type":"session_meta","payload":{"id":"019a4c01-e8f4-7270-bdab-7f19273b2381","timestamp":"2026-11-26T10:00:00Z","cwd":"/fixture/archive","model_provider":"openai","thread_source":"subagent","parent_thread_id":"019a4c01-e8f4-7270-bdab-7f19273b2399","agent_nickname":"archive-worker"}}
+{"type":"turn_context","payload":{"model":"gpt-5-codex"}}
+{"timestamp":"2026-11-26T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Read the archive"}}
+{"timestamp":"2026-11-26T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}}}
+{"timestamp":"2026-11-26T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15,"cached_input_tokens":3,"output_tokens":5,"reasoning_output_tokens":1}}}}
+{"timestamp":"2026-11-26T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"Archive read"}}
+{"type":"session_meta","payload":{"id":"019a4c01-e8f4-7270-bdab-7f19273b2399","timestamp":"2026-11-26T10:00:00Z","cwd":"/fixture/archive","thread_source":"user"}}
