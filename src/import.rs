@@ -275,7 +275,7 @@ fn decode_record(
             let token_source: TokenSource = e.token_source.parse().map_err(|()| {
                 anyhow!("line {line_no}: invalid token_source '{}'", e.token_source)
             })?;
-            Ok(RawUsageEvent {
+            let event = RawUsageEvent {
                 event_key: e.event_key,
                 event_seq: e.event_seq,
                 message_seq: e.message_seq,
@@ -291,7 +291,9 @@ fn decode_record(
                 parser_version: e.parser_version,
                 source_path: e.source_path,
                 raw_usage_json: e.raw_usage_json,
-            })
+            };
+            crate::db::usage_store::validate_usage_event(&event)?;
+            Ok(event)
         })
         .collect::<Result<Vec<_>>>()?;
 

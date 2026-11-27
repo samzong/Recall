@@ -167,3 +167,66 @@ pub(super) fn migrate_v21(conn: &Connection) -> anyhow::Result<()> {
     tx.commit()?;
     Ok(())
 }
+
+pub(super) fn migrate_v22(conn: &Connection) -> anyhow::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if super::read_schema_version(&tx)? >= 22 {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "UPDATE usage_events
+         SET output_tokens = output_tokens - reasoning_tokens, parser_version = 3
+         WHERE source = 'copilot-cli'
+           AND parser_version < 3
+           AND reasoning_tokens > 0
+           AND output_tokens >= reasoning_tokens
+           AND EXISTS (
+               SELECT 1 FROM usage_session_state uss
+               WHERE uss.session_id = usage_events.session_id
+                 AND uss.source = 'copilot-cli'
+                 AND uss.parser_version < 3
+           )
+           AND json_valid(raw_usage_json)
+           AND json_extract(raw_usage_json, '$.output_tokens') = output_tokens;
+
+         CREATE TRIGGER IF NOT EXISTS native_bindings_usage_ai AFTER INSERT ON native_bindings BEGIN
+            INSERT INTO usage_dirty_groups(dedup_group)
+                SELECT dedup_group FROM usage_event_ownership
+                WHERE session_id = NEW.session_id AND dedup_group IS NOT NULL
+                ON CONFLICT DO NOTHING;
+         END;
+         CREATE TRIGGER IF NOT EXISTS native_bindings_usage_au AFTER UPDATE ON native_bindings BEGIN
+            INSERT INTO usage_dirty_groups(dedup_group)
+                SELECT dedup_group FROM usage_event_ownership
+                WHERE session_id = OLD.session_id AND dedup_group IS NOT NULL
+                ON CONFLICT DO NOTHING;
+            INSERT INTO usage_dirty_groups(dedup_group)
+                SELECT dedup_group FROM usage_event_ownership
+                WHERE session_id = NEW.session_id AND dedup_group IS NOT NULL
+                ON CONFLICT DO NOTHING;
+         END;
+         CREATE TRIGGER IF NOT EXISTS native_bindings_usage_ad AFTER DELETE ON native_bindings BEGIN
+            INSERT INTO usage_dirty_groups(dedup_group)
+                SELECT dedup_group FROM usage_event_ownership
+                WHERE session_id = OLD.session_id AND dedup_group IS NOT NULL
+                ON CONFLICT DO NOTHING;
+         END;
+         DELETE FROM usage_event_ownership;
+         DELETE FROM usage_rollups;
+         DELETE FROM usage_dirty_sessions;
+         DELETE FROM usage_dirty_groups;",
+    )?;
+    let end: i64 =
+        tx.query_row("SELECT COALESCE(MAX(id), 0) FROM usage_events", [], |row| row.get(0))?;
+    let detail = (end != 0).then(|| serde_json::json!({"cursor": 0_i64, "end": end}).to_string());
+    tx.execute(
+        "INSERT INTO background_job_state(job, phase, detail, updated_at)
+         VALUES (?1, ?2, ?3, unixepoch() * 1000)
+         ON CONFLICT(job) DO UPDATE SET phase = excluded.phase, detail = excluded.detail,
+                                       updated_at = excluded.updated_at",
+        rusqlite::params![USAGE_INDEX_JOB, if end == 0 { "done" } else { "scan" }, detail],
+    )?;
+    tx.execute_batch("PRAGMA user_version = 22;")?;
+    tx.commit()?;
+    Ok(())
+}

@@ -41,6 +41,9 @@ impl Store {
     ) -> Result<()> {
         ensure!(!self.has_native_binding(id)?, "remote cannot replace a native session");
         let data = crate::import::decode_remote(revision.record.clone(), id.to_string())?;
+        for event in &data.usage_events {
+            crate::db::usage_store::validate_usage_event(event)?;
+        }
         clear_session_contents_tx(tx, id)?;
         persist_session_with_usage_and_events_tx(
             tx,

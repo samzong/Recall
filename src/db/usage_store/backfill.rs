@@ -8,9 +8,9 @@ use super::dirty::{
     RollupAccum, rebuild_session_ownership_tx, rebuild_session_rollups_tx, recompute_dedup_group_tx,
 };
 use super::{
-    BUCKET_MILLIS, PersistedUsage, USAGE_DEDUP_BATCH, USAGE_FINALIZE_GROUP_BATCH,
-    USAGE_FINALIZE_SESSION_BATCH, USAGE_SCAN_BATCH, UsageScanRow, dedup_group_key_from_parts,
-    normalize_persisted_usage,
+    PersistedUsage, USAGE_DEDUP_BATCH, USAGE_FINALIZE_GROUP_BATCH, USAGE_FINALIZE_SESSION_BATCH,
+    USAGE_SCAN_BATCH, UsageScanRow, dedup_group_key_from_parts, normalize_persisted_usage,
+    validate_usage_amounts,
 };
 
 pub(super) fn backfill_usage_scan_batch(
@@ -77,6 +77,16 @@ pub(super) fn backfill_usage_scan_batch(
                     },
                     row.raw_usage_json.as_deref(),
                 );
+                validate_usage_amounts(
+                    row.timestamp,
+                    [
+                        row.input_tokens,
+                        row.output_tokens,
+                        row.cache_read_tokens,
+                        row.cache_write_tokens,
+                        row.reasoning_tokens,
+                    ],
+                )?;
                 let group = dedup_group_key_from_parts(
                     &row.source,
                     &row.event_key,
@@ -97,7 +107,16 @@ pub(super) fn backfill_usage_scan_batch(
                     row.event_seq,
                     &row.event_key,
                 ])?;
-                let bucket_ms = row.timestamp.div_euclid(BUCKET_MILLIS) * BUCKET_MILLIS;
+                let bucket_ms = validate_usage_amounts(
+                    row.timestamp,
+                    [
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_write_tokens,
+                        usage.reasoning_tokens,
+                    ],
+                )?;
                 let entry = rollups
                     .entry((
                         bucket_ms,
@@ -108,12 +127,12 @@ pub(super) fn backfill_usage_scan_batch(
                         row.session_id.clone(),
                     ))
                     .or_insert((0, 0, 0, 0, 0, 0));
-                entry.0 += 1;
-                entry.1 += usage.input_tokens;
-                entry.2 += usage.output_tokens;
-                entry.3 += usage.cache_read_tokens;
-                entry.4 += usage.cache_write_tokens;
-                entry.5 += usage.reasoning_tokens;
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry.1.saturating_add(usage.input_tokens);
+                entry.2 = entry.2.saturating_add(usage.output_tokens);
+                entry.3 = entry.3.saturating_add(usage.cache_read_tokens);
+                entry.4 = entry.4.saturating_add(usage.cache_write_tokens);
+                entry.5 = entry.5.saturating_add(usage.reasoning_tokens);
             }
         }
         {
@@ -123,12 +142,12 @@ pub(super) fn backfill_usage_scan_batch(
                     events, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(bucket_ms, source, provider, model, token_source, session_id) DO UPDATE SET
-                    events = usage_rollups.events + excluded.events,
-                    input_tokens = usage_rollups.input_tokens + excluded.input_tokens,
-                    output_tokens = usage_rollups.output_tokens + excluded.output_tokens,
-                    cache_read_tokens = usage_rollups.cache_read_tokens + excluded.cache_read_tokens,
-                    cache_write_tokens = usage_rollups.cache_write_tokens + excluded.cache_write_tokens,
-                    reasoning_tokens = usage_rollups.reasoning_tokens + excluded.reasoning_tokens",
+                    events = MIN(9223372036854775807, usage_rollups.events + excluded.events),
+                    input_tokens = MIN(9223372036854775807, usage_rollups.input_tokens + excluded.input_tokens),
+                    output_tokens = MIN(9223372036854775807, usage_rollups.output_tokens + excluded.output_tokens),
+                    cache_read_tokens = MIN(9223372036854775807, usage_rollups.cache_read_tokens + excluded.cache_read_tokens),
+                    cache_write_tokens = MIN(9223372036854775807, usage_rollups.cache_write_tokens + excluded.cache_write_tokens),
+                    reasoning_tokens = MIN(9223372036854775807, usage_rollups.reasoning_tokens + excluded.reasoning_tokens)",
             )?;
             for ((bucket_ms, source, provider, model, token_source, session_id), sums) in rollups {
                 rollup_stmt.execute(rusqlite::params![

@@ -135,16 +135,17 @@ impl TokenTotals {
         cache_write_tokens: i64,
         reasoning_tokens: i64,
     ) {
-        self.input_tokens += input_tokens;
-        self.output_tokens += output_tokens;
-        self.cache_read_tokens += cache_read_tokens;
-        self.cache_write_tokens += cache_write_tokens;
-        self.reasoning_tokens += reasoning_tokens;
-        self.total_tokens = self.input_tokens
-            + self.output_tokens
-            + self.cache_read_tokens
-            + self.cache_write_tokens
-            + self.reasoning_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(cache_read_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.saturating_add(cache_write_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(reasoning_tokens);
+        self.total_tokens = self
+            .input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+            .saturating_add(self.reasoning_tokens);
     }
 }
 
@@ -275,7 +276,8 @@ impl UsageReportAccumulator {
         self.weekly_all_sessions.entry(week).or_default().insert(slice.session_id.clone());
         if dt.date_naive() == self.today {
             let hour = dt.hour() as usize;
-            self.hourly_today_tokens[hour] += slice_total_tokens(slice);
+            self.hourly_today_tokens[hour] =
+                self.hourly_today_tokens[hour].saturating_add(slice_total_tokens(slice));
             self.hourly_today_sessions[hour].insert(slice.session_id.clone());
         }
     }

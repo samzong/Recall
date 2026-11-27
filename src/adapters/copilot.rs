@@ -26,7 +26,7 @@ pub(crate) struct CopilotAdapter;
 
 const METADATA_PARSER_VERSION: u32 = 1;
 const EVENT_PARSER_VERSION: u32 = 3;
-const USAGE_PARSER_VERSION: u32 = 2;
+const USAGE_PARSER_VERSION: u32 = 3;
 
 impl SourceAdapter for CopilotAdapter {
     fn id(&self) -> &str {
@@ -208,8 +208,9 @@ fn load_copilot_usage_index(db_path: Option<&Path>) -> CopilotUsageIndex {
         let cache_read_tokens = cache_read.unwrap_or(0).max(0);
         let cache_write_tokens = cache_write.unwrap_or(0).max(0);
         let reasoning_tokens = reasoning.unwrap_or(0).max(0);
-        let input_tokens =
-            inclusive_input.saturating_sub(cache_read_tokens.saturating_add(cache_write_tokens));
+        let input_tokens = inclusive_input
+            .saturating_sub(cache_read_tokens.saturating_add(cache_write_tokens))
+            .max(0);
         if input_tokens == 0
             && output_tokens == 0
             && cache_read_tokens == 0
@@ -238,7 +239,7 @@ fn load_copilot_usage_index(db_path: Option<&Path>) -> CopilotUsageIndex {
             model,
             provider: "github".to_string(),
             input_tokens,
-            output_tokens,
+            output_tokens: output_tokens.saturating_sub(reasoning_tokens).max(0),
             cache_read_tokens,
             cache_write_tokens,
             reasoning_tokens,
@@ -914,7 +915,7 @@ mod tests {
         assert_eq!(result.sessions[0].usage_events[0].model, "gpt-5.6-luna");
         assert_eq!(result.sessions[0].usage_events[0].provider, "github");
         assert_eq!(result.sessions[0].usage_events[0].input_tokens, 95);
-        assert_eq!(result.sessions[0].usage_events[0].output_tokens, 20);
+        assert_eq!(result.sessions[0].usage_events[0].output_tokens, 17);
         assert_eq!(result.sessions[0].usage_events[0].cache_read_tokens, 5);
         assert_eq!(result.sessions[0].usage_events[0].reasoning_tokens, 3);
 
@@ -995,5 +996,71 @@ mod tests {
         assert_eq!(result.sessions[0].usage_events[0].input_tokens, 95);
 
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn v22_partial_usage_is_reparsed_with_unchanged_source_mtime() {
+        let root = temp_copilot_root("v22-partial");
+        let sessions_dir = root.join("session-state");
+        let uuid = "f3eca837-818f-44d7-9158-bf242901f960";
+        let events_path = write_copilot_session(&sessions_dir, "dir-1", uuid, "hello");
+        let mtime = file_scan::stat_mtime_ms(&events_path).unwrap();
+        let usage_db = root.join("session-store.db");
+        write_usage_db(&usage_db, uuid, "2026-08-27T19:12:13.186Z");
+        let store = setup_store();
+        let scanned = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            Some(&usage_db),
+        )
+        .unwrap();
+        let store = crate::sync::persist_raw_session_for_conformance(
+            store,
+            "copilot-cli",
+            scanned.sessions.into_iter().next().unwrap(),
+        )
+        .unwrap();
+        store.conn.execute_batch("UPDATE usage_events SET output_tokens = 20, parser_version = 2;
+            UPDATE usage_session_state SET parser_version = 2;
+            INSERT INTO usage_events(session_id,source,source_id,event_key,event_seq,timestamp,model,provider,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,token_source,parser_version,created_at)
+            SELECT session_id,source,source_id,'missing-raw',1,timestamp,model,provider,input_tokens,20,cache_read_tokens,cache_write_tokens,reasoning_tokens,token_source,2,created_at FROM usage_events;
+            PRAGMA user_version = 21;").unwrap();
+        crate::db::schema::init(&store.conn).unwrap();
+        assert_eq!(store.usage_state_meta_map("copilot-cli").unwrap()[uuid].parser_version, 2);
+        assert_eq!(file_scan::stat_mtime_ms(&events_path).unwrap(), mtime);
+        let result = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            Some(&usage_db),
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        let store = crate::sync::persist_raw_session_for_conformance(
+            store,
+            "copilot-cli",
+            result.sessions.into_iter().next().unwrap(),
+        )
+        .unwrap();
+        let session = store.get_session_by_source_id("copilot-cli", uuid).unwrap().unwrap();
+        let rows = store.list_usage_events_for_session(&session.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].output_tokens, rows[0].reasoning_tokens, rows[0].parser_version),
+            (17, 3, 3)
+        );
+        assert_eq!(store.usage_state_meta_map("copilot-cli").unwrap()[uuid].parser_version, 3);
+        let skipped = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "copilot-cli").unwrap(),
+            None,
+            true,
+            Some(&usage_db),
+        )
+        .unwrap();
+        assert!(skipped.sessions.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 }
