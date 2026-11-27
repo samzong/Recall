@@ -358,13 +358,12 @@ fn confer_text_scan_handles_multibyte_utf8_across_window_boundary() {
     let mut ev1 = crate::types::test_support::session_event("tool_call");
     ev1.event_seq = 0;
     ev1.message_seq = Some(0);
-    ev1.summary =
-        Some("room_id: 这是一段用于测试多字节字符跨窗口边界不会崩溃的中文文本内容".into());
+    ev1.summary = Some(format!("room_id: {} multibyte utf8 window check", "€".repeat(32)));
 
     let mut ev2 = crate::types::test_support::session_event("tool_call");
     ev2.event_seq = 1;
     ev2.message_seq = Some(1);
-    ev2.summary = Some(format!("room_id={room_id} 这是一段紧跟在编号后面的中文说明文本确保跨界"));
+    ev2.summary = Some(format!("room_id={room_id} {} multibyte utf8 window check", "€".repeat(32)));
 
     persist_session(&store, &host, &[ev1, ev2], &SessionTopologyWrite::none());
     persist_session(&store, &peer, &[], &SessionTopologyWrite::none());

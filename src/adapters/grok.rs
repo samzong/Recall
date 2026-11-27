@@ -1035,13 +1035,13 @@ mod tests {
     #[test]
     fn parse_grok_updates_preserves_native_edit_lifecycle() {
         let jsonl = r#"{"timestamp":1788319322,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Document share inventory"}}}}
-{"timestamp":1788319323,"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"edit-101","title":"search_replace","rawInput":{"file_path":"README.zh-CN.md","old_string":"share","new_string":"share\nlist"}}}}
-{"timestamp":1788319323,"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"edit-101","kind":"edit","title":"Edit README.zh-CN.md","content":[{"type":"diff","path":"README.zh-CN.md","oldText":"share","newText":"share\nlist"}],"rawInput":{"variant":"SearchReplace","file_path":"README.zh-CN.md","old_string":"share","new_string":"share\nlist","replace_all":false}}}}
-{"timestamp":1788319324,"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"edit-101","status":"completed","content":[{"type":"diff","path":"README.zh-CN.md","oldText":"share","newText":"share\nlist"}],"rawOutput":{"type":"SearchReplace","EditsApplied":{"absolute_path":"README.zh-CN.md","old_string":"share","new_string":"share\nlist","edits":{"details":[{"old_line":28,"new_line":28}]}}}}}}
+{"timestamp":1788319323,"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"edit-101","title":"search_replace","rawInput":{"file_path":"DEVELOPMENT.md","old_string":"share","new_string":"share\nlist"}}}}
+{"timestamp":1788319323,"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"edit-101","kind":"edit","title":"Edit DEVELOPMENT.md","content":[{"type":"diff","path":"DEVELOPMENT.md","oldText":"share","newText":"share\nlist"}],"rawInput":{"variant":"SearchReplace","file_path":"DEVELOPMENT.md","old_string":"share","new_string":"share\nlist","replace_all":false}}}}
+{"timestamp":1788319324,"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"edit-101","status":"completed","content":[{"type":"diff","path":"DEVELOPMENT.md","oldText":"share","newText":"share\nlist"}],"rawOutput":{"type":"SearchReplace","EditsApplied":{"absolute_path":"DEVELOPMENT.md","old_string":"share","new_string":"share\nlist","edits":{"details":[{"old_line":28,"new_line":28}]}}}}}}
 {"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"failed-edit","status":"failed","content":[{"type":"content","content":{"type":"text","text":"No match"}}]}}}
-{"timestamp":1788319325,"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"read-102","title":"read_file","rawInput":{"target_file":"README.zh-CN.md"}}}}
-{"timestamp":1788319326,"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"read-102","status":"completed","rawOutput":{"type":"ReadFile","FileContent":{"absolute_path":"README.zh-CN.md","content":"share\nlist","total_lines":2}}}}}
-{"timestamp":1788319327,"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"shell-103","title":"run_terminal_command","rawInput":{"command":"git diff -- README.zh-CN.md"}}}}
+{"timestamp":1788319325,"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"read-102","title":"read_file","rawInput":{"target_file":"DEVELOPMENT.md"}}}}
+{"timestamp":1788319326,"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"read-102","status":"completed","rawOutput":{"type":"ReadFile","FileContent":{"absolute_path":"DEVELOPMENT.md","content":"share\nlist","total_lines":2}}}}}
+{"timestamp":1788319327,"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"shell-103","title":"run_terminal_command","rawInput":{"command":"git diff -- DEVELOPMENT.md"}}}}
 "#;
         let (messages, _, events) = parse_grok_updates_reader(
             Cursor::new(jsonl),
@@ -1059,7 +1059,7 @@ mod tests {
             assert_eq!(event.message_seq, Some(0));
             assert_eq!(event.files.len(), 1);
             assert_eq!(event.files[0].operation, FileOperation::Write);
-            assert_eq!(event.files[0].path, "README.zh-CN.md");
+            assert_eq!(event.files[0].path, "DEVELOPMENT.md");
             assert_eq!(event.files[0].cwd.as_deref(), Some("/tmp/project"));
             assert!(event.files[0].target.is_none());
             let original: Value =
@@ -1082,7 +1082,7 @@ mod tests {
         assert_eq!(events[5].files[0].kind, FileEvidenceKind::Observation);
         assert_eq!(events[5].files[0].operation, FileOperation::Read);
         assert_eq!(events[6].kind, "command");
-        assert_eq!(events[6].target.as_deref(), Some("git diff -- README.zh-CN.md"));
+        assert_eq!(events[6].target.as_deref(), Some("git diff -- DEVELOPMENT.md"));
         assert!(events[6].files.is_empty());
         assert_eq!(
             events[6].command_evidence_status,
@@ -1090,14 +1090,14 @@ mod tests {
         );
         let (_, _, reads) = parse_grok_updates_reader(
             Cursor::new(
-                jsonl.replace("git diff -- README.zh-CN.md", "git restore -- README.zh-CN.md"),
+                jsonl.replace("git diff -- DEVELOPMENT.md", "git restore -- DEVELOPMENT.md"),
             ),
             Some("/native/updates.jsonl"),
             Some("/tmp/project"),
             true,
         )
         .unwrap();
-        assert_eq!(reads[6].files[0].path, "README.zh-CN.md");
+        assert_eq!(reads[6].files[0].path, "DEVELOPMENT.md");
         assert_eq!(reads[6].files[0].kind, FileEvidenceKind::Command);
         assert_eq!(reads[6].files[0].cwd, None);
         assert_eq!(

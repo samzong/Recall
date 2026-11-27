@@ -2248,7 +2248,7 @@ mod tests {
         let composer = uuid::Uuid::new_v4().to_string();
         let bubble = uuid::Uuid::new_v4().to_string();
         let conn = seed_global_db(&root, &composer, &bubble);
-        let content = "原始文件\n";
+        let content = "raw file\n";
         let content_id = format!("composer.content.{:x}", Sha256::digest(content.as_bytes()));
         let attrs = serde_json::json!({"beforeContentId":content_id,"afterContentId":content_id})
             .to_string();

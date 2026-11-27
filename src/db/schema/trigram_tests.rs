@@ -24,8 +24,8 @@ fn v20_converges_missing_partial_and_complete_legacy_indexes() {
                 "INSERT INTO sessions(id, source, source_id, title, started_at)
              VALUES ('s', 'test', 's', 'migration', 1);
              INSERT INTO messages(session_id, role, content, seq, trigram_indexed)
-             VALUES ('s', 'user', '历史消息包含数据库迁移', 0, NULL),
-                    ('s', 'user', '另一条包含数据库迁移', 1, 1),
+             VALUES ('s', 'user', '이전메시지에데이터이전포함', 0, NULL),
+                    ('s', 'user', '다른메시지에데이터이전포함', 1, 1),
                     ('s', 'user', 'ordinary English', 2, 0);
              PRAGMA user_version=19;",
             )
@@ -56,16 +56,16 @@ fn v20_converges_missing_partial_and_complete_legacy_indexes() {
         init(&store.conn).unwrap();
         assert_eq!(schema_version(&store.conn).unwrap(), current_schema_version());
         let engine = SearchEngine::new(&store.conn);
-        assert!(engine.search_messages("数据库迁移", &filters(), None, 50).is_err());
-        assert!(engine.hybrid_search("数据库迁移", None, &filters(), 20, 3).is_err());
+        assert!(engine.search_messages("데이터이전", &filters(), None, 50).is_err());
+        assert!(engine.hybrid_search("데이터이전", None, &filters(), 20, 3).is_err());
         assert_eq!(engine.search_messages("ordinary", &filters(), None, 50).unwrap().len(), 1);
         while store.backfill_trigram_batch().unwrap() {}
         store.finish_trigram_backfill().unwrap();
-        assert_eq!(engine.search_messages("数据库迁移", &filters(), None, 50).unwrap().len(), 2);
+        assert_eq!(engine.search_messages("데이터이전", &filters(), None, 50).unwrap().len(), 2);
         init(&store.conn).unwrap();
         assert!(!store.backfill_trigram_batch().unwrap());
         store.conn.execute_batch("DELETE FROM messages;").unwrap();
-        assert!(engine.search_messages("数据库迁移", &filters(), None, 50).unwrap().is_empty());
+        assert!(engine.search_messages("데이터이전", &filters(), None, 50).unwrap().is_empty());
         store.conn.execute_batch(
             "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES ('integrity-check');",
         ).unwrap();
@@ -85,7 +85,7 @@ fn v20_resumes_after_reopen_and_keeps_concurrent_and_legacy_writes_searchable() 
          VALUES ('s', 'test', 's', 'migration', 1);
          WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<260)
          INSERT INTO messages(session_id, role, content, seq, trigram_indexed)
-         SELECT 's', 'user', '历史消息包含数据库迁移', i, 1 FROM n;
+         SELECT 's', 'user', '이전메시지에데이터이전포함', i, 1 FROM n;
          PRAGMA user_version=19;",
         )
         .unwrap();
@@ -102,16 +102,16 @@ fn v20_resumes_after_reopen_and_keeps_concurrent_and_legacy_writes_searchable() 
          );
          DELETE FROM messages WHERE seq IN (1, 200);
          INSERT INTO messages(session_id, role, content, seq)
-         VALUES ('s', 'user', '降级写入数据库迁移', 300);
+         VALUES ('s', 'user', '폴백기록데이터이전', 300);
          INSERT INTO messages(session_id, role, content, seq, trigram_indexed)
-         VALUES ('s', 'user', '新增消息数据库迁移', 301, 1);
+         VALUES ('s', 'user', '신규기록데이터이전', 301, 1);
          DELETE FROM messages WHERE seq=301;",
         )
         .unwrap();
     while store.backfill_trigram_batch().unwrap() {}
     store.finish_trigram_backfill().unwrap();
     let count: i64 = store.conn.query_row(
-        "SELECT count(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH '数据库迁移'",
+        "SELECT count(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH '데이터이전'",
         [], |r| r.get(0),
     ).unwrap();
     assert_eq!(count, 258);
@@ -135,7 +135,7 @@ fn v20_missing_or_incomplete_job_state_cannot_corrupt_unindexed_deletions() {
         store.conn.execute_batch(
             "INSERT INTO sessions(id,source,source_id,title,started_at) VALUES ('s','test','s','state',1);
              INSERT INTO messages(session_id,role,content,seq,trigram_indexed)
-             VALUES ('s','user','数据库迁移',1,1),('s','user','数据库迁移',2,1);
+             VALUES ('s','user','데이터이전',1,1),('s','user','데이터이전',2,1);
              PRAGMA user_version=19;",
         ).unwrap();
         init(&store.conn).unwrap();
@@ -150,7 +150,7 @@ fn v20_missing_or_incomplete_job_state_cannot_corrupt_unindexed_deletions() {
         store.conn.execute_batch("DELETE FROM messages WHERE seq=2;").unwrap();
         assert!(
             SearchEngine::new(&store.conn)
-                .search_messages("数据库迁移", &filters(), None, 50)
+                .search_messages("데이터이전", &filters(), None, 50)
                 .is_err()
         );
         store.conn.execute(
@@ -166,7 +166,7 @@ fn v20_missing_or_incomplete_job_state_cannot_corrupt_unindexed_deletions() {
         assert_eq!(averages[0], 1);
         assert_eq!(
             SearchEngine::new(&store.conn)
-                .search_messages("数据库迁移", &filters(), None, 50)
+                .search_messages("데이터이전", &filters(), None, 50)
                 .unwrap()
                 .len(),
             1

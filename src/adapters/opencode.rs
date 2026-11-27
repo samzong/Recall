@@ -2168,7 +2168,7 @@ mod tests {
         )
         .unwrap();
         let message_id = conn.last_insert_rowid();
-        let long_output = "汉🦀".repeat(3000);
+        let long_output = "€🦀".repeat(3000);
         let parts = [
             serde_json::json!({
                 "type": "tool", "callID": "read-1", "tool": "read",

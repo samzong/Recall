@@ -299,7 +299,7 @@ fn get_session_events_bound_unicode_fields_and_total_text() {
     let mut stored = session("s1", "codex", "event text cap", 1_000);
     stored.message_count = 0;
     store.insert_session(&stored).unwrap();
-    let long = "汉".repeat(GET_EVENT_FIELD_CHAR_CAP + 50);
+    let long = "€".repeat(GET_EVENT_FIELD_CHAR_CAP + 50);
     let events = (0..GET_EVENT_LIMIT as u32)
         .map(|seq| {
             let mut event = event(seq, "tool_call", None, None, Some(&long), None);
@@ -330,7 +330,7 @@ fn get_session_events_bound_unicode_fields_and_total_text() {
 fn get_session_cursor_reads_the_rest_of_a_long_message() {
     let store = setup();
     store.insert_session(&session("s1", "codex", "Long", 2000)).unwrap();
-    let original = "\u{4f60}\u{597d}🦀end".repeat(500);
+    let original = "€★🦀end".repeat(500);
     store.insert_messages(&[message("s1", Role::Assistant, &original, 83)]).unwrap();
     let index = ready(store);
     let mut args = GetSessionArgs {
@@ -377,14 +377,15 @@ fn get_session_missing_id_is_a_tool_error() {
 #[test]
 fn paged_get_session_caps_utf8_bytes_losslessly_and_bounds_included_events() {
     let store = setup();
-    let mut stored = session("s1", "codex", "中文会话分页预算", 1_000);
-    stored.summary = Some(format!("\x1b[32m加载 10%\r加载 100%\x1b[0m\r\n{}", "摘".repeat(220)));
+    let mut stored = session("s1", "codex", "utf8-paged-session-budget", 1_000);
+    stored.summary =
+        Some(format!("\x1b[32mloading 10%\rloading 100%\x1b[0m\r\n{}", "€".repeat(220)));
     stored.message_count = 1;
     store.insert_session(&stored).unwrap();
-    let prefix = "\x1b[31m彩色终端\x1b[0m\r保留帧\r\n\"引号\"\\\x00🦀";
+    let prefix = "\x1b[31mcolor-tty\x1b[0m\rkept-frame\r\n\"quoted\"\\\x00🦀";
     let escape_heavy = "\x01\"\n".repeat(700);
     let pad_chars = 6000 - prefix.chars().count() - escape_heavy.chars().count();
-    let full_message = format!("{prefix}{escape_heavy}{}", "汉".repeat(pad_chars));
+    let full_message = format!("{prefix}{escape_heavy}{}", "€".repeat(pad_chars));
     assert_eq!(full_message.chars().count(), 6000);
     store.insert_messages(&[message("s1", Role::Assistant, &full_message, 83)]).unwrap();
     let events: Vec<_> = (0..45)
@@ -392,9 +393,9 @@ fn paged_get_session_caps_utf8_bytes_losslessly_and_bounds_included_events() {
             let mut ev = event(
                 seq,
                 "tool_call",
-                Some(&"路".repeat(180)),
+                Some(&"€".repeat(180)),
                 Some(1_700_000_000_000),
-                Some(&format!("\x1b[33mstep 1\rstep 2-{seq}\x1b[0m\r\n{}", "事".repeat(160))),
+                Some(&format!("\x1b[33mstep 1\rstep 2-{seq}\x1b[0m\r\n{}", "€".repeat(160))),
                 Some("Bash"),
             );
             ev.message_seq = Some(83);
@@ -419,8 +420,8 @@ fn paged_get_session_caps_utf8_bytes_losslessly_and_bounds_included_events() {
         );
         let summary = page.summary.as_deref().unwrap();
         assert!(!summary.contains('\x1b'));
-        assert!(!summary.contains("加载 10%"));
-        assert!(summary.starts_with("加载 100%\n"));
+        assert!(!summary.contains("loading 10%"));
+        assert!(summary.starts_with("loading 100%\n"));
         assert_eq!(summary.chars().count(), EXCERPT_CHAR_CAP);
         assert_eq!(page.first_message_byte_offset, Some(assembled.len()));
         assembled.push_str(page.messages.strip_prefix("[83][assistant] ").unwrap());

@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(session.source_id, "T-0199cccc-dddd-7eee-8fff-000011112222");
         assert_eq!(session.messages[0].content, "wrapped user");
         assert_eq!(session.messages[1].content, "wrapped assistant");
-        let payload = "完整".repeat(3000);
+        let payload = "€★".repeat(3000);
         let value = serde_json::json!({
             "thread": { "id": "native", "env": {"initial": {"trees": [{"uri": "file:///tmp/work"}]}},
                 "messages": [

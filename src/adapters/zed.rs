@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn start_url_preserves_unicode_and_query_delimiters() {
-        let prompt = "Read a&b? + 中文\nThen edit";
+        let prompt = "Read a&b? + €★\nThen edit";
         let command = ZedAdapter.start_command(prompt.into()).unwrap();
         assert_eq!(command.program, "zed");
         let encoded = command.args[0].strip_prefix("zed://agent?prompt=").unwrap();

@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn keys_cannot_escape_or_alias_the_target_root() {
-        for key in ["", "/a", "a/", "a//b", "a/../b", "a/./b", "a\\b", "a%2fb", "A", "中"] {
+        for key in ["", "/a", "a/", "a//b", "a/../b", "a/./b", "a\\b", "a%2fb", "A", "€"] {
             assert!(validate_key(key, false).is_err(), "{key}");
         }
         assert!(validate_key("revisions/0123.json", false).is_ok());

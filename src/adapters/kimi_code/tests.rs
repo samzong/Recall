@@ -27,9 +27,9 @@ pub(super) fn fixture_wire() -> &'static str {
         "\n",
         r#"{"type":"context.append_loop_event","time":1700000005000,"event":{"type":"content.part","uuid":"u2","part":{"type":"text","text":"Here is the fix."}}}"#,
         "\n",
-        r#"{"type":"context.append_loop_event","time":1700000005500,"event":{"type":"tool.call","uuid":"call-uuid","turnId":"1","step":1,"stepUuid":"step-uuid","toolCallId":"Edit:1","name":"Edit","args":{"path":"README.zh-CN.md","old_string":"old","new_string":"new"}}}"#,
+        r#"{"type":"context.append_loop_event","time":1700000005500,"event":{"type":"tool.call","uuid":"call-uuid","turnId":"1","step":1,"stepUuid":"step-uuid","toolCallId":"Edit:1","name":"Edit","args":{"path":"DEVELOPMENT.md","old_string":"old","new_string":"new"}}}"#,
         "\n",
-        r#"{"type":"context.append_loop_event","time":1700000005600,"event":{"type":"tool.result","parentUuid":"call-uuid","toolCallId":"Edit:1","result":{"output":"Replaced 1 occurrence in README.zh-CN.md"}}}"#,
+        r#"{"type":"context.append_loop_event","time":1700000005600,"event":{"type":"tool.result","parentUuid":"call-uuid","toolCallId":"Edit:1","result":{"output":"Replaced 1 occurrence in DEVELOPMENT.md"}}}"#,
         "\n",
         r#"{"type":"usage.record","time":1700000006000,"model":"kimi-k3","usageScope":"turn","usage":{"inputOther":1200,"output":80,"inputCacheRead":300,"inputCacheCreation":40}}"#,
     )

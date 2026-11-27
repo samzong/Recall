@@ -849,25 +849,21 @@ mod tests {
         let messages_json = r#"[
             {"ts": 1000, "type": "say", "say": "task", "text": "do something"},
             {"ts": 2000, "type": "say", "say": "text", "text": "ok, let me check"},
-            {"ts": 3000, "type": "question", "question": "请问你要选择哪个方案？"},
-            {"ts": 4000, "type": "say", "say": "text", "text": "根据你的选择继续"}
+            {"ts": 3000, "type": "question", "question": "Which option would you like to choose?"},
+            {"ts": 4000, "type": "say", "say": "text", "text": "Continuing with your selection"}
         ]"#;
         let path = write_task(&root, "3000", messages_json);
 
         let msgs = load_ui_messages(&path).unwrap();
         assert_eq!(msgs.len(), 4);
-        // Task is User
         assert!(matches!(msgs[0].role, Role::User));
         assert_eq!(msgs[0].content, "do something");
-        // Text after task is Assistant
         assert!(matches!(msgs[1].role, Role::Assistant));
         assert_eq!(msgs[1].content, "ok, let me check");
-        // Question is Assistant
         assert!(matches!(msgs[2].role, Role::Assistant));
-        assert_eq!(msgs[2].content, "请问你要选择哪个方案？");
-        // Text is Assistant
+        assert_eq!(msgs[2].content, "Which option would you like to choose?");
         assert!(matches!(msgs[3].role, Role::Assistant));
-        assert_eq!(msgs[3].content, "根据你的选择继续");
+        assert_eq!(msgs[3].content, "Continuing with your selection");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -918,7 +914,7 @@ mod tests {
             {"ts": 1000, "type": "say", "say": "task", "text": "fix the bug"},
             {"ts": 2000, "type": "say", "say": "checkpoint_created"},
             {"ts": 3000, "type": "say", "say": "api_req_started", "text": "{\"request\":\"<task>fix the bug</task>\"}"},
-            {"ts": 4000, "type": "say", "say": "reasoning", "text": "用户想修复bug"},
+            {"ts": 4000, "type": "say", "say": "reasoning", "text": "The user wants to fix the bug"},
             {"ts": 5000, "type": "say", "say": "text", "text": "I found the issue"}
         ]"#;
         let path = write_task(&root, "3000", messages_json);
