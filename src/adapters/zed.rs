@@ -408,12 +408,13 @@ fn parse_thread(
             events.push(event);
         }
     }
-    if messages.is_empty() {
+    let usage_events = parse_usage(thread, updated_at, path);
+    if messages.is_empty() && usage_events.is_empty() {
         return Ok(None);
     }
     let mut raw =
         RawSession::search_only(&meta.id, directory, started_at, Some(updated_at), None, messages)
-            .with_usage(parse_usage(thread, updated_at, path), USAGE_PARSER_VERSION);
+            .with_usage(usage_events, USAGE_PARSER_VERSION);
     if include_events {
         raw = raw.with_events(events, EVENT_PARSER_VERSION);
     }
@@ -566,6 +567,26 @@ mod tests {
             "request_token_usage": {"user-1": {"input_tokens": 500, "output_tokens": 30}},
             "model": {"provider": "custom", "model": "test-model"}
         })
+    }
+
+    #[test]
+    fn usage_only_threads_are_retained() {
+        let root = tempfile::tempdir().unwrap();
+        let (path, conn) = database(root.path(), true);
+        let mut thread = current_thread();
+        thread["messages"] = json!([]);
+        insert(&conn, "usage-only", "json", &serde_json::to_vec(&thread).unwrap());
+        for include_events in [false, true] {
+            let scan = scan_database(&path, None, None, include_events).unwrap();
+            assert_eq!(scan.sessions.len(), 1);
+            let raw = &scan.sessions[0];
+            assert!(raw.messages.is_empty());
+            assert_eq!(raw.usage_events.len(), 1);
+            assert_eq!(raw.usage_events[0].input_tokens, 1200);
+            assert_eq!(raw.usage_events[0].timestamp, timestamp(&metadata().updated_at).unwrap());
+        }
+        thread.as_object_mut().unwrap().remove("cumulative_token_usage");
+        assert!(parse_thread(&thread, &metadata(), &path, true).unwrap().is_none());
     }
 
     #[test]

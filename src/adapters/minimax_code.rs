@@ -18,8 +18,8 @@ use crate::adapters::json_util::{json_i64, jsonl_indexed};
 use crate::adapters::paths;
 use crate::adapters::usage::usage_count;
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SourceObservation, SyncScanResult,
-    SyncScanStats, first_timestamp, last_timestamp,
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SourceObservation, SyncScanOutput,
+    SyncScanResult, SyncScanStats, first_timestamp, last_timestamp,
 };
 use crate::types::{FileEvidence, FileOperation, RawSessionEvent, RawUsageEvent, Role};
 
@@ -61,7 +61,7 @@ impl SourceAdapter for MinimaxCodeAdapter {
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        let Some(entries) = minimax_session_entries() else {
+        let Some(entries) = minimax_session_entries(None) else {
             return Ok(vec![]);
         };
         Ok(parse_stable_sessions(entries, true)?.sessions)
@@ -73,7 +73,7 @@ impl SourceAdapter for MinimaxCodeAdapter {
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let Some(entries) = minimax_session_entries() else {
+        let Some(entries) = minimax_session_entries(Some(context)) else {
             return Ok(Some(SyncScanResult::default()));
         };
         let (moved, unchanged) = split_moved_sessions(context, entries);
@@ -88,13 +88,32 @@ impl SourceAdapter for MinimaxCodeAdapter {
         )?);
         Ok(Some(result))
     }
+
+    fn scan_for_sync_output(
+        &self,
+        context: &AdapterSyncContext,
+        since_ts: Option<i64>,
+        include_events: bool,
+        force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
+        if !force {
+            return Ok(self
+                .scan_for_sync(context, since_ts, include_events)?
+                .map(|scan| SyncScanOutput { scan, reconcile: None }));
+        }
+        let scan = match minimax_session_entries(Some(context)) {
+            Some(entries) => rescan_moved_sessions(entries, true)?,
+            None => SyncScanResult::default(),
+        };
+        Ok(Some(SyncScanOutput { scan, reconcile: None }))
+    }
 }
 
-fn minimax_session_entries() -> Option<Vec<FileScanEntry>> {
+fn minimax_session_entries(context: Option<&AdapterSyncContext>) -> Option<Vec<FileScanEntry>> {
     let data_dir = resolve_minimax_data_dir()?;
     let sessions_dir = paths::existing_dir(data_dir.join("v2").join("sessions"))?;
     let workspaces = read_workspace_dirs(&data_dir.join("v2").join("sqlite").join(RUNTIME_DB));
-    Some(collect_session_entries(&sessions_dir, &workspaces))
+    Some(collect_session_entries(&sessions_dir, &workspaces, context))
 }
 
 fn resolve_minimax_data_dir() -> Option<PathBuf> {
@@ -237,7 +256,13 @@ fn query_workspace_dirs(db_path: &Path) -> anyhow::Result<HashMap<String, String
 fn collect_session_entries(
     sessions_dir: &Path,
     workspaces: &HashMap<String, String>,
+    context: Option<&AdapterSyncContext>,
 ) -> Vec<FileScanEntry> {
+    let indexed_paths: HashMap<_, _> = context
+        .into_iter()
+        .flat_map(AdapterSyncContext::session_paths)
+        .filter_map(|session| Some((session.source_file_path.as_deref()?, session)))
+        .collect();
     let mut entries = Vec::new();
     for dir_entry in WalkDir::new(sessions_dir).max_depth(5).into_iter().filter_map(|e| e.ok()) {
         let path = dir_entry.path();
@@ -254,15 +279,20 @@ fn collect_session_entries(
         {
             continue;
         }
+        let mut indexed_directory = None;
         let session_id = match read_manifest(session_dir) {
             Ok(manifest) => manifest.session_id,
             Err(error) => {
                 warn!("{error}");
-                continue;
+                let indexed = path.to_str().and_then(|path| indexed_paths.get(path));
+                indexed_directory = indexed.and_then(|session| session.directory.clone());
+                indexed.map(|session| session.source_id.clone()).unwrap_or_else(|| {
+                    session_dir.file_name().unwrap().to_string_lossy().into_owned()
+                })
             }
         };
         entries.push(FileScanEntry {
-            directory: workspaces.get(&session_id).cloned(),
+            directory: workspaces.get(&session_id).cloned().or(indexed_directory),
             session_id,
             stat_target: path.to_path_buf(),
         });
@@ -272,7 +302,7 @@ fn collect_session_entries(
 
 #[derive(Debug, PartialEq, Eq)]
 struct MinimaxSessionSnapshot {
-    manifest: file_scan::FileMetadataSnapshot,
+    manifest: Option<file_scan::FileMetadataSnapshot>,
     messages: file_scan::FileMetadataSnapshot,
 }
 
@@ -280,9 +310,11 @@ fn minimax_session_snapshot(
     entry: &FileScanEntry,
 ) -> Option<file_scan::FileScanSnapshot<MinimaxSessionSnapshot>> {
     let session_dir = entry.stat_target.parent()?;
-    let manifest = file_scan::file_metadata_snapshot(&session_dir.join("manifest.json"))?;
+    let manifest = file_scan::file_metadata_snapshot(&session_dir.join("manifest.json"));
     let messages = file_scan::file_metadata_snapshot(&entry.stat_target)?;
-    let effective_mtime_ms = manifest.mtime_ms()?.max(messages.mtime_ms()?);
+    let effective_mtime_ms = messages
+        .mtime_ms()?
+        .max(manifest.as_ref().and_then(file_scan::FileMetadataSnapshot::mtime_ms).unwrap_or(0));
     Some(file_scan::FileScanSnapshot::new(
         effective_mtime_ms,
         MinimaxSessionSnapshot { manifest, messages },
@@ -333,17 +365,27 @@ fn parse_minimax_session_impl(
         .stat_target
         .parent()
         .with_context(|| format!("{} has no session directory", entry.stat_target.display()))?;
-    let manifest = read_manifest(session_dir)?;
+    let manifest = read_manifest(session_dir);
+    let usage_available = manifest.is_ok();
+    let manifest = manifest.unwrap_or_else(|error| {
+        warn!("{error}");
+        MinimaxManifest { session_id: entry.session_id.clone(), created_at_ms: None }
+    });
     let file = fs::File::open(&entry.stat_target)
         .with_context(|| format!("failed to read {}", entry.stat_target.display()))?;
-    parse_minimax_messages(
+    let mut session = parse_minimax_messages(
         manifest,
         entry.directory.clone(),
         BufReader::new(file).lines(),
         mtime_ms,
         entry.stat_target.to_str().map(str::to_string),
         include_events,
-    )
+    )?;
+    if !usage_available && let Some(session) = session.as_mut() {
+        session.usage_parser_version = None;
+        session.usage_events.clear();
+    }
+    Ok(session)
 }
 
 fn parse_minimax_messages(
@@ -644,7 +686,8 @@ pub(crate) fn parse_minimax_transcript(
 pub(crate) fn parse_conformance_fixture(data_dir: &Path) -> anyhow::Result<Option<RawSession>> {
     let sessions_dir = data_dir.join("v2").join("sessions");
     let workspaces = read_workspace_dirs(&data_dir.join("v2").join("sqlite").join(RUNTIME_DB));
-    let Some(entry) = collect_session_entries(&sessions_dir, &workspaces).into_iter().next() else {
+    let Some(entry) = collect_session_entries(&sessions_dir, &workspaces, None).into_iter().next()
+    else {
         return Ok(None);
     };
     let Some(snapshot) = minimax_session_snapshot(&entry) else {
@@ -861,5 +904,34 @@ mod tests {
         assert_eq!(session.events.len(), 4);
         assert_eq!(session.usage_events.len(), 1);
         assert_eq!(session.directory, None);
+    }
+
+    #[test]
+    fn corrupt_manifest_preserves_messages_transcript() {
+        for content in [
+            Some(b"{".as_slice()),
+            Some(b"[]".as_slice()),
+            Some([0xff].as_slice()),
+            None,
+            Some(b"directory".as_slice()),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let session_dir = root.path().join("v2/sessions/2026/09/18/17-11-12-765-session_test");
+            fs::create_dir_all(&session_dir).unwrap();
+            fs::write(session_dir.join("messages.jsonl"), TRANSCRIPT).unwrap();
+            match content {
+                Some(b"directory") => fs::create_dir(session_dir.join("manifest.json")).unwrap(),
+                Some(content) => fs::write(session_dir.join("manifest.json"), content).unwrap(),
+                None => {}
+            }
+            let session = parse_conformance_fixture(root.path()).unwrap().expect("transcript kept");
+            assert_eq!(session.source_id, "17-11-12-765-session_test");
+            assert_eq!(session.messages.len(), 2);
+            assert_eq!(session.messages[0].content, "share the current project");
+            assert_eq!(session.started_at, 1789751473094);
+            assert_eq!(session.events.len(), 4);
+            assert_eq!(session.usage_parser_version, None);
+            assert!(session.usage_events.is_empty());
+        }
     }
 }

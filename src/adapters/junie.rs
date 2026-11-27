@@ -19,7 +19,7 @@ use crate::types::{FileEvidence, FileOperation, RawSessionEvent, RawUsageEvent, 
 
 pub(crate) struct JunieAdapter;
 
-const USAGE_PARSER_VERSION: u32 = 1;
+const USAGE_PARSER_VERSION: u32 = 2;
 const EVENT_PARSER_VERSION: u32 = 1;
 
 type Fingerprint = Vec<(PathBuf, Option<FileMetadataSnapshot>)>;
@@ -246,7 +246,9 @@ fn parse_session(
     let mut messages: Vec<Message> = Vec::new();
     let mut user_ids = HashMap::new();
     let mut assistant_ids = HashMap::new();
-    let mut usage = Vec::new();
+    let mut usage_rows = Vec::new();
+    let mut first_event_timestamp = None;
+    let mut previous_event_timestamp = None;
     let mut usage_seen = HashSet::new();
     let mut blocks: Vec<Block> = Vec::new();
     let mut block_ids = HashMap::new();
@@ -259,6 +261,8 @@ fn parse_session(
     for record in jsonl_indexed(BufReader::new(fs::File::open(path)?).lines()) {
         let (line, value) = record?;
         let ts = timestamp(&value, "timestampMs");
+        first_event_timestamp = first_event_timestamp.or(ts);
+        previous_event_timestamp = ts.or(previous_event_timestamp);
         started = started.or(ts);
         match value.get("kind").and_then(Value::as_str).unwrap_or("") {
             "TaskStartedEvent" => task_times.push(ts),
@@ -332,12 +336,13 @@ fn parse_session(
                 if kind == "LlmResponseMetadataEvent"
                     && let Some(rows) = agent.get("modelUsage").and_then(Value::as_array)
                 {
-                    let identity = format!("{}:{agent}", ts.unwrap_or_default());
+                    let identity = match ts {
+                        Some(ts) => format!("{ts}:{agent}"),
+                        None => format!("line:{line}:{agent}"),
+                    };
                     if usage_seen.insert(identity) {
                         for (row, tokens) in rows.iter().enumerate() {
-                            if let Some(event) = parse_usage(tokens, ts, line, row, path) {
-                                usage.push(event);
-                            }
+                            usage_rows.push((tokens.clone(), previous_event_timestamp, line, row));
                         }
                     }
                 }
@@ -410,6 +415,12 @@ fn parse_session(
             _ => {}
         }
     }
+    let usage: Vec<_> = usage_rows
+        .into_iter()
+        .filter_map(|(tokens, ts, line, row)| {
+            parse_usage(&tokens, ts.or(first_event_timestamp), line, row, path)
+        })
+        .collect();
     if !saw_prompt {
         let state_path = path.with_file_name("state.json");
         if state_path.exists() {
@@ -684,6 +695,75 @@ mod tests {
 
     fn agent(at: i64, value: Value) -> Value {
         json!({"kind":"SessionA2uxEvent","timestampMs":at,"event":{"agentEvent":value}})
+    }
+
+    #[test]
+    fn usage_without_timestamp_uses_adjacent_event_time() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("events.jsonl");
+        let mut usage = agent(
+            2000,
+            json!({
+                "kind":"LlmResponseMetadataEvent",
+                "modelUsage":[{"model":"test","inputTokens":10,"outputTokens":5}]
+            }),
+        );
+        usage.as_object_mut().unwrap().remove("timestampMs");
+        for (records, expected) in [
+            (vec![usage.clone(), json!({"kind":"unknown","timestampMs":3000})], 3000),
+            (vec![json!({"kind":"unknown","timestampMs":1000}), usage.clone()], 1000),
+            (
+                vec![
+                    json!({"kind":"unknown","timestampMs":1000}),
+                    usage.clone(),
+                    json!({"kind":"unknown","timestampMs":3000}),
+                ],
+                1000,
+            ),
+        ] {
+            write_records(&path, &records);
+            for mtime in [4000, 9000] {
+                let session = parse_session(&path, "s", mtime, false, None).unwrap().unwrap();
+                assert!(session.messages.is_empty());
+                assert_eq!(session.usage_events.len(), 1);
+                assert_eq!(session.usage_events[0].timestamp, expected);
+                assert_eq!(session.usage_events[0].input_tokens, 10);
+            }
+        }
+        write_records(
+            &path,
+            &[
+                json!({"kind":"unknown","timestampMs":1000}),
+                usage.clone(),
+                json!({"kind":"unknown","timestampMs":3000}),
+                usage,
+            ],
+        );
+        let session = parse_session(&path, "s", 9000, false, None).unwrap().unwrap();
+        assert_eq!(session.usage_events.len(), 2);
+        assert_eq!(session.usage_events[0].timestamp, 1000);
+        assert_eq!(session.usage_events[1].timestamp, 3000);
+    }
+
+    #[test]
+    fn usage_without_any_event_timestamp_is_omitted() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("events.jsonl");
+        write_records(
+            &path,
+            &[
+                json!({"kind":"UserPromptEvent","prompt":"hello"}),
+                json!({"kind":"SessionA2uxEvent","event":{"agentEvent":{
+                    "kind":"LlmResponseMetadataEvent","modelUsage":[{"inputTokens":10}]
+                }}}),
+                json!({"kind":"unknown","timestampMs":0}),
+            ],
+        );
+        let session = parse_session(&path, "s", 9000, false, Some(&json!({"createdAt":8000})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert!(session.usage_events.is_empty());
     }
 
     #[test]
