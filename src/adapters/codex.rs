@@ -148,7 +148,7 @@ fn probe_invocation_nonce_in(
     let archived_dir = codex_dir.join("archived_sessions");
     probe_recent_files(
         nonce,
-        collect_codex_entries(&[&sessions_dir, &archived_dir])
+        collect_rollout_candidates(&[&sessions_dir, &archived_dir])
             .into_iter()
             .filter(|entry| entry.stat_target.extension().is_none_or(|ext| ext != "zst"))
             .collect(),
@@ -347,30 +347,15 @@ pub(crate) fn scan_rollouts_for_sync(
 }
 
 fn collect_codex_entries(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
-    let mut entries = Vec::new();
-    for dir in base_dirs {
-        if !dir.exists() {
-            continue;
-        }
-        for walk_entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-            let path = walk_entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some((stem, priority)) = rollout_filename_parts(path) else {
-                continue;
-            };
-            let Some(session_id) = extract_session_id_from_filename(stem) else {
-                continue;
-            };
-            let modified = fs::metadata(path).ok().and_then(|metadata| metadata.modified().ok());
-            entries.push((
-                priority,
-                modified,
-                FileScanEntry { session_id, stat_target: path.to_path_buf(), directory: None },
-            ));
-        }
-    }
+    let mut entries: Vec<_> = collect_rollout_candidates(base_dirs)
+        .into_iter()
+        .map(|entry| {
+            let priority = rollout_filename_parts(&entry.stat_target).unwrap().1;
+            let modified =
+                fs::metadata(&entry.stat_target).ok().and_then(|metadata| metadata.modified().ok());
+            (priority, modified, entry)
+        })
+        .collect();
     entries.sort_unstable_by(|left, right| {
         left.2
             .session_id
@@ -381,6 +366,33 @@ fn collect_codex_entries(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
     });
     entries.dedup_by(|left, right| left.2.session_id == right.2.session_id);
     entries.into_iter().map(|(_, _, entry)| entry).collect()
+}
+
+fn collect_rollout_candidates(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
+    let mut entries = Vec::new();
+    for dir in base_dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for walk_entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+            let path = walk_entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some((stem, _)) = rollout_filename_parts(path) else {
+                continue;
+            };
+            let Some(session_id) = extract_session_id_from_filename(stem) else {
+                continue;
+            };
+            entries.push(FileScanEntry {
+                session_id,
+                stat_target: path.to_path_buf(),
+                directory: None,
+            });
+        }
+    }
+    entries
 }
 
 fn parse_codex_session_for_entry(
