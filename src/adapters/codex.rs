@@ -148,7 +148,10 @@ fn probe_invocation_nonce_in(
     let archived_dir = codex_dir.join("archived_sessions");
     probe_recent_files(
         nonce,
-        collect_codex_entries(&[&sessions_dir, &archived_dir]),
+        collect_codex_entries(&[&sessions_dir, &archived_dir])
+            .into_iter()
+            .filter(|entry| entry.stat_target.extension().is_none_or(|ext| ext != "zst"))
+            .collect(),
         budget,
         codex_invocation_input,
     )
@@ -351,28 +354,33 @@ fn collect_codex_entries(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
         }
         for walk_entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             let path = walk_entry.path();
-            let ext = path.extension().and_then(|e| e.to_str());
-            if ext != Some("jsonl") && ext != Some("json") {
-                continue;
-            }
             if !path.is_file() {
                 continue;
             }
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) if !s.is_empty() => s,
-                _ => continue,
+            let Some((stem, priority)) = rollout_filename_parts(path) else {
+                continue;
             };
             let Some(session_id) = extract_session_id_from_filename(stem) else {
                 continue;
             };
-            entries.push(FileScanEntry {
-                session_id,
-                stat_target: path.to_path_buf(),
-                directory: None,
-            });
+            let modified = fs::metadata(path).ok().and_then(|metadata| metadata.modified().ok());
+            entries.push((
+                priority,
+                modified,
+                FileScanEntry { session_id, stat_target: path.to_path_buf(), directory: None },
+            ));
         }
     }
-    entries
+    entries.sort_unstable_by(|left, right| {
+        left.2
+            .session_id
+            .cmp(&right.2.session_id)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.stat_target.cmp(&right.2.stat_target))
+    });
+    entries.dedup_by(|left, right| left.2.session_id == right.2.session_id);
+    entries.into_iter().map(|(_, _, entry)| entry).collect()
 }
 
 fn parse_codex_session_for_entry(
@@ -386,7 +394,7 @@ fn parse_codex_session_for_entry(
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
         Err(e) => {
-            debug!(
+            tracing::warn!(
                 "failed to parse {} session {}: {e}",
                 dialect.source(),
                 entry.stat_target.display()
@@ -398,6 +406,13 @@ fn parse_codex_session_for_entry(
     raw.updated_at = Some(mtime_ms);
     raw.source_file_path = source_file_path;
     Ok(Some(raw))
+}
+
+fn rollout_filename_parts(path: &Path) -> Option<(&str, u8)> {
+    let name = path.file_name()?.to_str()?;
+    [(".jsonl", 0), (".json", 1), (".jsonl.zst", 2)]
+        .into_iter()
+        .find_map(|(suffix, priority)| name.strip_suffix(suffix).map(|stem| (stem, priority)))
 }
 
 fn extract_session_id_from_filename(stem: &str) -> Option<String> {
@@ -493,7 +508,11 @@ pub(crate) fn parse_rollout(
     dialect: RolloutDialect,
 ) -> anyhow::Result<Option<RawSession>> {
     let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
+    let reader: Box<dyn BufRead> = if path.extension().is_some_and(|ext| ext == "zst") {
+        Box::new(BufReader::new(zstd::stream::read::Decoder::new(file)?))
+    } else {
+        Box::new(BufReader::new(file))
+    };
     let fallback_timestamp = file_scan::stat_mtime_ms(path).unwrap_or(0);
     let mut meta_id: Option<String> = None;
     let mut meta_cwd: Option<String> = None;
@@ -910,15 +929,15 @@ pub(crate) fn parse_rollout(
         return Ok(None);
     }
 
-    let source_id = meta_id.unwrap_or_else(|| {
-        path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string()
-    });
+    let filename_stem = rollout_filename_parts(path)
+        .map(|(stem, _)| stem)
+        .or_else(|| path.file_stem().and_then(|stem| stem.to_str()));
+    let source_id = meta_id.unwrap_or_else(|| filename_stem.unwrap_or("unknown").to_string());
 
     let started_at =
         first_timestamp(meta_timestamp, &messages, &usage_events, &events).unwrap_or(0);
 
-    let filename_id =
-        path.file_stem().and_then(|s| s.to_str()).and_then(extract_session_id_from_filename);
+    let filename_id = filename_stem.and_then(extract_session_id_from_filename);
     let (thread_role, parent_links, subagent_title) = meta_topologies
         .iter()
         .find(|topo| topo.meta_id.is_some() && topo.meta_id.as_deref() == filename_id.as_deref())
@@ -2294,6 +2313,171 @@ mod tests {
         writeln!(f, "{usage2}").unwrap();
         writeln!(f, "{msg}").unwrap();
         path
+    }
+
+    #[test]
+    fn zstd_archives_do_not_enter_plaintext_invocation_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let archives = root.path().join("archived_sessions");
+        fs::create_dir_all(&archives).unwrap();
+        let path = archives.join("rollout-019a4c01-e8f4-7270-bdab-7f19273b2381.jsonl.zst");
+        let fixture = include_bytes!("../../tests/fixtures/codex-archive.jsonl");
+        fs::write(path, zstd::stream::encode_all(&fixture[..], 0).unwrap()).unwrap();
+        let result =
+            probe_invocation_nonce_in(root.path(), "nonce", InvocationProbeBudget::default());
+        assert!(result.complete);
+        assert!(result.source_ids.is_empty());
+        assert_eq!(result.files_read, 0);
+    }
+
+    #[test]
+    fn zstd_rollouts_match_plain_usage_and_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let plain = root.path().join("rollout-019a4c01-e8f4-7270-bdab-7f19273b2381.jsonl");
+        let archive = plain.with_extension("jsonl.zst");
+        let fixture = include_bytes!("../../tests/fixtures/codex-archive.jsonl");
+        fs::write(&plain, fixture).unwrap();
+        let split = fixture.len() / 2;
+        let compressed: Vec<_> = [&fixture[..split], &fixture[split..]]
+            .into_iter()
+            .flat_map(|bytes| zstd::stream::encode_all(bytes, 0).unwrap())
+            .collect();
+        fs::write(&archive, compressed).unwrap();
+
+        for dialect in [RolloutDialect::Codex, RolloutDialect::Trae] {
+            for include_events in [false, true] {
+                let plain = parse_rollout(&plain, include_events, dialect).unwrap().unwrap();
+                let archive = parse_rollout(&archive, include_events, dialect).unwrap().unwrap();
+                let usage = |raw: &RawSession| {
+                    raw.usage_events
+                        .iter()
+                        .map(|event| {
+                            (
+                                event.event_key.clone(),
+                                event.event_seq,
+                                event.timestamp,
+                                event.model.clone(),
+                                event.provider.clone(),
+                                event.input_tokens,
+                                event.output_tokens,
+                                event.cache_read_tokens,
+                                event.cache_write_tokens,
+                                event.reasoning_tokens,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(usage(&archive), usage(&plain));
+                assert_eq!(archive.usage_events.len(), 2);
+                let totals = archive.usage_events.iter().fold([0; 5], |mut totals, event| {
+                    for (total, value) in totals.iter_mut().zip([
+                        event.input_tokens,
+                        event.output_tokens,
+                        event.cache_read_tokens,
+                        event.cache_write_tokens,
+                        event.reasoning_tokens,
+                    ]) {
+                        *total += value;
+                    }
+                    totals
+                });
+                assert_eq!(totals, [12, 4, 3, 0, 1]);
+                let messages = |raw: &RawSession| {
+                    raw.messages
+                        .iter()
+                        .map(|message| {
+                            (
+                                message.role.as_str().to_string(),
+                                message.content.clone(),
+                                message.timestamp,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(messages(&archive), messages(&plain));
+                assert_eq!(archive.messages.len(), 2);
+                assert_eq!(archive.source_id, plain.source_id);
+                assert_eq!(plain.thread_role, Some(ThreadRole::Subagent));
+                assert_eq!(archive.thread_role, plain.thread_role);
+                assert_eq!(archive.parent_links, plain.parent_links);
+                assert_eq!(archive.custom_title, plain.custom_title);
+                assert_eq!(archive.custom_title.as_deref(), Some("archive-worker"));
+            }
+        }
+    }
+
+    #[test]
+    fn zstd_discovery_deduplicates_sessions_and_archives() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let archives = root.path().join("archived_sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&archives).unwrap();
+        let id = "019a4c01-e8f4-7270-bdab-7f19273b2381";
+        let other = "019a4c01-e8f4-7270-bdab-7f19273b2382";
+        let fixture = include_bytes!("../../tests/fixtures/codex-archive.jsonl");
+        let plain = sessions.join(format!("rollout-{id}.jsonl"));
+        let archive = archives.join(format!("rollout-{id}.jsonl.zst"));
+        fs::write(&plain, fixture).unwrap();
+        fs::write(&archive, zstd::stream::encode_all(&fixture[..], 0).unwrap()).unwrap();
+        fs::write(archives.join(format!("rollout-{id}.json")), fixture).unwrap();
+        let second = sessions.join(format!("rollout-{other}.jsonl.zst"));
+        fs::copy(&archive, &second).unwrap();
+        let newer = archives.join(format!("rollout-newer-{other}.jsonl.zst"));
+        fs::copy(&archive, &newer).unwrap();
+        fs::File::open(&second).unwrap().set_modified(std::time::UNIX_EPOCH).unwrap();
+
+        let entries = collect_codex_entries(&[&sessions, &archives]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].session_id, id);
+        assert_eq!(entries[0].stat_target, plain);
+        assert_eq!(entries[1].session_id, other);
+        assert_eq!(entries[1].stat_target, newer);
+        for dialect in [RolloutDialect::Codex, RolloutDialect::Trae] {
+            let scanned = scan_rollouts(root.path(), dialect).unwrap();
+            assert_eq!(scanned.len(), 2);
+            assert_eq!(scanned[0].source_id, id);
+            assert_eq!(scanned[1].source_id, other);
+            let store = setup_store();
+            let result = scan_rollouts_for_sync(
+                root.path(),
+                dialect,
+                &AdapterSyncContext::from_store_for_test(&store, dialect.source()).unwrap(),
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(result.stats.candidates, 2);
+            assert_eq!(result.sessions.len(), 2);
+        }
+    }
+
+    #[test]
+    fn zstd_corrupt_archives_drop_partial_sessions_without_aborting_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let archives = root.path().join("archived_sessions");
+        fs::create_dir_all(&archives).unwrap();
+        let fixture = include_bytes!("../../tests/fixtures/codex-archive.jsonl");
+        let mut partial = zstd::stream::encode_all(&fixture[..], 0).unwrap();
+        let mut truncated = partial.clone();
+        truncated.truncate(truncated.len() / 2);
+        partial.extend(&truncated);
+        for (id, data) in [
+            ("019a4c01-e8f4-7270-bdab-7f19273b2382", b"invalid zstd".to_vec()),
+            ("019a4c01-e8f4-7270-bdab-7f19273b2383", truncated),
+            ("019a4c01-e8f4-7270-bdab-7f19273b2384", partial),
+        ] {
+            let path = archives.join(format!("rollout-{id}.jsonl.zst"));
+            fs::write(&path, data).unwrap();
+            assert!(parse_rollout(&path, true, RolloutDialect::Codex).is_err());
+        }
+        write_codex_rollout(&sessions, "019a4c01-e8f4-7270-bdab-7f19273b2381", "valid");
+        for dialect in [RolloutDialect::Codex, RolloutDialect::Trae] {
+            let scanned = scan_rollouts(root.path(), dialect).unwrap();
+            assert_eq!(scanned.len(), 1);
+            assert_eq!(scanned[0].messages[0].content, "valid");
+        }
     }
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
