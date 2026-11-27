@@ -1,4 +1,4 @@
-**English** | [Chinese](./README.zh-CN.md)
+**English** | [Chinese](./README.zh-CN.md) | [Türkçe](./README.tr.md)
 
 # Recall
 
