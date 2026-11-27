@@ -307,3 +307,369 @@ fn bundle_dedups_globally_partitions_non_native_and_unions_weekly_sessions() {
         1
     );
 }
+
+fn sorted_object_keys(value: &serde_json::Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys
+}
+
+fn assert_json_keys(value: &serde_json::Value, expected: &[&str]) {
+    let mut expected_sorted = expected.to_vec();
+    expected_sorted.sort_unstable();
+    assert_eq!(sorted_object_keys(value), expected_sorted);
+}
+
+fn assert_token_totals_contract(tokens: &serde_json::Value) -> [i64; 6] {
+    assert_json_keys(
+        tokens,
+        &[
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+        ],
+    );
+    let buckets = [
+        tokens["input_tokens"].as_i64().unwrap(),
+        tokens["output_tokens"].as_i64().unwrap(),
+        tokens["cache_read_tokens"].as_i64().unwrap(),
+        tokens["cache_write_tokens"].as_i64().unwrap(),
+        tokens["reasoning_tokens"].as_i64().unwrap(),
+        tokens["total_tokens"].as_i64().unwrap(),
+    ];
+    for count in buckets {
+        assert!(count >= 0, "negative token count in {tokens}");
+    }
+    assert_eq!(
+        buckets[..5].iter().sum::<i64>(),
+        buckets[5],
+        "5-bucket conservation failed: {tokens}"
+    );
+    buckets
+}
+
+fn assert_bucket_slice_sum<'a>(
+    entries: impl IntoIterator<Item = &'a serde_json::Value>,
+    expected_keys: &[&str],
+    expected_tokens: [i64; 6],
+    expected_events: u64,
+) {
+    let mut sums = [0i64; 6];
+    let mut events = 0u64;
+    for entry in entries {
+        assert_json_keys(entry, expected_keys);
+        events += entry["events"].as_u64().unwrap();
+        let entry_tokens = assert_token_totals_contract(&entry["tokens"]);
+        for (acc, val) in sums.iter_mut().zip(entry_tokens) {
+            *acc += val;
+        }
+    }
+    assert_eq!(sums, expected_tokens);
+    assert_eq!(events, expected_events);
+}
+
+fn assert_usage_report_contract(
+    report: &crate::usage::UsageReport,
+    expected_scope: Option<(&str, &str)>,
+) {
+    let raw = serde_json::to_string(report).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    if let Some((kind, value)) = expected_scope {
+        assert_json_keys(
+            &json,
+            &["by_model", "by_source", "daily", "monthly", "scope", "summary", "weekly"],
+        );
+        assert_json_keys(&json["scope"], &["directory", "kind", "repository", "value"]);
+        assert_eq!(json["scope"]["kind"], kind);
+        assert_eq!(json["scope"]["value"], value);
+    } else {
+        assert!(json.get("scope").is_none());
+        assert_json_keys(
+            &json,
+            &["by_model", "by_source", "daily", "monthly", "summary", "weekly"],
+        );
+    }
+    let summary = &json["summary"];
+    assert_json_keys(
+        summary,
+        &["events", "models", "sessions", "sources", "token_source_events", "tokens"],
+    );
+    let summary_tokens = assert_token_totals_contract(&summary["tokens"]);
+    let summary_events = summary["events"].as_u64().unwrap();
+    let by_source = json["by_source"].as_array().unwrap();
+    let by_model = json["by_model"].as_array().unwrap();
+    assert_eq!(summary["sources"].as_u64().unwrap(), by_source.len() as u64);
+    assert_eq!(summary["models"].as_u64().unwrap(), by_model.len() as u64);
+    let token_source_sum: u64 = summary["token_source_events"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| v.as_u64().unwrap())
+        .sum();
+    assert_eq!(token_source_sum, summary_events);
+    assert_bucket_slice_sum(
+        by_source,
+        &["events", "sessions", "source", "tokens"],
+        summary_tokens,
+        summary_events,
+    );
+    assert_bucket_slice_sum(
+        by_model,
+        &["events", "model", "provider", "sessions", "source", "tokens"],
+        summary_tokens,
+        summary_events,
+    );
+    for period in ["daily", "weekly", "monthly"] {
+        assert_bucket_slice_sum(
+            json[period].as_array().unwrap(),
+            &["events", "period", "sessions", "tokens"],
+            summary_tokens,
+            summary_events,
+        );
+    }
+}
+
+fn assert_project_usage_report_contract(
+    report: &crate::usage::ProjectUsageReport,
+    expected_scope: Option<(&str, &str)>,
+) {
+    let raw = serde_json::to_string(report).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    if let Some((kind, value)) = expected_scope {
+        assert_json_keys(&json, &["projects", "scope", "summary"]);
+        assert_json_keys(&json["scope"], &["directory", "kind", "repository", "value"]);
+        assert_eq!(json["scope"]["kind"], kind);
+        assert_eq!(json["scope"]["value"], value);
+    } else {
+        assert!(json.get("scope").is_none());
+        assert_json_keys(&json, &["projects", "summary"]);
+    }
+    let summary = &json["summary"];
+    assert_json_keys(
+        summary,
+        &["events", "indexed_sessions", "models", "projects", "sessions", "sources", "tokens"],
+    );
+    let summary_tokens = assert_token_totals_contract(&summary["tokens"]);
+    let summary_events = summary["events"].as_u64().unwrap();
+    let projects = json["projects"].as_array().unwrap();
+    assert_eq!(summary["projects"].as_u64().unwrap(), projects.len() as u64);
+    assert_bucket_slice_sum(
+        projects,
+        &[
+            "by_model",
+            "directory",
+            "events",
+            "indexed_sessions",
+            "kind",
+            "project",
+            "repository",
+            "sessions",
+            "tokens",
+            "top_model",
+        ],
+        summary_tokens,
+        summary_events,
+    );
+    for entry in projects {
+        let entry_tokens = assert_token_totals_contract(&entry["tokens"]);
+        let entry_events = entry["events"].as_u64().unwrap();
+        if entry["repository"].is_object() {
+            assert_json_keys(&entry["repository"], &["name", "remote", "slug"]);
+        }
+        assert_bucket_slice_sum(
+            entry["by_model"].as_array().unwrap(),
+            &["events", "model", "provider", "sessions", "source", "tokens"],
+            entry_tokens,
+            entry_events,
+        );
+    }
+}
+
+fn seed_usage_contract_store() -> crate::db::store::Store {
+    use crate::types::{RawUsageEvent, Session};
+    use chrono::{Local, TimeZone};
+
+    crate::db::schema::register_sqlite_vec();
+    let store = crate::db::store::Store::open_in_memory().unwrap();
+    let ts = |month: u32, day: u32, hour: u32| {
+        Local.with_ymd_and_hms(2026, month, day, hour, 0, 0).single().unwrap().timestamp_millis()
+    };
+    let make_event =
+        |key: &str, timestamp: i64, provider: &str, model: &str, buckets: [i64; 5]| RawUsageEvent {
+            event_key: key.into(),
+            timestamp,
+            provider: provider.into(),
+            model: model.into(),
+            input_tokens: buckets[0],
+            output_tokens: buckets[1],
+            cache_read_tokens: buckets[2],
+            cache_write_tokens: buckets[3],
+            reasoning_tokens: buckets[4],
+            ..crate::types::test_support::usage_event(key)
+        };
+
+    let s1 = Session {
+        source: "claude-code".into(),
+        directory: Some("/tmp/acme-app".into()),
+        repo_remote: Some("github.com/acme/app".into()),
+        repo_slug: Some("acme/app".into()),
+        repo_name: Some("app".into()),
+        started_at: ts(8, 24, 10),
+        updated_at: Some(ts(8, 25, 11)),
+        ..crate::types::test_support::session("usage-s1")
+    };
+    let s2 = Session {
+        source: "codex".into(),
+        directory: Some("/tmp/local-tool".into()),
+        started_at: ts(8, 25, 14),
+        updated_at: Some(ts(8, 25, 14)),
+        ..crate::types::test_support::session("usage-s2")
+    };
+    let s3_zero = Session {
+        source: "codex".into(),
+        directory: Some("/tmp/local-tool".into()),
+        started_at: ts(8, 26, 9),
+        updated_at: Some(ts(8, 26, 12)),
+        ..crate::types::test_support::session("usage-s3-zero")
+    };
+    let s4_unattributed = Session {
+        source: "rx-agent".into(),
+        directory: None,
+        started_at: ts(9, 1, 16),
+        updated_at: Some(ts(9, 1, 16)),
+        ..crate::types::test_support::session("usage-s4")
+    };
+
+    store
+        .persist_session_with_usage(
+            &s1,
+            &[],
+            &[
+                make_event(
+                    "assistant:req-1:msg-1",
+                    ts(8, 24, 10),
+                    "anthropic",
+                    "claude-sonnet",
+                    [100, 40, 20, 10, 5],
+                ),
+                make_event(
+                    "assistant:req-2:msg-2",
+                    ts(8, 25, 11),
+                    "anthropic",
+                    "claude-sonnet",
+                    [50, 15, 5, 3, 2],
+                ),
+            ],
+            Some(1),
+        )
+        .unwrap();
+    store
+        .persist_session_with_usage(
+            &s2,
+            &[],
+            &[RawUsageEvent {
+                parser_version: 5,
+                ..make_event("token_count:1", ts(8, 25, 14), "openai", "gpt-5", [30, 12, 8, 4, 6])
+            }],
+            Some(5),
+        )
+        .unwrap();
+    store.persist_session_with_usage(&s3_zero, &[], &[], Some(1)).unwrap();
+    store
+        .persist_session_with_usage(
+            &s4_unattributed,
+            &[],
+            &[make_event("msg-1", ts(9, 1, 16), "fixture", "fixture-model", [11, 7, 3, 2, 1])],
+            Some(1),
+        )
+        .unwrap();
+    store
+}
+
+#[test]
+fn usage_report_locks_json_keys_conservation_and_scope() {
+    use crate::db::search::TimeRange;
+    use crate::usage::{
+        UsageFilters, UsageTarget, build_usage_report, build_usage_report_for_target,
+    };
+
+    let store = seed_usage_contract_store();
+    let global =
+        build_usage_report(&store, &UsageFilters { sources: None, time_range: TimeRange::All })
+            .unwrap();
+    assert_usage_report_contract(&global, None);
+    assert_eq!(global.summary.events, 4);
+    assert_eq!(global.summary.sessions, 3);
+    assert_eq!(global.summary.sources, 3);
+    assert_eq!(global.summary.models, 3);
+    assert_eq!(global.summary.tokens.total_tokens, 334);
+    assert_eq!(global.monthly.len(), 2);
+
+    let dir_scope = store.resolve_cli_project_selector("/tmp/local-tool").unwrap();
+    let dir_envelope = dir_scope.envelope();
+    let mut dir_report =
+        build_usage_report_for_target(&store, None, TimeRange::All, &UsageTarget::Scope(dir_scope))
+            .unwrap();
+    dir_report.scope = Some(dir_envelope);
+    assert_usage_report_contract(&dir_report, Some(("directory", "/tmp/local-tool")));
+    let dir_json = serde_json::to_value(&dir_report).unwrap();
+    assert_eq!(dir_json["scope"]["directory"], "/tmp/local-tool");
+    assert!(dir_json["scope"]["repository"].is_null());
+    assert_eq!(dir_report.summary.events, 1);
+    assert_eq!(dir_report.summary.sessions, 1);
+    assert_eq!(dir_report.summary.tokens.total_tokens, 60);
+
+    let repo_scope = store.resolve_cli_project_selector("acme/app").unwrap();
+    let repo_envelope = repo_scope.envelope();
+    let mut repo_report = build_usage_report_for_target(
+        &store,
+        None,
+        TimeRange::All,
+        &UsageTarget::Scope(repo_scope),
+    )
+    .unwrap();
+    repo_report.scope = Some(repo_envelope);
+    assert_usage_report_contract(&repo_report, Some(("repository", "acme/app")));
+    assert_eq!(repo_report.summary.events, 2);
+    assert_eq!(repo_report.summary.sessions, 1);
+    assert_eq!(repo_report.summary.tokens.total_tokens, 250);
+}
+
+#[test]
+fn project_usage_report_locks_json_keys_conservation_and_scope() {
+    use crate::db::search::TimeRange;
+    use crate::project_scope::ProjectScope;
+    use crate::usage::build_project_usage_report;
+
+    let store = seed_usage_contract_store();
+    let report = build_project_usage_report(&store, None, TimeRange::All).unwrap();
+    assert_project_usage_report_contract(&report, None);
+    assert_eq!(report.summary.projects, 3);
+    assert_eq!(report.summary.events, 4);
+    assert_eq!(report.summary.sessions, 3);
+    assert_eq!(report.summary.indexed_sessions, 4);
+    assert_eq!(report.summary.sources, 3);
+    assert_eq!(report.summary.models, 3);
+    assert_eq!(report.summary.tokens.total_tokens, 334);
+
+    let json = serde_json::to_value(&report).unwrap();
+    let projects = json["projects"].as_array().unwrap();
+    let repo_entry = projects.iter().find(|p| p["kind"] == "repository").unwrap();
+    assert_eq!(repo_entry["project"], "acme/app");
+    assert!(repo_entry["directory"].is_null());
+    assert_eq!(repo_entry["repository"]["slug"], "acme/app");
+
+    let dir_entry = projects.iter().find(|p| p["kind"] == "directory").unwrap();
+    assert_eq!(dir_entry["project"], "/tmp/local-tool");
+    assert_eq!(dir_entry["directory"], "/tmp/local-tool");
+    assert!(dir_entry["repository"].is_null());
+    assert_eq!(dir_entry["sessions"], 1);
+    assert_eq!(dir_entry["indexed_sessions"], 2);
+
+    let mut scoped = report.clone();
+    scoped.scope = Some(ProjectScope::Directory("/tmp/local-tool".into()).envelope());
+    assert_project_usage_report_contract(&scoped, Some(("directory", "/tmp/local-tool")));
+}
