@@ -48,11 +48,7 @@ pub(super) fn parse_antigravity_db(
     fallback_timestamp_ms: Option<i64>,
 ) -> anyhow::Result<ParsedAntigravityDb> {
     if fs::metadata(db_path)?.len() == 0 {
-        return Ok(ParsedAntigravityDb {
-            usage_events: Vec::new(),
-            created_at_ms: None,
-            workspace_dir: None,
-        });
+        anyhow::bail!("Antigravity usage database is empty");
     }
 
     let conn = Connection::open_with_flags(
@@ -69,11 +65,12 @@ pub(super) fn parse_antigravity_db(
     };
 
     if !table_exists(&tx, "gen_metadata")? {
-        return Ok(ParsedAntigravityDb { usage_events: Vec::new(), created_at_ms, workspace_dir });
+        anyhow::bail!("Antigravity usage database has no gen_metadata table");
     }
 
     let rows: Vec<(Option<i64>, Vec<u8>)> = {
-        let mut stmt = tx.prepare("SELECT idx, data FROM gen_metadata ORDER BY idx")?;
+        let mut stmt =
+            tx.prepare("SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx")?;
         let mapped = stmt.query_map([], |row| Ok((row.get::<_, Option<i64>>(0)?, row.get(1)?)))?;
         mapped.collect::<rusqlite::Result<_>>()?
     };
@@ -369,14 +366,16 @@ fn resolve_model_id(
     if let Some(model) = raw_response_model.filter(|m| is_concrete_response_model(m)) {
         return model.trim().to_string();
     }
-    if let Some(label) = display_label {
-        if let Some(recovered) = label_models.get(label) {
-            return recovered.clone();
-        }
-        return label.trim().to_string();
+    if let Some(label) = display_label
+        && let Some(recovered) = label_models.get(label)
+    {
+        return recovered.clone();
     }
-    if let Some(model) = raw_response_model {
-        return model.trim().to_string();
+    let mut concrete_models = label_models.values();
+    if let Some(model) = concrete_models.next()
+        && concrete_models.all(|other| other == model)
+    {
+        return model.clone();
     }
     "unknown".to_string()
 }

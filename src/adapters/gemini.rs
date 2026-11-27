@@ -145,9 +145,17 @@ fn resolve_gemini_root() -> anyhow::Result<Option<PathBuf>> {
         debug!("GEMINI_HOME not found, skipping Gemini CLI");
         return Ok(None);
     }
+    if let Some(home) = paths::env_path_dir("GEMINI_CLI_HOME") {
+        let dir = home.join(".gemini/tmp");
+        if dir.is_dir() {
+            return Ok(Some(dir));
+        }
+        debug!("GEMINI_CLI_HOME/.gemini/tmp not found, skipping Gemini CLI");
+        return Ok(None);
+    }
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
     let gemini_tmp = home.join(".gemini/tmp");
-    if !gemini_tmp.exists() {
+    if !gemini_tmp.is_dir() {
         debug!("~/.gemini/tmp not found, skipping Gemini CLI");
         return Ok(None);
     }
@@ -600,6 +608,58 @@ mod tests {
     use crate::adapters::test_support::{
         seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
     };
+
+    #[test]
+    fn gemini_home_precedence_and_missing_paths() {
+        if let Ok(expected) = std::env::var("RECALL_TEST_GEMINI_ROOT") {
+            assert_eq!(
+                resolve_gemini_root().unwrap(),
+                (!expected.is_empty()).then(|| PathBuf::from(expected))
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let cli_home = root.path().join("cli");
+        let explicit = root.path().join("explicit");
+        let default = home.join(".gemini/tmp");
+        let cli_tmp = cli_home.join(".gemini/tmp");
+        for path in [&default, &cli_tmp, &explicit] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let missing = root.path().join("missing");
+        for (gemini_home, gemini_cli_home, expected) in [
+            (Some(&explicit), Some(&cli_home), Some(&explicit)),
+            (None, Some(&cli_home), Some(&cli_tmp)),
+            (None, None, Some(&default)),
+            (Some(&missing), Some(&cli_home), None),
+            (None, Some(&missing), None),
+            (Some(&cli_home), Some(&missing), Some(&cli_home)),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "adapters::gemini::tests::gemini_home_precedence_and_missing_paths",
+                    "--nocapture",
+                ])
+                .env("HOME", &home)
+                .env_remove("GEMINI_HOME")
+                .env_remove("GEMINI_CLI_HOME")
+                .env(
+                    "RECALL_TEST_GEMINI_ROOT",
+                    expected.map(|p| p.as_os_str()).unwrap_or_default(),
+                );
+            if let Some(path) = gemini_home {
+                command.env("GEMINI_HOME", path);
+            }
+            if let Some(path) = gemini_cli_home {
+                command.env("GEMINI_CLI_HOME", path);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+        }
+    }
 
     #[test]
     fn parse_gemini_session_extracts_usage_events() {

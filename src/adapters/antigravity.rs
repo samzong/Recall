@@ -406,47 +406,38 @@ fn parse_antigravity_session_for_entry(
 ) -> anyhow::Result<Option<RawSession>> {
     let source_file_path = entry.stat_target.to_str().map(str::to_string);
 
+    let parsed_db = db_path.and_then(|path| {
+        match usage::parse_antigravity_db(
+            path,
+            &entry.session_id,
+            live_cascade_ids,
+            shell_meta.map(|meta| meta.started_at.max(mtime_ms)),
+        ) {
+            Ok(parsed) => Some(parsed),
+            Err(err) => {
+                debug!("failed to parse Antigravity usage db {}: {err}", path.display());
+                None
+            }
+        }
+    });
+
     if let Some(meta) = shell_meta {
-        let (usage_events, db_workspace) = match db_path {
-            Some(path) => match usage::parse_antigravity_db(
-                path,
-                &entry.session_id,
-                live_cascade_ids,
-                Some(meta.started_at.max(mtime_ms)),
-            ) {
-                Ok(parsed) => (parsed.usage_events, parsed.workspace_dir),
-                Err(err) => {
-                    debug!("failed to parse Antigravity usage db {}: {err}", path.display());
-                    return Ok(None);
-                }
-            },
-            None => (Vec::new(), None),
+        let Some(parsed) = parsed_db else {
+            return Ok(None);
         };
         let mut raw = RawSession::search_only(
             entry.session_id,
-            entry.directory.or(db_workspace),
+            entry.directory.or(parsed.workspace_dir),
             meta.started_at,
             Some(mtime_ms),
             None,
             Vec::new(),
         );
         raw.source_file_path = source_file_path;
-        return Ok(Some(raw.with_usage(usage_events, usage::USAGE_PARSER_VERSION)));
+        return Ok(Some(raw.with_usage(parsed.usage_events, usage::USAGE_PARSER_VERSION)));
     }
 
-    let parsed_db = match db_path {
-        Some(path) => {
-            match usage::parse_antigravity_db(path, &entry.session_id, live_cascade_ids, None) {
-                Ok(parsed) => Some(parsed),
-                Err(err) => {
-                    debug!("failed to parse Antigravity usage db {}: {err}", path.display());
-                    return Ok(None);
-                }
-            }
-        }
-        None => None,
-    };
-
+    let usage_available = parsed_db.is_some();
     let (mut usage_events, db_created_at, db_workspace) = match parsed_db {
         Some(parsed) => (parsed.usage_events, parsed.created_at_ms, parsed.workspace_dir),
         None => (Vec::new(), None, None),
@@ -497,7 +488,10 @@ fn parse_antigravity_session_for_entry(
     raw.directory = effective_directory;
     raw.updated_at = Some(mtime_ms);
     raw.source_file_path = source_file_path;
-    Ok(Some(raw.with_usage(usage_events, usage::USAGE_PARSER_VERSION)))
+    if usage_available {
+        raw = raw.with_usage(usage_events, usage::USAGE_PARSER_VERSION);
+    }
+    Ok(Some(raw))
 }
 
 fn parse_antigravity_transcript(
