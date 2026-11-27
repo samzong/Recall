@@ -417,59 +417,57 @@ fn unescape_json_text(input: &str) -> String {
 
 fn extract_room_uuids_from_text(text: &str, is_confer_event: bool) -> Vec<String> {
     let mut out = Vec::new();
+    let bytes = text.as_bytes();
     let lower = text.to_ascii_lowercase();
     for key in ["room_id", "roomid"] {
         let mut search_from = 0usize;
         while let Some(rel) = lower[search_from..].find(key) {
             let after_key = search_from + rel + key.len();
-            let window_end = (after_key + 64).min(text.len());
-            let window = &text[after_key..window_end];
-            if let Some(uuid) = find_first_uuid_36(window) {
+            let window_end = (after_key + 64).min(bytes.len());
+            for uuid in find_uuids_in_bytes(bytes, after_key, window_end, true) {
                 push_unique_str(&mut out, &uuid);
             }
             search_from = after_key;
         }
     }
     if is_confer_event && (lower.contains("mcp__confer__") || lower.contains("confer")) {
-        let bytes = text.as_bytes();
-        let mut i = 0usize;
-        while i + 36 <= bytes.len() {
-            if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-                && let Ok(slice) = std::str::from_utf8(&bytes[i..i + 36])
-                && is_uuid_36(slice)
-                && (i + 36 == bytes.len() || !bytes[i + 36].is_ascii_alphanumeric())
-            {
-                push_unique_str(&mut out, slice);
-                i += 36;
-                continue;
-            }
-            i += 1;
+        for uuid in find_uuids_in_bytes(bytes, 0, bytes.len(), false) {
+            push_unique_str(&mut out, &uuid);
         }
     }
     out
 }
 
-fn find_first_uuid_36(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i + 36 <= bytes.len() {
+fn find_uuids_in_bytes(bytes: &[u8], start: usize, end: usize, first_only: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let limit = end.min(bytes.len());
+    let mut i = start.min(limit);
+    while i + 36 <= limit {
         if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-            && let Ok(slice) = std::str::from_utf8(&bytes[i..i + 36])
-            && is_uuid_36(slice)
+            && is_uuid_36_bytes(&bytes[i..i + 36])
             && (i + 36 == bytes.len() || !bytes[i + 36].is_ascii_alphanumeric())
+            && let Ok(slice) = std::str::from_utf8(&bytes[i..i + 36])
         {
-            return Some(slice.to_string());
+            out.push(slice.to_string());
+            if first_only {
+                return out;
+            }
+            i += 36;
+            continue;
         }
         i += 1;
     }
-    None
+    out
 }
 
 fn is_uuid_36(s: &str) -> bool {
-    if s.len() != 36 {
+    is_uuid_36_bytes(s.as_bytes())
+}
+
+fn is_uuid_36_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() != 36 {
         return false;
     }
-    let bytes = s.as_bytes();
     for (idx, b) in bytes.iter().enumerate() {
         if matches!(idx, 8 | 13 | 18 | 23) {
             if *b != b'-' {

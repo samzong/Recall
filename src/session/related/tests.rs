@@ -347,3 +347,43 @@ fn confer_multi_room_nested_seats_and_unpositioned_tool_result_anchors_resolve()
     let sub = graph.related.iter().find(|r| r.session.id == "sub-s").unwrap();
     assert_eq!(sub.spawn_anchor, Some(6));
 }
+
+#[test]
+fn confer_text_scan_handles_multibyte_utf8_across_window_boundary() {
+    let store = store();
+    let room_id = "55555555-5555-5555-5555-555555555555";
+    let host = make_session("host-utf8", "codex", "host-utf8-src", "Host UTF8");
+    let peer = make_session("peer-utf8", "claude-code", "peer-utf8-native", "Peer UTF8");
+
+    let mut ev1 = crate::types::test_support::session_event("tool_call");
+    ev1.event_seq = 0;
+    ev1.message_seq = Some(0);
+    ev1.summary =
+        Some("room_id: 这是一段用于测试多字节字符跨窗口边界不会崩溃的中文文本内容".into());
+
+    let mut ev2 = crate::types::test_support::session_event("tool_call");
+    ev2.event_seq = 1;
+    ev2.message_seq = Some(1);
+    ev2.summary = Some(format!("room_id={room_id} 这是一段紧跟在编号后面的中文说明文本确保跨界"));
+
+    persist_session(&store, &host, &[ev1, ev2], &SessionTopologyWrite::none());
+    persist_session(&store, &peer, &[], &SessionTopologyWrite::none());
+
+    let dir = tempfile::tempdir().unwrap();
+    let rooms_path = dir.path().join("rooms.json");
+    fs::write(
+        &rooms_path,
+        format!(
+            r#"{{"schema_version":3,"rooms":[{{"id":"{room_id}","name":"UTF8 Room","seats":[{{"name":"reviewer","agent":"claude","native_session_id":"peer-utf8-native"}}]}}]}}"#
+        ),
+    )
+    .unwrap();
+
+    let graph = RelatedSessionGraph::for_session_with_confer_path(&store, &host, Some(&rooms_path))
+        .unwrap();
+    assert_eq!(graph.related.len(), 1);
+    assert_eq!(graph.related[0].session.id, "peer-utf8");
+    assert_eq!(graph.related[0].via.as_deref(), Some("confer"));
+    assert_eq!(graph.related[0].role_label.as_deref(), Some("reviewer"));
+    assert_eq!(graph.related[0].display_title, "Peer UTF8");
+}
