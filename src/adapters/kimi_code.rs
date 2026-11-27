@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,9 @@ use crate::adapters::AdapterSyncContext;
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::json_util::json_i64;
 use crate::adapters::paths;
-use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
+use crate::adapters::{
+    RawSession, ResumeCommand, SourceAdapter, SyncScanOutput, SyncScanResult, SyncScanStats,
+};
 
 #[cfg(test)]
 mod tests;
@@ -62,14 +64,45 @@ impl SourceAdapter for KimiCodeAdapter {
     ) -> anyhow::Result<Option<SyncScanResult>> {
         Ok(Some(scan_kimi_dirs_for_sync(&resolve_kimi_dirs()?, context, since_ts, include_events)?))
     }
+
+    fn scan_for_sync_output(
+        &self,
+        context: &AdapterSyncContext,
+        since_ts: Option<i64>,
+        include_events: bool,
+        force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
+        let scan = if force {
+            let sessions = scan_kimi_dirs_with_context(&resolve_kimi_dirs()?, Some(context))?;
+            let parsed = sessions.len() as u32;
+            SyncScanResult {
+                sessions,
+                stats: SyncScanStats { candidates: parsed, parsed, ..Default::default() },
+                ..Default::default()
+            }
+        } else {
+            scan_kimi_dirs_for_sync(&resolve_kimi_dirs()?, context, since_ts, include_events)?
+        };
+        Ok(Some(SyncScanOutput { scan, reconcile: None }))
+    }
 }
 
 fn scan_kimi_dirs(sessions_dirs: &[PathBuf]) -> anyhow::Result<Vec<RawSession>> {
+    scan_kimi_dirs_with_context(sessions_dirs, None)
+}
+
+fn scan_kimi_dirs_with_context(
+    sessions_dirs: &[PathBuf],
+    context: Option<&AdapterSyncContext>,
+) -> anyhow::Result<Vec<RawSession>> {
     let mut sessions = Vec::new();
     let mut claimed = HashSet::new();
     for sessions_dir in sessions_dirs {
         sessions.extend(scan_kimi_session_entries_with_parser(
-            claim_session_entries(collect_session_entries(sessions_dir), &mut claimed),
+            claim_session_entries(
+                collect_session_entries_with_context(sessions_dir, context),
+                &mut claimed,
+            ),
             |entry, mtime_ms| parse_kimi_session_file(entry, mtime_ms, true),
         )?);
     }
@@ -89,7 +122,10 @@ fn scan_kimi_dirs_for_sync(
             context,
             since_ts,
             kimi_scan_options(include_events),
-            claim_session_entries(collect_session_entries(sessions_dir), &mut claimed),
+            claim_session_entries(
+                collect_session_entries_with_context(sessions_dir, Some(context)),
+                &mut claimed,
+            ),
             kimi_session_snapshot,
             |entry, mtime_ms| parse_kimi_session_file(entry, mtime_ms, include_events),
         )?);
@@ -153,7 +189,7 @@ where
     Ok(sessions)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct StateMeta {
     pub(super) id: Option<String>,
     pub(super) cwd: Option<String>,
@@ -180,7 +216,20 @@ fn read_state_json(path: &Path) -> anyhow::Result<StateMeta> {
     parse_state_json(&content).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+#[cfg(test)]
 fn collect_session_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
+    collect_session_entries_with_context(sessions_dir, None)
+}
+
+fn collect_session_entries_with_context(
+    sessions_dir: &Path,
+    context: Option<&AdapterSyncContext>,
+) -> Vec<FileScanEntry> {
+    let indexed_paths: HashMap<_, _> = context
+        .into_iter()
+        .flat_map(AdapterSyncContext::session_paths)
+        .filter_map(|session| Some((session.source_file_path.as_deref()?, session)))
+        .collect();
     let mut entries = Vec::new();
     if !sessions_dir.exists() {
         return entries;
@@ -188,12 +237,10 @@ fn collect_session_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
 
     for dir_entry in WalkDir::new(sessions_dir).max_depth(3).into_iter().filter_map(|e| e.ok()) {
         let path = dir_entry.path();
-        if !path.is_file() || path.file_name().and_then(|n| n.to_str()) != Some("state.json") {
+        if !path.is_dir() {
             continue;
         }
-        let Some(session_dir) = path.parent() else {
-            continue;
-        };
+        let session_dir = path;
         let dir_name = session_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if !dir_name.starts_with("session_") {
             continue;
@@ -203,11 +250,16 @@ fn collect_session_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
             continue;
         }
 
-        let meta = match read_state_json(path) {
+        let meta = match read_state_json(&session_dir.join("state.json")) {
             Ok(meta) => meta,
             Err(error) => {
                 warn!("{error}");
-                continue;
+                let indexed = wire_path.to_str().and_then(|path| indexed_paths.get(path));
+                StateMeta {
+                    id: indexed.map(|session| session.source_id.clone()),
+                    cwd: indexed.and_then(|session| session.directory.clone()),
+                    ..Default::default()
+                }
             }
         };
         let session_id = meta.id.clone().unwrap_or_else(|| dir_name.to_string());
@@ -244,13 +296,31 @@ fn parse_kimi_session_file_impl(
     let Some(session_dir) = session_dir_for_wire(wire_path) else {
         return Ok(None);
     };
-    let meta = read_state_json(&session_dir.join("state.json"))?;
+    let meta = read_state_json(&session_dir.join("state.json"));
+    let usage_available = meta.is_ok();
+    let meta = meta.unwrap_or_else(|error| {
+        warn!("{error}");
+        StateMeta::default()
+    });
     let session_id = meta.id.clone().unwrap_or_else(|| entry.session_id.clone());
 
     let file = fs::File::open(wire_path)?;
     let reader = BufReader::new(file);
     let source_path = wire_path.to_str().map(str::to_string);
-    parse_kimi_wire(meta, session_id, reader.lines(), mtime_ms, None, source_path, include_events)
+    let mut session = parse_kimi_wire(
+        meta,
+        session_id,
+        reader.lines(),
+        mtime_ms,
+        entry.directory.clone(),
+        source_path,
+        include_events,
+    )?;
+    if !usage_available && let Some(session) = session.as_mut() {
+        session.usage_parser_version = None;
+        session.usage_events.clear();
+    }
+    Ok(session)
 }
 
 #[cfg(test)]
@@ -270,7 +340,7 @@ fn session_dir_for_wire(wire_path: &Path) -> Option<&Path> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct KimiSessionSnapshot {
-    state: file_scan::FileMetadataSnapshot,
+    state: Option<file_scan::FileMetadataSnapshot>,
     wire: file_scan::FileMetadataSnapshot,
 }
 
@@ -278,9 +348,11 @@ fn kimi_session_snapshot(
     entry: &FileScanEntry,
 ) -> Option<file_scan::FileScanSnapshot<KimiSessionSnapshot>> {
     let session_dir = session_dir_for_wire(&entry.stat_target)?;
-    let state = file_scan::file_metadata_snapshot(&session_dir.join("state.json"))?;
+    let state = file_scan::file_metadata_snapshot(&session_dir.join("state.json"));
     let wire = file_scan::file_metadata_snapshot(&entry.stat_target)?;
-    let effective_mtime_ms = state.mtime_ms()?.max(wire.mtime_ms()?);
+    let effective_mtime_ms = wire
+        .mtime_ms()?
+        .max(state.as_ref().and_then(file_scan::FileMetadataSnapshot::mtime_ms).unwrap_or(0));
     Some(file_scan::FileScanSnapshot::new(effective_mtime_ms, KimiSessionSnapshot { state, wire }))
 }
 
@@ -293,4 +365,42 @@ pub(crate) fn parse_kimi_session(
     let meta = parse_state_json(state_json).ok()?;
     let lines = wire_jsonl.lines().map(|line| Ok(line.to_string()));
     parse_kimi_wire(meta, session_id.to_string(), lines, 0, None, None, true).unwrap()
+}
+
+#[cfg(test)]
+mod degradation_tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_state_preserves_wire_transcript() {
+        for content in [
+            Some(b"{".as_slice()),
+            Some(b"[]".as_slice()),
+            Some([0xff].as_slice()),
+            None,
+            Some(b"directory".as_slice()),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let session_dir = root.path().join("wd_repo/session_abc");
+            let wire_dir = session_dir.join("agents/main");
+            fs::create_dir_all(&wire_dir).unwrap();
+            fs::write(wire_dir.join("wire.jsonl"), super::tests::fixture_wire()).unwrap();
+            match content {
+                Some(b"directory") => fs::create_dir(session_dir.join("state.json")).unwrap(),
+                Some(content) => fs::write(session_dir.join("state.json"), content).unwrap(),
+                None => {}
+            }
+            let sessions = scan_kimi_dirs(&[root.path().to_path_buf()]).unwrap();
+            assert_eq!(sessions.len(), 1);
+            let session = &sessions[0];
+            assert_eq!(session.source_id, "session_abc");
+            assert_eq!(session.messages.len(), 2);
+            assert_eq!(session.messages[0].content, "fix the bug");
+            assert_eq!(session.directory, None);
+            assert_eq!(session.started_at, 1700000001001);
+            assert_eq!(session.events.len(), 2);
+            assert_eq!(session.usage_parser_version, None);
+            assert!(session.usage_events.is_empty());
+        }
+    }
 }

@@ -215,15 +215,24 @@ fn parse_droid_session_file_impl(
                 if index == 0 { value.trim_start_matches('\u{feff}').to_string() } else { value }
             })
         });
-    let settings = read_settings(&settings_path(&entry.stat_target))?;
-    parse_droid_jsonl(
+    let settings = read_settings(&settings_path(&entry.stat_target));
+    let usage_available = matches!(settings, Ok(Some(_)));
+    let settings = settings.unwrap_or_else(|error| {
+        warn!("failed to read {}: {error}", settings_path(&entry.stat_target).display());
+        None
+    });
+    let mut session = parse_droid_jsonl(
         lines,
         entry.session_id.clone(),
         mtime_ms,
         entry.stat_target.to_str().map(str::to_string),
         settings,
         include_events,
-    )
+    )?;
+    if !usage_available && let Some(session) = session.as_mut() {
+        session.usage_parser_version = None;
+    }
+    Ok(session)
 }
 
 struct SettingsMeta {
@@ -703,10 +712,26 @@ mod tests {
         assert_eq!(sessions[0].usage_events.len(), 1);
         let path =
             root.path().join("-Users-x-git-demo").join(format!("{SESSION_ID}.settings.json"));
-        fs::write(&path, "{\"model\":").unwrap();
-        assert!(scan_droid_sessions(root.path()).unwrap().is_empty());
-        fs::write(&path, [0xff]).unwrap();
-        assert!(scan_droid_sessions(root.path()).unwrap().is_empty());
+        for content in [b"{\"model\":".as_slice(), b"[]", &[0xff]] {
+            fs::write(&path, content).unwrap();
+            let degraded = scan_droid_sessions(root.path()).unwrap();
+            assert_eq!(degraded.len(), 1);
+            assert_eq!(degraded[0].messages.len(), 2);
+            assert_eq!(degraded[0].events.len(), 5);
+            assert_eq!(degraded[0].usage_parser_version, None);
+        }
+        fs::remove_file(&path).unwrap();
+        for present in [true, false] {
+            if present {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::remove_dir(&path).unwrap();
+            }
+            let degraded = scan_droid_sessions(root.path()).unwrap();
+            assert_eq!(degraded.len(), 1);
+            assert_eq!(degraded[0].messages.len(), 2);
+            assert_eq!(degraded[0].usage_parser_version, None);
+        }
         fs::write(&path, fixture_settings()).unwrap();
         assert_eq!(scan_droid_sessions(root.path()).unwrap()[0].usage_events.len(), 1);
     }
