@@ -141,7 +141,7 @@ fn scan_for_sync_conn(
     let usage_state = context.usage_state();
     let event_state = context.event_state();
     let metadata_state = context.metadata_state();
-    let global_mtime = global_db_mtime();
+    let global_mtime = conn_db_mtime(conn);
     let lookup = ComposerLookup::load(conn);
     let composer_ids = discover_composer_ids(conn)?;
     let mut sessions = Vec::new();
@@ -172,14 +172,14 @@ fn scan_for_sync_conn(
             continue;
         }
 
-        let source_updated_at = updated_at.or(global_mtime);
+        let source_updated_at = max_opt(updated_at, global_mtime);
         if let Some(old) = existing.get(&composer_id)
             && cli_store::find_store_db(&composer_id).is_none()
             && !existing_paths
                 .get(&composer_id)
                 .and_then(|path| path.as_deref())
                 .is_some_and(|path| path.ends_with("store.db"))
-            && old.updated_at == source_updated_at
+            && (context.is_usage_only() || old.updated_at == source_updated_at)
             && crate::adapters::sync_state::session_state_is_current(
                 USAGE_PARSER_VERSION,
                 EVENT_PARSER_VERSION,
@@ -188,11 +188,12 @@ fn scan_for_sync_conn(
                 source_updated_at,
                 include_events,
             )
-            && crate::adapters::sync_state::parser_state_is_current(
-                METADATA_PARSER_VERSION,
-                metadata_state.get(&composer_id).copied(),
-                source_updated_at,
-            )
+            && (context.is_usage_only()
+                || crate::adapters::sync_state::parser_state_is_current(
+                    METADATA_PARSER_VERSION,
+                    metadata_state.get(&composer_id).copied(),
+                    source_updated_at,
+                ))
             && !source_path_changed
         {
             stats.skipped_sessions += 1;
@@ -346,6 +347,7 @@ fn build_raw_session(
     let Some(mut session) = parse_composer_session(conn, composer_id, meta, include_events)? else {
         return Ok(None);
     };
+    session.updated_at = max_opt(session.updated_at, conn_db_mtime(conn));
     session.source_file_path = transcript_paths
         .get(composer_id)
         .and_then(|transcript| transcript.path.to_str())
@@ -474,7 +476,8 @@ fn parse_composer_session(
         &messages,
         &usage_events,
         &session_events,
-    );
+    )
+    .or(json_i64(data.get("createdAt")).or(meta.created_at));
 
     let mut session = RawSession::search_only(
         composer_id.to_string(),
@@ -630,10 +633,9 @@ fn load_composer_meta(
         if meta.created_at.is_none() {
             meta.created_at = json_i64(data.get("createdAt"));
         }
-        if meta.last_updated_at.is_none() {
-            meta.last_updated_at = json_i64(data.get("lastUpdatedAt"))
-                .or(json_i64(data.get("conversationCheckpointLastUpdatedAt")));
-        }
+        let data_updated_at = json_i64(data.get("lastUpdatedAt"))
+            .or(json_i64(data.get("conversationCheckpointLastUpdatedAt")));
+        meta.last_updated_at = max_opt(meta.last_updated_at, data_updated_at);
     }
 
     if meta.directory.is_none()
@@ -1264,8 +1266,26 @@ fn open_global_db() -> anyhow::Result<Option<Connection>> {
     .map_err(Into::into)
 }
 
+fn max_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn db_mtime_with_wal(path: &Path) -> Option<i64> {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    [stat_mtime_ms(path), stat_mtime_ms(Path::new(&wal))].into_iter().flatten().max()
+}
+
+fn conn_db_mtime(conn: &Connection) -> Option<i64> {
+    conn.path().filter(|path| !path.is_empty()).and_then(|path| db_mtime_with_wal(Path::new(path)))
+}
+
+#[allow(dead_code)]
 fn global_db_mtime() -> Option<i64> {
-    resolve_global_state_db_path().and_then(|path| stat_mtime_ms(&path))
+    resolve_global_state_db_path().and_then(|path| db_mtime_with_wal(&path))
 }
 
 fn build_agent_cwd_map(db_path: Option<&Path>) -> HashMap<String, String> {
@@ -2391,5 +2411,183 @@ mod tests {
             "source_missing"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wal_only_bubble_commit_triggers_incremental_reparse_before_checkpoint() {
+        schema::register_sqlite_vec();
+        let root = temp_root("wal-reparse");
+        let db_path = root.join("state.vscdb");
+        let wal_path = root.join("state.vscdb-wal");
+        let composer_id = uuid::Uuid::new_v4().to_string();
+        let first_bubble = uuid::Uuid::new_v4().to_string();
+        let second_bubble = uuid::Uuid::new_v4().to_string();
+
+        let conn = seed_global_db(&root, &composer_id, &first_bubble);
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+        let initial_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_100);
+        fs::File::options()
+            .write(true)
+            .open(&db_path)
+            .unwrap()
+            .set_modified(initial_mtime)
+            .unwrap();
+        if wal_path.exists() {
+            fs::File::options()
+                .write(true)
+                .open(&wal_path)
+                .unwrap()
+                .set_modified(initial_mtime)
+                .unwrap();
+        }
+        let db_mtime_before = stat_mtime_ms(&db_path).unwrap();
+        assert_eq!(db_mtime_with_wal(&db_path), Some(db_mtime_before));
+
+        let ro_conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let initial = scan_for_sync_conn(
+            &ro_conn,
+            &AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap(),
+            None,
+            true,
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(initial.sessions.len(), 1);
+        let mut store = crate::sync::persist_raw_session_for_conformance(
+            store,
+            "cursor",
+            initial.sessions.into_iter().next().unwrap(),
+        )
+        .unwrap();
+
+        let steady = scan_for_sync_conn(
+            &ro_conn,
+            &AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap(),
+            None,
+            true,
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert!(steady.sessions.is_empty());
+        assert_eq!(steady.stats.skipped_sessions, 1);
+
+        let updated_composer = serde_json::json!({
+            "composerId": composer_id,
+            "createdAt": 1_700_000_000_000_i64,
+            "lastUpdatedAt": 1_700_000_100_000_i64,
+            "unifiedMode": "chat",
+            "modelConfig": { "modelName": "claude-sonnet-4" },
+            "fullConversationHeadersOnly": [
+                { "bubbleId": first_bubble, "type": 1 },
+                { "bubbleId": second_bubble, "type": 2 }
+            ]
+        });
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
+            rusqlite::params![updated_composer.to_string(), format!("composerData:{composer_id}")],
+        )
+        .unwrap();
+        let wal_bubble = serde_json::json!({
+            "type": 2,
+            "text": "assistant wal reply",
+            "createdAt": 1_700_000_100_000_i64,
+            "tokenCount": { "inputTokens": 120, "outputTokens": 45 }
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                format!("bubbleId:{composer_id}:{second_bubble}"),
+                wal_bubble.to_string()
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(stat_mtime_ms(&db_path), Some(db_mtime_before));
+        let wal_mtime = stat_mtime_ms(&wal_path).unwrap();
+        assert!(wal_mtime > db_mtime_before);
+        assert_eq!(db_mtime_with_wal(&db_path), Some(wal_mtime));
+
+        let usage_ctx = AdapterSyncContext::from_store_for_test(&store, "cursor")
+            .unwrap()
+            .with_usage_only(true);
+        let wal_usage = scan_for_sync_conn(
+            &ro_conn,
+            &usage_ctx,
+            None,
+            false,
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(wal_usage.sessions.len(), 1);
+        assert_eq!(wal_usage.stats.skipped_sessions, 0);
+        assert_eq!(wal_usage.sessions[0].usage_events.len(), 1);
+        assert_eq!(wal_usage.sessions[0].usage_events[0].token_source, TokenSource::Observed);
+        assert_eq!(wal_usage.sessions[0].usage_events[0].input_tokens, 120);
+        assert_eq!(wal_usage.sessions[0].usage_events[0].output_tokens, 45);
+        assert_eq!(wal_usage.sessions[0].usage_events[0].provider, "anthropic");
+
+        let usage_session = wal_usage.sessions.into_iter().next().unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "cursor",
+                &composer_id,
+                &usage_session.usage_events,
+                USAGE_PARSER_VERSION,
+                usage_session.updated_at,
+            )
+            .unwrap();
+        let steady_usage = scan_for_sync_conn(
+            &ro_conn,
+            &AdapterSyncContext::from_store_for_test(&store, "cursor")
+                .unwrap()
+                .with_usage_only(true),
+            None,
+            false,
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert!(steady_usage.sessions.is_empty());
+        assert_eq!(steady_usage.stats.skipped_sessions, 1);
+
+        let wal_full = scan_for_sync_conn(
+            &ro_conn,
+            &AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap(),
+            None,
+            true,
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(wal_full.sessions.len(), 1);
+        store = crate::sync::persist_raw_session_for_conformance(
+            store,
+            "cursor",
+            wal_full.sessions.into_iter().next().unwrap(),
+        )
+        .unwrap();
+        let post_wal = scan_for_sync_conn(
+            &ro_conn,
+            &AdapterSyncContext::from_store_for_test(&store, "cursor").unwrap(),
+            None,
+            true,
+            &HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert!(post_wal.sessions.is_empty());
+        assert_eq!(post_wal.stats.skipped_sessions, 1);
+
+        drop(ro_conn);
+        drop(conn);
+        let _ = fs::remove_dir_all(root);
     }
 }
