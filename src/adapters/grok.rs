@@ -65,6 +65,7 @@ impl SourceAdapter for GrokAdapter {
                 snapshot.effective_mtime_ms(),
                 true,
                 Some(&unified_index),
+                None,
             )? {
                 sessions.push(raw);
             }
@@ -182,6 +183,7 @@ fn scan_for_sync_impl(
                 mtime_ms,
                 include_events,
                 Some(&unified_index),
+                None,
             )? {
                 sessions.push(raw);
             }
@@ -205,6 +207,7 @@ fn scan_for_sync_impl(
                     mtime_ms,
                     include_events,
                     Some(&unified_index),
+                    Some(context),
                 )
             },
         )?
@@ -271,11 +274,7 @@ fn preserved_rotated_unified_mtime(
     if prev <= local_mtime_ms || usage.parser_version < USAGE_PARSER_VERSION {
         return None;
     }
-    if context.is_usage_only() {
-        return Some(prev);
-    }
-    let old = context.session_meta().get(session_id)?;
-    (old.updated_at == Some(prev)).then_some(prev)
+    (context.is_usage_only() || context.session_meta().contains_key(session_id)).then_some(prev)
 }
 
 fn unified_log_path(sessions_dir: &Path) -> Option<PathBuf> {
@@ -608,7 +607,13 @@ fn parse_grok_session_for_entry(
         .filter(|path| path.is_file())
         .map(|path| load_unified_log_index_from_path(&path))
         .transpose()?;
-    parse_grok_session_for_entry_with_unified(entry, mtime_ms, include_events, loaded.as_ref())
+    parse_grok_session_for_entry_with_unified(
+        entry,
+        mtime_ms,
+        include_events,
+        loaded.as_ref(),
+        None,
+    )
 }
 
 fn parse_grok_session_for_entry_with_unified(
@@ -616,6 +621,7 @@ fn parse_grok_session_for_entry_with_unified(
     mtime_ms: i64,
     include_events: bool,
     unified_index: Option<&UnifiedLogIndex>,
+    context: Option<&AdapterSyncContext>,
 ) -> anyhow::Result<Option<RawSession>> {
     let session_dir = entry
         .stat_target
@@ -659,13 +665,25 @@ fn parse_grok_session_for_entry_with_unified(
         .and_then(|index| index.source_path.as_deref())
         .and_then(|path| path.to_str())
         .map(str::to_string);
-    let usage_events = merge_grok_usage_events(
-        prompts,
-        usage_source_path.as_deref(),
-        unified_events,
-        unified_source_path.as_deref(),
-        &fallback_model,
-    );
+    let preserve_rotated_usage = unified_events.is_empty()
+        && context.is_some_and(|ctx| {
+            ctx.session_meta().contains_key(&entry.session_id)
+                && ctx.usage_state().get(&entry.session_id).is_some_and(|usage| {
+                    usage.parser_version >= USAGE_PARSER_VERSION
+                        && usage.source_updated_at == Some(mtime_ms)
+                })
+        });
+    let usage_events = if preserve_rotated_usage {
+        Vec::new()
+    } else {
+        merge_grok_usage_events(
+            prompts,
+            usage_source_path.as_deref(),
+            unified_events,
+            unified_source_path.as_deref(),
+            &fallback_model,
+        )
+    };
 
     let mut source_path = usage_source_path.clone();
     if messages.is_empty() {
@@ -688,7 +706,11 @@ fn parse_grok_session_for_entry_with_unified(
         }
     }
 
-    if messages.is_empty() && session_events.is_empty() && usage_events.is_empty() {
+    if messages.is_empty()
+        && session_events.is_empty()
+        && usage_events.is_empty()
+        && !preserve_rotated_usage
+    {
         return Ok(None);
     }
 
@@ -707,8 +729,10 @@ fn parse_grok_session_for_entry_with_unified(
         summary.updated_at.or(Some(mtime_ms)),
         None,
         messages,
-    )
-    .with_usage(usage_events, USAGE_PARSER_VERSION);
+    );
+    if !preserve_rotated_usage {
+        session = session.with_usage(usage_events, USAGE_PARSER_VERSION);
+    }
 
     session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
     session.refresh_session_on_metadata_backfill = true;
@@ -2218,6 +2242,43 @@ mod tests {
             store.list_usage_events_for_session(&format!("internal-{active_id}")).unwrap();
         assert_eq!(stored_events.len(), 2);
         assert!(stored_events.iter().all(|event| event.token_source == "observed"));
+
+        let rotated_full = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "grok")
+                .unwrap()
+                .with_usage_only(false),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(rotated_full.scan.sessions.len(), 1);
+        let refreshed = rotated_full.scan.sessions.into_iter().next().unwrap();
+        assert_eq!(refreshed.source_id, active_id);
+        assert_eq!(refreshed.updated_at, Some(bumped_mtime));
+        assert!(refreshed.usage_parser_version.is_none());
+        assert!(refreshed.usage_events.is_empty());
+
+        let store =
+            crate::sync::persist_raw_session_for_conformance(store, "grok", refreshed).unwrap();
+        let stored_events =
+            store.list_usage_events_for_session(&format!("internal-{active_id}")).unwrap();
+        assert_eq!(stored_events.len(), 2);
+        assert!(stored_events.iter().all(|event| event.token_source == "observed"));
+
+        let rotated_full_again = scan_for_sync_impl(
+            &sessions_dir,
+            &AdapterSyncContext::from_store_for_test(&store, "grok")
+                .unwrap()
+                .with_usage_only(false),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(rotated_full_again.scan.sessions.is_empty());
+        assert_eq!(rotated_full_again.scan.stats.skipped_sessions, 2);
 
         let _ = fs::remove_dir_all(&root);
     }
