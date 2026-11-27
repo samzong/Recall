@@ -222,7 +222,7 @@ messages {
 messages {
   id: "probe-message-16"
   agent_output {
-    text: "`sample.txt` 原先是 `alpha`、`beta` 两行（末尾有换行），`wc -l` 是 2。\n\n已追加一行 `gamma`。现在是 3 行：\n\n```\nalpha\nbeta\ngamma\n```"
+    text: "`sample.txt` originally had two lines, `alpha` and `beta` (with a trailing newline), and `wc -l` returned 2.\n\nAppended `gamma`. It now has 3 lines:\n\n```\nalpha\nbeta\ngamma\n```"
   }
   task_id: "probe-task"
   request_id: "probe-request-16"

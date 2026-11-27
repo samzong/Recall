@@ -1,5 +1,3 @@
-**English** | [Chinese](./README.zh-CN.md)
-
 # Recall
 
 > Local-first search across every AI coding session on your machine.

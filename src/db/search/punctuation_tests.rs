@@ -138,15 +138,15 @@ fn punctuation_search_handles_identifiers_paths_quotes_and_empty_terms() {
 #[test]
 fn punctuation_search_preserves_trigram_substrings() {
     let store = seed(&[
-        ("hyphen", "claude-code", "统计-不准确"),
-        ("joined", "codex", "统计不准确"),
-        ("space", "codex", "统计 不准确"),
-        ("short", "codex", "矩阵运算"),
-        ("mixed", "codex", "缓存-cache"),
+        ("hyphen", "claude-code", "집계-불일치"),
+        ("joined", "codex", "집계불일치"),
+        ("space", "codex", "집계 불일치"),
+        ("short", "codex", "행렬연산"),
+        ("mixed", "codex", "캐시-cache"),
     ]);
-    assert_matches(&store, "统计-不准确", None, &["hyphen"]);
-    assert_matches(&store, "\"统计-不准确\"", Some("claude-code"), &["hyphen"]);
-    assert_matches(&store, "计不准", None, &["joined"]);
-    assert_matches(&store, "矩阵", None, &["short"]);
-    assert_matches(&store, "缓存-cache", None, &["mixed"]);
+    assert_matches(&store, "집계-불일치", None, &["hyphen"]);
+    assert_matches(&store, "\"집계-불일치\"", Some("claude-code"), &["hyphen"]);
+    assert_matches(&store, "계불일", None, &["joined"]);
+    assert_matches(&store, "행렬", None, &["short"]);
+    assert_matches(&store, "캐시-cache", None, &["mixed"]);
 }

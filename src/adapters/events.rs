@@ -258,7 +258,8 @@ mod tests {
     #[test]
     fn command_candidates_decode_literals_without_inventing_execution() {
         use crate::types::{CommandEvidenceStatus, FileEvidenceKind};
-        let patch = "*** Begin Patch\n*** Update File: /repo/README.zh-CN.md\n@@\n-old\n+new\n*** End Patch";
+        let patch =
+            "*** Begin Patch\n*** Update File: /repo/DEVELOPMENT.md\n@@\n-old\n+new\n*** End Patch";
         for script in [
             format!("text(await tools.apply_patch({}));", serde_json::to_string(patch).unwrap()),
             format!(
@@ -273,7 +274,7 @@ mod tests {
                 super::command_file_evidence("exec", Some(&serde_json::json!(script)), None);
             assert_eq!(status, CommandEvidenceStatus::Unsupported);
             assert_eq!(files.len(), 1);
-            assert_eq!(files[0].path, "/repo/README.zh-CN.md");
+            assert_eq!(files[0].path, "/repo/DEVELOPMENT.md");
             assert_eq!(files[0].kind, FileEvidenceKind::Command);
             assert!(files[0].cwd.is_none());
         }

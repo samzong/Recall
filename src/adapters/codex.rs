@@ -2096,7 +2096,7 @@ mod tests {
                 "payload": {
                     "type": "message",
                     "role": "developer",
-                    "content": [{"type": "input_text", "text": "汉".repeat(5000)}]
+                    "content": [{"type": "input_text", "text": "€".repeat(5000)}]
                 }
             }),
         ];

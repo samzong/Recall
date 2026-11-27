@@ -386,15 +386,15 @@ fn message_search_opens_sparse_context_and_preserves_explicit_current_session_re
 #[test]
 fn discovery_and_message_search_sanitize_terminal_noise_and_water_fill_inline_budget() {
     let store = setup();
-    let short_clean = "简短命中保留全文 keywordneedle";
+    let short_clean = "short clean match keywordneedle";
     for idx in 0..10 {
         let id = format!("s{idx:02}");
-        let mut stored = session(&id, "codex", &"标题汉字".repeat(50), 10_000 - i64::from(idx));
+        let mut stored = session(&id, "codex", &"€★☃─".repeat(50), 10_000 - i64::from(idx));
         stored.summary = Some(if idx == 0 {
-            "\x1b[32m进度 10%\r进度 100%\x1b[0m\r\n\x1b]8;;https://example.com\x07短摘要\x1b]8;;\x07"
+            "\x1b[32mprogress 10%\rprogress 100%\x1b[0m\r\n\x1b]8;;https://example.com\x07short summary\x1b]8;;\x07"
                 .to_string()
         } else {
-            format!("\x1b[36m旧帧\r新帧-{idx}\x1b[0m\r\n{}", "摘".repeat(220))
+            format!("\x1b[36mold-frame\rnew-frame-{idx}\x1b[0m\r\n{}", "€".repeat(220))
         });
         store.insert_session(&stored).unwrap();
         let body = if idx == 0 {
@@ -404,8 +404,8 @@ fn discovery_and_message_search_sanitize_terminal_noise_and_water_fill_inline_bu
         } else {
             format!(
                 "\x1b[35mframeA\rframeB-{idx}\x1b[0m\r\n{} keywordneedle {}",
-                "前".repeat(220),
-                "后".repeat(220)
+                "€".repeat(220),
+                "★".repeat(220)
             )
         };
         store.insert_messages(&[message(&id, Role::Assistant, &body, idx)]).unwrap();
@@ -417,7 +417,7 @@ fn discovery_and_message_search_sanitize_terminal_noise_and_water_fill_inline_bu
                 "file_write",
                 Some("src/mcp.rs"),
                 Some(20_000 + i64::from(seq)),
-                Some(&format!("\x1b[32m0%\r100%-{seq}\x1b[0m\r\n{}", "改".repeat(210))),
+                Some(&format!("\x1b[32m0%\r100%-{seq}\x1b[0m\r\n{}", "€".repeat(210))),
                 Some("Edit"),
             )
         })
@@ -480,7 +480,7 @@ fn discovery_and_message_search_sanitize_terminal_noise_and_water_fill_inline_bu
 
     let recent_hits = list_recent_sessions(&index, &ListRecentSessionsArgs::default()).unwrap();
     assert!(serde_json::to_vec(&recent_hits).unwrap().len() <= MCP_INLINE_MAX_BYTES);
-    assert_eq!(recent_hits.hits[0].excerpt.as_deref(), Some("进度 100%\n短摘要"));
+    assert_eq!(recent_hits.hits[0].excerpt.as_deref(), Some("progress 100%\nshort summary"));
 
     let legacy_history = file_history(&index, &file_history_args("src/mcp.rs")).unwrap();
     assert_eq!(legacy_history.events.len(), 20);

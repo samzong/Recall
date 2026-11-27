@@ -1056,7 +1056,7 @@ mod tests {
         let project = root.join("projects").join("-tmp-foo");
         fs::create_dir_all(&project).unwrap();
         let path = project.join("tool-session.jsonl");
-        let large_content = "汉🦀".repeat(3000);
+        let large_content = "€🦀".repeat(3000);
         let cases = [
             ("Read", serde_json::json!({"file_path": "src/main.rs"}), Some(false)),
             (
@@ -1275,7 +1275,7 @@ mod tests {
                 "type": "assistant",
                 "isMeta": true,
                 "timestamp": "2026-04-13T10:00:04Z",
-                "message": {"content": [{"type": "text", "text": "汉".repeat(5000)}]}
+                "message": {"content": [{"type": "text", "text": "€".repeat(5000)}]}
             }),
             serde_json::json!({
                 "type": "user",

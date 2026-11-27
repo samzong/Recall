@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(call.timestamp, Some(1700000005500));
         assert_eq!(call.message_seq, Some(1));
         assert_eq!(call.files.len(), 1);
-        assert_eq!(call.files[0].path, "README.zh-CN.md");
+        assert_eq!(call.files[0].path, "DEVELOPMENT.md");
         assert_eq!(call.files[0].cwd.as_deref(), Some("/repo"));
         assert_eq!(call.files[0].operation, FileOperation::Write);
         assert_eq!(call.files[0].kind, FileEvidenceKind::Call);
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(attrs.pointer("/event/parentUuid"), Some(&Value::from("call-uuid")));
         assert_eq!(
             attrs.pointer("/event/result/output"),
-            Some(&Value::from("Replaced 1 occurrence in README.zh-CN.md"))
+            Some(&Value::from("Replaced 1 occurrence in DEVELOPMENT.md"))
         );
     }
 

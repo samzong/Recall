@@ -14,7 +14,7 @@ fn event_evidence_pages_native_payload_and_binds_related_revisions() {
     call.tool_call_id = Some("shared-call-id".into());
     call.source_event_id = Some("call-record".into());
     call.source_path = Some("composer:src-s1".into());
-    call.attrs_json = Some(serde_json::json!({"input":"汉\n\\\"".repeat(900)}).to_string());
+    call.attrs_json = Some(serde_json::json!({"input":"€\n\\\"".repeat(900)}).to_string());
     let mut result = event(4, "tool_result", None, None, Some("result"), None);
     result.tool_call_id = call.tool_call_id.clone();
     result.source_event_id = Some("r".repeat(3500));
@@ -136,8 +136,7 @@ fn event_evidence_defaults_to_inline_budget_and_packs_utf8_without_6x_waste() {
     let store = setup();
     store.insert_session(&session("s1", "cursor", "Evidence", 1_000)).unwrap();
     let mut call = event(1, "tool_call", Some("src/mcp.rs"), None, Some("edit"), Some("Edit"));
-    call.attrs_json =
-        Some(serde_json::json!({"patch": "中文证据内容片段".repeat(650)}).to_string());
+    call.attrs_json = Some(serde_json::json!({"patch": "€★☃─€★☃─".repeat(650)}).to_string());
     persist_events(&store, "cursor", "s1", std::slice::from_ref(&call));
     let reference = {
         let tx = store.conn.unchecked_transaction().unwrap();

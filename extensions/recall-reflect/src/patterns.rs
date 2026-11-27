@@ -1,7 +1,7 @@
 use crate::model::{ObservedPattern, TimelineMoment};
 
 pub(crate) fn detect_observed_patterns(moments: &[TimelineMoment]) -> Vec<ObservedPattern> {
-    let scope_signals = ["scope", "don't expand", "do not expand", "keep it small", "不要扩大"];
+    let scope_signals = ["scope", "don't expand", "do not expand", "keep it small"];
 
     let matched: Vec<&str> = moments
         .iter()

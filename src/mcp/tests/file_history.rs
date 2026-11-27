@@ -275,7 +275,7 @@ fn target_file_history_default_limit_converges_bytes_and_pages_losslessly() {
                 "file_write",
                 Some("src/lib.rs"),
                 (seq < 15).then_some(10_000 + i64::from(seq)),
-                Some(&format!("\x1b[32mdraft\rfinal-{seq}\x1b[0m\r\n{}", "详".repeat(90))),
+                Some(&format!("\x1b[32mdraft\rfinal-{seq}\x1b[0m\r\n{}", "€".repeat(90))),
                 Some("Edit"),
             );
             ev.files = vec![file.clone()];

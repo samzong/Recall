@@ -99,7 +99,7 @@ mod tests {
             "2147483648s",
             "4294967295h",
             "999999999999s",
-            "时间",
+            "€",
         ] {
             assert!(parse_interval(value).is_err(), "accepted {value}");
         }

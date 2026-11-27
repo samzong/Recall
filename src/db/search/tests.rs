@@ -22,7 +22,7 @@ fn search_keeps_short_and_mixed_terms_without_embeddings() {
                 ('long', 'user', 'context cache enables powercontext', 0);",
         )
         .unwrap();
-    let cjk = "\u{77e9}\u{9635}\u{8fd0}\u{7b97}";
+    let cjk = "행렬연산";
     store
         .conn
         .execute(
@@ -42,7 +42,7 @@ fn search_keeps_short_and_mixed_terms_without_embeddings() {
 
     let short = engine.hybrid_search("rx", None, &filters, 10, 3).unwrap();
     assert_eq!(short[0].session.id, "short");
-    let cjk = engine.hybrid_search("\u{77e9}\u{9635}", None, &filters, 10, 3).unwrap();
+    let cjk = engine.hybrid_search("행렬", None, &filters, 10, 3).unwrap();
     assert_eq!(cjk[0].session.id, "cjk");
     let mut mixed: Vec<_> = engine
         .hybrid_search("context rx", None, &filters, 10, 3)

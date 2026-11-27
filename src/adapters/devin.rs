@@ -747,16 +747,14 @@ mod tests {
         let db_path = setup_db(root.path());
         let conn = Connection::open(&db_path).unwrap();
         insert_session(&conn, "s1", 0);
-        let mut slash =
-            user_message("u1", "**回复语言**：中文\n\n# Simplify\n\nReduce maintenance");
+        let mut slash = user_message("u1", "**Language**: en\n\n# Simplify\n\nReduce maintenance");
         slash["metadata"]["extensions"] = serde_json::json!({"chisel/acp-content-blocks": [{"type": "text", "text": "/simplify "}]});
         insert_node(&conn, "s1", 1, None, &slash, 1000);
         insert_node(&conn, "s1", 2, Some(1), &assistant_message("a1", "ok", None), 1001);
-        let mut linked =
-            user_message("u2", "[README.md](file:///repo/README.md)  这次改动太啰嗦了");
+        let mut linked = user_message("u2", "[README.md](file:///repo/README.md)  Too verbose");
         linked["metadata"]["extensions"] = serde_json::json!({"chisel/acp-content-blocks": [
             {"type": "resource_link", "name": "README.md", "uri": "file:///repo/README.md"},
-            {"type": "text", "text": "  这次改动太啰嗦了"},
+            {"type": "text", "text": "  Too verbose"},
         ]});
         insert_node(&conn, "s1", 3, Some(2), &linked, 1002);
         insert_node(&conn, "s1", 4, Some(3), &assistant_message("a2", "done", None), 1003);
@@ -767,7 +765,7 @@ mod tests {
             [
                 ("user", "/simplify"),
                 ("assistant", "ok"),
-                ("user", "README.md 这次改动太啰嗦了"),
+                ("user", "README.md Too verbose"),
                 ("assistant", "done"),
             ]
         );

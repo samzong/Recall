@@ -1029,7 +1029,7 @@ mod tests {
     fn parse_json_snapshot_extracts_requests() {
         let root = temp_root("json");
         let path = root.join("sess-2.json");
-        let payload = "完整".repeat(3000);
+        let payload = "€★".repeat(3000);
         let doc = serde_json::json!({
             "version": 3, "sessionId": "sess-2", "creationDate": 1700000000000i64,
             "customTitle": "Old chat", "responderUsername": "GitHub Copilot",

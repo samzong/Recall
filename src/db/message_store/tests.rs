@@ -66,8 +66,7 @@ fn around_counts_messages_across_gaps_and_stops_at_edges() {
 
 #[test]
 fn pages_preserve_unicode_nul_empty_and_duplicate_sequence_messages() {
-    let input =
-        [(2, "\u{4f60}\u{597d}🦀e\u{301}\0end"), (2, "second"), (9, ""), (100, "\u{6700}\u{540e}")];
+    let input = [(2, "€★🦀e\u{301}\0end"), (2, "second"), (9, ""), (100, "€★")];
     let store = store_with_messages(&input);
     for budget in 1..=12 {
         let mut cursor = None;
@@ -150,14 +149,14 @@ fn cursor_keeps_selection_and_rejects_reindexed_messages() {
 
 #[test]
 fn rendered_byte_budget_preserves_lossless_cursor_and_advances_single_codepoint() {
-    for ch in ('\x00'..='\x7f').chain(['汉', '🦀', '…', '\u{2028}']) {
+    for ch in ('\x00'..='\x7f').chain(['€', '🦀', '…', '\u{2028}']) {
         let expected = serde_json::to_vec(&ch.to_string()).unwrap().len() - 2;
         assert_eq!(json_escaped_char_bytes(ch), expected);
     }
     let input = [
-        (3, "\x1b[31m红\x1b[0m\r覆写\r\n\"quote\"\\\x00🦀"),
+        (3, "\x1b[31m€\x1b[0m\r€★\r\n\"quote\"\\\x00🦀"),
         (4, ""),
-        (83, "终端进度10%\r终端进度100%\n完成"),
+        (83, "progress 10%\rprogress 100%\ndone"),
     ];
     let store = store_with_messages(&input);
     for byte_budget in [1usize, 19, 64] {

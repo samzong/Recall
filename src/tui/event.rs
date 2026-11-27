@@ -87,10 +87,10 @@ mod tests {
 
     #[test]
     fn text_editing_preserves_utf8_cursor_boundaries() {
-        let mut text = "a界🙂".to_string();
+        let mut text = "a€🙂".to_string();
         let mut cursor = text.len();
         for (key, expected, position, changed) in [
-            (KeyCode::Left, "a界🙂", 4, false),
+            (KeyCode::Left, "a€🙂", 4, false),
             (KeyCode::Backspace, "a🙂", 1, true),
             (KeyCode::Char('é'), "aé🙂", 3, true),
             (KeyCode::Right, "aé🙂", 7, false),
