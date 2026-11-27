@@ -27,8 +27,8 @@ use crate::types::{
 pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 6;
-const EVENT_PARSER_VERSION: u32 = 7;
-const METADATA_PARSER_VERSION: u32 = 3;
+const EVENT_PARSER_VERSION: u32 = 8;
+const METADATA_PARSER_VERSION: u32 = 4;
 
 impl SourceAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &str {
@@ -78,7 +78,7 @@ fn scan_claude_dirs(claude_dirs: &[PathBuf]) -> anyhow::Result<Vec<RawSession>> 
         entries.extend(collect_transcript_entries(claude_dir));
         claim_session_entries(&mut entries, &mut claimed);
         for entry in entries {
-            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+            let Some(mtime_ms) = claude_entry_mtime_ms(&entry.stat_target) else {
                 continue;
             };
             if let Some(raw) = parse_claude_session_file(entry, mtime_ms, &indexes, true)? {
@@ -228,6 +228,16 @@ fn scan_for_sync_impl(
     scan_for_sync_claimed(claude_dir, context, since_ts, include_events, &mut HashSet::new())
 }
 
+fn claude_entry_mtime_ms(path: &Path) -> Option<i64> {
+    let jsonl_ms = file_scan::stat_mtime_ms(path)?;
+    if path.components().any(|c| c.as_os_str() == "subagents")
+        && let Some(meta_ms) = file_scan::stat_mtime_ms(&path.with_extension("meta.json"))
+    {
+        return Some(jsonl_ms.max(meta_ms));
+    }
+    Some(jsonl_ms)
+}
+
 fn scan_for_sync_claimed(
     claude_dir: &Path,
     context: &AdapterSyncContext,
@@ -240,7 +250,7 @@ fn scan_for_sync_claimed(
     entries.extend(collect_transcript_entries(claude_dir));
     claim_session_entries(&mut entries, claimed);
 
-    file_scan::run_file_scan_with_options(
+    file_scan::run_file_scan_with_options_and_mtime(
         context,
         since_ts,
         file_scan::FileScanOptions {
@@ -250,6 +260,7 @@ fn scan_for_sync_claimed(
             metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
         },
         entries,
+        |entry| claude_entry_mtime_ms(&entry.stat_target),
         |entry, mtime_ms| parse_claude_session_file(entry, mtime_ms, &indexes, include_events),
     )
 }
@@ -453,8 +464,12 @@ fn parse_claude_session_file(
     };
     let summary =
         parsed.summary.or_else(|| indexes.project_summaries.get(&entry.session_id).cloned());
-    let (thread_role, parent_links) =
-        claude_topology(&entry.stat_target, &entry.session_id, parsed.session_id.as_deref());
+    let (thread_role, parent_links) = claude_topology(
+        &entry.stat_target,
+        &entry.session_id,
+        parsed.session_id.as_deref(),
+        parsed.parent_agent_id.as_deref(),
+    );
     Ok(Some(RawSession {
         source_id: entry.session_id,
         directory,
@@ -500,6 +515,38 @@ pub(crate) struct ParsedConversation {
     first_ts: Option<i64>,
     last_ts: Option<i64>,
     session_id: Option<String>,
+    parent_agent_id: Option<String>,
+}
+
+#[derive(Default)]
+struct SubagentMeta {
+    description: Option<String>,
+    parent_agent_id: Option<String>,
+    tool_use_id: Option<String>,
+    raw_json: Option<String>,
+}
+
+fn read_claude_subagent_meta(path: &Path) -> SubagentMeta {
+    let meta_path = path.with_extension("meta.json");
+    let Ok(content) = fs::read_to_string(&meta_path) else {
+        return SubagentMeta::default();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&content) else {
+        return SubagentMeta::default();
+    };
+    let trimmed = |key: &str| {
+        v.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    SubagentMeta {
+        description: trimmed("description"),
+        parent_agent_id: trimmed("parentAgentId"),
+        tool_use_id: trimmed("toolUseId"),
+        raw_json: Some(v.to_string()),
+    }
 }
 
 pub(crate) fn parse_conversation_jsonl(
@@ -509,6 +556,9 @@ pub(crate) fn parse_conversation_jsonl(
 ) -> anyhow::Result<ParsedConversation> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
+    let is_subagent_file = path.components().any(|c| c.as_os_str() == "subagents");
+    let subagent_meta =
+        if is_subagent_file { read_claude_subagent_meta(path) } else { SubagentMeta::default() };
     let mut messages = Vec::new();
     let mut usage_events: Vec<RawUsageEvent> = Vec::new();
     let mut events = Vec::new();
@@ -573,8 +623,9 @@ pub(crate) fn parse_conversation_jsonl(
         let is_compact_summary =
             v.get("isCompactSummary").and_then(Value::as_bool).unwrap_or(false);
         let is_sidechain = v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false);
+        let effective_sidechain = is_sidechain && !is_subagent_file;
         let is_meta = v.get("isMeta").and_then(Value::as_bool);
-        let is_machinery = is_compact_summary || is_sidechain || is_meta == Some(true);
+        let is_machinery = is_compact_summary || effective_sidechain || is_meta == Some(true);
 
         let role = if msg_type == "user" { Role::User } else { Role::Assistant };
 
@@ -649,7 +700,7 @@ pub(crate) fn parse_conversation_jsonl(
             continue;
         }
 
-        if is_sidechain {
+        if effective_sidechain {
             continue;
         }
 
@@ -670,6 +721,29 @@ pub(crate) fn parse_conversation_jsonl(
         }
     }
 
+    if custom_title.is_none() {
+        custom_title = subagent_meta.description;
+    }
+
+    if include_events && let Some(tool_use_id) = subagent_meta.tool_use_id {
+        let meta_path = path.with_extension("meta.json");
+        let mut event = events::EventContext {
+            event_seq: events.len() as u32,
+            timestamp: first_ts,
+            source_path: Some(meta_path.to_string_lossy().to_string()),
+            source_event_id: Some("meta".to_string()),
+            message_seq: None,
+            parser_version: EVENT_PARSER_VERSION,
+        }
+        .event("native_record", "system");
+        event.name = Some("subagent_meta".to_string());
+        event.tool_call_id = Some(tool_use_id);
+        event.is_meta = Some(true);
+        event.visibility = Some(EvidenceVisibility::Hidden);
+        event.attrs_json = subagent_meta.raw_json;
+        events.push(event);
+    }
+
     Ok(ParsedConversation {
         messages,
         usage_events,
@@ -680,21 +754,30 @@ pub(crate) fn parse_conversation_jsonl(
         first_ts,
         last_ts,
         session_id,
+        parent_agent_id: subagent_meta.parent_agent_id,
     })
 }
 
-/// Subagent path → role subagent; parent id is the transcript's own `sessionId` field.
-/// Claude stores subagents under `…/<parent>/subagents/<agent>.jsonl`.
 fn claude_topology(
     path: &Path,
     own_source_id: &str,
     parent_session_id: Option<&str>,
+    parent_agent_id: Option<&str>,
 ) -> (Option<ThreadRole>, Vec<ParentLink>) {
     if !path.components().any(|c| c.as_os_str() == "subagents") {
         return (Some(ThreadRole::Primary), Vec::new());
     }
-    let parents = parent_session_id
-        .filter(|parent| !parent.is_empty() && *parent != own_source_id)
+    let normalized_agent = parent_agent_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| if id.starts_with("agent-") { id.to_string() } else { format!("agent-{id}") });
+    let parent =
+        normalized_agent.as_deref().filter(|parent| *parent != own_source_id).or_else(|| {
+            parent_session_id
+                .map(str::trim)
+                .filter(|parent| !parent.is_empty() && *parent != own_source_id)
+        });
+    let parents = parent
         .map(|parent| {
             vec![ParentLink {
                 relation: ParentRelation::Spawn,
@@ -1773,13 +1856,46 @@ mod tests {
     fn claude_topology_classifies_primary_and_subagent() {
         let primary = Path::new("/home/x/.claude/projects/proj/parent-uuid.jsonl");
         assert_eq!(
-            claude_topology(primary, "parent-uuid", Some("parent-uuid")),
+            claude_topology(primary, "parent-uuid", Some("parent-uuid"), None),
             (Some(ThreadRole::Primary), Vec::new())
         );
 
         let sub = Path::new("/home/x/.claude/projects/proj/parent-uuid/subagents/agent-abc.jsonl");
         assert_eq!(
-            claude_topology(sub, "agent-abc", Some("parent-uuid")),
+            claude_topology(sub, "agent-abc", Some("parent-uuid"), None),
+            (
+                Some(ThreadRole::Subagent),
+                vec![ParentLink {
+                    relation: ParentRelation::Spawn,
+                    source: "claude-code".to_string(),
+                    source_id: "parent-uuid".to_string(),
+                }]
+            )
+        );
+        assert_eq!(
+            claude_topology(sub, "agent-abc", Some("parent-uuid"), Some("parent-hex")),
+            (
+                Some(ThreadRole::Subagent),
+                vec![ParentLink {
+                    relation: ParentRelation::Spawn,
+                    source: "claude-code".to_string(),
+                    source_id: "agent-parent-hex".to_string(),
+                }]
+            )
+        );
+        assert_eq!(
+            claude_topology(sub, "agent-abc", Some("parent-uuid"), Some("agent-parent-hex")),
+            (
+                Some(ThreadRole::Subagent),
+                vec![ParentLink {
+                    relation: ParentRelation::Spawn,
+                    source: "claude-code".to_string(),
+                    source_id: "agent-parent-hex".to_string(),
+                }]
+            )
+        );
+        assert_eq!(
+            claude_topology(sub, "agent-abc", Some("parent-uuid"), Some("abc")),
             (
                 Some(ThreadRole::Subagent),
                 vec![ParentLink {
@@ -1790,15 +1906,282 @@ mod tests {
             )
         );
 
-        // A subagent without a resolvable parent, or a self-referential parent,
-        // stays a subagent with no invented link.
         assert_eq!(
-            claude_topology(sub, "agent-abc", None),
+            claude_topology(sub, "agent-abc", None, None),
             (Some(ThreadRole::Subagent), Vec::new())
         );
         assert_eq!(
-            claude_topology(sub, "agent-abc", Some("agent-abc")),
+            claude_topology(sub, "agent-abc", Some("agent-abc"), None),
             (Some(ThreadRole::Subagent), Vec::new())
         );
+    }
+
+    #[test]
+    fn standalone_subagent_transcript_keeps_messages_events_and_meta_json() {
+        let root = temp_claude_root("subagent-meta");
+        let subagents_dir =
+            root.join("projects").join("-tmp-proj").join("root-uuid").join("subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+        let path = subagents_dir.join("agent-child1.jsonl");
+        let meta_path = subagents_dir.join("agent-child1.meta.json");
+
+        let lines = [
+            serde_json::json!({
+                "type": "user",
+                "isSidechain": true,
+                "sessionId": "root-uuid",
+                "cwd": "/tmp/subagent-cwd",
+                "timestamp": "2026-04-13T10:00:00Z",
+                "message": {"role": "user", "content": "Inspect auth module"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "isSidechain": true,
+                "sessionId": "root-uuid",
+                "timestamp": "2026-04-13T10:01:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Reading auth.rs."},
+                        {"type": "tool_use", "id": "call-1", "name": "Read", "input": {"file_path": "src/auth.rs"}}
+                    ]
+                }
+            }),
+        ];
+        let mut f = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "agentType": "Explore",
+                "description": "  Analyze auth engine  ",
+                "parentAgentId": "  parent123  ",
+                "toolUseId": "  toolu_parent_call  "
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+        let entry = FileScanEntry {
+            session_id: "agent-child1".to_string(),
+            stat_target: path.clone(),
+            directory: None,
+        };
+        let raw = parse_claude_session_file(entry.clone(), mtime, &SessionIndexes::default(), true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));
+        assert_eq!(
+            raw.parent_links,
+            vec![ParentLink {
+                relation: ParentRelation::Spawn,
+                source: "claude-code".to_string(),
+                source_id: "agent-parent123".to_string(),
+            }]
+        );
+        assert_eq!(raw.custom_title.as_deref(), Some("Analyze auth engine"));
+        assert_eq!(raw.messages.len(), 2);
+        assert_eq!(raw.messages[0].content, "Inspect auth module");
+        assert_eq!(raw.messages[1].content, "Reading auth.rs.");
+        assert_eq!(raw.started_at, 1_776_074_400_000);
+        assert_eq!(raw.duration_minutes, Some(1));
+        assert_eq!(raw.directory.as_deref(), Some("/tmp/subagent-cwd"));
+        assert_eq!(raw.events.len(), 2);
+        assert_eq!(raw.events[0].name.as_deref(), Some("Read"));
+        assert_eq!(raw.events[0].visibility, None);
+        assert_eq!(raw.events[0].message_seq, Some(1));
+        assert_eq!(raw.events[0].files[0].cwd.as_deref(), Some("/tmp/subagent-cwd"));
+        assert_eq!(raw.events[1].kind, "native_record");
+        assert_eq!(raw.events[1].actor, "system");
+        assert_eq!(raw.events[1].name.as_deref(), Some("subagent_meta"));
+        assert_eq!(raw.events[1].tool_call_id.as_deref(), Some("toolu_parent_call"));
+        assert_eq!(raw.events[1].is_meta, Some(true));
+        assert_eq!(raw.events[1].visibility, Some(EvidenceVisibility::Hidden));
+
+        let no_events =
+            parse_claude_session_file(entry.clone(), mtime, &SessionIndexes::default(), false)
+                .unwrap()
+                .unwrap();
+        assert!(no_events.events.is_empty());
+        assert_eq!(no_events.custom_title.as_deref(), Some("Analyze auth engine"));
+
+        fs::write(&meta_path, "{malformed json").unwrap();
+        let malformed =
+            parse_claude_session_file(entry.clone(), mtime, &SessionIndexes::default(), true)
+                .unwrap()
+                .unwrap();
+        assert_eq!(malformed.custom_title, None);
+        assert_eq!(
+            malformed.parent_links,
+            vec![ParentLink {
+                relation: ParentRelation::Spawn,
+                source: "claude-code".to_string(),
+                source_id: "root-uuid".to_string(),
+            }]
+        );
+        assert_eq!(malformed.events.len(), 1);
+
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "description": "Meta description fallback",
+                "parentAgentId": "child1",
+                "toolUseId": "   "
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut f_append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            f_append,
+            "{}",
+            serde_json::json!({"type": "custom-title", "customTitle": "Explicit jsonl title"})
+        )
+        .unwrap();
+        let override_check =
+            parse_claude_session_file(entry, mtime, &SessionIndexes::default(), true)
+                .unwrap()
+                .unwrap();
+        assert_eq!(override_check.custom_title.as_deref(), Some("Explicit jsonl title"));
+        assert_eq!(
+            override_check.parent_links,
+            vec![ParentLink {
+                relation: ParentRelation::Spawn,
+                source: "claude-code".to_string(),
+                source_id: "root-uuid".to_string(),
+            }]
+        );
+        assert_eq!(override_check.events.len(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn subagent_meta_json_mtime_triggers_incremental_rescan() {
+        let root = temp_claude_root("subagent-meta-mtime");
+        let subagents_dir =
+            root.join("projects").join("-tmp-proj").join("root-uuid").join("subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+        let path = subagents_dir.join("agent-child2.jsonl");
+        let meta_path = subagents_dir.join("agent-child2.meta.json");
+
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "user",
+                    "isSidechain": true,
+                    "sessionId": "root-uuid",
+                    "timestamp": "2026-04-13T10:00:00Z",
+                    "message": {"role": "user", "content": "Inspect auth"}
+                })
+            ),
+        )
+        .unwrap();
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(old_time).unwrap();
+
+        let store = setup_store();
+        let initial = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(initial.sessions.len(), 1);
+        let raw = &initial.sessions[0];
+        let msgs: Vec<crate::types::Message> = raw
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(seq, m)| crate::types::Message {
+                session_id: "s-child2".to_string(),
+                role: m.role.clone(),
+                content: m.content.clone(),
+                timestamp: m.timestamp,
+                seq: seq as u32,
+            })
+            .collect();
+        let session = crate::types::Session {
+            id: "s-child2".to_string(),
+            source: "claude-code".to_string(),
+            source_id: raw.source_id.clone(),
+            title: "Inspect auth".to_string(),
+            directory: raw.directory.clone(),
+            repo_remote: None,
+            repo_slug: None,
+            repo_name: None,
+            started_at: raw.started_at,
+            updated_at: raw.updated_at,
+            message_count: msgs.len() as u32,
+            entrypoint: None,
+            custom_title: raw.custom_title.clone(),
+            summary: None,
+            duration_minutes: None,
+            source_file_path: None,
+            is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
+        };
+        store
+            .persist_session_with_usage_and_events_with_topology(
+                &session,
+                &msgs,
+                &[],
+                Some(USAGE_PARSER_VERSION),
+                &raw.events,
+                raw.event_parser_version,
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: raw.thread_role,
+                    parents: &raw.parent_links,
+                    parser_version: raw.metadata_parser_version,
+                },
+            )
+            .unwrap();
+
+        let skipped = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(skipped.sessions.is_empty());
+
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "description": "Updated sidecar title",
+                "parentAgentId": "parent999"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let rescanned = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(rescanned.sessions.len(), 1);
+        assert_eq!(rescanned.sessions[0].custom_title.as_deref(), Some("Updated sidecar title"));
+        assert_eq!(
+            rescanned.sessions[0].parent_links,
+            vec![ParentLink {
+                relation: ParentRelation::Spawn,
+                source: "claude-code".to_string(),
+                source_id: "agent-parent999".to_string(),
+            }]
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
