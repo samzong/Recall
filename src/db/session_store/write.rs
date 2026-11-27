@@ -221,7 +221,24 @@ impl Store {
         if old_id.as_deref().is_some_and(|id| id != session.id) {
             delete_session_data_tx(&tx, old_source, old_source_id)?;
         }
-        clear_session_contents_tx(&tx, &session.id)?;
+        tx.execute(
+            "DELETE FROM message_vec WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
+            [&session.id],
+        )?;
+        for table in [
+            "messages",
+            "session_events",
+            "event_session_state",
+            "session_embedding_state",
+            "session_parent_links",
+        ] {
+            tx.execute(&format!("DELETE FROM {table} WHERE session_id = ?1"), [&session.id])?;
+        }
+        if usage_parser_version.is_some() || !usage_events.is_empty() {
+            for table in ["usage_events", "usage_session_state"] {
+                tx.execute(&format!("DELETE FROM {table} WHERE session_id = ?1"), [&session.id])?;
+            }
+        }
         persist_session_with_usage_and_events_tx(
             &tx,
             session,
@@ -372,16 +389,18 @@ pub(in super::super) fn persist_session_with_usage_and_events_tx(
 
     insert_messages_tx(tx, messages)?;
 
-    usage_store::replace_usage_events(
-        tx,
-        &session.id,
-        &session.source,
-        &session.source_id,
-        usage_events,
-        usage_parser_version,
-        session.updated_at,
-        usage_store::UsageConflict::Update,
-    )?;
+    if usage_parser_version.is_some() || !usage_events.is_empty() {
+        usage_store::replace_usage_events(
+            tx,
+            &session.id,
+            &session.source,
+            &session.source_id,
+            usage_events,
+            usage_parser_version,
+            session.updated_at,
+            usage_store::UsageConflict::Update,
+        )?;
+    }
 
     replace_session_events(
         tx,

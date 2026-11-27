@@ -84,10 +84,12 @@ impl Store {
         mut fold: impl FnMut(&mut T, UsageEventRecord, UsageOwnership),
     ) -> Result<T> {
         let mut sql = String::from(
-            "SELECT session_id, source, source_id, event_key, timestamp, model, provider,
-                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    reasoning_tokens, token_source, parser_version, raw_usage_json
-             FROM usage_events
+            "SELECT ue.session_id, ue.source, ue.source_id, ue.event_key, ue.timestamp, ue.model, ue.provider,
+                    ue.input_tokens, ue.output_tokens, ue.cache_read_tokens, ue.cache_write_tokens,
+                    ue.reasoning_tokens, ue.token_source, ue.parser_version, ue.raw_usage_json
+             FROM usage_events ue
+             JOIN sessions s ON s.id = ue.session_id
+             LEFT JOIN session_sync ss ON ss.session_id = s.id
              WHERE 1 = 1",
         );
 
@@ -97,7 +99,7 @@ impl Store {
         if let Some(source_ids) = sources
             && !source_ids.is_empty()
         {
-            sql.push_str(" AND source IN (");
+            sql.push_str(" AND ue.source IN (");
             for (i, source_id) in source_ids.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
@@ -110,7 +112,14 @@ impl Store {
         }
 
         sql.push_str(
-            " ORDER BY timestamp ASC, source ASC, event_seq ASC, session_id ASC, event_key ASC",
+            " ORDER BY ue.timestamp ASC,
+              ue.event_seq ASC,
+              s.source_id ASC,
+              (NOT EXISTS (SELECT 1 FROM native_bindings nb WHERE nb.session_id = s.id)) ASC,
+              CASE WHEN EXISTS (SELECT 1 FROM native_bindings nb WHERE nb.session_id = s.id)
+                   THEN '' ELSE COALESCE(ss.sync_id, '') END ASC,
+              ue.event_key ASC,
+              ue.session_id ASC",
         );
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =

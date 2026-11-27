@@ -397,3 +397,42 @@ fn schema_migration_sets_current_version() {
     let store = setup();
     assert_eq!(schema::schema_version(&store.conn).unwrap(), schema::current_schema_version());
 }
+
+#[test]
+fn native_refresh_preserves_unknown_usage_and_clears_confirmed_empty_usage() {
+    let store = setup();
+    let mut session = make_session("preserve-usage", "copilot-cli", "native", "before");
+    let event = make_usage_event("usage:1", 1_800_000, "model");
+    store.persist_session_with_usage(&session, &[], &[event], Some(2)).unwrap();
+    session.title = "after".into();
+    store
+        .replace_session_with_usage_and_events(
+            "copilot-cli",
+            "native",
+            &session,
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+    assert_eq!(store.get_session_by_id(&session.id).unwrap().unwrap().title, "after");
+    assert_eq!(store.list_usage_events_for_session(&session.id).unwrap().len(), 1);
+    assert_eq!(store.usage_state_meta_map("copilot-cli").unwrap()["native"].parser_version, 2);
+    store
+        .replace_session_with_usage_and_events(
+            "copilot-cli",
+            "native",
+            &session,
+            &[],
+            &[],
+            Some(3),
+            &[],
+            None,
+        )
+        .unwrap();
+    assert!(store.list_usage_events_for_session(&session.id).unwrap().is_empty());
+    assert_eq!(store.usage_state_meta_map("copilot-cli").unwrap()["native"].parser_version, 3);
+    assert_eq!(count_rows(&store, "SELECT event_count FROM usage_session_state"), 0);
+}

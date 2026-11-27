@@ -163,7 +163,7 @@ impl TrendWindow {
                 (0..days).contains(&offset).then_some(offset as usize)
             }
             TrendMode::Weekly { start_monday, weeks } => {
-                let offset = (week_monday(date) - start_monday).num_days() / 7;
+                let offset = (date - start_monday).num_days().div_euclid(7);
                 (0..weeks).contains(&offset).then_some(offset as usize)
             }
         }
@@ -257,9 +257,11 @@ impl ProjectEntryAcc {
             .or_default()
             .add_slice(slice);
         let model_name = if slice.model.is_empty() { "unknown" } else { slice.model.as_str() };
-        *self.model_totals.entry(model_name.to_string()).or_insert(0) += slice_total_tokens(slice);
+        let model_total = self.model_totals.entry(model_name.to_string()).or_insert(0);
+        *model_total = model_total.saturating_add(slice_total_tokens(slice));
         if let Some(bucket) = trend.bucket(slice.timestamp) {
-            self.trend_tokens[bucket] += slice_total_tokens(slice);
+            self.trend_tokens[bucket] =
+                self.trend_tokens[bucket].saturating_add(slice_total_tokens(slice));
             self.trend_sessions[bucket].insert(slice.session_id.clone());
         }
     }
@@ -552,5 +554,40 @@ pub(crate) fn matches_target(
         UsageTarget::Partition { key, .. } => {
             session_partition_key(session_meta.get(session_id)) == *key
         }
+    }
+}
+
+#[cfg(test)]
+mod saturation_tests {
+    use super::*;
+
+    #[test]
+    fn project_models_and_trends_saturate_independently() {
+        let now = Local::now();
+        let trend = TrendWindow::new(TimeRange::Today, now);
+        let mut acc = ProjectEntryAcc::new(24);
+        let mut slice = UsageSlice {
+            session_id: "large".into(),
+            source: "copilot-cli".into(),
+            timestamp: now.timestamp_millis(),
+            model: "first".into(),
+            provider: "github".into(),
+            input_tokens: i64::MAX,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            token_source: "observed".into(),
+            events: 1,
+        };
+        acc.add_slice(None, &slice, &trend);
+        acc.add_slice(None, &slice, &trend);
+        slice.model = "second".into();
+        slice.input_tokens = 7;
+        acc.add_slice(None, &slice, &trend);
+        assert_eq!(acc.tokens.total_tokens, i64::MAX);
+        assert_eq!(acc.model_totals["first"], i64::MAX);
+        assert_eq!(acc.model_totals["second"], 7);
+        assert_eq!(acc.trend_tokens[trend.bucket(slice.timestamp).unwrap()], i64::MAX);
     }
 }

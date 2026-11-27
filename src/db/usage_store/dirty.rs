@@ -5,8 +5,8 @@ use rusqlite::{OptionalExtension, Transaction};
 
 use super::super::schema::USAGE_INDEX_JOB;
 use super::{
-    BUCKET_MILLIS, OwnershipSourceRow, PersistedUsage, dedup_group_key_from_parts,
-    normalize_persisted_usage,
+    OwnershipSourceRow, PersistedUsage, dedup_group_key_from_parts, normalize_persisted_usage,
+    validate_usage_amounts,
 };
 pub(super) fn has_dirty_usage(conn: &rusqlite::Connection) -> Result<bool> {
     Ok(conn.query_row(
@@ -123,6 +123,16 @@ pub(super) fn rebuild_session_ownership_tx(
             },
             row.raw_usage_json.as_deref(),
         );
+        validate_usage_amounts(
+            row.timestamp,
+            [
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_write_tokens,
+                row.reasoning_tokens,
+            ],
+        )?;
         let group = dedup_group_key_from_parts(
             &row.source,
             &row.event_key,
@@ -157,10 +167,20 @@ pub(super) fn recompute_dedup_group_tx(
 ) -> Result<()> {
     let rows: Vec<(i64, String, i64)> = {
         let mut stmt = tx.prepare(
-            "SELECT event_id, session_id, ownership
-             FROM usage_event_ownership
-             WHERE dedup_group = ?1
-             ORDER BY timestamp ASC, event_seq ASC, session_id ASC, event_key ASC",
+            "SELECT o.event_id, ue.session_id, o.ownership
+             FROM usage_event_ownership o
+             JOIN usage_events ue ON ue.id = o.event_id
+             JOIN sessions s ON s.id = ue.session_id
+             LEFT JOIN session_sync ss ON ss.session_id = s.id
+             WHERE o.dedup_group = ?1
+             ORDER BY ue.timestamp ASC,
+              ue.event_seq ASC,
+              s.source_id ASC,
+              (NOT EXISTS (SELECT 1 FROM native_bindings nb WHERE nb.session_id = s.id)) ASC,
+              CASE WHEN EXISTS (SELECT 1 FROM native_bindings nb WHERE nb.session_id = s.id)
+                   THEN '' ELSE COALESCE(ss.sync_id, '') END ASC,
+              ue.event_key ASC,
+              ue.session_id ASC",
         )?;
         stmt.query_map([group], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?
@@ -227,16 +247,25 @@ pub(super) fn rebuild_session_rollups_tx(tx: &Transaction<'_>, session_id: &str)
         })?;
         for row in rows {
             let (source, timestamp, provider, model, token_source, usage) = row?;
-            let bucket_ms = timestamp.div_euclid(BUCKET_MILLIS) * BUCKET_MILLIS;
+            let bucket_ms = validate_usage_amounts(
+                timestamp,
+                [
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens,
+                    usage.reasoning_tokens,
+                ],
+            )?;
             let entry = buckets
                 .entry((bucket_ms, source, provider, model, token_source))
                 .or_insert((0, 0, 0, 0, 0, 0));
-            entry.0 += 1;
-            entry.1 += usage.input_tokens;
-            entry.2 += usage.output_tokens;
-            entry.3 += usage.cache_read_tokens;
-            entry.4 += usage.cache_write_tokens;
-            entry.5 += usage.reasoning_tokens;
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = entry.1.saturating_add(usage.input_tokens);
+            entry.2 = entry.2.saturating_add(usage.output_tokens);
+            entry.3 = entry.3.saturating_add(usage.cache_read_tokens);
+            entry.4 = entry.4.saturating_add(usage.cache_write_tokens);
+            entry.5 = entry.5.saturating_add(usage.reasoning_tokens);
         }
     }
     let mut insert = tx.prepare(

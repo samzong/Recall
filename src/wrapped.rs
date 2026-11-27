@@ -4,11 +4,9 @@ use std::path::Path;
 mod render;
 
 use anyhow::Result;
-use chrono::{
-    DateTime, Datelike, Days, Local, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Timelike,
-};
+use chrono::{DateTime, Datelike, Days, Local, NaiveDate, TimeZone, Timelike};
 
-use crate::db::search::RepoFilter;
+use crate::db::search::{RepoFilter, first_valid_local_millis};
 use crate::db::store::Store;
 use crate::db::usage_store::UsageSlice;
 use crate::project_scope::ProjectScope;
@@ -55,17 +53,6 @@ impl WrappedPeriod {
             Local.from_local_datetime(&candidate).earliest().map(|value| value.timestamp_millis())
         }))
     }
-}
-
-fn first_valid_local_millis(
-    start: NaiveDateTime,
-    mut resolve: impl FnMut(NaiveDateTime) -> Option<i64>,
-) -> i64 {
-    (0_i64..=48 * 60)
-        .find_map(|minutes| {
-            start.checked_add_signed(TimeDelta::minutes(minutes)).and_then(&mut resolve)
-        })
-        .expect("local period boundary resolves within 48 hours")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,9 +114,8 @@ impl WrappedAcc {
     }
 
     fn add_slice(&mut self, slice: &UsageSlice) {
-        let previous = self.tokens.total_tokens;
         self.tokens.add_slice(slice);
-        let added = self.tokens.total_tokens - previous;
+        let added = slice.total_tokens();
         self.sessions.insert(slice.session_id.clone());
 
         let dt = Local
@@ -143,11 +129,12 @@ impl WrappedAcc {
         source.sessions.insert(slice.session_id.clone());
 
         let model = if slice.model.is_empty() { "unknown" } else { slice.model.as_str() };
-        *self.by_model.entry(model.to_string()).or_insert(0) += added;
+        let model_total = self.by_model.entry(model.to_string()).or_insert(0);
+        *model_total = model_total.saturating_add(added);
 
         let weekday = dt.weekday().num_days_from_monday() as usize;
         let hour = dt.hour() as usize;
-        self.slot_tokens[weekday][hour] += added;
+        self.slot_tokens[weekday][hour] = self.slot_tokens[weekday][hour].saturating_add(added);
         self.slot_events[weekday][hour] += slice.events;
     }
 
@@ -410,3 +397,41 @@ pub(super) fn sanitize_label(input: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod saturation_tests {
+    use super::*;
+
+    #[test]
+    fn wrapped_models_and_slots_accumulate_after_global_saturation() {
+        let mut acc = WrappedAcc::default();
+        let mut slice = UsageSlice {
+            session_id: "large".into(),
+            source: "copilot-cli".into(),
+            timestamp: 0,
+            model: "first".into(),
+            provider: "github".into(),
+            input_tokens: i64::MAX,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            token_source: "observed".into(),
+            events: 1,
+        };
+        acc.add_slice(&slice);
+        acc.add_slice(&slice);
+        slice.model = "second".into();
+        slice.input_tokens = 7;
+        slice.timestamp = 86_400_000;
+        acc.add_slice(&slice);
+        assert_eq!(acc.tokens.total_tokens, i64::MAX);
+        assert_eq!(acc.by_model["first"], i64::MAX);
+        assert_eq!(acc.by_model["second"], 7);
+        let dt = Local.timestamp_millis_opt(slice.timestamp).unwrap();
+        assert_eq!(
+            acc.slot_tokens[dt.weekday().num_days_from_monday() as usize][dt.hour() as usize],
+            7
+        );
+    }
+}

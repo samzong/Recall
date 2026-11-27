@@ -114,16 +114,30 @@ impl TimeRange {
 
     pub(crate) fn cutoff_millis_at(&self, now: chrono::DateTime<Local>) -> Option<i64> {
         match self {
-            TimeRange::Today => now
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .and_then(|start| Local.from_local_datetime(&start).earliest())
-                .map(|start| start.timestamp_millis()),
+            TimeRange::Today => now.date_naive().and_hms_opt(0, 0, 0).map(|start| {
+                first_valid_local_millis(start, |candidate| {
+                    Local
+                        .from_local_datetime(&candidate)
+                        .earliest()
+                        .map(|value| value.timestamp_millis())
+                })
+            }),
             TimeRange::Week => Some(now.timestamp_millis() - 7 * 24 * 3600 * 1000),
             TimeRange::Month => Some(now.timestamp_millis() - 30 * 24 * 3600 * 1000),
             TimeRange::All => None,
         }
     }
+}
+
+pub(crate) fn first_valid_local_millis(
+    start: chrono::NaiveDateTime,
+    mut resolve: impl FnMut(chrono::NaiveDateTime) -> Option<i64>,
+) -> i64 {
+    (0_i64..=48 * 60)
+        .find_map(|minutes| {
+            start.checked_add_signed(chrono::TimeDelta::minutes(minutes)).and_then(&mut resolve)
+        })
+        .expect("local period boundary resolves within 48 hours")
 }
 
 struct Hit {
@@ -564,3 +578,33 @@ mod punctuation_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod usage_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn today_starts_at_first_valid_time_on_midnight_dst_gap() {
+        if std::env::var_os("RECALL_DST_TEST").is_some() {
+            let now = Local.with_ymd_and_hms(2018, 11, 4, 12, 0, 0).unwrap();
+            let expected = Local.with_ymd_and_hms(2018, 11, 4, 1, 0, 0).unwrap();
+            assert!(Local.with_ymd_and_hms(2018, 11, 4, 0, 0, 0).single().is_none());
+            assert_eq!(TimeRange::Today.cutoff_millis_at(now), Some(expected.timestamp_millis()));
+        } else {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "db::search::usage_boundary_tests::today_starts_at_first_valid_time_on_midnight_dst_gap", "--nocapture"])
+                .env("TZ", "STD3DST,M11.1.0/0,M2.3.0/0")
+                .env("RECALL_DST_TEST", "1")
+                .output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                )
+            );
+        }
+    }
+}

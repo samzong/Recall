@@ -30,6 +30,31 @@ pub(super) struct PersistedUsage {
     pub(super) parser_version: u32,
 }
 
+pub(crate) fn validate_usage_amounts(timestamp: i64, tokens: [i64; 5]) -> Result<i64> {
+    anyhow::ensure!(
+        tokens.into_iter().all(|value| value >= 0),
+        "usage tokens must be non-negative"
+    );
+    timestamp
+        .div_euclid(BUCKET_MILLIS)
+        .checked_mul(BUCKET_MILLIS)
+        .ok_or_else(|| anyhow::anyhow!("usage timestamp is below the supported bucket floor"))
+}
+
+pub(crate) fn validate_usage_event(event: &RawUsageEvent) -> Result<()> {
+    validate_usage_amounts(
+        event.timestamp,
+        [
+            event.input_tokens,
+            event.output_tokens,
+            event.cache_read_tokens,
+            event.cache_write_tokens,
+            event.reasoning_tokens,
+        ],
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct UsageSlice {
     pub(crate) session_id: String,
@@ -66,10 +91,10 @@ impl UsageSlice {
 
     pub(crate) fn total_tokens(&self) -> i64 {
         self.input_tokens
-            + self.output_tokens
-            + self.cache_read_tokens
-            + self.cache_write_tokens
-            + self.reasoning_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+            .saturating_add(self.reasoning_tokens)
     }
 }
 
@@ -234,7 +259,11 @@ fn persisted_usage_total(raw_usage_json: Option<&str>) -> Option<i64> {
     let usage = serde_json::from_str::<serde_json::Value>(raw_usage_json?).ok()?;
     ["totalTokens", "total_tokens"]
         .iter()
-        .find_map(|key| usage.get(*key).and_then(serde_json::Value::as_i64))
+        .find_map(|key| {
+            usage
+                .get(*key)
+                .and_then(|value| crate::adapters::json_util::usage_json_i64(Some(value)))
+        })
         .filter(|total| *total >= 0)
 }
 
@@ -294,6 +323,7 @@ pub(super) fn replace_usage_events(
              ){conflict}",
         ))?;
         for event in usage_events {
+            validate_usage_event(event)?;
             stmt.execute(rusqlite::params![
                 session_id,
                 source,
