@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -15,12 +15,16 @@ use crate::adapters::events::{
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::paths::{file_uri_to_path, resolve_home_dir};
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
+use crate::db::store::IndexedSessionMeta;
 use crate::types::{FileEvidence, FileOperation, ParentLink, ParentRelation, Role, ThreadRole};
 
 const EVENT_PARSER_VERSION: u32 = 2;
 const METADATA_PARSER_VERSION: u32 = 1;
 
 const TRANSCRIPT_RELATIVE_PATH: &[&str] = &[".system_generated", "logs", "transcript.jsonl"];
+const CLI_DIR: &str = ".gemini/antigravity-cli";
+const ACP_DIR: &str = ".gemini/antigravity-acp";
+const DESKTOP_DIR: &str = ".gemini/antigravity";
 
 #[derive(Clone, Copy)]
 pub(crate) enum AntigravityAdapter {
@@ -43,9 +47,19 @@ impl SourceAdapter for AntigravityAdapter {
         }
     }
 
+    fn usage_parser_version(&self) -> Option<u32> {
+        Some(usage::USAGE_PARSER_VERSION)
+    }
+
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
         match self {
-            Self::Cli => Some(ResumeCommand::new("agy", &["--conversation", source_id])),
+            Self::Cli => {
+                if is_acp_only_conversation(source_id) {
+                    None
+                } else {
+                    Some(ResumeCommand::new("agy", &["--conversation", source_id]))
+                }
+            }
             Self::Desktop => None,
         }
     }
@@ -61,23 +75,26 @@ impl SourceAdapter for AntigravityAdapter {
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        let Some(cli_dir) = resolve_antigravity_dir(*self)? else {
-            return Ok(vec![]);
-        };
-
         let mut sessions = Vec::new();
-        for entry in collect_antigravity_entries(&cli_dir, *self)? {
-            let Some(snapshot) = antigravity_snapshot(&entry) else {
-                continue;
-            };
-            if let Some(raw) = parse_antigravity_session_for_entry(
-                entry.clone(),
-                snapshot.effective_mtime_ms(),
-                true,
-                self.id(),
-            )? && antigravity_snapshot(&entry).as_ref() == Some(&snapshot)
-            {
-                sessions.push(raw);
+        for root_dir in resolve_antigravity_dirs(*self)? {
+            let scan_data = collect_antigravity_scan_data(&root_dir)?;
+            for entry in scan_data.entries {
+                let db_path = scan_data.db_paths.get(&entry.session_id).map(PathBuf::as_path);
+                let Some(snapshot) = antigravity_snapshot(&entry, db_path) else {
+                    continue;
+                };
+                if let Some(raw) = parse_antigravity_session_for_entry(
+                    entry.clone(),
+                    db_path,
+                    &scan_data.live_cascade_ids,
+                    snapshot.effective_mtime_ms(),
+                    true,
+                    None,
+                    self.id(),
+                )? && antigravity_snapshot(&entry, db_path).as_ref() == Some(&snapshot)
+                {
+                    sessions.push(raw);
+                }
             }
         }
         Ok(sessions)
@@ -89,90 +106,203 @@ impl SourceAdapter for AntigravityAdapter {
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let Some(cli_dir) = resolve_antigravity_dir(*self)? else {
-            return Ok(Some(SyncScanResult::default()));
-        };
-        Ok(Some(scan_for_sync_impl(&cli_dir, *self, context, since_ts, include_events)?))
+        let mut combined = SyncScanResult::default();
+        for root_dir in resolve_antigravity_dirs(*self)? {
+            let part = scan_for_sync_impl(&root_dir, *self, context, since_ts, include_events)?;
+            combined.absorb(part);
+        }
+        Ok(Some(combined))
     }
 }
 
-fn resolve_antigravity_dir(adapter: AntigravityAdapter) -> anyhow::Result<Option<PathBuf>> {
-    match adapter {
-        AntigravityAdapter::Cli => resolve_home_dir(
-            ".gemini/antigravity-cli",
-            "~/.gemini/antigravity-cli not found, skipping Antigravity CLI",
-        ),
-        AntigravityAdapter::Desktop => resolve_home_dir(
-            ".gemini/antigravity",
-            "~/.gemini/antigravity not found, skipping Antigravity desktop",
-        ),
+fn is_acp_only_conversation(source_id: &str) -> bool {
+    let Ok(Some(acp_dir)) = resolve_home_dir(ACP_DIR, "~/.gemini/antigravity-acp not found") else {
+        return false;
+    };
+    let in_acp = acp_dir.join("conversations").join(format!("{source_id}.db")).is_file()
+        || acp_dir.join("brain").join(source_id).is_dir();
+    if !in_acp {
+        return false;
     }
+    let Ok(Some(cli_dir)) = resolve_home_dir(CLI_DIR, "~/.gemini/antigravity-cli not found") else {
+        return true;
+    };
+    let in_cli = cli_dir.join("conversations").join(format!("{source_id}.db")).is_file()
+        || cli_dir.join("brain").join(source_id).is_dir();
+    !in_cli
+}
+
+fn resolve_antigravity_dirs(adapter: AntigravityAdapter) -> anyhow::Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    match adapter {
+        AntigravityAdapter::Cli => {
+            if let Some(cli) =
+                resolve_home_dir(CLI_DIR, "~/.gemini/antigravity-cli not found, skipping")?
+            {
+                dirs.push(cli);
+            }
+            if let Some(acp) =
+                resolve_home_dir(ACP_DIR, "~/.gemini/antigravity-acp not found, skipping")?
+            {
+                dirs.push(acp);
+            }
+        }
+        AntigravityAdapter::Desktop => {
+            if let Some(desktop) =
+                resolve_home_dir(DESKTOP_DIR, "~/.gemini/antigravity not found, skipping")?
+            {
+                dirs.push(desktop);
+            }
+        }
+    }
+    Ok(dirs)
 }
 
 fn scan_for_sync_impl(
-    cli_dir: &Path,
+    root_dir: &Path,
     adapter: AntigravityAdapter,
     context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
-    let entries = collect_antigravity_entries(cli_dir, adapter)?;
+    let scan_data = collect_antigravity_scan_data(root_dir)?;
+    let db_paths = &scan_data.db_paths;
+    let live_cascade_ids = &scan_data.live_cascade_ids;
     file_scan::run_file_scan_with_options_and_snapshot(
         context,
         since_ts,
         file_scan::FileScanOptions {
             stream_sessions: true,
+            usage_parser_version: Some(usage::USAGE_PARSER_VERSION),
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
             metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
-            ..Default::default()
         },
-        entries,
+        scan_data.entries,
         |entry| {
-            antigravity_snapshot(entry).map(|snapshot| {
-                let directory_changed = matches!(adapter, AntigravityAdapter::Desktop)
-                    && entry.directory.as_ref().is_some_and(|directory| {
-                        context
-                            .session_meta()
-                            .get(&entry.session_id)
-                            .is_some_and(|old| old.directory.as_ref() != Some(directory))
-                    });
+            let db_path = db_paths.get(&entry.session_id).map(PathBuf::as_path);
+            antigravity_snapshot(entry, db_path).map(|snapshot| {
+                let directory_changed = entry.directory.as_ref().is_some_and(|directory| {
+                    context
+                        .session_meta()
+                        .get(&entry.session_id)
+                        .is_some_and(|old| old.directory.as_ref() != Some(directory))
+                });
                 snapshot.requiring_parse(directory_changed)
             })
         },
         |entry, mtime| {
-            parse_antigravity_session_for_entry(entry, mtime, include_events, adapter.id())
+            let db_path = db_paths.get(&entry.session_id).map(PathBuf::as_path);
+            let shell_meta = (context.is_usage_only() && !include_events)
+                .then(|| context.session_meta().get(&entry.session_id))
+                .flatten();
+            parse_antigravity_session_for_entry(
+                entry,
+                db_path,
+                live_cascade_ids,
+                mtime,
+                include_events,
+                shell_meta,
+                adapter.id(),
+            )
         },
     )
 }
 
-fn antigravity_snapshot(
-    entry: &FileScanEntry,
-) -> Option<file_scan::FileScanSnapshot<file_scan::FileMetadataSnapshot>> {
-    let fingerprint = file_scan::file_metadata_snapshot(&entry.stat_target)?;
-    Some(file_scan::FileScanSnapshot::new(fingerprint.mtime_ms()?, fingerprint))
+fn wal_path(db_path: &Path) -> PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push("-wal");
+    PathBuf::from(os)
 }
 
+fn antigravity_snapshot(
+    entry: &FileScanEntry,
+    db_path: Option<&Path>,
+) -> Option<file_scan::FileScanSnapshot<[Option<file_scan::FileMetadataSnapshot>; 3]>> {
+    let transcript = file_scan::file_metadata_snapshot(&entry.stat_target)?;
+    let db = db_path.and_then(file_scan::file_metadata_snapshot);
+    let wal = db_path
+        .and_then(|path| file_scan::file_metadata_snapshot(&wal_path(path)))
+        .filter(|meta| meta.len() > 0);
+    let effective_mtime = [Some(&transcript), db.as_ref(), wal.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(file_scan::FileMetadataSnapshot::mtime_ms)
+        .max()?;
+    Some(file_scan::FileScanSnapshot::new(effective_mtime, [Some(transcript), db, wal]))
+}
+
+struct AntigravityScanData {
+    entries: Vec<FileScanEntry>,
+    db_paths: HashMap<String, PathBuf>,
+    live_cascade_ids: HashSet<String>,
+}
+
+#[cfg(test)]
 fn collect_antigravity_entries(
     cli_dir: &Path,
-    adapter: AntigravityAdapter,
+    _adapter: AntigravityAdapter,
 ) -> anyhow::Result<Vec<FileScanEntry>> {
-    let brain_dir = cli_dir.join("brain");
+    Ok(collect_antigravity_scan_data(cli_dir)?.entries)
+}
+
+fn collect_antigravity_scan_data(root_dir: &Path) -> anyhow::Result<AntigravityScanData> {
+    let brain_dir = root_dir.join("brain");
     if !brain_dir.exists() {
-        return Ok(vec![]);
+        return Ok(AntigravityScanData {
+            entries: Vec::new(),
+            db_paths: HashMap::new(),
+            live_cascade_ids: HashSet::new(),
+        });
     }
 
-    let workspace_by_conversation = match adapter {
-        AntigravityAdapter::Cli => load_history_workspace_map(&cli_dir.join("history.jsonl"))?,
-        AntigravityAdapter::Desktop => {
-            let path = cli_dir.join("conversation_summaries.db");
-            load_desktop_workspace_map(&path).unwrap_or_else(|err| {
-                warn!("failed to read Antigravity workspaces {}: {err}", path.display());
-                HashMap::new()
-            })
+    let mut workspace_by_conversation = HashMap::new();
+    let summaries_path = root_dir.join("conversation_summaries.db");
+    match load_summaries_workspace_map(&summaries_path) {
+        Ok(map) => workspace_by_conversation.extend(map),
+        Err(err) => {
+            warn!("failed to read Antigravity workspaces {}: {err}", summaries_path.display());
         }
-    };
-    let mut entries = Vec::new();
+    }
+    workspace_by_conversation.extend(load_history_workspace_map(&root_dir.join("history.jsonl"))?);
 
+    let conversations_dir = root_dir.join("conversations");
+    let mut db_paths = HashMap::new();
+    let mut live_cascade_ids = HashSet::new();
+    if conversations_dir.is_dir() {
+        for walk_entry in WalkDir::new(&conversations_dir)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = walk_entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if uuid::Uuid::try_parse(stem).is_err() {
+                continue;
+            }
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("db") => {
+                    if fs::metadata(path).is_ok_and(|m| m.len() > 0) {
+                        live_cascade_ids.insert(stem.to_string());
+                    }
+                    db_paths.insert(stem.to_string(), path.to_path_buf());
+                }
+                Some("meta") => {
+                    if let Some(cwd) = read_meta_cwd(path) {
+                        workspace_by_conversation.entry(stem.to_string()).or_insert(cwd);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
     for walk_entry in
         WalkDir::new(&brain_dir).min_depth(1).max_depth(1).into_iter().filter_map(|e| e.ok())
     {
@@ -201,10 +331,17 @@ fn collect_antigravity_entries(
         });
     }
 
-    Ok(entries)
+    Ok(AntigravityScanData { entries, db_paths, live_cascade_ids })
 }
 
-fn load_desktop_workspace_map(path: &Path) -> anyhow::Result<HashMap<String, String>> {
+fn read_meta_cwd(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    let cwd = value.get("cwd").and_then(Value::as_str)?.trim();
+    (!cwd.is_empty()).then(|| cwd.to_string())
+}
+
+fn load_summaries_workspace_map(path: &Path) -> anyhow::Result<HashMap<String, String>> {
     if !path.is_file() {
         return Ok(HashMap::new());
     }
@@ -260,29 +397,107 @@ fn load_history_workspace_map(path: &Path) -> anyhow::Result<HashMap<String, Str
 
 fn parse_antigravity_session_for_entry(
     entry: FileScanEntry,
+    db_path: Option<&Path>,
+    live_cascade_ids: &HashSet<String>,
     mtime_ms: i64,
     include_events: bool,
+    shell_meta: Option<&IndexedSessionMeta>,
     adapter_id: &str,
 ) -> anyhow::Result<Option<RawSession>> {
     let source_file_path = entry.stat_target.to_str().map(str::to_string);
-    let mut raw = match parse_antigravity_transcript(
+
+    if let Some(meta) = shell_meta {
+        let (usage_events, db_workspace) = match db_path {
+            Some(path) => match usage::parse_antigravity_db(
+                path,
+                &entry.session_id,
+                live_cascade_ids,
+                Some(meta.started_at.max(mtime_ms)),
+            ) {
+                Ok(parsed) => (parsed.usage_events, parsed.workspace_dir),
+                Err(err) => {
+                    debug!("failed to parse Antigravity usage db {}: {err}", path.display());
+                    return Ok(None);
+                }
+            },
+            None => (Vec::new(), None),
+        };
+        let mut raw = RawSession::search_only(
+            entry.session_id,
+            entry.directory.or(db_workspace),
+            meta.started_at,
+            Some(mtime_ms),
+            None,
+            Vec::new(),
+        );
+        raw.source_file_path = source_file_path;
+        return Ok(Some(raw.with_usage(usage_events, usage::USAGE_PARSER_VERSION)));
+    }
+
+    let parsed_db = match db_path {
+        Some(path) => {
+            match usage::parse_antigravity_db(path, &entry.session_id, live_cascade_ids, None) {
+                Ok(parsed) => Some(parsed),
+                Err(err) => {
+                    debug!("failed to parse Antigravity usage db {}: {err}", path.display());
+                    return Ok(None);
+                }
+            }
+        }
+        None => None,
+    };
+
+    let (mut usage_events, db_created_at, db_workspace) = match parsed_db {
+        Some(parsed) => (parsed.usage_events, parsed.created_at_ms, parsed.workspace_dir),
+        None => (Vec::new(), None, None),
+    };
+    let effective_directory = entry.directory.or(db_workspace);
+
+    let raw_transcript = match parse_antigravity_transcript(
         &entry.stat_target,
         &entry.session_id,
-        entry.directory.as_deref(),
+        effective_directory.as_deref(),
         include_events,
         adapter_id,
     ) {
-        Ok(Some(raw)) => raw,
-        Ok(None) => return Ok(None),
+        Ok(raw) => raw,
         Err(e) => {
             debug!("failed to parse Antigravity transcript {}: {e}", entry.stat_target.display());
             return Ok(None);
         }
     };
-    raw.directory = entry.directory;
+
+    let fallback_ts = raw_transcript
+        .as_ref()
+        .map(|raw| raw.started_at)
+        .filter(|&ts| ts > 0)
+        .or(db_created_at)
+        .unwrap_or(mtime_ms);
+    for event in &mut usage_events {
+        if event.timestamp == 0 {
+            event.timestamp = fallback_ts;
+        }
+    }
+
+    let mut raw = match raw_transcript {
+        Some(raw) => raw,
+        None if !usage_events.is_empty() => RawSession::search_only(
+            entry.session_id,
+            None,
+            db_created_at
+                .or_else(|| usage_events.first().map(|event| event.timestamp))
+                .unwrap_or(mtime_ms),
+            Some(mtime_ms),
+            None,
+            Vec::new(),
+        ),
+        None => return Ok(None),
+    };
+
+    raw.directory = effective_directory;
     raw.updated_at = Some(mtime_ms);
     raw.source_file_path = source_file_path;
-    Ok(Some(raw))
+    Ok(Some(raw.with_usage(usage_events, usage::USAGE_PARSER_VERSION)))
 }
 
 fn parse_antigravity_transcript(
@@ -531,6 +746,7 @@ fn parse_created_at(v: &Value) -> Option<i64> {
 mod subagent;
 #[cfg(test)]
 mod tests;
+mod usage;
 
 use subagent::{
     collect_send_message_reports, extract_antigravity_system_body, parse_antigravity_system_message,

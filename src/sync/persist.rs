@@ -73,6 +73,45 @@ impl SyncJob {
             stored.source_file_path = Some(source_file_path.to_string());
         }
 
+        if self.options.usage_only
+            && self.event_backfill.is_none()
+            && let Some(directory) = raw.directory.as_deref()
+            && let Some(stored) = existing.paths.get_mut(&raw_source_id)
+        {
+            let directory_changed = stored.directory.as_deref() != Some(directory);
+            let (repo_remote, repo_slug, repo_name) = match repo_identity.as_ref() {
+                Some(repo) => {
+                    (Some(repo.remote.as_str()), Some(repo.slug.as_str()), Some(repo.name.as_str()))
+                }
+                None if !directory_changed => (
+                    stored.repo_remote.as_deref(),
+                    stored.repo_slug.as_deref(),
+                    stored.repo_name.as_deref(),
+                ),
+                None => (None, None, None),
+            };
+            let repo_changed = stored.repo_remote.as_deref() != repo_remote
+                || stored.repo_slug.as_deref() != repo_slug
+                || stored.repo_name.as_deref() != repo_name;
+            if directory_changed || repo_changed {
+                self.store.update_session_directory_and_repo(
+                    source_id,
+                    &raw_source_id,
+                    directory,
+                    repo_remote,
+                    repo_slug,
+                    repo_name,
+                )?;
+                stored.directory = Some(directory.to_string());
+                stored.repo_remote = repo_remote.map(str::to_string);
+                stored.repo_slug = repo_slug.map(str::to_string);
+                stored.repo_name = repo_name.map(str::to_string);
+                if let Some(meta) = existing.meta.get_mut(&raw_source_id) {
+                    meta.directory = Some(directory.to_string());
+                }
+            }
+        }
+
         if let Some(cutoff) = self.since_ts {
             let ts = raw.updated_at.unwrap_or(raw.started_at);
             if ts < cutoff {

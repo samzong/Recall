@@ -41,6 +41,27 @@ impl Store {
         Ok(n > 0)
     }
 
+    pub(crate) fn update_session_directory_and_repo(
+        &self,
+        source: &str,
+        source_id: &str,
+        directory: &str,
+        repo_remote: Option<&str>,
+        repo_slug: Option<&str>,
+        repo_name: Option<&str>,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE sessions
+                SET directory = ?3,
+                    repo_remote = ?4,
+                    repo_slug = ?5,
+                    repo_name = ?6
+              WHERE id = (SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2)",
+            rusqlite::params![source, source_id, directory, repo_remote, repo_slug, repo_name],
+        )?;
+        Ok(n > 0)
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_session(&self, session: &Session) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;

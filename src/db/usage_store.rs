@@ -112,6 +112,11 @@ pub(super) fn dedup_group_key_from_parts(
         {
             event_key.to_string()
         }
+        "antigravity" | "antigravity-cli"
+            if event_key.starts_with("response:") || event_key.starts_with("request:") =>
+        {
+            event_key.to_string()
+        }
         _ => return None,
     };
     Some(format!("{source}\0{key}"))
