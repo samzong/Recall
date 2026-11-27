@@ -1,4 +1,5 @@
 pub(crate) mod session_args;
+pub(crate) mod usage_args;
 
 use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
@@ -109,33 +110,7 @@ enum Commands {
         format: crate::info::InfoFormat,
     },
     #[command(about = "Show token usage reports")]
-    Usage {
-        #[arg(long, help = "Output usage report as JSON", conflicts_with = "card")]
-        json: bool,
-        #[arg(
-            long,
-            help = "Filter by comma-separated source ids or labels",
-            conflicts_with = "card"
-        )]
-        source: Option<String>,
-        #[arg(
-            long,
-            value_parser = crate::query::parse_time_range_arg,
-            help = "Filter by time range",
-            conflicts_with = "card"
-        )]
-        time: Option<String>,
-        #[arg(long, help = "Print a shareable usage stats card")]
-        card: bool,
-        #[arg(
-            long,
-            value_enum,
-            default_value_t = crate::wrapped::WrappedPeriod::Week,
-            requires = "card",
-            help = "Card time window"
-        )]
-        period: crate::wrapped::WrappedPeriod,
-    },
+    Usage(usage_args::UsageArgs),
     #[command(about = "Export session records as JSON Lines")]
     Export {
         #[arg(long, help = "Filter by comma-separated source ids or labels")]
@@ -395,9 +370,7 @@ pub(crate) fn run() -> Result<()> {
                 )?
             }
         }
-        Some(Commands::Usage { json, source, time, card, period }) => {
-            crate::usage::run_cli(json, source.as_deref(), time.as_deref(), card, period)?
-        }
+        Some(Commands::Usage(args)) => crate::usage::run_cli(args)?,
         Some(Commands::Export {
             source,
             time,

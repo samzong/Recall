@@ -132,6 +132,9 @@ impl App {
 
     pub(super) fn handle_usage_key(&mut self, key: KeyEvent, store: &Store) {
         match key.code {
+            KeyCode::Esc | KeyCode::Backspace if self.usage.drilldown.is_some() => {
+                self.exit_project_drilldown();
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
             }
@@ -147,15 +150,28 @@ impl App {
                 self.cycle_usage_source();
                 self.usage.request_refresh();
             }
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                self.usage.toggle_chart_metric();
+            }
+            KeyCode::Char('g') if self.usage.tab == UsageTab::Tokens => {
+                self.usage.toggle_granularity();
+            }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.filters.active.sources.clear();
                 self.usage.reset();
+            }
+            KeyCode::Enter if self.usage.tab == UsageTab::Projects && !self.usage.is_loading() => {
+                self.enter_project_drilldown();
             }
             KeyCode::Enter if self.usage.tab == UsageTab::Skills && !self.usage.is_loading() => {
                 self.open_skill_sessions(store);
             }
             KeyCode::Up | KeyCode::Char('k') => self.handle_scroll_up(store),
             KeyCode::Down | KeyCode::Char('j') => self.handle_scroll_down(store),
+            KeyCode::PageUp => self.usage.page_list(true, self.usage_page_size()),
+            KeyCode::PageDown => self.usage.page_list(false, self.usage_page_size()),
+            KeyCode::Home | KeyCode::Char('g') => self.usage.jump_top(),
+            KeyCode::End | KeyCode::Char('G') => self.usage.jump_bottom(),
             _ => {}
         }
     }

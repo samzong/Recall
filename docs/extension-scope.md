@@ -67,3 +67,13 @@ Export time filters select sessions by their start time, not usage events by the
 For totals that match `recall usage --json`, request `usage-ownership` with `--time all` and `--limit 0`.
 Count only events with `is_counted: true` and apply the usage window to each event timestamp.
 Keep the same source selector and use `--project all`, because `recall usage` covers all projects.
+
+## Project usage selection
+
+`recall usage` defaults to global scope across all indexed projects. Pass `--project` to
+filter `recall usage --json`, `recall usage --card`, or the interactive dashboard to one
+repository or directory. CLI commands normalize `.`, `~/...`, and relative paths in
+`--project` without resolving symlinks. Pass `--projects` with `--json` to group usage by
+repository, directory, and unattributed sessions, including imported sessions without local
+native bindings. Deduplication runs globally across all sessions before any project or time
+filter applies.

@@ -1,13 +1,9 @@
-use std::collections::BTreeMap;
-
-use chrono::{Datelike, Duration, Local, NaiveDate};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::db::search::TimeRange;
 use crate::skill_audit::{SkillTier, SkillUsageEntry, format_last_used, format_signals};
 use crate::tui::app::App;
 use crate::tui::theme::THEME;
@@ -19,6 +15,7 @@ use super::{format_compact, format_count, truncate_label};
 pub(super) fn render_usage_dashboard(f: &mut Frame, app: &App) {
     match app.usage.tab {
         UsageTab::Tokens => render_tokens_dashboard(f, app),
+        UsageTab::Projects => super::usage_projects::render_projects_dashboard(f, app),
         UsageTab::Skills => render_skill_audit_dashboard(f, app),
     }
 }
@@ -36,34 +33,44 @@ pub(super) fn render_tokens_dashboard(f: &mut Frame, app: &App) {
         .split(area);
 
     render_usage_header(f, app, outer[0]);
-    render_activity_map(f, app, outer[1]);
+    super::usage_chart::render_activity_map(f, app, outer[1]);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
         .split(outer[2]);
-    render_daily_token_chart(f, app, main[0]);
+    super::usage_chart::render_over_time_chart(f, app, main[0]);
     render_usage_breakdown(f, app, main[1]);
     render_usage_status(f, app, outer[3]);
 }
 
 pub(super) fn render_usage_header(f: &mut Frame, app: &App, area: Rect) {
+    let title = match &app.usage.drilldown {
+        Some((_, label)) => format!(" Recall Usage · {} ", truncate_label(label, 32)),
+        None => " Recall Usage Dashboard ".to_string(),
+    };
     let block = Block::default()
-        .title(" Recall Usage Dashboard ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.border_focus));
 
     let chip = Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(THEME.text_muted);
 
-    let control = vec![
+    let mut control = vec![
         Span::styled(" range ", muted),
         Span::styled(format!("[{}]", app.usage.time_label()), chip),
         Span::styled(" source ", muted),
         Span::styled(format!("[{}]", app.source_filter_label()), chip),
         Span::styled(" metric ", muted),
+        Span::styled(format!("[{}]", app.usage.metric_label()), chip),
+        Span::styled(" tab ", muted),
         Span::styled(format!("[{}]", app.usage.tab_label()), chip),
     ];
+    if let Some(scope_label) = app.usage.scope_chip_label() {
+        control.push(Span::styled(" scope ", muted));
+        control.push(Span::styled(format!("[{}]", truncate_label(&scope_label, 20)), chip));
+    }
 
     let mut lines = vec![Line::from(control)];
 
@@ -114,152 +121,6 @@ pub(super) fn render_usage_header(f: &mut Frame, app: &App, area: Rect) {
     } else {
         lines.push(Line::from(Span::styled("No usage data loaded", muted)));
         lines.push(Line::from(""));
-    }
-
-    f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-pub(super) fn render_activity_map(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .title(" Token Activity Map ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME.success));
-
-    if app.usage.is_loading() {
-        f.render_widget(
-            Paragraph::new("Loading usage data...")
-                .style(Style::default().fg(THEME.accent))
-                .block(block),
-            area,
-        );
-        return;
-    }
-
-    let report = app.usage.year_report.as_ref().or(app.usage.report.as_ref());
-    let Some(report) = report else {
-        f.render_widget(
-            Paragraph::new("No usage events")
-                .style(Style::default().fg(THEME.text_muted))
-                .block(block),
-            area,
-        );
-        return;
-    };
-
-    let today = Local::now().date_naive();
-    let start = today.checked_sub_signed(Duration::days(364)).unwrap_or(today);
-    let grid_start = start
-        .checked_sub_signed(Duration::days(start.weekday().num_days_from_monday() as i64))
-        .unwrap_or(start);
-    let total_days = today.signed_duration_since(grid_start).num_days().max(0) as usize + 1;
-    let weeks = total_days.div_ceil(7);
-
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let map_width = inner_width.saturating_sub(5).max(1);
-    let visible_weeks = weeks.min(map_width);
-    let first_col = weeks.saturating_sub(visible_weeks);
-    let max_value = report.daily.iter().map(|day| day.tokens.total_tokens).max().unwrap_or(0);
-    let values = daily_token_map(report);
-
-    let mut lines = Vec::new();
-    for (row, label) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate() {
-        let mut cells = String::new();
-        for (visible_col, col) in (first_col..weeks).enumerate() {
-            let cell_width = distributed_width(visible_col, visible_weeks, map_width);
-            let offset = (col * 7 + row) as i64;
-            let Some(date) = grid_start.checked_add_signed(Duration::days(offset)) else {
-                continue;
-            };
-            if date < start || date > today {
-                cells.push_str(&" ".repeat(cell_width));
-                continue;
-            }
-            let value = values.get(&date).copied().unwrap_or(0);
-            cells.push_str(&heatmap_cell(value, max_value).to_string().repeat(cell_width));
-        }
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {label} "), Style::default().fg(THEME.text_muted)),
-            Span::styled(cells, Style::default().fg(THEME.success)),
-        ]));
-    }
-
-    f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-pub(super) fn render_daily_token_chart(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .title(" Daily Token Usage ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME.border_focus));
-
-    if app.usage.is_loading() {
-        f.render_widget(
-            Paragraph::new("Loading usage data...")
-                .style(Style::default().fg(THEME.accent))
-                .block(block),
-            area,
-        );
-        return;
-    }
-
-    let Some(report) = app.usage.report.as_ref() else {
-        f.render_widget(
-            Paragraph::new("No token usage")
-                .style(Style::default().fg(THEME.text_muted))
-                .block(block),
-            area,
-        );
-        return;
-    };
-
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let label_width = 8usize;
-    let plot_width = inner_width.saturating_sub(label_width).max(1);
-    let points = daily_token_points(report, app.usage.time_filter, plot_width);
-    let max_tokens = points.iter().map(|(_, value)| *value).max().unwrap_or(0);
-    if points.is_empty() || max_tokens == 0 {
-        f.render_widget(
-            Paragraph::new("No token usage in this range")
-                .style(Style::default().fg(THEME.text_muted))
-                .block(block),
-            area,
-        );
-        return;
-    }
-
-    let chart_height = area.height.saturating_sub(5).max(1) as usize;
-    let mut lines = Vec::new();
-    for row in (1..=chart_height).rev() {
-        let label = if row == chart_height {
-            format!("{:>7}", format_compact(max_tokens))
-        } else if row == 1 {
-            "      0".to_string()
-        } else {
-            "       ".to_string()
-        };
-        let mut bars = String::with_capacity(plot_width);
-        for (index, (_, value)) in points.iter().enumerate() {
-            let day_width = distributed_width(index, points.len(), plot_width);
-            if *value * chart_height as i64 >= max_tokens * row as i64 {
-                bars.push_str(&"█".repeat(day_width));
-            } else {
-                bars.push_str(&" ".repeat(day_width));
-            }
-        }
-        lines.push(Line::from(vec![
-            Span::styled(format!("{label} "), Style::default().fg(THEME.text_muted)),
-            Span::styled(bars, Style::default().fg(THEME.highlight)),
-        ]));
-    }
-
-    if let (Some((first, _)), Some((last, _))) = (points.first(), points.last()) {
-        lines.push(Line::from(vec![
-            Span::styled("        ", Style::default().fg(THEME.text_muted)),
-            Span::styled(
-                endpoint_labels(first, last, plot_width),
-                Style::default().fg(THEME.text_muted),
-            ),
-        ]));
     }
 
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -386,142 +247,69 @@ fn build_usage_model_lines(
 }
 
 pub(super) fn render_usage_status(f: &mut Frame, app: &App, area: Rect) {
-    let line = match app.usage.tab {
-        UsageTab::Tokens => Line::from(vec![
-            Span::styled("m", Style::default().fg(THEME.accent)),
-            Span::styled(" tab  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("t", Style::default().fg(THEME.accent)),
-            Span::styled(" time  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("s", Style::default().fg(THEME.accent)),
-            Span::styled(" source  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("↑↓", Style::default().fg(THEME.accent)),
-            Span::styled(" breakdown  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("r", Style::default().fg(THEME.accent)),
-            Span::styled(" reset  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("Esc/q", Style::default().fg(THEME.accent)),
-            Span::styled(" quit", Style::default().fg(THEME.text_muted)),
-        ]),
-        UsageTab::Skills => Line::from(vec![
-            Span::styled("m", Style::default().fg(THEME.accent)),
-            Span::styled(" tab  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("t", Style::default().fg(THEME.accent)),
-            Span::styled(" time  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("s", Style::default().fg(THEME.accent)),
-            Span::styled(" source  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("↑↓", Style::default().fg(THEME.accent)),
-            Span::styled(" select  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("Enter", Style::default().fg(THEME.accent)),
-            Span::styled(" sessions  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("r", Style::default().fg(THEME.accent)),
-            Span::styled(" reset  ", Style::default().fg(THEME.text_muted)),
-            Span::styled("Esc/q", Style::default().fg(THEME.accent)),
-            Span::styled(" quit", Style::default().fg(THEME.text_muted)),
-        ]),
-    };
-    f.render_widget(Paragraph::new(line), area);
-}
-
-fn daily_token_map(report: &UsageReport) -> BTreeMap<NaiveDate, i64> {
-    let mut values = BTreeMap::new();
-    for day in &report.daily {
-        if let Ok(date) = NaiveDate::parse_from_str(&day.period, "%Y-%m-%d") {
-            values.insert(date, day.tokens.total_tokens);
-        }
-    }
-    values
-}
-
-fn daily_token_points(
-    report: &UsageReport,
-    time_range: TimeRange,
-    max_points: usize,
-) -> Vec<(String, i64)> {
-    if max_points == 0 {
-        return Vec::new();
-    }
-
-    let values: BTreeMap<NaiveDate, i64> = report
-        .daily
-        .iter()
-        .filter_map(|day| {
-            NaiveDate::parse_from_str(&day.period, "%Y-%m-%d")
-                .ok()
-                .map(|date| (date, day.tokens.total_tokens))
-        })
-        .collect();
-
-    match time_range {
-        TimeRange::Today | TimeRange::Week | TimeRange::Month => {
-            let days = match time_range {
-                TimeRange::Today => 1,
-                TimeRange::Week => 7,
-                TimeRange::Month => 30,
-                TimeRange::All => unreachable!(),
-            };
-            let today = Local::now().date_naive();
-            let start = today.checked_sub_signed(Duration::days(days - 1)).unwrap_or(today);
-            (0..days)
-                .filter_map(|offset| start.checked_add_signed(Duration::days(offset)))
-                .rev()
-                .take(max_points)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(|date| {
-                    let label = date.format("%m-%d").to_string();
-                    let value = values.get(&date).copied().unwrap_or(0);
-                    (label, value)
-                })
-                .collect()
-        }
-        TimeRange::All => values
-            .into_iter()
-            .rev()
-            .take(max_points)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|(date, value)| (date.format("%m-%d").to_string(), value))
-            .collect(),
-    }
-}
-
-fn heatmap_cell(value: i64, max_value: i64) -> char {
-    if value <= 0 || max_value <= 0 {
-        return '·';
-    }
-    let ratio = value as f64 / max_value as f64;
-    if ratio < 0.25 {
-        '░'
-    } else if ratio < 0.5 {
-        '▒'
-    } else if ratio < 0.75 {
-        '▓'
+    let key = Style::default().fg(THEME.accent);
+    let text = Style::default().fg(THEME.text_muted);
+    let exit_spans = if app.usage.drilldown.is_some() {
+        vec![
+            Span::styled("Esc", key),
+            Span::styled(" back  ", text),
+            Span::styled("q", key),
+            Span::styled(" quit", text),
+        ]
     } else {
-        '█'
-    }
-}
+        vec![Span::styled("Esc/q", key), Span::styled(" quit", text)]
+    };
 
-fn distributed_width(index: usize, item_count: usize, total_width: usize) -> usize {
-    if item_count == 0 || total_width == 0 {
-        return 0;
-    }
-    let base = total_width / item_count;
-    let remainder = total_width % item_count;
-    base + usize::from(index < remainder)
-}
-
-fn endpoint_labels(first: &str, last: &str, width: usize) -> String {
-    let mut chars = vec![' '; width];
-    for (index, ch) in first.chars().take(width).enumerate() {
-        chars[index] = ch;
-    }
-    let last_len = last.chars().count().min(width);
-    let start = width.saturating_sub(last_len);
-    for (offset, ch) in last.chars().take(last_len).enumerate() {
-        chars[start + offset] = ch;
-    }
-    chars.into_iter().collect()
+    let mut spans = match app.usage.tab {
+        UsageTab::Tokens => vec![
+            Span::styled("m", key),
+            Span::styled(" tab  ", text),
+            Span::styled("t", key),
+            Span::styled(" time  ", text),
+            Span::styled("s", key),
+            Span::styled(" source  ", text),
+            Span::styled("v", key),
+            Span::styled(" metric  ", text),
+            Span::styled("g", key),
+            Span::styled(" day/week  ", text),
+            Span::styled("↑↓", key),
+            Span::styled(" breakdown  ", text),
+            Span::styled("r", key),
+            Span::styled(" reset  ", text),
+        ],
+        UsageTab::Projects => vec![
+            Span::styled("m", key),
+            Span::styled(" tab  ", text),
+            Span::styled("t", key),
+            Span::styled(" time  ", text),
+            Span::styled("s", key),
+            Span::styled(" source  ", text),
+            Span::styled("v", key),
+            Span::styled(" metric  ", text),
+            Span::styled("↑↓", key),
+            Span::styled(" select  ", text),
+            Span::styled("Enter", key),
+            Span::styled(" drill  ", text),
+            Span::styled("r", key),
+            Span::styled(" reset  ", text),
+        ],
+        UsageTab::Skills => vec![
+            Span::styled("m", key),
+            Span::styled(" tab  ", text),
+            Span::styled("t", key),
+            Span::styled(" time  ", text),
+            Span::styled("s", key),
+            Span::styled(" source  ", text),
+            Span::styled("↑↓", key),
+            Span::styled(" select  ", text),
+            Span::styled("Enter", key),
+            Span::styled(" sessions  ", text),
+            Span::styled("r", key),
+            Span::styled(" reset  ", text),
+        ],
+    };
+    spans.extend(exit_spans);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn usage_bar_line(
@@ -597,7 +385,7 @@ pub(super) fn render_skill_audit_header(f: &mut Frame, app: &App, area: Rect) {
     let chip = Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(THEME.text_muted);
 
-    let control = vec![
+    let mut control = vec![
         Span::styled(" range ", muted),
         Span::styled(format!("[{}]", app.usage.time_label()), chip),
         Span::styled(" source ", muted),
@@ -605,6 +393,10 @@ pub(super) fn render_skill_audit_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" tab ", muted),
         Span::styled(format!("[{}]", app.usage.tab_label()), chip),
     ];
+    if let Some(scope_label) = app.usage.scope_chip_label() {
+        control.push(Span::styled(" scope ", muted));
+        control.push(Span::styled(format!("[{}]", truncate_label(&scope_label, 20)), chip));
+    }
 
     let mut lines = vec![Line::from(control)];
 

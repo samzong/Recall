@@ -2,6 +2,8 @@ mod pickers;
 mod popups;
 mod search;
 mod usage;
+mod usage_chart;
+mod usage_projects;
 mod viewing;
 
 use ratatui::Frame;
@@ -345,6 +347,115 @@ mod tests {
 
         assert!(rendered.contains("Target16 (t16)"));
         assert!(!rendered.contains("Target0 (t0)"));
+    }
+
+    #[test]
+    fn usage_charts_render_today_daily_weekly_and_metric_toggles() {
+        use std::collections::BTreeMap;
+
+        use chrono::{Datelike, Duration, Local};
+
+        use crate::db::search::TimeRange;
+        use crate::tui::usage_state::UsageTab;
+        use crate::usage::{PeriodUsage, TokenTotals, UsageReport, UsageSummary};
+
+        let now = Local::now();
+        let today = now.date_naive();
+        let two_days_ago = today - Duration::days(2);
+        let iso_now = today.iso_week();
+        let iso_prev = (today - Duration::weeks(2)).iso_week();
+        let mut hourly_today_tokens = [0i64; 24];
+        let mut hourly_today_sessions = [0usize; 24];
+        hourly_today_tokens[9] = 1_500;
+        hourly_today_tokens[15] = 3_000;
+        hourly_today_sessions[9] = 2;
+        hourly_today_sessions[15] = 5;
+
+        let mut daily_all_sessions = BTreeMap::new();
+        daily_all_sessions.insert(two_days_ago.format("%Y-%m-%d").to_string(), 3);
+        daily_all_sessions.insert(today.format("%Y-%m-%d").to_string(), 7);
+
+        let week_prev = format!("{}-W{:02}", iso_prev.year(), iso_prev.week());
+        let week_now = format!("{}-W{:02}", iso_now.year(), iso_now.week());
+        let mut weekly_all_sessions = BTreeMap::new();
+        weekly_all_sessions.insert(week_prev.clone(), 4);
+        weekly_all_sessions.insert(week_now.clone(), 9);
+
+        let report = UsageReport {
+            scope: None,
+            summary: UsageSummary {
+                events: 10,
+                sessions: 10,
+                sources: 1,
+                models: 1,
+                token_source_events: BTreeMap::new(),
+                tokens: TokenTotals { total_tokens: 4_500, ..TokenTotals::default() },
+            },
+            by_source: Vec::new(),
+            by_model: Vec::new(),
+            daily: vec![
+                PeriodUsage {
+                    period: two_days_ago.format("%Y-%m-%d").to_string(),
+                    sessions: 3,
+                    events: 3,
+                    tokens: TokenTotals { total_tokens: 1_500, ..TokenTotals::default() },
+                },
+                PeriodUsage {
+                    period: today.format("%Y-%m-%d").to_string(),
+                    sessions: 7,
+                    events: 7,
+                    tokens: TokenTotals { total_tokens: 3_000, ..TokenTotals::default() },
+                },
+            ],
+            weekly: vec![
+                PeriodUsage {
+                    period: week_prev,
+                    sessions: 4,
+                    events: 4,
+                    tokens: TokenTotals { total_tokens: 1_500, ..TokenTotals::default() },
+                },
+                PeriodUsage {
+                    period: week_now,
+                    sessions: 9,
+                    events: 9,
+                    tokens: TokenTotals { total_tokens: 3_000, ..TokenTotals::default() },
+                },
+            ],
+            monthly: Vec::new(),
+            hourly_today_tokens,
+            hourly_today_sessions,
+            daily_all_sessions,
+            weekly_all_sessions,
+        };
+
+        let mut app = test_app();
+        app.mode = AppMode::Usage;
+        app.usage.tab = UsageTab::Tokens;
+        app.usage.year_report = Some(report.clone());
+        app.usage.report = Some(report);
+
+        app.usage.time_filter = TimeRange::Today;
+        let today_tokens = render_to_text(&app, 100, 26);
+        assert!(today_tokens.contains("Token Activity Map"));
+        assert!(today_tokens.contains("Tokens Over Time (today)"));
+        assert!(!today_tokens.contains("(24h)"));
+        assert!(today_tokens.chars().any(|c| "▁▂▃▄▅▆▇█".contains(c)));
+
+        app.usage.toggle_chart_metric();
+        let today_sessions = render_to_text(&app, 100, 26);
+        assert!(today_sessions.contains("Session Activity Map"));
+        assert!(today_sessions.contains("Sessions Over Time (today)"));
+
+        app.usage.time_filter = TimeRange::Week;
+        let week_daily = render_to_text(&app, 100, 26);
+        assert!(week_daily.contains("Sessions Over Time (daily)"));
+
+        app.usage.toggle_granularity();
+        let week_weekly = render_to_text(&app, 100, 26);
+        assert!(week_weekly.contains("Sessions Over Time (weekly)"));
+
+        let narrow = render_to_text(&app, 55, 22);
+        assert!(narrow.contains("Recall Usage"));
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {

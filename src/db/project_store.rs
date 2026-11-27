@@ -1,10 +1,25 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path};
+
 use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 
 use super::store::{ProjectDirectory, SessionPath, Store};
 use crate::db::search::{RepoFilter, TimeRange};
 use crate::project_scope::{ProjectScope, ScopeResolution, SelectorForm, classify_selector};
-use crate::repo_identity::{RepoIdentity, normalize_remote_url, normalize_slug};
+use crate::repo_identity::{
+    RepoIdentity, git_toplevel, normalize_remote_url, normalize_slug, origin_identity,
+};
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionUsageMeta {
+    pub(crate) directory: Option<String>,
+    pub(crate) repo_remote: Option<String>,
+    pub(crate) repo_slug: Option<String>,
+    pub(crate) repo_name: Option<String>,
+    pub(crate) started_at: i64,
+    pub(crate) updated_at: Option<i64>,
+}
 
 impl Store {
     pub(crate) fn session_paths_for_source(&self, source: &str) -> Result<Vec<SessionPath>> {
@@ -115,7 +130,7 @@ impl Store {
 
         match project {
             Some(project) => Ok(ScopeResolution {
-                scope: self.resolve_project_selector(project)?,
+                scope: self.resolve_cli_project_selector(project)?,
                 inferred: false,
             }),
             None => Ok(ScopeResolution {
@@ -123,6 +138,17 @@ impl Store {
                 inferred: true,
             }),
         }
+    }
+
+    pub(crate) fn resolve_cli_project_selector(&self, value: &str) -> Result<ProjectScope> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            bail!("project filter cannot be empty");
+        }
+        if trimmed.starts_with(['.', '/', '\\', '~']) {
+            return resolve_cli_path_selector(trimmed);
+        }
+        self.resolve_project_selector(trimmed)
     }
 
     pub(crate) fn resolve_project_selector(&self, value: &str) -> Result<ProjectScope> {
@@ -190,6 +216,153 @@ impl Store {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    pub(crate) fn session_ids_in_scope(&self, scope: &ProjectScope) -> Result<HashSet<String>> {
+        let mut sql = String::from("SELECT s.id FROM sessions s WHERE 1 = 1");
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+        apply_project_scope(&mut sql, &mut params, &mut param_idx, scope);
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<HashSet<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn session_usage_meta_map(
+        &self,
+        sources: Option<&[String]>,
+    ) -> Result<HashMap<String, SessionUsageMeta>> {
+        let mut sql = String::from(
+            "SELECT s.id, s.directory, s.repo_remote, s.repo_slug, s.repo_name,
+                    s.started_at, s.updated_at
+             FROM sessions s
+             WHERE 1 = 1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(source_ids) = sources
+            && !source_ids.is_empty()
+        {
+            let placeholders: Vec<String> =
+                (1..=source_ids.len()).map(|idx| format!("?{idx}")).collect();
+            sql.push_str(&format!(" AND s.source IN ({})", placeholders.join(", ")));
+            for source_id in source_ids {
+                params.push(Box::new(source_id.clone()));
+            }
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SessionUsageMeta {
+                    directory: row.get(1)?,
+                    repo_remote: row.get(2)?,
+                    repo_slug: row.get(3)?,
+                    repo_name: row.get(4)?,
+                    started_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                },
+            ))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
+    }
+}
+
+fn resolve_cli_path_selector(trimmed: &str) -> Result<ProjectScope> {
+    if matches!(trimmed, "." | "./" | ".\\") {
+        let cwd = std::env::current_dir()?;
+        let cwd_literal = join_lexical_segments(&cwd, "");
+        if let Some(root) = git_toplevel(&cwd_literal)? {
+            let root = strip_trailing_sep(&root).to_string();
+            return Ok(match origin_identity(&root)? {
+                Some(identity) => ProjectScope::Repository {
+                    filter: RepoFilter::Remote(identity.remote),
+                    local_root: Some(root),
+                },
+                None => ProjectScope::Directory(root),
+            });
+        }
+        return Ok(ProjectScope::Directory(cwd_literal));
+    }
+
+    if trimmed == "~" || trimmed.starts_with("~/") || trimmed.starts_with("~\\") {
+        let home =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+        let rest = trimmed.strip_prefix('~').unwrap_or("");
+        return Ok(ProjectScope::Directory(join_lexical_segments(&home, rest)));
+    }
+
+    if trimmed.starts_with('~') {
+        return Ok(ProjectScope::Directory(strip_trailing_sep(trimmed).to_string()));
+    }
+
+    if trimmed.starts_with('/') {
+        return Ok(ProjectScope::Directory(join_lexical_segments(Path::new("/"), trimmed)));
+    }
+
+    if trimmed.starts_with('\\') {
+        return Ok(ProjectScope::Directory(strip_trailing_sep(trimmed).to_string()));
+    }
+
+    let cwd = std::env::current_dir()?;
+    Ok(ProjectScope::Directory(join_lexical_segments(&cwd, trimmed)))
+}
+
+fn join_lexical_segments(base: &Path, raw: &str) -> String {
+    let mut prefix = String::new();
+    let mut has_root = false;
+    let mut parts: Vec<String> = Vec::new();
+
+    for component in base.components() {
+        match component {
+            Component::Prefix(value) => {
+                prefix = value.as_os_str().to_string_lossy().into_owned();
+            }
+            Component::RootDir => has_root = true,
+            Component::Normal(segment) => {
+                parts.push(segment.to_string_lossy().into_owned());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+        }
+    }
+
+    for segment in raw.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other.to_string()),
+        }
+    }
+
+    let sep = if prefix.contains('\\') || (!has_root && raw.contains('\\')) { '\\' } else { '/' };
+    if parts.is_empty() {
+        if has_root {
+            return format!("{prefix}{sep}");
+        }
+        if !prefix.is_empty() {
+            return prefix;
+        }
+        return ".".to_string();
+    }
+
+    if has_root {
+        format!("{prefix}{sep}{}", parts.join(&sep.to_string()))
+    } else if !prefix.is_empty() {
+        format!("{prefix}{}", parts.join(&sep.to_string()))
+    } else {
+        parts.join(&sep.to_string())
+    }
+}
+
+fn strip_trailing_sep(path: &str) -> &str {
+    if path == "/" || path == "\\" { path } else { path.trim_end_matches(['/', '\\']) }
 }
 
 pub(crate) fn apply_scope_filters(

@@ -2,13 +2,14 @@ use anyhow::Result;
 
 use crate::adapters;
 use crate::config::AppConfig;
-use crate::db::search::TimeRange;
 use crate::db::store::Store;
 use crate::tui::search_worker::SearchWorker;
 use crate::tui::sync_worker::SyncWorker;
+use crate::tui::usage_state::UsageTab;
 use crate::tui::usage_worker::UsageWorker;
+use crate::usage::UsageStart;
 
-pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Result<()> {
+pub(crate) fn run(usage_start: Option<UsageStart>) -> Result<()> {
     use std::io;
     use std::time::Duration;
 
@@ -84,10 +85,14 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
             app.fail_sync("Sync worker unavailable");
         }
     }
-    if let Some((source_filter, time_filter)) = usage_start {
-        app.filters.active.sources = source_filter.unwrap_or_default();
-        if let Some(time_filter) = time_filter {
+    if let Some(start) = usage_start {
+        app.filters.active.sources = start.sources.unwrap_or_default();
+        if let Some(time_filter) = start.time_range {
             app.usage.time_filter = time_filter;
+        }
+        app.usage.initial_scope = start.initial_scope;
+        if start.open_projects_tab {
+            app.usage.tab = UsageTab::Projects;
         }
         app.mode = AppMode::Usage;
         app.usage.request_refresh();

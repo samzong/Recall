@@ -8,6 +8,8 @@ use serde_json::Value;
 
 use crate::db::search::TimeRange;
 use crate::db::store::{SkillAuditEventRow, Store};
+use crate::project_scope::ProjectScope;
+use crate::usage::{UsageTarget, session_partition_key};
 
 pub(crate) const CORE_INVOCATION_THRESHOLD: usize = 10;
 
@@ -28,6 +30,7 @@ pub(crate) enum SkillSignal {
 pub(crate) struct SkillAuditFilters {
     pub(crate) sources: Option<Vec<String>>,
     pub(crate) time_range: TimeRange,
+    pub(crate) target: UsageTarget,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,8 +82,34 @@ pub(crate) fn build_skill_audit_report(
     let installed = scan_installed_skills();
     let installed_ids: HashSet<String> = installed.iter().map(|skill| skill.id.clone()).collect();
     let events = store.list_skill_audit_events(filters.sources.as_deref(), filters.time_range)?;
+    let has_any_events = !events.is_empty();
+    let scope_ids = match &filters.target {
+        UsageTarget::Scope(ProjectScope::Global) => None,
+        UsageTarget::Scope(scope) => Some(store.session_ids_in_scope(scope)?),
+        UsageTarget::Partition { .. } => None,
+    };
+    let session_meta = match &filters.target {
+        UsageTarget::Partition { .. } => {
+            Some(store.session_usage_meta_map(filters.sources.as_deref())?)
+        }
+        UsageTarget::Scope(_) => None,
+    };
     let mut usage: HashMap<String, SkillAccumulator> = HashMap::new();
     for event in &events {
+        let in_target = match &filters.target {
+            UsageTarget::Scope(ProjectScope::Global) => true,
+            UsageTarget::Scope(_) => {
+                scope_ids.as_ref().is_some_and(|ids| ids.contains(&event.session_id))
+            }
+            UsageTarget::Partition { key, .. } => {
+                session_partition_key(
+                    session_meta.as_ref().and_then(|map| map.get(&event.session_id)),
+                ) == *key
+            }
+        };
+        if !in_target {
+            continue;
+        }
         let Some((skill_id, signal)) = extract_skill_from_event(event, &installed_ids) else {
             continue;
         };
@@ -121,7 +150,7 @@ pub(crate) fn build_skill_audit_report(
         dormant: dormant.len(),
     };
 
-    let coverage_note = if events.is_empty() {
+    let coverage_note = if !has_any_events {
         Some(
             "No skill activity in index. Run `recall sync --force` on codex/claude/cursor sources."
                 .to_string(),
