@@ -58,6 +58,10 @@ impl FileMetadataSnapshot {
         let duration = self.modified.duration_since(UNIX_EPOCH).ok()?;
         Some(duration.as_millis() as i64)
     }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
 }
 
 pub(crate) fn run_file_scan_with_options<I, F>(

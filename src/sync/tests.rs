@@ -1374,3 +1374,47 @@ fn source_progress_skips_adapters_without_usage_during_usage_sync() {
     job.run_with(&adapters, Some(&mut |label| seen.push(label.to_string()))).unwrap();
     assert!(seen.is_empty());
 }
+
+#[test]
+fn usage_only_backfills_missing_directory_for_project_usage() {
+    let mut job = global_job(&[]);
+    job.options.usage_only = true;
+    let mut existing_session = session("s-cli-1", "antigravity-cli", "cid-1");
+    existing_session.directory = None;
+    existing_session.source_file_path = Some("/tmp/transcript.jsonl".to_string());
+    existing_session.message_count = 2;
+    job.store.insert_session(&existing_session).unwrap();
+
+    let context = job.load_adapter_sync_context("antigravity-cli").unwrap();
+    let mut existing = job.prepare_existing_state("antigravity-cli", context).unwrap();
+
+    let mut ev = crate::types::RawUsageEvent::observed("response:r1".into(), 0, 1000, 1);
+    ev.model = "gemini-4-carbon".into();
+    ev.provider = "google".into();
+    ev.input_tokens = 250;
+    ev.output_tokens = 50;
+
+    let mut raw = RawSession::search_only(
+        "cid-1",
+        Some("/Users/x/git/samzong/Recall".to_string()),
+        1000,
+        Some(2000),
+        None,
+        vec![],
+    )
+    .with_usage(vec![ev], 1);
+    raw.source_file_path = Some("/tmp/transcript.jsonl".to_string());
+
+    job.process_raw_session("antigravity-cli", raw, &mut existing, &mut HashSet::new()).unwrap();
+
+    let report = crate::usage::build_project_usage_report(
+        &job.store,
+        Some(&["antigravity-cli".to_string()]),
+        crate::db::search::TimeRange::All,
+    )
+    .unwrap();
+    assert_eq!(report.projects.len(), 1);
+    assert_eq!(report.projects[0].tokens.total_tokens, 300);
+    assert!(report.projects[0].project != "unattributed");
+    assert_eq!(existing.paths["cid-1"].directory.as_deref(), Some("/Users/x/git/samzong/Recall"));
+}
