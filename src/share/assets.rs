@@ -56,7 +56,7 @@ pub(crate) const SESSION_PAGE_SCRIPT: &str = r#"<script>
     var sections = Array.prototype.slice.call(document.querySelectorAll('.turn.user'));
     var ticks = Array.prototype.slice.call(document.querySelectorAll('.tick'));
     if(!sections.length || !ticks.length) return;
-    var tickFor = {};
+    var tickFor = Object.create(null);
     ticks.forEach(function(t){ var h=t.getAttribute('href'); if(h) tickFor[h.slice(1)]=t; });
     var activeId = sections[0].id, offset = 150;
     function compute(){
@@ -87,11 +87,14 @@ pub(crate) const SESSION_PAGE_SCRIPT: &str = r#"<script>
 
   function setupBundle(panels){
     document.documentElement.classList.add('js-bundle');
-    var panelById = {};
+    var panelById = Object.create(null);
     panels.forEach(function(p){
       var id = p.getAttribute('data-panel-id');
       if(id) panelById[id] = p;
     });
+    function hasPanel(id){
+      return !!(id && Object.prototype.hasOwnProperty.call(panelById, id) && panelById[id]);
+    }
     var tocs = Array.prototype.slice.call(document.querySelectorAll('.user-toc[data-toc-for]'));
     var treeLinks = Array.prototype.slice.call(document.querySelectorAll('[data-panel-target]'));
     var detailsToggle = document.querySelector('.details-toggle');
@@ -109,7 +112,7 @@ pub(crate) const SESSION_PAGE_SCRIPT: &str = r#"<script>
 
     var activeSections = [];
     var activeTicks = [];
-    var tickFor = {};
+    var tickFor = Object.create(null);
     var activeTurnId = '';
     var offset = 150;
 
@@ -177,11 +180,8 @@ pub(crate) const SESSION_PAGE_SCRIPT: &str = r#"<script>
     }
 
     function activatePanel(panelId, updateUrl, preserveHash){
-      var panel = panelById[panelId];
-      if(!panel){
-        panel = panels[0];
-        panelId = panel.getAttribute('data-panel-id');
-      }
+      var panel = hasPanel(panelId) ? panelById[panelId] : panels[0];
+      panelId = panel.getAttribute('data-panel-id');
       panels.forEach(function(p){
         p.classList.toggle('is-active', p === panel);
       });
@@ -204,7 +204,7 @@ pub(crate) const SESSION_PAGE_SCRIPT: &str = r#"<script>
 
       activeSections = Array.prototype.slice.call(panel.querySelectorAll('.turn.user'));
       activeTicks = activeToc ? Array.prototype.slice.call(activeToc.querySelectorAll('.tick')) : [];
-      tickFor = {};
+      tickFor = Object.create(null);
       activeTicks.forEach(function(t){ var h=t.getAttribute('href'); if(h) tickFor[h.slice(1)]=t; });
       bindTocNav(activeToc);
       computeToc();
@@ -223,7 +223,7 @@ pub(crate) const SESSION_PAGE_SCRIPT: &str = r#"<script>
       link.addEventListener('click', function(e){
         if(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
         var target = link.getAttribute('data-panel-target');
-        if(!target || !panelById[target]) return;
+        if(!hasPanel(target)) return;
         e.preventDefault();
         activatePanel(target, true, false);
         window.scrollTo({ top: 0 });
@@ -232,13 +232,13 @@ pub(crate) const SESSION_PAGE_SCRIPT: &str = r#"<script>
 
     var params = new URLSearchParams(window.location.search);
     var requested = params.get('s');
-    var initialId = requested && panelById[requested] ? requested : null;
+    var initialId = hasPanel(requested) ? requested : null;
     if(!initialId && window.location.hash){
       var rawHash = window.location.hash.slice(1);
       var dash = rawHash.indexOf('-user-');
       if(dash > 0){
         var candidate = rawHash.slice(0, dash);
-        if(panelById[candidate]) initialId = candidate;
+        if(hasPanel(candidate)) initialId = candidate;
       }
     }
     if(!initialId) initialId = panels[0].getAttribute('data-panel-id');
