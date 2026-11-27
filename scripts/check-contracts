@@ -15,6 +15,74 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 ID = "019a0000-0000-7000-8000-000000000001"
+ISOLATED_ADAPTER_ENV_VARS = (
+    "AMP_THREADS_DIR",
+    "CLAUDE_CONFIG_DIR",
+    "CLINE_DIR",
+    "CODEBUDDY_CONFIG_DIR",
+    "CODEX_HOME",
+    "CRUSH_GLOBAL_DATA",
+    "DEVIN_HOME",
+    "DROID_SESSIONS_DIR",
+    "DSH_HOME",
+    "FILE_STORE_PATH",
+    "GEMINI_CLI_HOME",
+    "GEMINI_HOME",
+    "GOOSE_PATH_ROOT",
+    "GROK_HOME",
+    "JUNIE_HOME",
+    "KILO_DB",
+    "KIMI_CODE_HOME",
+    "KIRO_DATA_DIR",
+    "KIRO_HOME",
+    "MAVIS_DATA_DIR",
+    "MIMOCODE_DB",
+    "MINIMAX_DATA_DIR",
+    "OH_PERSISTENCE_DIR",
+    "OPENHANDS_CONVERSATIONS_DIR",
+    "OPENHANDS_PERSISTENCE_DIR",
+    "OPENCODE_SQLITE_DB",
+    "PI_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_SESSION_DIR",
+    "QODERCN_CONFIG_DIR",
+    "QODER_CONFIG_DIR",
+    "QWEN_HOME",
+    "QWEN_RUNTIME_DIR",
+    "TRAECLI_HOME",
+    "TRAE_HOME",
+    "ZCODE_STORAGE_DIR",
+)
+TOKEN_BUCKETS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+TOKEN_KEYS = (*TOKEN_BUCKETS, "total_tokens")
+USAGE_REPORT_KEYS = {"summary", "by_source", "by_model", "daily", "weekly", "monthly"}
+USAGE_SUMMARY_KEYS = {"events", "sessions", "sources", "models", "token_source_events", "tokens"}
+PROJECTS_SUMMARY_KEYS = {
+    "projects",
+    "events",
+    "sessions",
+    "indexed_sessions",
+    "sources",
+    "models",
+    "tokens",
+}
+PROJECT_ENTRY_KEYS = {
+    "project",
+    "kind",
+    "repository",
+    "directory",
+    "sessions",
+    "indexed_sessions",
+    "events",
+    "top_model",
+    "tokens",
+    "by_model",
+}
 TOOLS = {
     "search_sessions": ({"query"}, {"query", "project", "source", "limit", "invocation_nonce"}),
     "search_messages": ({"query"}, {"query", "project", "source", "limit", "invocation_nonce", "session_id"}),
@@ -22,6 +90,80 @@ TOOLS = {
     "get_session": ({"session_id"}, {"session_id", "event_ref", "evidence_part", "max_bytes", "max_messages", "tail", "include_events", "from_seq", "to_seq", "around_seq", "before", "after", "max_chars", "cursor"}),
     "file_history": ({"path"}, {"path", "project", "source", "kind", "limit", "target_project", "include_command_candidates", "cursor"}),
 }
+
+
+def assert_nonneg_int(value, context):
+    assert type(value) is int and value >= 0, (context, value)
+
+
+def assert_token_totals(tokens):
+    assert isinstance(tokens, dict) and set(TOKEN_KEYS) <= tokens.keys(), tokens
+    for key in TOKEN_KEYS:
+        assert_nonneg_int(tokens[key], key)
+    assert sum(tokens[key] for key in TOKEN_BUCKETS) == tokens["total_tokens"], tokens
+
+
+def assert_usage_report(report, expected_scope=None):
+    assert isinstance(report, dict) and USAGE_REPORT_KEYS <= report.keys(), report
+    if expected_scope is None:
+        assert "scope" not in report, report
+    else:
+        assert isinstance(report.get("scope"), dict), report
+        for key, value in expected_scope.items():
+            assert report["scope"].get(key) == value, report["scope"]
+    summary = report["summary"]
+    assert isinstance(summary, dict) and USAGE_SUMMARY_KEYS <= summary.keys(), summary
+    for key in ("events", "sessions", "sources", "models"):
+        assert_nonneg_int(summary[key], f"summary.{key}")
+    assert summary["events"] == 3 and summary["sessions"] == 1, summary
+    assert isinstance(summary["token_source_events"], dict), summary
+    for key, count in summary["token_source_events"].items():
+        assert isinstance(key, str)
+        assert_nonneg_int(count, f"token_source_events.{key}")
+    assert sum(summary["token_source_events"].values()) == summary["events"], summary
+    assert_token_totals(summary["tokens"])
+    expected_total = summary["tokens"]["total_tokens"]
+    for section, required_keys in (
+        ("by_source", {"source", "sessions", "events", "tokens"}),
+        ("by_model", {"source", "provider", "model", "sessions", "events", "tokens"}),
+        ("daily", {"period", "sessions", "events", "tokens"}),
+        ("weekly", {"period", "sessions", "events", "tokens"}),
+        ("monthly", {"period", "sessions", "events", "tokens"}),
+    ):
+        entries = report[section]
+        assert isinstance(entries, list) and len(entries) >= 1, (section, report)
+        for entry in entries:
+            assert isinstance(entry, dict) and required_keys <= entry.keys(), (section, entry)
+            assert_nonneg_int(entry["sessions"], f"{section}.sessions")
+            assert_nonneg_int(entry["events"], f"{section}.events")
+            assert_token_totals(entry["tokens"])
+        assert sum(entry["tokens"]["total_tokens"] for entry in entries) == expected_total, (section, report)
+
+
+def assert_projects_usage_report(report, expected_project):
+    assert isinstance(report, dict) and {"summary", "projects"} <= report.keys(), report
+    assert "scope" not in report, report
+    summary = report["summary"]
+    assert isinstance(summary, dict) and PROJECTS_SUMMARY_KEYS <= summary.keys(), summary
+    for key in ("projects", "events", "sessions", "indexed_sessions", "sources", "models"):
+        assert_nonneg_int(summary[key], f"summary.{key}")
+    assert summary["projects"] == 1 and summary["events"] == 3 and summary["sessions"] == 1, summary
+    assert summary["indexed_sessions"] == 1, summary
+    assert_token_totals(summary["tokens"])
+    projects = report["projects"]
+    assert isinstance(projects, list) and len(projects) == summary["projects"], report
+    for entry in projects:
+        assert isinstance(entry, dict) and PROJECT_ENTRY_KEYS <= entry.keys(), entry
+        assert_nonneg_int(entry["sessions"], "projects.sessions")
+        assert_nonneg_int(entry["indexed_sessions"], "projects.indexed_sessions")
+        assert_nonneg_int(entry["events"], "projects.events")
+        assert_token_totals(entry["tokens"])
+        assert isinstance(entry["by_model"], list) and len(entry["by_model"]) >= 1, entry
+        for model_entry in entry["by_model"]:
+            assert isinstance(model_entry, dict) and {"source", "provider", "model", "sessions", "events", "tokens"} <= model_entry.keys(), model_entry
+            assert_token_totals(model_entry["tokens"])
+    assert sum(entry["tokens"]["total_tokens"] for entry in projects) == summary["tokens"]["total_tokens"], report
+    assert projects[0]["kind"] == "directory" and projects[0]["project"] == expected_project, projects[0]
 
 
 def mcp(binary, env, cwd, session_id, future=False):
@@ -88,9 +230,10 @@ def main():
     scratch = Path("/Volumes/git/scratch")
     with tempfile.TemporaryDirectory(prefix="recall-contract-", dir=scratch if scratch.is_dir() else None) as temp:
         home = Path(temp)
-        env = {**os.environ, "HOME": str(home), "XDG_DATA_HOME": str(home / "data"),
-               "XDG_CONFIG_HOME": str(home / "config"), "XDG_CACHE_HOME": str(home / "cache"),
-               "RX_HOME": str(home / "rx")}
+        env = {key: value for key, value in os.environ.items() if key not in ISOLATED_ADAPTER_ENV_VARS}
+        env.update({"HOME": str(home), "XDG_DATA_HOME": str(home / "data"),
+                    "XDG_CONFIG_HOME": str(home / "config"), "XDG_CACHE_HOME": str(home / "cache"),
+                    "XDG_STATE_HOME": str(home / "state"), "RX_HOME": str(home / "rx")})
         sessions = home / "rx" / "sessions"
         sessions.mkdir(parents=True)
         shutil.copyfile(ROOT / "tests" / "fixtures" / "rx-agent" / f"{ID}.jsonl", sessions / f"{ID}.jsonl")
@@ -111,6 +254,8 @@ def main():
         assert len(listed["sessions"]) == 1, listed
         session_id = listed["sessions"][0]["id"]
         assert listed["sessions"][0]["source_id"] == ID, listed
+        project_scope = listed["sessions"][0]["project"]
+        assert project_scope == "/fixture/rx-project", listed
         hits = json.loads(run("search", "adapter", "--source", "rx-agent", "--project", "all", "--format", "json").stdout)
         assert hits["sessions"][0]["id"] == session_id, hits
         for with_scope in [False, True]:
@@ -122,6 +267,15 @@ def main():
             assert record["schema_version"] == 7 and record["record_type"] == "session", record
             assert record["session"]["source_id"] == ID, record
             assert len(record["messages"]) == 4 and len(record["usage_events"]) == 3, record
+        usage_global = json.loads(run("usage", "--json").stdout)
+        assert_usage_report(usage_global, expected_scope=None)
+        assert usage_global["summary"]["tokens"]["total_tokens"] == 240, usage_global
+        usage_scoped = json.loads(run("usage", "--project", project_scope, "--json").stdout)
+        assert_usage_report(usage_scoped, expected_scope={"kind": "directory", "value": project_scope, "directory": project_scope})
+        assert usage_scoped["summary"]["tokens"] == usage_global["summary"]["tokens"]
+        usage_projects = json.loads(run("usage", "--projects", "--json").stdout)
+        assert_projects_usage_report(usage_projects, project_scope)
+        assert usage_projects["summary"]["tokens"] == usage_global["summary"]["tokens"]
         missing = run("session", "show", "--id", "missing-contract-session", "--format", "json", success=False)
         assert not missing.stdout and missing.stderr, missing
         mcp(binary, env, home, session_id)
@@ -144,7 +298,7 @@ def main():
                 assert isinstance(manifest["min_recall"], str) and manifest["min_recall"]
                 if "transport_version" in manifest:
                     assert manifest["transport_version"] == 1
-        print(f"PASS: Recall {version}; rx-agent sync/search; CLI JSON/JSONL; MCP initialize/tools/list/tools/call; future schema rejection" + ("; extension manifests" if args.extensions else ""))
+        print(f"PASS: Recall {version}; rx-agent sync/search; CLI JSON/JSONL/usage; MCP initialize/tools/list/tools/call; future schema rejection" + ("; extension manifests" if args.extensions else ""))
 
 
 if __name__ == "__main__":
