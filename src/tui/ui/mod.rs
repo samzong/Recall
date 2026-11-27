@@ -152,6 +152,10 @@ pub(crate) fn render(f: &mut Frame, app: &App) {
         AppMode::Search => search::render_search(f, app),
         AppMode::Usage => usage::render_usage_dashboard(f, app),
         AppMode::Viewing => viewing::render_viewing(f, app),
+        AppMode::SharePicker => {
+            viewing::render_viewing(f, app);
+            pickers::render_share_picker(f, app);
+        }
         AppMode::ShareResult => {
             viewing::render_viewing(f, app);
             popups::render_share_result(f, app);
@@ -456,6 +460,153 @@ mod tests {
 
         let narrow = render_to_text(&app, 55, 22);
         assert!(narrow.contains("Recall Usage"));
+    }
+
+    #[test]
+    fn share_picker_defaults_toggles_and_renders_counts() {
+        use crate::db::store::SessionTopologyWrite;
+        use crate::tui::share_state::SharePublishOutcome;
+        use crate::types::{ParentLink, ParentRelation, ThreadRole};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut root = numbered_session_result(1).session;
+        root.id = "root-1".into();
+        root.source_id = "root-src".into();
+        root.title = "Primary Thread".into();
+        root.message_count = 1;
+
+        let mut child_non_empty = numbered_session_result(2).session;
+        child_non_empty.id = "child-1".into();
+        child_non_empty.source_id = "child-src-1".into();
+        child_non_empty.title = "NonEmpty Subagent".into();
+        child_non_empty.message_count = 1;
+
+        let mut child_empty = numbered_session_result(3).session;
+        child_empty.id = "child-2".into();
+        child_empty.source_id = "child-src-2".into();
+        child_empty.title = "Empty Subagent".into();
+        child_empty.message_count = 0;
+
+        store
+            .persist_session_with_usage_and_events_with_topology(
+                &root,
+                &[Message {
+                    session_id: "root-1".into(),
+                    role: Role::User,
+                    content: "hi".into(),
+                    timestamp: None,
+                    seq: 0,
+                }],
+                &[],
+                None,
+                &[],
+                None,
+                &SessionTopologyWrite {
+                    thread_role: Some(ThreadRole::Primary),
+                    parents: &[],
+                    parser_version: Some(1),
+                },
+            )
+            .unwrap();
+        store
+            .persist_session_with_usage_and_events_with_topology(
+                &child_non_empty,
+                &[Message {
+                    session_id: "child-1".into(),
+                    role: Role::User,
+                    content: "sub".into(),
+                    timestamp: None,
+                    seq: 0,
+                }],
+                &[],
+                None,
+                &[],
+                None,
+                &SessionTopologyWrite {
+                    thread_role: Some(ThreadRole::Subagent),
+                    parents: &[ParentLink {
+                        relation: ParentRelation::Spawn,
+                        source: "codex".into(),
+                        source_id: "root-src".into(),
+                    }],
+                    parser_version: Some(1),
+                },
+            )
+            .unwrap();
+        store
+            .persist_session_with_usage_and_events_with_topology(
+                &child_empty,
+                &[],
+                &[],
+                None,
+                &[],
+                None,
+                &SessionTopologyWrite {
+                    thread_role: Some(ThreadRole::Subagent),
+                    parents: &[ParentLink {
+                        relation: ParentRelation::Spawn,
+                        source: "codex".into(),
+                        source_id: "root-src".into(),
+                    }],
+                    parser_version: Some(1),
+                },
+            )
+            .unwrap();
+
+        let mut app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+        app.viewing.load(child_non_empty.clone(), &store);
+        app.mode = AppMode::Viewing;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &store);
+        assert!(matches!(app.mode, AppMode::SharePicker));
+        let picker = app.share_picker.as_ref().unwrap();
+        assert_eq!(picker.items.len(), 3);
+        assert!(picker.items[0].is_root && picker.items[0].checked);
+        assert!(picker.items[1].checked);
+        assert!(!picker.items[2].checked);
+
+        let rendered = render_to_text(&app, 100, 14);
+        assert!(rendered.contains("Share sessions (2/3)"));
+        assert!(rendered.contains("[x] Primary Thread"));
+        assert!(rendered.contains("0 msgs"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &store);
+        assert!(app.share_picker.as_ref().unwrap().items[0].checked);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &store);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &store);
+        assert!(!app.share_picker.as_ref().unwrap().items[1].checked);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &store);
+        assert!(app.share_picker.as_ref().unwrap().items[1].checked);
+        assert!(!app.share_picker.as_ref().unwrap().items[2].checked);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &store);
+        assert!(app.share_picker.as_ref().unwrap().items[0].checked);
+        assert!(!app.share_picker.as_ref().unwrap().items[1].checked);
+        assert!(!app.share_picker.as_ref().unwrap().items[2].checked);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);
+        assert!(matches!(app.mode, AppMode::Viewing));
+        assert!(app.share_picker.is_none());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.share_request_id = 5;
+        app.share_publish_rx = Some(rx);
+        tx.send(crate::tui::share_state::SharePublishResponse {
+            request_id: 4,
+            result: Ok(SharePublishOutcome {
+                url: "https://stale.example".into(),
+                session_count: 1,
+                bundle_diff: None,
+            }),
+        })
+        .unwrap();
+        app.poll_share_publish();
+        assert!(app.share_popup.is_none());
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {

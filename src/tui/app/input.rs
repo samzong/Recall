@@ -19,6 +19,7 @@ impl App {
                     self.anchor_viewing_scroll();
                 }
             }
+            AppMode::SharePicker => self.handle_share_picker_key(key, store),
             AppMode::ShareResult => self.handle_share_result_key(key),
             AppMode::ExportInput => self.handle_export_key(key),
             AppMode::Settings => self.handle_settings_key(key, store),
@@ -228,7 +229,7 @@ impl App {
                 self.start_export();
             }
             KeyCode::Char('s') => {
-                self.share_current_session();
+                self.share_current_session(store);
             }
             KeyCode::Char('v') => {
                 self.preview_current_session();

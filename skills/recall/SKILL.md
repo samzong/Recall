@@ -152,32 +152,51 @@ Use the returned `session_id` for subsequent reads; if sync fails, resolve the e
 
 ## Share Sessions
 
-An explicit share or refresh request authorizes a real deployment. Use `--dry-run` only for an explicit preview. Before publishing, stop if the selected session contains concrete credentials or private material the user did not authorize sharing.
+An explicit share or refresh request authorizes a real deployment. Use `--dry-run` only for a preview.
 
-Use an explicit session id when provided. Otherwise sync and list recent sessions for the active project, filtering by source only when known. Select the current conversation only when its identity is unambiguous; inspect the smallest necessary tail or ask the user if several candidates remain.
+Use an explicit session id when provided. Otherwise sync and list recent sessions for the active project. Filter by source only when known. Select the current conversation only when its identity is unambiguous. If multiple candidates remain, inspect a small tail or ask the user.
 
 ```bash
 recall session list --project /absolute/project/path --source <sources> --limit 5 --sort updated --sync --format json
 ```
 
-Base the TL;DR on the selected session. For the current conversation, use the existing context without reloading its transcript solely for a summary. For another session, use its retrieved transcript; omit the optional TL;DR if evidence is insufficient. Never substitute the current conversation for a different session.
-
-When including a TL;DR, create a temporary directory. If `/Volumes/git` is mounted, use `mktemp -d /Volumes/git/scratch/recall-tldr-XXXXXX`. Otherwise, use `mktemp -d`. Write the short Markdown summary to `<temporary-directory>/tldr.md`, then publish with that file path:
+Inspect related subagents and Confer peers before sharing:
 
 ```bash
-recall session share --id <session-id> --tldr-file <temporary-tldr-path> --format json
+recall session show --id <session-id> --format json
 ```
 
-Omit `--tldr-file` when no summary is supplied. After publishing succeeds or fails, delete only the temporary directory you created and its contents. Missing, unreadable, or blank TL;DR input does not block publishing. Read `share.url` from the JSON and verify it with `curl -I -L`. If the first check returns 404, publish once more and recheck, then stop. If sharing is not configured, tell the user to run `recall share init`. Return the live URL rather than raw JSON.
+Read the `related` array from the output. If related sessions exist, show them to the user and recommend including them.
 
-List and unpublish shared pages with:
+Create a temporary directory when you write a summary or dry-run preview file. If `/Volumes/git` is mounted, run `mktemp -d /Volumes/git/scratch/recall-share-XXXXXX`. Otherwise run `mktemp -d`.
+
+Before live publish, write the rendered HTML to `<scratch>/share.html` and scan it for credentials:
+
+```bash
+recall session share --id <session-id> --include-related --dry-run --output <scratch>/share.html --format json
+```
+
+Make sure that the rendered HTML contains no unauthorized credentials or private material. Stop and ask the user if sensitive data appears in the output.
+
+Base the optional summary on the selected session. For another session, read its retrieved transcript instead of the current context. Write a short Markdown summary to `<scratch>/tldr.md` when evidence supports it, or omit `--tldr-file`.
+
+Publish one session or a multi-session bundle:
+
+```bash
+recall session share --id <session-id> --include-related --tldr-file <scratch>/tldr.md --format json
+recall session share --id <id-1> --id <id-2> --exclude-id <skip-id> --format json
+```
+
+Delete only the temporary directory that you created after publishing finishes. Read `share.url` from the JSON and make sure that `curl -I -L` succeeds. If the first request returns 404, publish once more and test again, then stop. If sharing configuration is missing, tell the user to run `recall share init`. Return the live URL instead of raw JSON.
+
+List and unpublish shared pages with these commands:
 
 ```bash
 recall share list --format json
 recall share unpublish <share-id-or-url> --yes --format json
 ```
 
-The list is the local publish inventory, not a live crawl. Unpublish only an exact target selected by the user; list first and ask when no target was supplied.
+The list shows the local publish inventory, not a live crawl. Unpublish only an exact target selected by the user. List first and ask when no target exists.
 
 ## Review Project History
 

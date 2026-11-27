@@ -6,11 +6,12 @@ pub(crate) mod render;
 
 pub(crate) use inventory::{ShareFormat, run_list, run_unpublish};
 pub(crate) use publish::{
-    create_session_preview, default_project_name, default_publish_dir, expand_path,
-    init_cloudflare_pages, open_preview_file, preflight_cloudflare_pages,
-    preview_session_with_options, publish_session, publish_session_with_options,
+    BundleDiff, SharePreview, create_bundle_preview, create_session_preview, default_project_name,
+    default_publish_dir, dry_run_bundle_to_output, expand_path, init_cloudflare_pages,
+    open_preview_file, preflight_cloudflare_pages, preview_bundle_with_options,
+    publish_bundle_with_options,
 };
-pub(crate) use render::ShareRenderOptions;
+pub(crate) use render::{BundledSessionInput, MAX_BUNDLE_SESSIONS, ShareRenderOptions};
 
 #[cfg(test)]
 fn test_session(source_id: &str) -> crate::types::Session {
