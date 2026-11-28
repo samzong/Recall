@@ -19,7 +19,7 @@ use crate::types::{
     FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, RawUsageEvent, Role,
 };
 
-const USAGE_PARSER_VERSION: u32 = 3;
+const USAGE_PARSER_VERSION: u32 = 4;
 const METADATA_PARSER_VERSION: u32 = 2;
 const EVENT_PARSER_VERSION: u32 = 2;
 
@@ -102,6 +102,11 @@ struct GrokSummary {
     current_model_id: Option<String>,
 }
 
+struct TurnCompletedUsage {
+    timestamp: i64,
+    usage: Value,
+}
+
 struct PromptTokenState {
     prompt_id: String,
     peak_total_tokens: i64,
@@ -111,6 +116,7 @@ struct PromptTokenState {
     min_agent_ms: Option<i64>,
     max_agent_ms: Option<i64>,
     model: Option<String>,
+    turn_completed_usages: Vec<TurnCompletedUsage>,
 }
 
 #[derive(Clone)]
@@ -926,7 +932,7 @@ fn parse_grok_updates_reader<R: BufRead>(
 ) -> anyhow::Result<(Vec<RawMessage>, Vec<RawUsageEvent>, Vec<RawSessionEvent>)> {
     let (messages, prompts, session_events) =
         parse_grok_updates_reader_with_prompts(reader, source_path, cwd, include_events)?;
-    let usage_events = prompt_usage_events(prompts, &[], source_path, None);
+    let usage_events = merge_grok_usage_events(prompts, source_path, &[], None, "grok");
     Ok((messages, usage_events, session_events))
 }
 
@@ -956,7 +962,14 @@ fn parse_grok_updates_reader_with_prompts<R: BufRead>(
         let session_update =
             update.get("sessionUpdate").and_then(|value| value.as_str()).unwrap_or("");
         let timestamp_ms = json_i64(doc.get("timestamp")).and_then(|ts| ts.checked_mul(1000));
-        track_prompt_tokens(params, timestamp_ms, &mut prompts, &mut prompt_index, &mut last_model);
+        let prompt_idx = track_prompt_tokens(
+            params,
+            update,
+            timestamp_ms,
+            &mut prompts,
+            &mut prompt_index,
+            &mut last_model,
+        );
 
         match session_update {
             "user_message_chunk" => {
@@ -996,6 +1009,21 @@ fn parse_grok_updates_reader_with_prompts<R: BufRead>(
                     session_events.push(parse_grok_tool_event(&doc, update, context, cwd));
                 }
             }
+            "turn_completed" => {
+                pending_agent = None;
+                if let Some(index) = prompt_idx
+                    && let Some(usage) = update.get("usage").filter(|value| value.is_object())
+                {
+                    let meta_agent_ms =
+                        params.get("_meta").and_then(|meta| json_i64(meta.get("agentTimestampMs")));
+                    let prompt = &mut prompts[index];
+                    let tc_timestamp =
+                        timestamp_ms.or(meta_agent_ms).or(prompt.timestamp).unwrap_or_default();
+                    prompt
+                        .turn_completed_usages
+                        .push(TurnCompletedUsage { timestamp: tc_timestamp, usage: usage.clone() });
+                }
+            }
             "agent_thought_chunk" | "available_commands_update" => {}
             _ => {}
         }
@@ -1006,25 +1034,30 @@ fn parse_grok_updates_reader_with_prompts<R: BufRead>(
 
 fn track_prompt_tokens(
     params: &Value,
+    update: &Value,
     timestamp_ms: Option<i64>,
     prompts: &mut Vec<PromptTokenState>,
     prompt_index: &mut HashMap<String, usize>,
     last_model: &mut Option<String>,
-) {
-    let Some(meta) = params.get("_meta") else {
-        return;
-    };
-    if let Some(model) = meta.get("modelId").and_then(|value| value.as_str())
+) -> Option<usize> {
+    let meta = params.get("_meta");
+    if let Some(model) = meta.and_then(|m| m.get("modelId")).and_then(|value| value.as_str())
         && !model.is_empty()
     {
         *last_model = Some(model.to_string());
     }
-    let Some(prompt_id) =
-        meta.get("promptId").and_then(|value| value.as_str()).filter(|id| !id.is_empty())
-    else {
-        return;
-    };
-    let total_tokens = json_i64(meta.get("totalTokens"));
+    let prompt_id = update
+        .get("prompt_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            meta.and_then(|m| m.get("promptId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+        })?;
+    let total_tokens = meta.and_then(|m| json_i64(m.get("totalTokens")));
     let index = match prompt_index.get(prompt_id) {
         Some(index) => *index,
         None => {
@@ -1037,6 +1070,7 @@ fn track_prompt_tokens(
                 min_agent_ms: None,
                 max_agent_ms: None,
                 model: None,
+                turn_completed_usages: Vec::new(),
             });
             prompt_index.insert(prompt_id.to_string(), prompts.len() - 1);
             prompts.len() - 1
@@ -1051,15 +1085,16 @@ fn track_prompt_tokens(
         prompt.timestamp = Some(ts);
     }
     if prompt.turn_start_ms.is_none() {
-        prompt.turn_start_ms = json_i64(meta.get("turnStartMs"));
+        prompt.turn_start_ms = meta.and_then(|m| json_i64(m.get("turnStartMs")));
     }
-    if let Some(agent_ms) = json_i64(meta.get("agentTimestampMs")) {
+    if let Some(agent_ms) = meta.and_then(|m| json_i64(m.get("agentTimestampMs"))) {
         prompt.min_agent_ms = Some(prompt.min_agent_ms.map_or(agent_ms, |prev| prev.min(agent_ms)));
         prompt.max_agent_ms = Some(prompt.max_agent_ms.map_or(agent_ms, |prev| prev.max(agent_ms)));
     }
     if prompt.model.is_none() {
         prompt.model = last_model.clone();
     }
+    Some(index)
 }
 
 fn build_prompt_windows(prompts: &[PromptTokenState]) -> Vec<Option<(i64, i64)>> {
@@ -1128,6 +1163,85 @@ fn match_unified_event_to_prompt(
         .map(|(index, _)| index)
 }
 
+fn turn_completed_usage_events(
+    prompt: &PromptTokenState,
+    updates_path: Option<&str>,
+    fallback_model: &str,
+    seen_keys: &mut HashMap<String, usize>,
+) -> Vec<RawUsageEvent> {
+    let prompt_model = prompt
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(fallback_model);
+    let mut events = Vec::new();
+    for tc in &prompt.turn_completed_usages {
+        let mut model_entries: Vec<(&str, &Value)> = tc
+            .usage
+            .get("modelUsage")
+            .and_then(Value::as_object)
+            .map(|map| {
+                let mut entries: Vec<(&str, &Value)> = map
+                    .iter()
+                    .filter_map(|(model, value)| {
+                        let model = model.trim();
+                        (!model.is_empty() && value.is_object()).then_some((model, value))
+                    })
+                    .collect();
+                entries.sort_by(|left, right| left.0.cmp(right.0));
+                entries
+            })
+            .unwrap_or_default();
+        if model_entries.is_empty() {
+            model_entries.push((prompt_model, &tc.usage));
+        }
+        for (model, u) in model_entries {
+            let cache_read_tokens = usage_json_i64(u.get("cachedReadTokens")).unwrap_or(0).max(0);
+            let cache_write_tokens =
+                usage_json_i64(u.get("cacheCreationTokens")).unwrap_or(0).max(0);
+            let reasoning_tokens = usage_json_i64(u.get("reasoningTokens")).unwrap_or(0).max(0);
+            let raw_input = usage_json_i64(u.get("inputTokens")).unwrap_or(0).max(0);
+            let raw_output = usage_json_i64(u.get("outputTokens")).unwrap_or(0).max(0);
+
+            let cache_read = cache_read_tokens.min(raw_input);
+            let cache_write = cache_write_tokens.min(raw_input.saturating_sub(cache_read));
+            let input_tokens = raw_input.saturating_sub(cache_read).saturating_sub(cache_write);
+            let reasoning = reasoning_tokens.min(raw_output);
+            let output_tokens = raw_output.saturating_sub(reasoning);
+
+            if input_tokens == 0
+                && output_tokens == 0
+                && cache_read == 0
+                && cache_write == 0
+                && reasoning == 0
+            {
+                continue;
+            }
+
+            let base_key = format!("turn:{}:{model}", prompt.prompt_id);
+            let occurrence = seen_keys.entry(base_key.clone()).or_insert(0);
+            let event_key =
+                if *occurrence == 0 { base_key } else { format!("{base_key}:{}", *occurrence) };
+            *occurrence += 1;
+
+            events.push(RawUsageEvent {
+                model: model.to_string(),
+                provider: "xai".to_string(),
+                input_tokens,
+                output_tokens,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: cache_write,
+                reasoning_tokens: reasoning,
+                source_path: updates_path.map(str::to_string),
+                raw_usage_json: Some(u.to_string()),
+                ..RawUsageEvent::observed(event_key, 0, tc.timestamp, USAGE_PARSER_VERSION)
+            });
+        }
+    }
+    events
+}
+
 fn merge_grok_usage_events(
     prompts: Vec<PromptTokenState>,
     updates_path: Option<&str>,
@@ -1137,19 +1251,52 @@ fn merge_grok_usage_events(
 ) -> Vec<RawUsageEvent> {
     let windows = build_prompt_windows(&prompts);
     let mut matched_prompts = vec![false; prompts.len()];
-    let mut matched_prompt_models: Vec<Option<String>> = Vec::with_capacity(unified_events.len());
+    let mut matched_prompt_indices: Vec<Option<usize>> = Vec::with_capacity(unified_events.len());
     for event in unified_events {
         if let Some(prompt_idx) = match_unified_event_to_prompt(event, &prompts, &windows) {
             matched_prompts[prompt_idx] = true;
-            matched_prompt_models.push(prompts[prompt_idx].model.clone());
+            matched_prompt_indices.push(Some(prompt_idx));
         } else {
-            matched_prompt_models.push(None);
+            matched_prompt_indices.push(None);
         }
     }
 
-    let mut combined =
-        prompt_usage_events(prompts, &matched_prompts, updates_path, Some(fallback_model));
-    for (event, prompt_model) in unified_events.iter().zip(matched_prompt_models) {
+    let has_turn_usage: Vec<bool> =
+        prompts.iter().map(|prompt| !prompt.turn_completed_usages.is_empty()).collect();
+    let prompt_models: Vec<Option<String>> =
+        prompts.iter().map(|prompt| prompt.model.clone()).collect();
+    let covered_prompts: Vec<bool> = matched_prompts
+        .iter()
+        .zip(&has_turn_usage)
+        .map(|(matched, has_turn)| *matched || *has_turn)
+        .collect();
+
+    let mut seen_turn_keys: HashMap<String, usize> = HashMap::new();
+    let mut combined = Vec::new();
+    for (prompt, has_turn) in prompts.iter().zip(&has_turn_usage) {
+        if *has_turn {
+            combined.extend(turn_completed_usage_events(
+                prompt,
+                updates_path,
+                fallback_model,
+                &mut seen_turn_keys,
+            ));
+        }
+    }
+
+    combined.extend(prompt_usage_events(
+        prompts,
+        &covered_prompts,
+        updates_path,
+        Some(fallback_model),
+    ));
+    for (event, prompt_idx) in unified_events.iter().zip(matched_prompt_indices) {
+        if let Some(idx) = prompt_idx
+            && has_turn_usage.get(idx).copied().unwrap_or(false)
+        {
+            continue;
+        }
+        let prompt_model = prompt_idx.and_then(|idx| prompt_models.get(idx).cloned().flatten());
         let model = if !event.model.is_empty() {
             event.model.clone()
         } else {
@@ -2073,7 +2220,7 @@ mod tests {
         assert_eq!(result.scan.sessions.len(), 1);
         let session = &result.scan.sessions[0];
         assert_eq!(session.source_id, session_id);
-        assert_eq!(session.usage_parser_version, Some(3));
+        assert_eq!(session.usage_parser_version, Some(USAGE_PARSER_VERSION));
         assert_eq!(session.usage_events.len(), 4);
 
         let early1 = &session.usage_events[0];
@@ -2105,7 +2252,7 @@ mod tests {
         assert_eq!(obs1.output_tokens, 253);
         assert_eq!(obs1.reasoning_tokens, 471);
         assert_eq!(obs1.cache_write_tokens, 0);
-        assert_eq!(obs1.parser_version, 3);
+        assert_eq!(obs1.parser_version, USAGE_PARSER_VERSION);
         assert!(obs1.source_path.as_deref().unwrap().ends_with("logs/unified.jsonl"));
 
         let obs2 = &session.usage_events[3];
@@ -2327,6 +2474,160 @@ mod tests {
         let keys: HashSet<&str> =
             session.usage_events.iter().map(|event| event.event_key.as_str()).collect();
         assert_eq!(keys.len(), 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_grok_turn_completed_extracts_model_usage_and_top_level_fallback() {
+        use crate::types::TokenSource;
+
+        let root = temp_grok_root("turn-completed-5bucket");
+        let sessions_dir = root.join("sessions");
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let updates_path = write_grok_session(
+            &sessions_dir,
+            "%2Ftmp%2Fproject",
+            session_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-11-20T10:00:00Z","current_model_id":"grok-4.7-fallback"}"#,
+            r#"{"timestamp":100,"method":"_x.ai/session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"turn_completed","prompt_id":"p-multi","stop_reason":"end_turn","usage":{"inputTokens":1000,"outputTokens":200,"cachedReadTokens":600,"cacheCreationTokens":100,"reasoningTokens":80,"modelUsage":{"grok-z":{"inputTokens":500,"outputTokens":100,"cachedReadTokens":300,"cacheCreationTokens":50,"reasoningTokens":40},"grok-a":{"inputTokens":500,"outputTokens":100,"cachedReadTokens":300,"cacheCreationTokens":50,"reasoningTokens":40}}}},"_meta":{"agentTimestampMs":100500}}}
+{"method":"_x.ai/session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn","usage":{"inputTokens":200,"outputTokens":50,"cachedReadTokens":150,"cacheCreationTokens":100,"reasoningTokens":70,"modelUsage":{}}},"_meta":{"promptId":"p-top","agentTimestampMs":200500}}}
+{"timestamp":300,"method":"_x.ai/session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"turn_completed","prompt_id":"p-multi","stop_reason":"end_turn","usage":{"modelUsage":{"grok-a":{"inputTokens":10,"outputTokens":2,"cachedReadTokens":0,"cacheCreationTokens":0,"reasoningTokens":0}}}}}}
+{"timestamp":400,"method":"_x.ai/session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"turn_completed","prompt_id":"p-zero","stop_reason":"end_turn","usage":{"inputTokens":0,"outputTokens":0,"cachedReadTokens":0,"cacheCreationTokens":0,"reasoningTokens":0}}}}
+"#,
+        );
+
+        let mtime = file_scan::stat_mtime_ms(&updates_path).unwrap();
+        let entry = FileScanEntry {
+            session_id: session_id.to_string(),
+            stat_target: updates_path.clone(),
+            directory: None,
+        };
+        let session = parse_grok_session_for_entry(&entry, mtime, false).unwrap().unwrap();
+        assert_eq!(session.usage_parser_version, Some(USAGE_PARSER_VERSION));
+        assert_eq!(session.usage_events.len(), 4);
+
+        let first = &session.usage_events[0];
+        assert_eq!(first.event_key, "turn:p-multi:grok-a");
+        assert_eq!(first.model, "grok-a");
+        assert_eq!(first.provider, "xai");
+        assert_eq!(first.timestamp, 100_000);
+        assert_eq!(first.token_source, TokenSource::Observed);
+        assert_eq!(first.parser_version, USAGE_PARSER_VERSION);
+        assert_eq!(first.input_tokens, 150);
+        assert_eq!(first.cache_read_tokens, 300);
+        assert_eq!(first.cache_write_tokens, 50);
+        assert_eq!(first.output_tokens, 60);
+        assert_eq!(first.reasoning_tokens, 40);
+        assert_eq!(first.source_path.as_deref(), updates_path.to_str());
+        assert!(first.raw_usage_json.as_deref().unwrap().contains("\"cacheCreationTokens\":50"));
+
+        let second = &session.usage_events[1];
+        assert_eq!(second.event_key, "turn:p-multi:grok-z");
+        assert_eq!(second.model, "grok-z");
+
+        let top = &session.usage_events[2];
+        assert_eq!(top.event_key, "turn:p-top:grok-4.7-fallback");
+        assert_eq!(top.model, "grok-4.7-fallback");
+        assert_eq!(top.timestamp, 200_500);
+        assert_eq!(top.cache_read_tokens, 150);
+        assert_eq!(top.cache_write_tokens, 50);
+        assert_eq!(top.input_tokens, 0);
+        assert_eq!(top.reasoning_tokens, 50);
+        assert_eq!(top.output_tokens, 0);
+
+        let dup = &session.usage_events[3];
+        assert_eq!(dup.event_key, "turn:p-multi:grok-a:1");
+        assert_eq!(dup.timestamp, 300_000);
+        assert_eq!(dup.input_tokens, 10);
+        assert_eq!(dup.output_tokens, 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_grok_reconciles_turn_completed_interrupted_unified_and_legacy_fallback() {
+        use crate::types::TokenSource;
+
+        let root = temp_grok_root("reconcile-v4");
+        let sessions_dir = root.join("sessions");
+        let logs_dir = root.join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let updates_path = write_grok_session(
+            &sessions_dir,
+            "%2Ftmp%2Fproject",
+            session_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-11-20T10:00:00Z","current_model_id":"grok-4.7"}"#,
+            r#"{"timestamp":1795168808,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"legacy"}},"_meta":{"totalTokens":1000,"promptId":"p-legacy","turnStartMs":1795168808000}}}
+{"timestamp":1795168868,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"completed"}},"_meta":{"totalTokens":2500,"promptId":"p-completed","turnStartMs":1795168868000}}}
+{"timestamp":1795168875,"method":"_x.ai/session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"turn_completed","prompt_id":"p-completed","stop_reason":"end_turn","usage":{"inputTokens":2400,"outputTokens":100,"cachedReadTokens":1000,"cacheCreationTokens":200,"reasoningTokens":40,"modelUsage":{"grok-4.7-build":{"inputTokens":2400,"outputTokens":100,"cachedReadTokens":1000,"cacheCreationTokens":200,"reasoningTokens":40}}}},"_meta":{"agentTimestampMs":1795168875500}}}
+{"timestamp":1795168920,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial"}},"_meta":{"totalTokens":3200,"promptId":"p-interrupted","turnStartMs":1795168920000,"agentTimestampMs":1795168925000}}}
+{"timestamp":1795168930,"method":"_x.ai/session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"turn_completed","prompt_id":"p-interrupted","stop_reason":"interrupted"},"_meta":{"agentTimestampMs":1795168930500}}}
+{"timestamp":1795168980,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"after"}},"_meta":{"totalTokens":4000,"promptId":"p-legacy-after","turnStartMs":1795168980000}}}
+"#,
+        );
+        let unified_path = logs_dir.join("unified.jsonl");
+        fs::write(
+            &unified_path,
+            r#"{"ts":"2026-11-20T10:01:12.000Z","src":"shell","sid":"019e9003-1ed9-70e3-803b-1e7f96a072eb","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"elapsed_since_turn_start_ms":4000,"prompt_tokens":2300,"cached_prompt_tokens":900,"completion_tokens":90,"reasoning_tokens":30}}
+{"ts":"2026-11-20T10:02:05.000Z","src":"shell","sid":"019e9003-1ed9-70e3-803b-1e7f96a072eb","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"elapsed_since_turn_start_ms":5000,"prompt_tokens":1500,"cached_prompt_tokens":800,"completion_tokens":75,"reasoning_tokens":25}}
+{"ts":"2026-11-20T10:05:00.000Z","src":"shell","sid":"019e9003-1ed9-70e3-803b-1e7f96a072eb","msg":"shell.turn.inference_done","ctx":{"loop_index":9,"prompt_tokens":500,"cached_prompt_tokens":100,"completion_tokens":50,"reasoning_tokens":10}}
+"#,
+        )
+        .unwrap();
+
+        let mtime = file_scan::stat_mtime_ms(&updates_path).unwrap();
+        let entry = FileScanEntry {
+            session_id: session_id.to_string(),
+            stat_target: updates_path.clone(),
+            directory: None,
+        };
+        let session = parse_grok_session_for_entry(&entry, mtime, false).unwrap().unwrap();
+        assert_eq!(session.usage_events.len(), 5);
+
+        let e0 = &session.usage_events[0];
+        assert_eq!(e0.event_key, "prompt:p-legacy");
+        assert_eq!(e0.token_source, TokenSource::Derived);
+        assert_eq!(e0.input_tokens, 1000);
+
+        let e1 = &session.usage_events[1];
+        assert_eq!(e1.event_key, "turn:p-completed:grok-4.7-build");
+        assert_eq!(e1.token_source, TokenSource::Observed);
+        assert_eq!(e1.input_tokens, 1200);
+        assert_eq!(e1.cache_read_tokens, 1000);
+        assert_eq!(e1.cache_write_tokens, 200);
+        assert_eq!(e1.output_tokens, 60);
+        assert_eq!(e1.reasoning_tokens, 40);
+        assert!(e1.source_path.as_deref().unwrap().ends_with("updates.jsonl"));
+
+        assert!(
+            !session
+                .usage_events
+                .iter()
+                .any(|e| e.event_key.contains(":10:01:12") || e.input_tokens == 1400)
+        );
+        assert!(!session.usage_events.iter().any(|e| e.event_key == "prompt:p-completed"));
+        assert!(!session.usage_events.iter().any(|e| e.event_key == "prompt:p-interrupted"));
+
+        let e2 = &session.usage_events[2];
+        assert_eq!(e2.token_source, TokenSource::Observed);
+        assert_eq!(e2.input_tokens, 700);
+        assert_eq!(e2.cache_read_tokens, 800);
+        assert_eq!(e2.output_tokens, 50);
+        assert_eq!(e2.reasoning_tokens, 25);
+        assert!(e2.source_path.as_deref().unwrap().ends_with("logs/unified.jsonl"));
+
+        let e3 = &session.usage_events[3];
+        assert_eq!(e3.event_key, "prompt:p-legacy-after");
+        assert_eq!(e3.token_source, TokenSource::Derived);
+        assert_eq!(e3.input_tokens, 800);
+
+        let e4 = &session.usage_events[4];
+        assert_eq!(e4.token_source, TokenSource::Observed);
+        assert_eq!(e4.input_tokens, 400);
+        assert!(e4.source_path.as_deref().unwrap().ends_with("logs/unified.jsonl"));
 
         let _ = fs::remove_dir_all(&root);
     }
