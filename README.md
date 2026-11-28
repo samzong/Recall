@@ -100,7 +100,7 @@ Qoder CLI usage requires exposed, nonzero token counts. Cache-inclusive input is
 
 rx-agent sessions use `$RX_HOME/sessions` (default `~/.rx/sessions`). Recall reads version 1 logs and preserves the complete history across compaction checkpoints.
 
-Grok usage reads `turn_completed.usage` records from `updates.jsonl` and reconciles interrupted turns with `unified.jsonl`. When neither source exists for a turn, Recall falls back to `_meta.totalTokens`. Recall excludes Grok `subagent` and `subagent_resume` sessions. Recall also excludes interrupted turns that rotated out of `unified.jsonl` before re-parse.
+Grok usage reads `turn_completed.usage` records from `updates.jsonl` and reconciles interrupted turns with `unified.jsonl`. When neither source exists for a turn, Recall falls back to `_meta.totalTokens`. Recall excludes Grok `subagent` and `subagent_resume` sessions. Interrupted turns that rotated out of `unified.jsonl` before re-parse fall back to `_meta.totalTokens` when present and otherwise emit no usage.
 
 ## Acknowledgements
 
