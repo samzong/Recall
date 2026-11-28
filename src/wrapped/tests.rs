@@ -294,7 +294,7 @@ fn store_backed_report_normalizes_legacy_usage_rows() {
     let codex = store.list_usage_events_for_session("codex").unwrap();
     assert_eq!(codex[0].output_tokens, 6);
     assert_eq!(codex[0].reasoning_tokens, 4);
-    assert_eq!(codex[0].parser_version, 5);
+    assert_eq!(codex[0].parser_version, 7);
 
     let gemini = store.list_usage_events_for_session("gemini").unwrap();
     assert_eq!(gemini[0].input_tokens, 70);

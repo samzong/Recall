@@ -586,3 +586,237 @@ fn remote_usage_snapshots_replace_nonempty_and_empty_usage() {
         parent = Some(hash);
     }
 }
+
+#[test]
+fn codex_legacy_zero_last_token_usage_normalizes_to_zero_v7() {
+    let store = setup();
+    let mut event = crate::types::test_support::usage_event("tok-zero");
+    event.input_tokens = 100;
+    event.output_tokens = 50;
+    event.cache_read_tokens = 20;
+    event.reasoning_tokens = 5;
+    event.parser_version = 6;
+    event.raw_usage_json = Some(
+        serde_json::json!({
+            "total_token_usage": {
+                "input_tokens": 120,
+                "cached_input_tokens": 20,
+                "output_tokens": 50,
+                "reasoning_output_tokens": 5
+            },
+            "last_token_usage": {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 0
+            }
+        })
+        .to_string(),
+    );
+    store
+        .persist_session_with_usage(
+            &make_session("codex-legacy", "codex", "codex-legacy", "Codex Legacy"),
+            &[],
+            &[event],
+            Some(6),
+        )
+        .unwrap();
+
+    let by_session = store.usage_by_session().unwrap();
+    assert_eq!(by_session["codex-legacy"].tokens.total_tokens, 0);
+    let report =
+        build_usage_report(&store, &UsageFilters { sources: None, time_range: TimeRange::All })
+            .unwrap();
+    assert_eq!(report.summary.tokens.total_tokens, 0);
+    let listed = store.list_usage_events_for_session("codex-legacy").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].parser_version, 7);
+    assert_eq!(listed[0].input_tokens, 0);
+    assert_eq!(listed[0].output_tokens, 0);
+    assert_eq!(listed[0].cache_read_tokens, 0);
+    assert_eq!(listed[0].reasoning_tokens, 0);
+}
+
+#[test]
+fn migrate_v23_suppresses_codex_copied_fork_mirror_until_native_binding_deleted() {
+    let store = setup();
+    let shared_source_id = "01a0238a-0000-7000-8000-000000000099";
+    let native_session = make_session("native-codex", "codex", shared_source_id, "Native Fork");
+    let copied_raw = serde_json::json!({
+        "total_token_usage": {
+            "input_tokens": 120,
+            "cached_input_tokens": 20,
+            "output_tokens": 15,
+            "reasoning_output_tokens": 3
+        },
+        "last_token_usage": {
+            "input_tokens": 120,
+            "cached_input_tokens": 20,
+            "output_tokens": 15,
+            "reasoning_output_tokens": 3
+        }
+    })
+    .to_string();
+    let ambiguous_raw = serde_json::json!({
+        "total_token_usage": {
+            "input_tokens": 50,
+            "cached_input_tokens": 0,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 0
+        },
+        "last_token_usage": {
+            "input_tokens": 50,
+            "cached_input_tokens": 0,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 0
+        }
+    })
+    .to_string();
+    let mut kept_event = crate::types::test_support::usage_event("native-kept");
+    kept_event.timestamp = 2000;
+    kept_event.input_tokens = 30;
+    kept_event.output_tokens = 5;
+    kept_event.parser_version = 7;
+
+    let excluded_pair =
+        crate::adapters::codex::codex_excluded_pair_from_raw_json(&copied_raw, 1000).unwrap();
+    let repeated_pair =
+        crate::adapters::codex::codex_excluded_pair_from_raw_json(&ambiguous_raw, 1500).unwrap();
+    store
+        .replace_session_with_usage_events_and_codex_exclusions(
+            "codex",
+            shared_source_id,
+            &native_session,
+            &[],
+            &[kept_event],
+            &[excluded_pair, repeated_pair.clone(), repeated_pair],
+            Some(7),
+            &[],
+            None,
+            &crate::db::store::SessionTopologyWrite::none(),
+        )
+        .unwrap();
+
+    let mut mirror_session =
+        make_session("mirror-codex", "codex", shared_source_id, "Remote Fork Mirror");
+    mirror_session.is_import = true;
+
+    let mut mirror_copied = crate::types::test_support::usage_event("mirror-copied");
+    mirror_copied.timestamp = 1000;
+    mirror_copied.input_tokens = 100;
+    mirror_copied.cache_read_tokens = 20;
+    mirror_copied.output_tokens = 15;
+    mirror_copied.reasoning_tokens = 3;
+    mirror_copied.parser_version = 7;
+    mirror_copied.raw_usage_json = Some(copied_raw);
+
+    let mut mirror_ambiguous = crate::types::test_support::usage_event("mirror-ambiguous");
+    mirror_ambiguous.event_seq = 1;
+    mirror_ambiguous.timestamp = 1500;
+    mirror_ambiguous.input_tokens = 50;
+    mirror_ambiguous.output_tokens = 5;
+    mirror_ambiguous.parser_version = 7;
+    mirror_ambiguous.raw_usage_json = Some(ambiguous_raw);
+
+    let mut mirror_kept = crate::types::test_support::usage_event("mirror-kept");
+    mirror_kept.event_seq = 2;
+    mirror_kept.timestamp = 3000;
+    mirror_kept.input_tokens = 40;
+    mirror_kept.output_tokens = 6;
+    mirror_kept.parser_version = 7;
+
+    store
+        .conn
+        .execute(
+            "INSERT INTO sessions(id, source, source_id, title, started_at, is_import)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            rusqlite::params![
+                mirror_session.id,
+                mirror_session.source,
+                mirror_session.source_id,
+                mirror_session.title,
+                mirror_session.started_at
+            ],
+        )
+        .unwrap();
+    for (idx, event) in [&mirror_copied, &mirror_ambiguous, &mirror_kept].into_iter().enumerate() {
+        store
+            .conn
+            .execute(
+                "INSERT INTO usage_events(
+                    session_id, source, source_id, event_key, event_seq, message_seq,
+                    timestamp, model, provider, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    token_source, parser_version, raw_usage_json, created_at
+                 ) VALUES (?1, 'codex', ?2, ?3, ?4, NULL, ?5, 'gpt-5', 'openai', ?6, ?7, ?8, 0, ?9, 'observed', 7, ?10, 1)",
+                rusqlite::params![
+                    mirror_session.id,
+                    shared_source_id,
+                    event.event_key,
+                    idx as i64,
+                    event.timestamp,
+                    event.input_tokens,
+                    event.output_tokens,
+                    event.cache_read_tokens,
+                    event.reasoning_tokens,
+                    event.raw_usage_json
+                ],
+            )
+            .unwrap();
+    }
+    store
+        .conn
+        .execute_batch(
+            "UPDATE background_job_state SET phase = 'scan', detail = json_object('cursor', 0, 'end', (SELECT MAX(id) FROM usage_events)) WHERE job = 'usage_index';
+             DELETE FROM usage_event_ownership;
+             DELETE FROM usage_rollups;",
+        )
+        .unwrap();
+    while store.backfill_usage_index_batch().unwrap() {}
+
+    assert_eq!(store.list_usage_events_for_session("mirror-codex").unwrap().len(), 3);
+    let copied_ownership: i64 = store
+        .conn
+        .query_row(
+            "SELECT ownership FROM usage_event_ownership WHERE event_key = 'mirror-copied'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(copied_ownership, 3);
+    let by_session = store.usage_by_session().unwrap();
+    assert_eq!(by_session["native-codex"].tokens.total_tokens, 35);
+    assert_eq!(by_session["mirror-codex"].tokens.total_tokens, 55 + 46);
+
+    let report =
+        build_usage_report(&store, &UsageFilters { sources: None, time_range: TimeRange::All })
+            .unwrap();
+    assert_eq!(report.summary.tokens.total_tokens, 35 + 55 + 46);
+    let folded_mirror_total = store
+        .fold_usage_events_after(Some(&["codex".to_string()]), None, 0_i64, |acc, event| {
+            if event.session_id == "mirror-codex" {
+                *acc += event.input_tokens
+                    + event.output_tokens
+                    + event.cache_read_tokens
+                    + event.cache_write_tokens
+                    + event.reasoning_tokens;
+            }
+        })
+        .unwrap();
+    assert_eq!(folded_mirror_total, 55 + 46);
+
+    store.delete_session_data("codex", shared_source_id).unwrap();
+    assert_eq!(count_rows(&store, "SELECT COUNT(*) FROM codex_excluded_usage"), 0);
+    let restored_ownership: i64 = store
+        .conn
+        .query_row(
+            "SELECT ownership FROM usage_event_ownership WHERE event_key = 'mirror-copied'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(restored_ownership, 1);
+    let by_session_after = store.usage_by_session().unwrap();
+    assert_eq!(by_session_after["mirror-codex"].tokens.total_tokens, 138 + 55 + 46);
+}

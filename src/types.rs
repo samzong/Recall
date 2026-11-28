@@ -218,6 +218,13 @@ pub(crate) mod test_support {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ExcludedCodexUsage {
+    pub(crate) timestamp: i64,
+    pub(crate) total: [i64; 5],
+    pub(crate) last: [i64; 5],
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RawUsageEvent {
     pub(crate) event_key: String,

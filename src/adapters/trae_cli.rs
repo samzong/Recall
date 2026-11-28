@@ -19,7 +19,7 @@ impl SourceAdapter for TraeCliAdapter {
     }
 
     fn usage_parser_version(&self) -> Option<u32> {
-        Some(codex::USAGE_PARSER_VERSION)
+        Some(codex::usage_parser_version_for_dialect(RolloutDialect::Trae))
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {

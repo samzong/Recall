@@ -478,6 +478,7 @@ fn parse_claude_session_file(
         entrypoint,
         messages: parsed.messages,
         usage_events: parsed.usage_events,
+        excluded_codex_usage: Vec::new(),
         usage_parser_version: Some(USAGE_PARSER_VERSION),
         events: parsed.events,
         event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),

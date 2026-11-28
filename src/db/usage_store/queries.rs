@@ -6,10 +6,11 @@ use rusqlite::OptionalExtension;
 use super::super::store::{ParserStateMeta, Store};
 use super::dirty::flush_dirty_usage_tx;
 use super::{
-    PersistedUsage, UsageConflict, UsageDedup, UsageOwnership, map_usage_event_row,
-    normalize_persisted_usage, replace_usage_events,
+    PersistedUsage, UsageConflict, UsageDedup, UsageOwnership, codex_mirror_row_suppressed,
+    map_usage_event_row, normalize_persisted_usage, replace_codex_excluded_usage_tx,
+    replace_usage_events,
 };
-use crate::types::{RawUsageEvent, SessionUsageEventRecord, UsageEventRecord};
+use crate::types::{ExcludedCodexUsage, RawUsageEvent, SessionUsageEventRecord, UsageEventRecord};
 
 impl Store {
     pub(crate) fn usage_state_meta_map(
@@ -24,11 +25,31 @@ impl Store {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn persist_usage_events_for_existing_session(
         &self,
         source: &str,
         source_id: &str,
         usage_events: &[RawUsageEvent],
+        usage_parser_version: u32,
+        source_updated_at: Option<i64>,
+    ) -> Result<bool> {
+        self.persist_usage_events_for_existing_session_with_exclusions(
+            source,
+            source_id,
+            usage_events,
+            &[],
+            usage_parser_version,
+            source_updated_at,
+        )
+    }
+
+    pub(crate) fn persist_usage_events_for_existing_session_with_exclusions(
+        &self,
+        source: &str,
+        source_id: &str,
+        usage_events: &[RawUsageEvent],
+        excluded_codex_usage: &[ExcludedCodexUsage],
         usage_parser_version: u32,
         source_updated_at: Option<i64>,
     ) -> Result<bool> {
@@ -55,6 +76,14 @@ impl Store {
             Some(usage_parser_version),
             source_updated_at,
             UsageConflict::Reject,
+        )?;
+        replace_codex_excluded_usage_tx(
+            &tx,
+            source,
+            source_id,
+            usage_events,
+            excluded_codex_usage,
+            Some(usage_parser_version),
         )?;
         flush_dirty_usage_tx(&tx)?;
         tx.commit()?;
@@ -84,7 +113,7 @@ impl Store {
         mut fold: impl FnMut(&mut T, UsageEventRecord, UsageOwnership),
     ) -> Result<T> {
         let mut sql = String::from(
-            "SELECT ue.session_id, ue.source, ue.source_id, ue.event_key, ue.timestamp, ue.model, ue.provider,
+            "SELECT ue.session_id, ue.source, s.source_id, ue.event_key, ue.timestamp, ue.model, ue.provider,
                     ue.input_tokens, ue.output_tokens, ue.cache_read_tokens, ue.cache_write_tokens,
                     ue.reasoning_tokens, ue.token_source, ue.parser_version, ue.raw_usage_json
              FROM usage_events ue
@@ -125,12 +154,26 @@ impl Store {
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), map_usage_event_row)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            let raw_usage_json = row.get::<_, Option<String>>(14)?;
+            Ok((map_usage_event_row(row)?, raw_usage_json))
+        })?;
 
         let mut dedup = UsageDedup::default();
         for row in rows {
-            let event = row?;
-            let ownership = dedup.assign(&event);
+            let (event, raw_usage_json) = row?;
+            let ownership = if codex_mirror_row_suppressed(
+                &self.conn,
+                &event.session_id,
+                &event.source,
+                &event.source_id,
+                event.timestamp,
+                raw_usage_json.as_deref(),
+            )? {
+                UsageOwnership::OtherSession
+            } else {
+                dedup.assign(&event)
+            };
             fold(&mut state, event, ownership);
         }
         Ok(state)

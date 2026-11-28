@@ -4,15 +4,16 @@ mod queries;
 mod rollups;
 pub(super) use dirty::flush_dirty_usage_tx;
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use anyhow::Result;
 use chrono::Utc;
 
-use crate::types::{RawUsageEvent, UsageEventRecord};
+use crate::types::{ExcludedCodexUsage, RawUsageEvent, UsageEventRecord};
 use crate::usage::TokenTotals;
 
 const CODEX_DISJOINT_REASONING_VERSION: u32 = 5;
+const CODEX_V7_VERSION: u32 = 7;
 const CACHE_EXCLUSIVE_INPUT_VERSION: u32 = 2;
 const FLEXIBLE_REASONING_VERSION: u32 = 2;
 pub(super) const BUCKET_MILLIS: i64 = 900_000;
@@ -52,6 +53,141 @@ pub(crate) fn validate_usage_event(event: &RawUsageEvent) -> Result<()> {
             event.reasoning_tokens,
         ],
     )?;
+    Ok(())
+}
+
+pub(super) fn codex_mirror_row_suppressed(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    source: &str,
+    source_id: &str,
+    timestamp: i64,
+    raw_usage_json: Option<&str>,
+) -> Result<bool> {
+    if source != "codex" {
+        return Ok(false);
+    }
+    let Some(raw) = raw_usage_json else {
+        return Ok(false);
+    };
+    let Some(pair) = crate::adapters::codex::codex_excluded_pair_from_raw_json(raw, timestamp)
+    else {
+        return Ok(false);
+    };
+    let suppressed: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM codex_excluded_usage ex
+            WHERE ex.source_id = ?1
+              AND ex.timestamp = ?2
+              AND ex.total_input_tokens = ?3
+              AND ex.total_cached_tokens = ?4
+              AND ex.total_cache_write_tokens = ?5
+              AND ex.total_output_tokens = ?6
+              AND ex.total_reasoning_tokens = ?7
+              AND ex.last_input_tokens = ?8
+              AND ex.last_cached_tokens = ?9
+              AND ex.last_cache_write_tokens = ?10
+              AND ex.last_output_tokens = ?11
+              AND ex.last_reasoning_tokens = ?12
+              AND EXISTS(SELECT 1 FROM native_bindings nb WHERE nb.source = 'codex' AND nb.source_id = ?1)
+              AND NOT EXISTS(SELECT 1 FROM native_bindings nb WHERE nb.session_id = ?13)
+        )",
+        rusqlite::params![
+            source_id,
+            pair.timestamp,
+            pair.total[0],
+            pair.total[1],
+            pair.total[2],
+            pair.total[3],
+            pair.total[4],
+            pair.last[0],
+            pair.last[1],
+            pair.last[2],
+            pair.last[3],
+            pair.last[4],
+            session_id,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(suppressed)
+}
+
+pub(in super::super) fn replace_codex_excluded_usage_tx(
+    tx: &rusqlite::Transaction<'_>,
+    source: &str,
+    source_id: &str,
+    usage_events: &[RawUsageEvent],
+    excluded_codex_usage: &[ExcludedCodexUsage],
+    usage_parser_version: Option<u32>,
+) -> Result<()> {
+    if source != "codex" || usage_parser_version.is_none_or(|v| v < CODEX_V7_VERSION) {
+        return Ok(());
+    }
+    let has_native: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM native_bindings WHERE source = 'codex' AND source_id = ?1)",
+        [source_id],
+        |row| row.get(0),
+    )?;
+    if !has_native {
+        return Ok(());
+    }
+
+    let retained: HashSet<ExcludedCodexUsage> = usage_events
+        .iter()
+        .filter_map(|event| {
+            crate::adapters::codex::codex_excluded_pair_from_raw_json(
+                event.raw_usage_json.as_deref()?,
+                event.timestamp,
+            )
+        })
+        .collect();
+    let mut counts: HashMap<&ExcludedCodexUsage, usize> = HashMap::new();
+    for item in excluded_codex_usage {
+        *counts.entry(item).or_insert(0) += 1;
+    }
+
+    let deleted =
+        tx.execute("DELETE FROM codex_excluded_usage WHERE source_id = ?1", [source_id])?;
+    let mut inserted = 0_usize;
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO codex_excluded_usage (
+            source_id, timestamp,
+            total_input_tokens, total_cached_tokens, total_cache_write_tokens, total_output_tokens, total_reasoning_tokens,
+            last_input_tokens, last_cached_tokens, last_cache_write_tokens, last_output_tokens, last_reasoning_tokens
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?;
+    for (item, count) in counts {
+        if count != 1 || retained.contains(item) {
+            continue;
+        }
+        inserted += stmt.execute(rusqlite::params![
+            source_id,
+            item.timestamp,
+            item.total[0],
+            item.total[1],
+            item.total[2],
+            item.total[3],
+            item.total[4],
+            item.last[0],
+            item.last[1],
+            item.last[2],
+            item.last[3],
+            item.last[4],
+        ])?;
+    }
+    drop(stmt);
+
+    if deleted > 0 || inserted > 0 {
+        tx.execute(
+            "INSERT INTO usage_dirty_sessions(session_id)
+             SELECT id FROM sessions
+             WHERE source = 'codex' AND source_id = ?1
+               AND NOT EXISTS(SELECT 1 FROM native_bindings nb WHERE nb.session_id = sessions.id)
+             ON CONFLICT DO NOTHING",
+            [source_id],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -182,6 +318,7 @@ impl UsageDedup {
 pub(super) struct OwnershipSourceRow {
     pub(super) event_id: i64,
     pub(super) source: String,
+    pub(super) source_id: String,
     pub(super) event_seq: i64,
     pub(super) timestamp: i64,
     pub(super) event_key: String,
@@ -200,6 +337,7 @@ pub(super) struct UsageScanRow {
     pub(super) event_id: i64,
     pub(super) session_id: String,
     pub(super) source: String,
+    pub(super) source_id: String,
     pub(super) event_seq: i64,
     pub(super) timestamp: i64,
     pub(super) event_key: String,
@@ -221,9 +359,18 @@ pub(super) fn normalize_persisted_usage(
     raw_usage_json: Option<&str>,
 ) -> PersistedUsage {
     match source {
-        "codex" if usage.parser_version < CODEX_DISJOINT_REASONING_VERSION => {
-            split_inclusive_output(&mut usage);
-            usage.parser_version = CODEX_DISJOINT_REASONING_VERSION;
+        "codex" if usage.parser_version < CODEX_V7_VERSION => {
+            if usage.parser_version < CODEX_DISJOINT_REASONING_VERSION {
+                split_inclusive_output(&mut usage);
+            }
+            if crate::adapters::codex::codex_last_usage_is_zero_object(raw_usage_json) {
+                usage.input_tokens = 0;
+                usage.output_tokens = 0;
+                usage.cache_read_tokens = 0;
+                usage.cache_write_tokens = 0;
+                usage.reasoning_tokens = 0;
+            }
+            usage.parser_version = CODEX_V7_VERSION;
         }
         "gemini-cli" | "qwen-code" if usage.parser_version < CACHE_EXCLUSIVE_INPUT_VERSION => {
             usage.input_tokens = usage.input_tokens.saturating_sub(usage.cache_read_tokens).max(0);

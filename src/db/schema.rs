@@ -8,7 +8,7 @@ use legacy::*;
 pub(crate) use usage_index::{REVISION_COMPRESSION_JOB, SKILL_USAGE_JOB, USAGE_INDEX_JOB};
 
 const V12_SCHEMA_VERSION: i64 = 12;
-pub(crate) const SCHEMA_VERSION: i64 = 22;
+pub(crate) const SCHEMA_VERSION: i64 = 23;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -85,6 +85,9 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     }
     if version < 22 {
         usage_index::migrate_v22(conn)?;
+    }
+    if version < 23 {
+        usage_index::migrate_v23(conn)?;
     }
     Ok(())
 }

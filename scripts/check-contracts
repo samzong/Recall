@@ -248,7 +248,7 @@ def main():
         run("sync", "--source", "rx-agent", "--project", "all")
         info = json.loads(run("info", "--format", "json").stdout)
         assert info["protocol_version"] == 2, info
-        assert info["schemas"] == {"export_record": 7, "database": 22}, info
+        assert info["schemas"] == {"export_record": 7, "database": 23}, info
         assert next(source for source in info["sources"] if source["id"] == "rx-agent")["sessions"] == 1
         listed = json.loads(run("session", "list", "--source", "rx-agent", "--project", "all", "--format", "json").stdout)
         assert len(listed["sessions"]) == 1, listed
@@ -281,7 +281,7 @@ def main():
         mcp(binary, env, home, session_id)
         database, = home.rglob("recall.db")
         with sqlite3.connect(database) as connection:
-            connection.execute("PRAGMA user_version = 23")
+            connection.execute("PRAGMA user_version = 24")
         before = database.read_bytes()
         rejected = run("info", "--format", "json", success=False)
         assert not rejected.stdout and "newer than supported" in rejected.stderr, rejected

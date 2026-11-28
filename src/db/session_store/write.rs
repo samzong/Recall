@@ -6,7 +6,7 @@ use super::super::event_store::replace_session_events;
 use super::super::store::{SessionTopologyWrite, Store};
 use super::super::topology_store::replace_parent_links_tx;
 use crate::db::{skill_audit_store, usage_store};
-use crate::types::{Message, RawSessionEvent, RawUsageEvent, Session};
+use crate::types::{ExcludedCodexUsage, Message, RawSessionEvent, RawUsageEvent, Session};
 
 impl Store {
     pub(crate) fn update_session_fields(
@@ -89,8 +89,6 @@ impl Store {
             ],
         )?;
         bind_native_tx(&tx, session)?;
-        usage_store::flush_dirty_usage_tx(&tx)?;
-        skill_audit_store::flush_dirty_skill_tx(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -165,6 +163,14 @@ impl Store {
             topology,
         )?;
         bind_native_tx(&tx, session)?;
+        usage_store::replace_codex_excluded_usage_tx(
+            &tx,
+            &session.source,
+            &session.source_id,
+            usage_events,
+            &[],
+            usage_parser_version,
+        )?;
         usage_store::flush_dirty_usage_tx(&tx)?;
         skill_audit_store::flush_dirty_skill_tx(&tx)?;
         tx.commit()?;
@@ -197,6 +203,7 @@ impl Store {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn replace_session_with_usage_and_events_with_topology(
         &self,
@@ -205,6 +212,34 @@ impl Store {
         session: &Session,
         messages: &[Message],
         usage_events: &[RawUsageEvent],
+        usage_parser_version: Option<u32>,
+        session_events: &[RawSessionEvent],
+        event_parser_version: Option<u32>,
+        topology: &SessionTopologyWrite<'_>,
+    ) -> Result<()> {
+        self.replace_session_with_usage_events_and_codex_exclusions(
+            old_source,
+            old_source_id,
+            session,
+            messages,
+            usage_events,
+            &[],
+            usage_parser_version,
+            session_events,
+            event_parser_version,
+            topology,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn replace_session_with_usage_events_and_codex_exclusions(
+        &self,
+        old_source: &str,
+        old_source_id: &str,
+        session: &Session,
+        messages: &[Message],
+        usage_events: &[RawUsageEvent],
+        excluded_codex_usage: &[ExcludedCodexUsage],
         usage_parser_version: Option<u32>,
         session_events: &[RawSessionEvent],
         event_parser_version: Option<u32>,
@@ -250,6 +285,14 @@ impl Store {
             topology,
         )?;
         bind_native_tx(&tx, session)?;
+        usage_store::replace_codex_excluded_usage_tx(
+            &tx,
+            &session.source,
+            &session.source_id,
+            usage_events,
+            excluded_codex_usage,
+            usage_parser_version,
+        )?;
         usage_store::flush_dirty_usage_tx(&tx)?;
         skill_audit_store::flush_dirty_skill_tx(&tx)?;
         tx.commit()?;
