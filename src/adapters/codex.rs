@@ -1141,6 +1141,7 @@ fn parse_rollout_components(
                                 payload,
                                 timestamp,
                                 &source_path,
+                                segment_id,
                                 line_index,
                                 &mut events,
                             );
@@ -1614,6 +1615,7 @@ fn collect_codex_meta_event(
     payload: &Value,
     timestamp: Option<i64>,
     source_path: &str,
+    segment_id: Option<&str>,
     line_index: usize,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
@@ -1631,7 +1633,7 @@ fn collect_codex_meta_event(
             event_seq: events_out.len() as u32,
             timestamp,
             source_path: Some(source_path.to_string()),
-            source_event_id: Some(line_index.to_string()),
+            source_event_id: Some(namespaced_line_id(segment_id, line_index)),
             message_seq: None,
             parser_version: EVENT_PARSER_VERSION,
         }
