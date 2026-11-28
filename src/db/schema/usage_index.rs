@@ -230,3 +230,68 @@ pub(super) fn migrate_v22(conn: &Connection) -> anyhow::Result<()> {
     tx.commit()?;
     Ok(())
 }
+
+pub(super) fn migrate_v23(conn: &Connection) -> anyhow::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if super::read_schema_version(&tx)? >= 23 {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS codex_excluded_usage (
+            source_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            total_input_tokens INTEGER NOT NULL,
+            total_cached_tokens INTEGER NOT NULL,
+            total_cache_write_tokens INTEGER NOT NULL,
+            total_output_tokens INTEGER NOT NULL,
+            total_reasoning_tokens INTEGER NOT NULL,
+            last_input_tokens INTEGER NOT NULL,
+            last_cached_tokens INTEGER NOT NULL,
+            last_cache_write_tokens INTEGER NOT NULL,
+            last_output_tokens INTEGER NOT NULL,
+            last_reasoning_tokens INTEGER NOT NULL,
+            PRIMARY KEY (
+                source_id,
+                timestamp,
+                total_input_tokens,
+                total_cached_tokens,
+                total_cache_write_tokens,
+                total_output_tokens,
+                total_reasoning_tokens,
+                last_input_tokens,
+                last_cached_tokens,
+                last_cache_write_tokens,
+                last_output_tokens,
+                last_reasoning_tokens
+            )
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS idx_usage_events_codex_source
+            ON usage_events(source_id, session_id)
+            WHERE source = 'codex';
+         CREATE TRIGGER IF NOT EXISTS codex_excluded_usage_native_ad AFTER DELETE ON native_bindings
+         WHEN OLD.source = 'codex'
+         BEGIN
+            DELETE FROM codex_excluded_usage WHERE source_id = OLD.source_id;
+            INSERT INTO usage_dirty_sessions(session_id)
+                SELECT DISTINCT session_id FROM usage_events WHERE source = 'codex' AND source_id = OLD.source_id
+                ON CONFLICT DO NOTHING;
+         END;
+         DELETE FROM usage_event_ownership;
+         DELETE FROM usage_rollups;
+         DELETE FROM usage_dirty_sessions;
+         DELETE FROM usage_dirty_groups;",
+    )?;
+    let end: i64 =
+        tx.query_row("SELECT COALESCE(MAX(id), 0) FROM usage_events", [], |row| row.get(0))?;
+    let detail = (end != 0).then(|| serde_json::json!({"cursor": 0_i64, "end": end}).to_string());
+    tx.execute(
+        "INSERT INTO background_job_state(job, phase, detail, updated_at)
+         VALUES (?1, ?2, ?3, unixepoch() * 1000)
+         ON CONFLICT(job) DO UPDATE SET phase = excluded.phase, detail = excluded.detail,
+                                       updated_at = excluded.updated_at",
+        rusqlite::params![USAGE_INDEX_JOB, if end == 0 { "done" } else { "scan" }, detail],
+    )?;
+    tx.execute_batch("PRAGMA user_version = 23;")?;
+    tx.commit()?;
+    Ok(())
+}

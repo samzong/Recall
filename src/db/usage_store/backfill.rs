@@ -9,8 +9,8 @@ use super::dirty::{
 };
 use super::{
     PersistedUsage, USAGE_DEDUP_BATCH, USAGE_FINALIZE_GROUP_BATCH, USAGE_FINALIZE_SESSION_BATCH,
-    USAGE_SCAN_BATCH, UsageScanRow, dedup_group_key_from_parts, normalize_persisted_usage,
-    validate_usage_amounts,
+    USAGE_SCAN_BATCH, UsageScanRow, codex_mirror_row_suppressed, dedup_group_key_from_parts,
+    normalize_persisted_usage, validate_usage_amounts,
 };
 
 pub(super) fn backfill_usage_scan_batch(
@@ -24,12 +24,14 @@ pub(super) fn backfill_usage_scan_batch(
 
     let rows: Vec<UsageScanRow> = {
         let mut stmt = tx.prepare(
-            "SELECT id, session_id, source, event_seq, timestamp, event_key, model, provider,
-                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    reasoning_tokens, token_source, parser_version, raw_usage_json
-             FROM usage_events
-             WHERE id > ?1 AND id <= ?2
-             ORDER BY id
+            "SELECT ue.id, ue.session_id, ue.source, s.source_id, ue.event_seq, ue.timestamp,
+                    ue.event_key, ue.model, ue.provider,
+                    ue.input_tokens, ue.output_tokens, ue.cache_read_tokens, ue.cache_write_tokens,
+                    ue.reasoning_tokens, ue.token_source, ue.parser_version, ue.raw_usage_json
+             FROM usage_events ue
+             JOIN sessions s ON s.id = ue.session_id
+             WHERE ue.id > ?1 AND ue.id <= ?2
+             ORDER BY ue.id
              LIMIT ?3",
         )?;
         stmt.query_map(rusqlite::params![cursor, end, USAGE_SCAN_BATCH], |row| {
@@ -37,19 +39,20 @@ pub(super) fn backfill_usage_scan_batch(
                 event_id: row.get(0)?,
                 session_id: row.get(1)?,
                 source: row.get(2)?,
-                event_seq: row.get(3)?,
-                timestamp: row.get(4)?,
-                event_key: row.get(5)?,
-                model: row.get(6)?,
-                provider: row.get(7)?,
-                input_tokens: row.get(8)?,
-                output_tokens: row.get(9)?,
-                cache_read_tokens: row.get(10)?,
-                cache_write_tokens: row.get(11)?,
-                reasoning_tokens: row.get(12)?,
-                token_source: row.get(13)?,
-                parser_version: row.get(14)?,
-                raw_usage_json: row.get(15)?,
+                source_id: row.get(3)?,
+                event_seq: row.get(4)?,
+                timestamp: row.get(5)?,
+                event_key: row.get(6)?,
+                model: row.get(7)?,
+                provider: row.get(8)?,
+                input_tokens: row.get(9)?,
+                output_tokens: row.get(10)?,
+                cache_read_tokens: row.get(11)?,
+                cache_write_tokens: row.get(12)?,
+                reasoning_tokens: row.get(13)?,
+                token_source: row.get(14)?,
+                parser_version: row.get(15)?,
+                raw_usage_json: row.get(16)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?
@@ -62,7 +65,7 @@ pub(super) fn backfill_usage_scan_batch(
             let mut own_stmt = tx.prepare(
                 "INSERT OR IGNORE INTO usage_event_ownership(
                     event_id, session_id, dedup_group, timestamp, event_seq, event_key, ownership
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for row in &rows {
                 let usage = normalize_persisted_usage(
@@ -99,6 +102,15 @@ pub(super) fn backfill_usage_scan_batch(
                     usage.cache_write_tokens,
                     usage.reasoning_tokens,
                 );
+                let suppressed = codex_mirror_row_suppressed(
+                    tx,
+                    &row.session_id,
+                    &row.source,
+                    &row.source_id,
+                    row.timestamp,
+                    row.raw_usage_json.as_deref(),
+                )?;
+                let ownership = if suppressed { 3 } else { 1 };
                 own_stmt.execute(rusqlite::params![
                     row.event_id,
                     &row.session_id,
@@ -106,7 +118,11 @@ pub(super) fn backfill_usage_scan_batch(
                     row.timestamp,
                     row.event_seq,
                     &row.event_key,
+                    ownership,
                 ])?;
+                if suppressed {
+                    continue;
+                }
                 let bucket_ms = validate_usage_amounts(
                     row.timestamp,
                     [

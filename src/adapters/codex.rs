@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 
 use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
-use crate::adapters::file_scan::{self, FileScanEntry};
+use crate::adapters::file_scan::{self, FileMetadataSnapshot, FileScanEntry, FileScanSnapshot};
 use crate::adapters::invocation_probe::{
     InvocationProbeBudget, ProviderInvocationProbe, is_discovery_tool, nonce_matches_input,
     probe_recent_files,
@@ -21,15 +21,23 @@ use crate::adapters::{
     last_timestamp,
 };
 use crate::types::{
-    FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation, RawSessionEvent,
-    RawUsageEvent, Role, ThreadRole,
+    ExcludedCodexUsage, FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation,
+    RawSessionEvent, RawUsageEvent, Role, ThreadRole,
 };
 
 pub(crate) struct CodexAdapter;
 
-pub(crate) const USAGE_PARSER_VERSION: u32 = 6;
+pub(crate) const USAGE_PARSER_VERSION: u32 = 7;
+const TRAE_USAGE_PARSER_VERSION: u32 = 6;
 const EVENT_PARSER_VERSION: u32 = 6;
 const METADATA_PARSER_VERSION: u32 = 2;
+
+pub(crate) const fn usage_parser_version_for_dialect(dialect: RolloutDialect) -> u32 {
+    match dialect {
+        RolloutDialect::Codex => USAGE_PARSER_VERSION,
+        RolloutDialect::Trae => TRAE_USAGE_PARSER_VERSION,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RolloutDialect {
@@ -289,16 +297,32 @@ fn json_string(input: &str) -> Option<String> {
     None
 }
 
+#[derive(Clone)]
+struct RolloutComponent {
+    session_id: String,
+    segment_id: Option<String>,
+    priority: u8,
+    modified: Option<std::time::SystemTime>,
+    path: PathBuf,
+}
+
 pub(crate) fn scan_rollouts(
     root: &Path,
     dialect: RolloutDialect,
 ) -> anyhow::Result<Vec<RawSession>> {
     let mut sessions = Vec::new();
-    for entry in collect_codex_entries(&[&root.join("sessions"), &root.join("archived_sessions")]) {
-        let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+    let (entries, groups) =
+        collect_rollout_groups(&[&root.join("sessions"), &root.join("archived_sessions")], dialect);
+    for entry in entries {
+        let Some(components) = groups.get(&entry.session_id) else {
             continue;
         };
-        if let Some(raw) = parse_codex_session_for_entry(entry, mtime_ms, true, dialect)? {
+        let Some(mtime_ms) = rollout_group_mtime_ms(components) else {
+            continue;
+        };
+        if let Some(raw) =
+            parse_codex_session_for_components(&entry, components, mtime_ms, true, dialect)?
+        {
             sessions.push(raw);
         }
     }
@@ -321,20 +345,33 @@ pub(crate) fn scan_rollouts_for_sync(
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
-    let entries = collect_codex_entries(&[&root.join("sessions"), &root.join("archived_sessions")]);
-    file_scan::run_file_scan_with_options(
+    let (entries, groups) =
+        collect_rollout_groups(&[&root.join("sessions"), &root.join("archived_sessions")], dialect);
+    file_scan::run_file_scan_with_options_and_snapshot(
         context,
         since_ts,
         file_scan::FileScanOptions {
             stream_sessions: true,
-            usage_parser_version: Some(USAGE_PARSER_VERSION),
+            usage_parser_version: Some(usage_parser_version_for_dialect(dialect)),
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
             metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
         },
         entries,
+        |entry| {
+            let components = groups.get(&entry.session_id)?;
+            rollout_group_snapshot(components)
+        },
         |entry, mtime_ms| {
-            let Some(session) =
-                parse_codex_session_for_entry(entry, mtime_ms, include_events, dialect)?
+            let Some(components) = groups.get(&entry.session_id) else {
+                return Ok(None);
+            };
+            let Some(session) = parse_codex_session_for_components(
+                &entry,
+                components,
+                mtime_ms,
+                include_events,
+                dialect,
+            )?
             else {
                 return Ok(None);
             };
@@ -346,30 +383,37 @@ pub(crate) fn scan_rollouts_for_sync(
     )
 }
 
-fn collect_codex_entries(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
-    let mut entries: Vec<_> = collect_rollout_candidates(base_dirs)
-        .into_iter()
-        .map(|entry| {
-            let priority = rollout_filename_parts(&entry.stat_target).unwrap().1;
-            let modified =
-                fs::metadata(&entry.stat_target).ok().and_then(|metadata| metadata.modified().ok());
-            (priority, modified, entry)
-        })
-        .collect();
-    entries.sort_unstable_by(|left, right| {
-        left.2
-            .session_id
-            .cmp(&right.2.session_id)
-            .then_with(|| left.0.cmp(&right.0))
-            .then_with(|| right.1.cmp(&left.1))
-            .then_with(|| left.2.stat_target.cmp(&right.2.stat_target))
-    });
-    entries.dedup_by(|left, right| left.2.session_id == right.2.session_id);
-    entries.into_iter().map(|(_, _, entry)| entry).collect()
+fn rollout_group_mtime_ms(components: &[RolloutComponent]) -> Option<i64> {
+    components.iter().filter_map(|component| file_scan::stat_mtime_ms(&component.path)).max()
 }
 
-fn collect_rollout_candidates(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
-    let mut entries = Vec::new();
+type RolloutSegmentFingerprint = (PathBuf, Option<FileMetadataSnapshot>);
+
+fn rollout_group_snapshot(
+    components: &[RolloutComponent],
+) -> Option<FileScanSnapshot<Vec<RolloutSegmentFingerprint>>> {
+    let mut max_mtime_ms: Option<i64> = None;
+    let mut fingerprint = Vec::with_capacity(components.len());
+    for component in components {
+        let meta = file_scan::file_metadata_snapshot(&component.path);
+        if let Some(mtime) = meta.as_ref().and_then(FileMetadataSnapshot::mtime_ms) {
+            max_mtime_ms = Some(max_mtime_ms.map_or(mtime, |prev| prev.max(mtime)));
+        }
+        fingerprint.push((component.path.clone(), meta));
+    }
+    Some(FileScanSnapshot::new(max_mtime_ms?, fingerprint))
+}
+
+#[cfg(test)]
+fn collect_codex_entries(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
+    collect_rollout_groups(base_dirs, RolloutDialect::Codex).0
+}
+
+fn collect_rollout_groups(
+    base_dirs: &[&Path],
+    dialect: RolloutDialect,
+) -> (Vec<FileScanEntry>, HashMap<String, Vec<RolloutComponent>>) {
+    let mut components: Vec<RolloutComponent> = Vec::new();
     for dir in base_dirs {
         if !dir.exists() {
             continue;
@@ -379,30 +423,74 @@ fn collect_rollout_candidates(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
             if !path.is_file() {
                 continue;
             }
-            let Some((stem, _)) = rollout_filename_parts(path) else {
+            let Some((stem, priority)) = rollout_filename_parts(path) else {
                 continue;
             };
-            let Some(session_id) = extract_session_id_from_filename(stem) else {
+            let Some((session_id, segment_id)) = extract_rollout_ids(stem, dialect) else {
                 continue;
             };
-            entries.push(FileScanEntry {
+            let modified = fs::metadata(path).ok().and_then(|metadata| metadata.modified().ok());
+            components.push(RolloutComponent {
                 session_id,
-                stat_target: path.to_path_buf(),
-                directory: None,
+                segment_id,
+                priority,
+                modified,
+                path: path.to_path_buf(),
             });
         }
     }
-    entries
+    components.sort_unstable_by(|left, right| {
+        left.session_id
+            .cmp(&right.session_id)
+            .then_with(|| left.segment_id.cmp(&right.segment_id))
+            .then_with(|| left.priority.cmp(&right.priority))
+            .then_with(|| right.modified.cmp(&left.modified))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    components.dedup_by(|left, right| {
+        left.session_id == right.session_id && left.segment_id == right.segment_id
+    });
+
+    let mut groups: HashMap<String, Vec<RolloutComponent>> = HashMap::new();
+    for component in components {
+        groups.entry(component.session_id.clone()).or_default().push(component);
+    }
+
+    let mut entries = Vec::with_capacity(groups.len());
+    for (session_id, list) in &mut groups {
+        list.sort_unstable_by(|left, right| {
+            let left_seg_ts = left.segment_id.as_deref().and_then(uuid7_timestamp_ms);
+            let right_seg_ts = right.segment_id.as_deref().and_then(uuid7_timestamp_ms);
+            left.segment_id
+                .is_some()
+                .cmp(&right.segment_id.is_some())
+                .then_with(|| left_seg_ts.cmp(&right_seg_ts))
+                .then_with(|| left.segment_id.cmp(&right.segment_id))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        entries.push(FileScanEntry {
+            session_id: session_id.clone(),
+            stat_target: list[0].path.clone(),
+            directory: None,
+        });
+    }
+    entries.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+    (entries, groups)
 }
 
-fn parse_codex_session_for_entry(
-    entry: FileScanEntry,
+fn collect_rollout_candidates(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
+    collect_rollout_groups(base_dirs, RolloutDialect::Codex).0
+}
+
+fn parse_codex_session_for_components(
+    entry: &FileScanEntry,
+    components: &[RolloutComponent],
     mtime_ms: i64,
     include_events: bool,
     dialect: RolloutDialect,
 ) -> anyhow::Result<Option<RawSession>> {
     let source_file_path = entry.stat_target.to_str().map(str::to_string);
-    let mut raw = match parse_rollout(&entry.stat_target, include_events, dialect) {
+    let mut raw = match parse_rollout_components(components, include_events, dialect) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
         Err(e) => {
@@ -414,7 +502,7 @@ fn parse_codex_session_for_entry(
             return Ok(None);
         }
     };
-    raw.source_id = entry.session_id;
+    raw.source_id = entry.session_id.clone();
     raw.updated_at = Some(mtime_ms);
     raw.source_file_path = source_file_path;
     Ok(Some(raw))
@@ -425,6 +513,33 @@ fn rollout_filename_parts(path: &Path) -> Option<(&str, u8)> {
     [(".jsonl", 0), (".json", 1), (".jsonl.zst", 2)]
         .into_iter()
         .find_map(|(suffix, priority)| name.strip_suffix(suffix).map(|stem| (stem, priority)))
+}
+
+fn extract_rollout_ids(stem: &str, dialect: RolloutDialect) -> Option<(String, Option<String>)> {
+    if let Some(id) = extract_session_id_from_filename(stem) {
+        return Some((id, None));
+    }
+    if dialect != RolloutDialect::Codex || stem.len() < 74 {
+        return None;
+    }
+    let seg_start = stem.len() - 36;
+    let sep_idx = seg_start.checked_sub(1)?;
+    if stem.as_bytes().get(sep_idx) != Some(&b'_') {
+        return None;
+    }
+    let seg = &stem[seg_start..];
+    uuid::Uuid::try_parse(seg).ok()?;
+    let base_stem = &stem[..sep_idx];
+    let thread_id = extract_session_id_from_filename(base_stem)?;
+    Some((thread_id, Some(seg.to_string())))
+}
+
+fn uuid7_timestamp_ms(id: &str) -> Option<i64> {
+    let parsed = uuid::Uuid::try_parse(id).ok()?;
+    if parsed.get_version_num() != 7 {
+        return None;
+    }
+    Some((parsed.as_u128() >> 80) as i64)
 }
 
 fn extract_session_id_from_filename(stem: &str) -> Option<String> {
@@ -514,94 +629,227 @@ fn parse_codex_session(path: &Path) -> anyhow::Result<Option<RawSession>> {
     parse_rollout(path, true, RolloutDialect::Codex)
 }
 
+struct PendingCompactionUsage {
+    line_index: usize,
+    timestamp: i64,
+    model: Option<String>,
+    usage_json: Value,
+    totals: CodexUsageTotals,
+    source_path: String,
+    event_key: String,
+}
+
+fn namespaced_line_id(segment_id: Option<&str>, line_index: usize) -> String {
+    match segment_id {
+        Some(seg) => format!("{seg}:{line_index}"),
+        None => line_index.to_string(),
+    }
+}
+
+fn namespaced_usage_key(prefix: &str, segment_id: Option<&str>, line_index: usize) -> String {
+    match segment_id {
+        Some(seg) => format!("{prefix}:{seg}:{line_index}"),
+        None => format!("{prefix}:{line_index}"),
+    }
+}
+
+#[cfg(any(test, feature = "bench"))]
 pub(crate) fn parse_rollout(
     path: &Path,
     include_events: bool,
     dialect: RolloutDialect,
 ) -> anyhow::Result<Option<RawSession>> {
-    let file = fs::File::open(path)?;
-    let reader: Box<dyn BufRead> = if path.extension().is_some_and(|ext| ext == "zst") {
-        Box::new(BufReader::new(zstd::stream::read::Decoder::new(file)?))
-    } else {
-        Box::new(BufReader::new(file))
+    let stem = rollout_filename_parts(path)
+        .map(|(stem, _)| stem)
+        .or_else(|| path.file_stem().and_then(|s| s.to_str()))
+        .unwrap_or("");
+    let (session_id, segment_id) =
+        extract_rollout_ids(stem, dialect).unwrap_or_else(|| (stem.to_string(), None));
+    let component = RolloutComponent {
+        session_id,
+        segment_id,
+        priority: 0,
+        modified: None,
+        path: path.to_path_buf(),
     };
-    let fallback_timestamp = file_scan::stat_mtime_ms(path).unwrap_or(0);
+    parse_rollout_components(&[component], include_events, dialect)
+}
+
+fn parse_rollout_components(
+    components: &[RolloutComponent],
+    include_events: bool,
+    dialect: RolloutDialect,
+) -> anyhow::Result<Option<RawSession>> {
+    let Some(primary_component) = components.first() else {
+        return Ok(None);
+    };
+    let filename_stem = rollout_filename_parts(&primary_component.path)
+        .map(|(stem, _)| stem)
+        .or_else(|| primary_component.path.file_stem().and_then(|stem| stem.to_str()));
+    let filename_id =
+        filename_stem.and_then(|stem| extract_rollout_ids(stem, dialect).map(|(id, _)| id));
+
     let mut meta_id: Option<String> = None;
     let mut meta_cwd: Option<String> = None;
     let mut event_cwd: Option<String> = None;
     let mut meta_timestamp: Option<i64> = None;
+    let mut seen_matching_meta = false;
+    let mut seen_primary_session_meta = false;
     let mut meta_topologies: Vec<CodexMetaTopology> = Vec::new();
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
+    let mut excluded_codex_usage = Vec::new();
     let mut events = Vec::new();
     let mut current_model: Option<String> = None;
     let mut provider: Option<String> = None;
-    let mut previous_totals: Option<CodexUsageTotals> = None;
     let mut pending_model_usage_indices: Vec<usize> = Vec::new();
-    let mut forked_child_waiting_for_turn_context = false;
-    let mut forked_child_inherited_baseline: Option<CodexUsageTotals> = None;
-    let mut forked_child_inherited_reported_total: Option<i64> = None;
     let mut last_visible_message_seq: Option<u32> = None;
     let mut user_dedup = CodexUserDedup::default();
     let mut seen_tool_items = HashSet::new();
     let mut trae_ledger = (dialect == RolloutDialect::Trae).then(TraeMessageLedger::default);
-    let source_path = path.to_string_lossy().to_string();
 
-    for item in jsonl_indexed(reader.lines()) {
-        let (line_index, v) = item?;
+    for component in components {
+        let path = &component.path;
+        let segment_id = component.segment_id.as_deref();
+        let is_base_component = segment_id.is_none();
+        let file = fs::File::open(path)?;
+        let reader: Box<dyn BufRead> = if path.extension().is_some_and(|ext| ext == "zst") {
+            Box::new(BufReader::new(zstd::stream::read::Decoder::new(file)?))
+        } else {
+            Box::new(BufReader::new(file))
+        };
+        let fallback_timestamp = file_scan::stat_mtime_ms(path).unwrap_or(0);
+        let source_path = path.to_string_lossy().to_string();
 
-        let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let mut previous_totals: Option<CodexUsageTotals> = None;
+        let mut forked_child_waiting_for_turn_context = false;
+        let mut forked_child_inherited_baseline: Option<CodexUsageTotals> = None;
+        let mut forked_child_inherited_reported_total: Option<i64> = None;
+        let mut skipping_copied_parent_usage = false;
+        let mut copied_parent_gate_child_ms: Option<i64> = None;
+        let mut pending_compaction: Option<PendingCompactionUsage> = None;
+        let mut compacted_since_record = false;
 
-        let payload = v.get("payload");
-        let payload_type =
-            payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()).unwrap_or("");
-        let is_token_count = msg_type == "event_msg" && payload_type == "token_count";
-        if let Some(ledger) = trae_ledger.as_mut()
-            && let Some(turn) = payload.and_then(|p| p.get("turn_id")).and_then(Value::as_str)
-        {
-            ledger.turn = Some(turn.to_string());
-        }
-        let event_has_model = payload.and_then(extract_codex_model).is_some()
-            || (is_token_count
-                && payload.and_then(|p| p.get("info")).and_then(extract_codex_model).is_some());
-
-        if !pending_model_usage_indices.is_empty()
-            && !event_has_model
-            && !is_token_count
-            && msg_type != "session_meta"
-        {
-            pending_model_usage_indices.clear();
-        }
-
-        if forked_child_waiting_for_turn_context {
-            if msg_type == "turn_context" {
-                forked_child_waiting_for_turn_context = false;
-            } else {
-                if is_token_count && let Some(info) = payload.and_then(|p| p.get("info")) {
-                    remember_forked_child_inherited_baseline(
-                        &mut previous_totals,
-                        &mut forked_child_inherited_baseline,
-                        &mut forked_child_inherited_reported_total,
-                        info,
-                    );
-                }
-                continue;
+        for item in jsonl_indexed(reader.lines()) {
+            let (line_index, v) = item?;
+            let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let payload = v.get("payload");
+            let payload_type =
+                payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+            let is_token_count = msg_type == "event_msg" && payload_type == "token_count";
+            if let Some(ledger) = trae_ledger.as_mut()
+                && let Some(turn) = payload.and_then(|p| p.get("turn_id")).and_then(Value::as_str)
+            {
+                ledger.turn = Some(turn.to_string());
             }
-        }
+            let event_has_model = payload.and_then(extract_codex_model).is_some()
+                || (is_token_count
+                    && payload.and_then(|p| p.get("info")).and_then(extract_codex_model).is_some());
 
-        match msg_type {
-            "session_meta" => {
-                if let Some(payload) = payload {
-                    meta_id = payload.get("id").and_then(|s| s.as_str()).map(String::from);
-                    meta_cwd = payload.get("cwd").and_then(|s| s.as_str()).map(String::from);
-                    event_cwd.clone_from(&meta_cwd);
-                    provider = payload
-                        .get("model_provider")
-                        .and_then(|s| s.as_str())
-                        .filter(|s| !s.trim().is_empty())
-                        .map(String::from)
-                        .or(provider);
-                    if let Some(model) = extract_codex_model(payload) {
+            if !pending_model_usage_indices.is_empty()
+                && !event_has_model
+                && !is_token_count
+                && msg_type != "session_meta"
+            {
+                pending_model_usage_indices.clear();
+            }
+
+            if forked_child_waiting_for_turn_context {
+                if msg_type == "turn_context" {
+                    forked_child_waiting_for_turn_context = false;
+                } else {
+                    if is_token_count && let Some(info) = payload.and_then(|p| p.get("info")) {
+                        remember_forked_child_inherited_baseline(
+                            &mut previous_totals,
+                            &mut forked_child_inherited_baseline,
+                            &mut forked_child_inherited_reported_total,
+                            info,
+                        );
+                    }
+                    continue;
+                }
+            }
+
+            match msg_type {
+                "session_meta" => {
+                    if let Some(payload) = payload {
+                        let payload_id =
+                            payload.get("id").and_then(|s| s.as_str()).map(String::from);
+                        let matches_filename = filename_id
+                            .as_deref()
+                            .is_some_and(|fid| payload_id.as_deref() == Some(fid));
+                        if !seen_matching_meta && (meta_id.is_none() || matches_filename) {
+                            meta_id.clone_from(&payload_id);
+                            meta_cwd =
+                                payload.get("cwd").and_then(|s| s.as_str()).map(String::from);
+                            event_cwd.clone_from(&meta_cwd);
+                            meta_timestamp = rfc3339_ms(payload.get("timestamp"));
+                            if matches_filename {
+                                seen_matching_meta = true;
+                            }
+                        }
+                        provider = payload
+                            .get("model_provider")
+                            .and_then(|s| s.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .map(String::from)
+                            .or(provider);
+                        if let Some(model) = extract_codex_model(payload) {
+                            current_model = Some(model.clone());
+                            apply_pending_codex_model(
+                                &mut usage_events,
+                                &mut pending_model_usage_indices,
+                                &model,
+                            );
+                        }
+                        meta_topologies.push(CodexMetaTopology {
+                            meta_id: payload_id.clone(),
+                            thread_role: codex_thread_role(payload),
+                            parent_links: codex_parent_links(payload, dialect.source()),
+                            subagent_title: codex_subagent_title(payload),
+                        });
+                        if is_base_component && !seen_primary_session_meta {
+                            let has_fork_parent =
+                                payload.get("forked_from_id").and_then(|s| s.as_str()).is_some();
+                            let child_ms = payload_id
+                                .as_deref()
+                                .or(filename_id.as_deref())
+                                .and_then(uuid7_timestamp_ms);
+                            if dialect == RolloutDialect::Codex
+                                && has_fork_parent
+                                && let Some(ms) = child_ms
+                            {
+                                skipping_copied_parent_usage = true;
+                                copied_parent_gate_child_ms = Some(ms);
+                            } else if has_fork_parent {
+                                forked_child_waiting_for_turn_context = true;
+                                forked_child_inherited_baseline = None;
+                                forked_child_inherited_reported_total = None;
+                            }
+                        }
+                        if is_base_component {
+                            seen_primary_session_meta = true;
+                        }
+                    }
+                }
+                "turn_context" => {
+                    if skipping_copied_parent_usage
+                        && let Some(child_ms) = copied_parent_gate_child_ms
+                        && let Some(turn_id) =
+                            payload.and_then(|value| value.get("turn_id")).and_then(Value::as_str)
+                        && let Some(turn_ms) = uuid7_timestamp_ms(turn_id)
+                        && turn_ms >= child_ms
+                    {
+                        skipping_copied_parent_usage = false;
+                    }
+                    if let Some(cwd) =
+                        payload.and_then(|value| value.get("cwd")).and_then(Value::as_str)
+                    {
+                        event_cwd = Some(cwd.into());
+                    }
+                    if let Some(payload) = payload
+                        && let Some(model) = extract_codex_model(payload)
+                    {
                         current_model = Some(model.clone());
                         apply_pending_codex_model(
                             &mut usage_events,
@@ -609,79 +857,100 @@ pub(crate) fn parse_rollout(
                             &model,
                         );
                     }
-                    meta_timestamp = rfc3339_ms(payload.get("timestamp"));
-                    meta_topologies.push(CodexMetaTopology {
-                        meta_id: meta_id.clone(),
-                        thread_role: codex_thread_role(payload),
-                        parent_links: codex_parent_links(payload, dialect.source()),
-                        subagent_title: codex_subagent_title(payload),
+                }
+                "token_usage_record" if dialect == RolloutDialect::Codex => {
+                    compacted_since_record = false;
+                    pending_compaction = payload.and_then(|p| {
+                        let usage = p.get("usage")?.clone();
+                        let totals = CodexUsageTotals::from_usage(&usage)?;
+                        Some(PendingCompactionUsage {
+                            line_index,
+                            timestamp: parse_timestamp(&v).unwrap_or(fallback_timestamp),
+                            model: extract_codex_model(p).or_else(|| current_model.clone()),
+                            usage_json: usage,
+                            totals,
+                            source_path: source_path.clone(),
+                            event_key: namespaced_usage_key(
+                                "token_usage_record",
+                                segment_id,
+                                line_index,
+                            ),
+                        })
                     });
-                    if payload.get("forked_from_id").and_then(|s| s.as_str()).is_some() {
-                        forked_child_waiting_for_turn_context = true;
-                        forked_child_inherited_baseline = None;
-                        forked_child_inherited_reported_total = None;
+                }
+                "compacted" if dialect == RolloutDialect::Codex => {
+                    if pending_compaction.is_some() {
+                        compacted_since_record = true;
                     }
                 }
-            }
-            "turn_context" => {
-                if let Some(cwd) =
-                    payload.and_then(|value| value.get("cwd")).and_then(Value::as_str)
-                {
-                    event_cwd = Some(cwd.into());
-                }
-                if let Some(payload) = payload
-                    && let Some(model) = extract_codex_model(payload)
-                {
-                    current_model = Some(model.clone());
-                    apply_pending_codex_model(
-                        &mut usage_events,
-                        &mut pending_model_usage_indices,
-                        &model,
-                    );
-                }
-            }
-            "event_msg" => {
-                if let Some(payload) = payload {
-                    match payload_type {
-                        "item_completed" if dialect == RolloutDialect::Trae => {
-                            let item = payload.get("item");
-                            let text = item.map(trae_item_text).filter(|text| !text.is_empty());
-                            let ts = parse_timestamp(&v);
-                            match (
-                                item.and_then(|item| item.get("type")).and_then(Value::as_str),
-                                text,
-                            ) {
-                                (Some("UserMessage"), Some(text))
-                                    if admits(&mut trae_ledger, Role::User, &text) =>
-                                {
-                                    last_visible_message_seq = push_codex_user(
-                                        &mut messages,
-                                        &mut user_dedup,
-                                        CodexUserStream::ItemCompleted,
-                                        text,
-                                        ts,
+                "event_msg" => {
+                    if let Some(payload) = payload {
+                        if dialect == RolloutDialect::Codex
+                            && matches!(payload_type, "compacted" | "context_compacted")
+                            && pending_compaction.is_some()
+                        {
+                            compacted_since_record = true;
+                        }
+                        match payload_type {
+                            "item_completed" if dialect == RolloutDialect::Trae => {
+                                let item = payload.get("item");
+                                let text = item.map(trae_item_text).filter(|text| !text.is_empty());
+                                let ts = parse_timestamp(&v);
+                                match (
+                                    item.and_then(|item| item.get("type")).and_then(Value::as_str),
+                                    text,
+                                ) {
+                                    (Some("UserMessage"), Some(text))
+                                        if admits(&mut trae_ledger, Role::User, &text) =>
+                                    {
+                                        last_visible_message_seq = push_codex_user(
+                                            &mut messages,
+                                            &mut user_dedup,
+                                            CodexUserStream::ItemCompleted,
+                                            text,
+                                            ts,
+                                        );
+                                    }
+                                    (Some("AgentMessage"), Some(text))
+                                        if admits(&mut trae_ledger, Role::Assistant, &text) =>
+                                    {
+                                        last_visible_message_seq = push_codex_message(
+                                            &mut messages,
+                                            Role::Assistant,
+                                            text,
+                                            ts,
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                                if include_events {
+                                    collect_codex_file_change(
+                                        payload,
+                                        events::EventContext {
+                                            event_seq: events.len() as u32,
+                                            timestamp: ts,
+                                            source_path: Some(source_path.clone()),
+                                            source_event_id: Some(namespaced_line_id(
+                                                segment_id, line_index,
+                                            )),
+                                            message_seq: last_visible_message_seq,
+                                            parser_version: EVENT_PARSER_VERSION,
+                                        },
+                                        event_cwd.as_deref(),
+                                        &mut events,
                                     );
                                 }
-                                (Some("AgentMessage"), Some(text))
-                                    if admits(&mut trae_ledger, Role::Assistant, &text) =>
-                                {
-                                    last_visible_message_seq = push_codex_message(
-                                        &mut messages,
-                                        Role::Assistant,
-                                        text,
-                                        ts,
-                                    );
-                                }
-                                _ => {}
                             }
-                            if include_events {
+                            "item_completed" if include_events => {
                                 collect_codex_file_change(
                                     payload,
                                     events::EventContext {
                                         event_seq: events.len() as u32,
-                                        timestamp: ts,
+                                        timestamp: parse_timestamp(&v),
                                         source_path: Some(source_path.clone()),
-                                        source_event_id: Some(line_index.to_string()),
+                                        source_event_id: Some(namespaced_line_id(
+                                            segment_id, line_index,
+                                        )),
                                         message_seq: last_visible_message_seq,
                                         parser_version: EVENT_PARSER_VERSION,
                                     },
@@ -689,239 +958,207 @@ pub(crate) fn parse_rollout(
                                     &mut events,
                                 );
                             }
-                        }
-                        "item_completed" if include_events => {
-                            collect_codex_file_change(
-                                payload,
-                                events::EventContext {
-                                    event_seq: events.len() as u32,
-                                    timestamp: parse_timestamp(&v),
-                                    source_path: Some(source_path.clone()),
-                                    source_event_id: Some(line_index.to_string()),
-                                    message_seq: last_visible_message_seq,
-                                    parser_version: EVENT_PARSER_VERSION,
-                                },
-                                event_cwd.as_deref(),
-                                &mut events,
-                            );
-                        }
-                        "token_count" => {
-                            if let Some(info) = payload.get("info") {
-                                let total_usage = info
-                                    .get("total_token_usage")
-                                    .and_then(CodexUsageTotals::from_usage);
-                                if forked_child_matches_inherited_baseline(
-                                    forked_child_inherited_baseline,
-                                    forked_child_inherited_reported_total,
-                                    info,
-                                    total_usage,
-                                ) {
-                                    if let Some(total) = total_usage {
-                                        previous_totals = Some(total);
+                            "token_count" => {
+                                let buffered_compaction = pending_compaction.take();
+                                let saw_compacted = compacted_since_record;
+                                compacted_since_record = false;
+
+                                let mut matched_inherited = false;
+                                if let Some(info) = payload.get("info") {
+                                    let total_usage = info
+                                        .get("total_token_usage")
+                                        .and_then(CodexUsageTotals::from_usage);
+                                    if forked_child_matches_inherited_baseline(
+                                        forked_child_inherited_baseline,
+                                        forked_child_inherited_reported_total,
+                                        info,
+                                        total_usage,
+                                    ) {
+                                        if let Some(total) = total_usage {
+                                            previous_totals = Some(total);
+                                        }
+                                        forked_child_inherited_baseline = None;
+                                        forked_child_inherited_reported_total = None;
+                                        matched_inherited = true;
+                                    } else {
+                                        forked_child_inherited_baseline = None;
+                                        forked_child_inherited_reported_total = None;
                                     }
-                                    forked_child_inherited_baseline = None;
-                                    forked_child_inherited_reported_total = None;
+                                }
+                                if matched_inherited {
                                     continue;
                                 }
-                                forked_child_inherited_baseline = None;
-                                forked_child_inherited_reported_total = None;
-                            }
-                            if let Some(event) = extract_codex_usage_event(
-                                payload,
-                                line_index as u32,
-                                &mut previous_totals,
-                                parse_timestamp(&v).unwrap_or(fallback_timestamp),
-                                provider.as_deref().unwrap_or("openai"),
-                                current_model.as_deref(),
-                                &source_path,
-                            ) {
-                                if event.model == "unknown" {
-                                    pending_model_usage_indices.push(usage_events.len());
-                                } else {
-                                    current_model = Some(event.model.clone());
+
+                                if dialect == RolloutDialect::Codex
+                                    && !skipping_copied_parent_usage
+                                    && saw_compacted
+                                    && let Some(compaction) = buffered_compaction
+                                    && let Some(info) = payload.get("info")
+                                    && is_unchanged_zero_delta_token_count(info, previous_totals)
+                                {
+                                    if let Some(event) = compaction_usage_event(
+                                        compaction,
+                                        provider.as_deref().unwrap_or("openai"),
+                                        current_model.as_deref(),
+                                    ) {
+                                        if event.model == "unknown" {
+                                            pending_model_usage_indices.push(usage_events.len());
+                                        } else {
+                                            current_model = Some(event.model.clone());
+                                        }
+                                        usage_events.push(event);
+                                    }
+                                    continue;
                                 }
-                                usage_events.push(event);
+
+                                let usage_key =
+                                    namespaced_usage_key("token_count", segment_id, line_index);
+                                if let Some(event) = extract_codex_usage_event(
+                                    payload,
+                                    line_index as u32,
+                                    usage_key,
+                                    &mut previous_totals,
+                                    parse_timestamp(&v).unwrap_or(fallback_timestamp),
+                                    provider.as_deref().unwrap_or("openai"),
+                                    current_model.as_deref(),
+                                    &source_path,
+                                    dialect,
+                                ) {
+                                    if skipping_copied_parent_usage {
+                                        if dialect == RolloutDialect::Codex
+                                            && let Some(raw_json) = event.raw_usage_json.as_deref()
+                                            && let Some(pair) = codex_excluded_pair_from_raw_json(
+                                                raw_json,
+                                                event.timestamp,
+                                            )
+                                        {
+                                            excluded_codex_usage.push(pair);
+                                        }
+                                    } else {
+                                        if event.model == "unknown" {
+                                            pending_model_usage_indices.push(usage_events.len());
+                                        } else {
+                                            current_model = Some(event.model.clone());
+                                        }
+                                        usage_events.push(event);
+                                    }
+                                }
                             }
+                            "user_message" => {
+                                if let Some(text) = payload.get("message").and_then(|m| m.as_str())
+                                    && !text.is_empty()
+                                    && admits(&mut trae_ledger, Role::User, text)
+                                {
+                                    let ts = parse_timestamp(&v);
+                                    last_visible_message_seq = push_codex_user(
+                                        &mut messages,
+                                        &mut user_dedup,
+                                        CodexUserStream::EventMsg,
+                                        text.to_string(),
+                                        ts,
+                                    );
+                                }
+                            }
+                            "agent_message" => {
+                                if let Some(text) = payload.get("message").and_then(|m| m.as_str())
+                                    && !text.is_empty()
+                                    && admits(&mut trae_ledger, Role::Assistant, text)
+                                {
+                                    let ts = parse_timestamp(&v);
+                                    last_visible_message_seq = push_codex_message(
+                                        &mut messages,
+                                        Role::Assistant,
+                                        text.to_string(),
+                                        ts,
+                                    );
+                                }
+                            }
+                            _ => {}
                         }
-                        "user_message" => {
-                            if let Some(text) = payload.get("message").and_then(|m| m.as_str())
-                                && !text.is_empty()
-                                && admits(&mut trae_ledger, Role::User, text)
-                            {
-                                let ts = parse_timestamp(&v);
+                    }
+                }
+                "response_item" => {
+                    if let Some(payload) = v.get("payload") {
+                        let timestamp = parse_timestamp(&v);
+                        let payload_type = payload.get("type").and_then(|t| t.as_str());
+                        let role = payload.get("role").and_then(|r| r.as_str());
+                        if dialect == RolloutDialect::Trae
+                            && payload_type != Some("message")
+                            && trae_tool_item_key(payload)
+                                .is_some_and(|key| !seen_tool_items.insert(key))
+                        {
+                            continue;
+                        }
+                        if dialect == RolloutDialect::Codex
+                            && payload_type == Some("message")
+                            && role == Some("user")
+                        {
+                            let text = extract_content_array(payload.get("content"));
+                            if !text.is_empty() && !is_codex_injected_context(&text) {
                                 last_visible_message_seq = push_codex_user(
                                     &mut messages,
                                     &mut user_dedup,
-                                    CodexUserStream::EventMsg,
-                                    text.to_string(),
-                                    ts,
-                                );
-                            }
-                        }
-                        "agent_message" => {
-                            if let Some(text) = payload.get("message").and_then(|m| m.as_str())
-                                && !text.is_empty()
-                                && admits(&mut trae_ledger, Role::Assistant, text)
-                            {
-                                let ts = parse_timestamp(&v);
-                                last_visible_message_seq = push_codex_message(
-                                    &mut messages,
-                                    Role::Assistant,
-                                    text.to_string(),
-                                    ts,
-                                );
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            "response_item" => {
-                if let Some(payload) = v.get("payload") {
-                    let timestamp = parse_timestamp(&v);
-                    let payload_type = payload.get("type").and_then(|t| t.as_str());
-                    let role = payload.get("role").and_then(|r| r.as_str());
-                    if dialect == RolloutDialect::Trae
-                        && payload_type != Some("message")
-                        && trae_tool_item_key(payload)
-                            .is_some_and(|key| !seen_tool_items.insert(key))
-                    {
-                        continue;
-                    }
-                    if dialect == RolloutDialect::Codex
-                        && payload_type == Some("message")
-                        && role == Some("user")
-                    {
-                        let text = extract_content_array(payload.get("content"));
-                        if !text.is_empty() && !is_codex_injected_context(&text) {
-                            last_visible_message_seq = push_codex_user(
-                                &mut messages,
-                                &mut user_dedup,
-                                CodexUserStream::ResponseItem,
-                                text,
-                                timestamp,
-                            );
-                        }
-                    } else if payload_type == Some("message") && role == Some("assistant") {
-                        let text = extract_content_array(payload.get("content"));
-                        let message_seq = if text.is_empty()
-                            || !admits(&mut trae_ledger, Role::Assistant, &text)
-                        {
-                            None
-                        } else {
-                            push_codex_message(&mut messages, Role::Assistant, text, timestamp)
-                        };
-                        if include_events {
-                            collect_codex_content_events(
-                                payload.get("content"),
-                                events::EventContext {
-                                    event_seq: events.len() as u32,
-                                    timestamp,
-                                    source_path: Some(source_path.clone()),
-                                    source_event_id: Some(line_index.to_string()),
-                                    message_seq: last_visible_message_seq,
-                                    parser_version: EVENT_PARSER_VERSION,
-                                },
-                                message_seq,
-                                event_cwd.as_deref(),
-                                &mut events,
-                            );
-                        }
-                        if codex_content_has_visible_text(payload.get("content")) {
-                            last_visible_message_seq = message_seq;
-                        }
-                    } else if include_events
-                        && payload_type == Some("message")
-                        && matches!(role, Some("developer" | "system"))
-                    {
-                        collect_codex_meta_event(
-                            payload,
-                            timestamp,
-                            &source_path,
-                            line_index,
-                            &mut events,
-                        );
-                    } else if include_events {
-                        let payload = match dialect {
-                            RolloutDialect::Trae => trae_tool_item(payload),
-                            RolloutDialect::Codex => std::borrow::Cow::Borrowed(payload),
-                        };
-                        collect_codex_response_item_event(
-                            &payload,
-                            events::EventContext {
-                                event_seq: events.len() as u32,
-                                timestamp,
-                                source_path: Some(source_path.clone()),
-                                source_event_id: Some(line_index.to_string()),
-                                message_seq: last_visible_message_seq,
-                                parser_version: EVENT_PARSER_VERSION,
-                            },
-                            event_cwd.as_deref(),
-                            &mut events,
-                        );
-                    }
-                }
-            }
-            "history_mutation" if dialect == RolloutDialect::Trae => {
-                let Some(payload) = payload
-                    .filter(|p| p.get("operation").and_then(Value::as_str) == Some("append"))
-                else {
-                    continue;
-                };
-                let timestamp = parse_timestamp(&v);
-                for completion in payload
-                    .get("display_completions")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let Some(item) = completion.get("item").filter(|item| {
-                        item.get("type").and_then(Value::as_str) == Some("UserMessage")
-                    }) else {
-                        continue;
-                    };
-                    let text = trae_item_text(item);
-                    if !text.is_empty() && admits(&mut trae_ledger, Role::User, &text) {
-                        last_visible_message_seq = push_codex_user(
-                            &mut messages,
-                            &mut user_dedup,
-                            CodexUserStream::DisplayCompletion,
-                            text,
-                            timestamp,
-                        );
-                    }
-                }
-                for (item_index, item) in
-                    payload.get("items").and_then(Value::as_array).into_iter().flatten().enumerate()
-                {
-                    match (
-                        item.get("type").and_then(Value::as_str),
-                        item.get("role").and_then(Value::as_str),
-                    ) {
-                        (Some("message"), Some("assistant")) => {
-                            let text = extract_content_array(item.get("content"));
-                            if !text.is_empty() && admits(&mut trae_ledger, Role::Assistant, &text)
-                            {
-                                last_visible_message_seq = push_codex_message(
-                                    &mut messages,
-                                    Role::Assistant,
+                                    CodexUserStream::ResponseItem,
                                     text,
                                     timestamp,
                                 );
                             }
-                        }
-                        (Some("message"), _) => {}
-                        _ if include_events
-                            && trae_tool_item_key(item)
-                                .is_none_or(|key| seen_tool_items.insert(key)) =>
+                        } else if payload_type == Some("message") && role == Some("assistant") {
+                            let text = extract_content_array(payload.get("content"));
+                            let message_seq = if text.is_empty()
+                                || !admits(&mut trae_ledger, Role::Assistant, &text)
+                            {
+                                None
+                            } else {
+                                push_codex_message(&mut messages, Role::Assistant, text, timestamp)
+                            };
+                            if include_events {
+                                collect_codex_content_events(
+                                    payload.get("content"),
+                                    events::EventContext {
+                                        event_seq: events.len() as u32,
+                                        timestamp,
+                                        source_path: Some(source_path.clone()),
+                                        source_event_id: Some(namespaced_line_id(
+                                            segment_id, line_index,
+                                        )),
+                                        message_seq: last_visible_message_seq,
+                                        parser_version: EVENT_PARSER_VERSION,
+                                    },
+                                    message_seq,
+                                    event_cwd.as_deref(),
+                                    &mut events,
+                                );
+                            }
+                            if codex_content_has_visible_text(payload.get("content")) {
+                                last_visible_message_seq = message_seq;
+                            }
+                        } else if include_events
+                            && payload_type == Some("message")
+                            && matches!(role, Some("developer" | "system"))
                         {
+                            collect_codex_meta_event(
+                                payload,
+                                timestamp,
+                                &source_path,
+                                segment_id,
+                                line_index,
+                                &mut events,
+                            );
+                        } else if include_events {
+                            let payload = match dialect {
+                                RolloutDialect::Trae => trae_tool_item(payload),
+                                RolloutDialect::Codex => std::borrow::Cow::Borrowed(payload),
+                            };
                             collect_codex_response_item_event(
-                                &trae_tool_item(item),
+                                &payload,
                                 events::EventContext {
                                     event_seq: events.len() as u32,
                                     timestamp,
                                     source_path: Some(source_path.clone()),
-                                    source_event_id: Some(format!("{line_index}:{item_index}")),
+                                    source_event_id: Some(namespaced_line_id(
+                                        segment_id, line_index,
+                                    )),
                                     message_seq: last_visible_message_seq,
                                     parser_version: EVENT_PARSER_VERSION,
                                 },
@@ -929,11 +1166,86 @@ pub(crate) fn parse_rollout(
                                 &mut events,
                             );
                         }
-                        _ => {}
                     }
                 }
+                "history_mutation" if dialect == RolloutDialect::Trae => {
+                    let Some(payload) = payload
+                        .filter(|p| p.get("operation").and_then(Value::as_str) == Some("append"))
+                    else {
+                        continue;
+                    };
+                    let timestamp = parse_timestamp(&v);
+                    for completion in payload
+                        .get("display_completions")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let Some(item) = completion.get("item").filter(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("UserMessage")
+                        }) else {
+                            continue;
+                        };
+                        let text = trae_item_text(item);
+                        if !text.is_empty() && admits(&mut trae_ledger, Role::User, &text) {
+                            last_visible_message_seq = push_codex_user(
+                                &mut messages,
+                                &mut user_dedup,
+                                CodexUserStream::DisplayCompletion,
+                                text,
+                                timestamp,
+                            );
+                        }
+                    }
+                    for (item_index, item) in payload
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                    {
+                        match (
+                            item.get("type").and_then(Value::as_str),
+                            item.get("role").and_then(Value::as_str),
+                        ) {
+                            (Some("message"), Some("assistant")) => {
+                                let text = extract_content_array(item.get("content"));
+                                if !text.is_empty()
+                                    && admits(&mut trae_ledger, Role::Assistant, &text)
+                                {
+                                    last_visible_message_seq = push_codex_message(
+                                        &mut messages,
+                                        Role::Assistant,
+                                        text,
+                                        timestamp,
+                                    );
+                                }
+                            }
+                            (Some("message"), _) => {}
+                            _ if include_events
+                                && trae_tool_item_key(item)
+                                    .is_none_or(|key| seen_tool_items.insert(key)) =>
+                            {
+                                collect_codex_response_item_event(
+                                    &trae_tool_item(item),
+                                    events::EventContext {
+                                        event_seq: events.len() as u32,
+                                        timestamp,
+                                        source_path: Some(source_path.clone()),
+                                        source_event_id: Some(format!("{line_index}:{item_index}")),
+                                        message_seq: last_visible_message_seq,
+                                        parser_version: EVENT_PARSER_VERSION,
+                                    },
+                                    event_cwd.as_deref(),
+                                    &mut events,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -941,15 +1253,11 @@ pub(crate) fn parse_rollout(
         return Ok(None);
     }
 
-    let filename_stem = rollout_filename_parts(path)
-        .map(|(stem, _)| stem)
-        .or_else(|| path.file_stem().and_then(|stem| stem.to_str()));
     let source_id = meta_id.unwrap_or_else(|| filename_stem.unwrap_or("unknown").to_string());
 
     let started_at =
         first_timestamp(meta_timestamp, &messages, &usage_events, &events).unwrap_or(0);
 
-    let filename_id = filename_stem.and_then(extract_session_id_from_filename);
     let (thread_role, parent_links, subagent_title) = meta_topologies
         .iter()
         .find(|topo| topo.meta_id.is_some() && topo.meta_id.as_deref() == filename_id.as_deref())
@@ -970,7 +1278,8 @@ pub(crate) fn parse_rollout(
         entrypoint: None,
         messages,
         usage_events,
-        usage_parser_version: Some(USAGE_PARSER_VERSION),
+        excluded_codex_usage,
+        usage_parser_version: Some(usage_parser_version_for_dialect(dialect)),
         events,
         event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
         source_file_path: None,
@@ -1306,6 +1615,7 @@ fn collect_codex_meta_event(
     payload: &Value,
     timestamp: Option<i64>,
     source_path: &str,
+    segment_id: Option<&str>,
     line_index: usize,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
@@ -1323,7 +1633,7 @@ fn collect_codex_meta_event(
             event_seq: events_out.len() as u32,
             timestamp,
             source_path: Some(source_path.to_string()),
-            source_event_id: Some(line_index.to_string()),
+            source_event_id: Some(namespaced_line_id(segment_id, line_index)),
             message_seq: None,
             parser_version: EVENT_PARSER_VERSION,
         }
@@ -1383,35 +1693,91 @@ fn extract_content_array(content: Option<&Value>) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CodexUsageTotals {
     input: i64,
-    output: i64,
     cached: i64,
+    cache_write: i64,
+    output: i64,
     reasoning: i64,
+}
+
+fn non_negative_usage_field(obj: &serde_json::Map<String, Value>, key: &str) -> Option<i64> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Some(0),
+        Some(value) => value.as_i64().filter(|v| *v >= 0),
+    }
+}
+
+fn extract_strict_five_buckets_from_obj(value: &Value) -> Option<[i64; 5]> {
+    let obj = value.as_object()?;
+    let input = non_negative_usage_field(obj, "input_tokens")?;
+    let cached_primary = non_negative_usage_field(obj, "cached_input_tokens")?;
+    let cached_alt = non_negative_usage_field(obj, "cache_read_input_tokens")?;
+    let cache_write = non_negative_usage_field(obj, "cache_write_input_tokens")?;
+    let output = non_negative_usage_field(obj, "output_tokens")?;
+    let reasoning = non_negative_usage_field(obj, "reasoning_output_tokens")?;
+    Some([input, cached_primary.max(cached_alt), cache_write, output, reasoning])
+}
+
+pub(crate) fn codex_excluded_pair_from_raw_json(
+    raw_json: &str,
+    timestamp: i64,
+) -> Option<ExcludedCodexUsage> {
+    let info: Value = serde_json::from_str(raw_json).ok()?;
+    let total = extract_strict_five_buckets_from_obj(info.get("total_token_usage")?)?;
+    let last = extract_strict_five_buckets_from_obj(info.get("last_token_usage")?)?;
+    Some(ExcludedCodexUsage { timestamp, total, last })
+}
+
+pub(crate) fn codex_last_usage_is_zero_object(raw_json: Option<&str>) -> bool {
+    let Some(raw_json) = raw_json else {
+        return false;
+    };
+    let Ok(info) = serde_json::from_str::<Value>(raw_json) else {
+        return false;
+    };
+    let Some(last) = info.get("last_token_usage") else {
+        return false;
+    };
+    extract_strict_five_buckets_from_obj(last) == Some([0, 0, 0, 0, 0])
 }
 
 impl CodexUsageTotals {
     fn from_usage(value: &Value) -> Option<Self> {
-        let input = value.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
-        let output = value.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
-        let cached = value
-            .get("cached_input_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            .max(value.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0))
-            .max(0);
-        let reasoning =
-            value.get("reasoning_output_tokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+        let [input, cached, cache_write, output, reasoning] =
+            extract_strict_five_buckets_from_obj(value).unwrap_or_else(|| {
+                let input = value.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+                let output =
+                    value.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+                let cached = value
+                    .get("cached_input_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .max(value.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0))
+                    .max(0);
+                let cache_write = value
+                    .get("cache_write_input_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .max(0);
+                let reasoning = value
+                    .get("reasoning_output_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .max(0);
+                [input, cached, cache_write, output, reasoning]
+            });
 
-        if input == 0 && output == 0 && cached == 0 && reasoning == 0 {
+        if input == 0 && cached == 0 && cache_write == 0 && output == 0 && reasoning == 0 {
             return None;
         }
 
-        Some(Self { input, output, cached, reasoning })
+        Some(Self { input, cached, cache_write, output, reasoning })
     }
 
     fn delta_from(self, previous: Self) -> Option<Self> {
         if self.input < previous.input
-            || self.output < previous.output
             || self.cached < previous.cached
+            || self.cache_write < previous.cache_write
+            || self.output < previous.output
             || self.reasoning < previous.reasoning
         {
             return None;
@@ -1419,8 +1785,9 @@ impl CodexUsageTotals {
 
         Some(Self {
             input: self.input - previous.input,
-            output: self.output - previous.output,
             cached: self.cached - previous.cached,
+            cache_write: self.cache_write - previous.cache_write,
+            output: self.output - previous.output,
             reasoning: self.reasoning - previous.reasoning,
         })
     }
@@ -1428,8 +1795,9 @@ impl CodexUsageTotals {
     fn saturating_add(self, other: Self) -> Self {
         Self {
             input: self.input.saturating_add(other.input),
-            output: self.output.saturating_add(other.output),
             cached: self.cached.saturating_add(other.cached),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+            output: self.output.saturating_add(other.output),
             reasoning: self.reasoning.saturating_add(other.reasoning),
         }
     }
@@ -1438,7 +1806,27 @@ impl CodexUsageTotals {
         self.input
             .saturating_add(self.output)
             .saturating_add(self.cached)
+            .saturating_add(self.cache_write)
             .saturating_add(self.reasoning)
+    }
+
+    fn disjoint_buckets(self) -> Option<(i64, i64, i64, i64, i64)> {
+        let cache_read_tokens = self.cached.min(self.input).max(0);
+        let cache_write_tokens =
+            self.cache_write.min(self.input.saturating_sub(cache_read_tokens)).max(0);
+        let input_tokens =
+            self.input.saturating_sub(cache_read_tokens).saturating_sub(cache_write_tokens).max(0);
+        let reasoning_tokens = self.reasoning.min(self.output).max(0);
+        let output_tokens = self.output.saturating_sub(reasoning_tokens).max(0);
+        if input_tokens == 0
+            && output_tokens == 0
+            && cache_read_tokens == 0
+            && cache_write_tokens == 0
+            && reasoning_tokens == 0
+        {
+            return None;
+        }
+        Some((input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens))
     }
 
     fn looks_like_stale_regression(self, previous: Self, last: Self) -> bool {
@@ -1497,18 +1885,82 @@ fn forked_child_matches_inherited_baseline(
     false
 }
 
+fn is_unchanged_zero_delta_token_count(
+    info: &Value,
+    previous_totals: Option<CodexUsageTotals>,
+) -> bool {
+    let Some(previous) = previous_totals else {
+        return false;
+    };
+    let Some(total_usage) = info.get("total_token_usage").and_then(CodexUsageTotals::from_usage)
+    else {
+        return false;
+    };
+    if total_usage != previous {
+        return false;
+    }
+    let Some(last) = info.get("last_token_usage") else {
+        return false;
+    };
+    extract_strict_five_buckets_from_obj(last) == Some([0, 0, 0, 0, 0])
+}
+
+fn compaction_usage_event(
+    compaction: PendingCompactionUsage,
+    provider: &str,
+    current_model: Option<&str>,
+) -> Option<RawUsageEvent> {
+    let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens) =
+        compaction.totals.disjoint_buckets()?;
+    let model = compaction
+        .model
+        .or_else(|| current_model.map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(RawUsageEvent {
+        model,
+        provider: provider.to_string(),
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
+        source_path: Some(compaction.source_path),
+        raw_usage_json: Some(compaction.usage_json.to_string()),
+        ..RawUsageEvent::observed(
+            compaction.event_key,
+            compaction.line_index as u32,
+            compaction.timestamp,
+            usage_parser_version_for_dialect(RolloutDialect::Codex),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn extract_codex_usage_event(
     payload: &Value,
     event_seq: u32,
+    event_key: String,
     previous_totals: &mut Option<CodexUsageTotals>,
     timestamp: i64,
     provider: &str,
     current_model: Option<&str>,
     source_path: &str,
+    dialect: RolloutDialect,
 ) -> Option<RawUsageEvent> {
     let info = payload.get("info")?;
     let total_usage = info.get("total_token_usage").and_then(CodexUsageTotals::from_usage);
-    let last_usage = info.get("last_token_usage").and_then(CodexUsageTotals::from_usage);
+    let last_usage_value = info.get("last_token_usage");
+    let last_usage = last_usage_value.and_then(CodexUsageTotals::from_usage);
+    if dialect == RolloutDialect::Codex
+        && let Some(last_val) = last_usage_value
+        && last_val.is_object()
+        && last_usage.is_none()
+    {
+        if let Some(total) = total_usage {
+            *previous_totals = Some(total);
+        }
+        return None;
+    }
 
     let (tokens, next_totals) = match (total_usage, last_usage, *previous_totals) {
         (Some(total), Some(last), Some(previous)) => {
@@ -1536,13 +1988,8 @@ fn extract_codex_usage_event(
         (None, None, _) => return None,
     };
 
-    let cache_read_tokens = tokens.cached.min(tokens.input).max(0);
-    let input_tokens = tokens.input.saturating_sub(cache_read_tokens).max(0);
-    let reasoning_tokens = tokens.reasoning.max(0);
-    let output_tokens = tokens.output.saturating_sub(reasoning_tokens).max(0);
-    if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 && reasoning_tokens == 0 {
-        return None;
-    }
+    let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens) =
+        tokens.disjoint_buckets()?;
 
     *previous_totals = next_totals;
 
@@ -1557,14 +2004,15 @@ fn extract_codex_usage_event(
         input_tokens,
         output_tokens,
         cache_read_tokens,
+        cache_write_tokens,
         reasoning_tokens,
         source_path: Some(source_path.to_string()),
         raw_usage_json: Some(info.to_string()),
         ..RawUsageEvent::derived(
-            format!("token_count:{event_seq}"),
+            event_key,
             event_seq,
             timestamp,
-            USAGE_PARSER_VERSION,
+            usage_parser_version_for_dialect(dialect),
         )
     })
 }
@@ -3093,5 +3541,439 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn zero_bucket_last_usage_skips_emission_and_anchors_previous_totals() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root
+            .path()
+            .join("rollout-2026-04-13T10-00-00-019a4c01-e8f4-7270-bdab-7f19273b2310.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "019a4c01-e8f4-7270-bdab-7f19273b2310",
+                    "timestamp": "2026-04-13T10:00:00Z",
+                    "cwd": "/tmp/zero-last"
+                }
+            }),
+            serde_json::json!({
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.4"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 500,
+                            "output_tokens": 50,
+                            "reasoning_output_tokens": 5
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 0,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 0,
+                            "reasoning_output_tokens": 0
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:02Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1020,
+                            "cached_input_tokens": 510,
+                            "output_tokens": 60,
+                            "reasoning_output_tokens": 7
+                        }
+                    }
+                }
+            }),
+        ];
+        let mut f = fs::File::create(&path).unwrap();
+        for line in &lines {
+            writeln!(f, "{line}").unwrap();
+        }
+
+        let raw = parse_rollout(&path, false, RolloutDialect::Codex).unwrap().unwrap();
+        assert_eq!(raw.usage_events.len(), 1);
+        assert_eq!(raw.usage_events[0].input_tokens, 10);
+        assert_eq!(raw.usage_events[0].cache_read_tokens, 10);
+        assert_eq!(raw.usage_events[0].output_tokens, 8);
+        assert_eq!(raw.usage_events[0].reasoning_tokens, 2);
+        assert_eq!(CodexAdapter.usage_parser_version(), Some(7));
+        assert_eq!(crate::adapters::trae_cli::TraeCliAdapter.usage_parser_version(), Some(6));
+    }
+
+    #[test]
+    fn forked_child_uuid7_turn_id_gate_excludes_copied_parent_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "019f6a0a-0000-7000-8000-000000000001";
+        let parent_turn_id = "019f6a0a-1000-7000-8000-000000000003";
+        let child_id = "01a0238a-0000-7000-8000-000000000002";
+        let child_turn_id = "01a0238a-1000-7000-8000-000000000004";
+        let path = root.path().join(format!("rollout-2026-04-13T10-00-00-{child_id}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": child_id,
+                    "forked_from_id": parent_id,
+                    "timestamp": "2026-04-13T10:00:00Z",
+                    "cwd": "/tmp/fork"
+                }
+            }),
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": parent_id,
+                    "timestamp": "2026-04-12T10:00:00Z",
+                    "cwd": "/tmp/fork"
+                }
+            }),
+            serde_json::json!({
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": parent_turn_id,
+                    "model": "gpt-5.4"
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-12T10:00:05Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 10,
+                            "reasoning_output_tokens": 2
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 10,
+                            "reasoning_output_tokens": 2
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": child_turn_id,
+                    "model": "gpt-5.4"
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:01:00Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 130,
+                            "cached_input_tokens": 30,
+                            "output_tokens": 15,
+                            "reasoning_output_tokens": 3
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 30,
+                            "cached_input_tokens": 10,
+                            "output_tokens": 5,
+                            "reasoning_output_tokens": 1
+                        }
+                    }
+                }
+            }),
+        ];
+        let mut f = fs::File::create(&path).unwrap();
+        for line in &lines {
+            writeln!(f, "{line}").unwrap();
+        }
+
+        let raw = parse_rollout(&path, false, RolloutDialect::Codex).unwrap().unwrap();
+        assert_eq!(raw.excluded_codex_usage.len(), 1);
+        assert_eq!(raw.excluded_codex_usage[0].total, [100, 20, 0, 10, 2]);
+        assert_eq!(raw.usage_events.len(), 1);
+        assert_eq!(raw.usage_events[0].input_tokens, 20);
+        assert_eq!(raw.usage_events[0].cache_read_tokens, 10);
+        assert_eq!(raw.usage_events[0].output_tokens, 4);
+        assert_eq!(raw.usage_events[0].reasoning_tokens, 1);
+    }
+
+    #[test]
+    fn segmented_rollout_groups_and_resets_previous_totals_per_segment() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions_dir = root.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let session_uuid = "01a083e8-0000-7000-8000-000000000010";
+        let seg_uuid = "01a083e9-0000-7000-8000-000000000011";
+        let base_path =
+            sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{session_uuid}.jsonl"));
+        let seg_path = sessions_dir
+            .join(format!("rollout-2026-04-13T10-05-00-{session_uuid}_{seg_uuid}.jsonl"));
+
+        let mut base = fs::File::create(&base_path).unwrap();
+        writeln!(
+            base,
+            "{}",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": session_uuid,
+                    "timestamp": "2026-04-13T10:00:00Z",
+                    "cwd": "/tmp/segmented"
+                }
+            })
+        )
+        .unwrap();
+        writeln!(
+            base,
+            "{}",
+            serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-5.4"}})
+        )
+        .unwrap();
+        writeln!(
+            base,
+            "{}",
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:05Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 50,
+                            "cached_input_tokens": 10,
+                            "output_tokens": 10,
+                            "reasoning_output_tokens": 2
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 50,
+                            "cached_input_tokens": 10,
+                            "output_tokens": 10,
+                            "reasoning_output_tokens": 2
+                        }
+                    }
+                }
+            })
+        )
+        .unwrap();
+
+        let (entries_before, groups_before) =
+            collect_rollout_groups(&[&sessions_dir], RolloutDialect::Codex);
+        assert_eq!(entries_before.len(), 1);
+        let snap_before = rollout_group_snapshot(&groups_before[session_uuid]).unwrap();
+
+        let mut seg = fs::File::create(&seg_path).unwrap();
+        writeln!(
+            seg,
+            "{}",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": session_uuid,
+                    "timestamp": "2026-04-13T10:05:00Z",
+                    "cwd": "/tmp/segmented"
+                }
+            })
+        )
+        .unwrap();
+        writeln!(
+            seg,
+            "{}",
+            serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-5.4"}})
+        )
+        .unwrap();
+        writeln!(
+            seg,
+            "{}",
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:05:05Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 12,
+                            "cached_input_tokens": 2,
+                            "output_tokens": 3,
+                            "reasoning_output_tokens": 1
+                        }
+                    }
+                }
+            })
+        )
+        .unwrap();
+
+        let (entries_after, groups_after) =
+            collect_rollout_groups(&[&sessions_dir], RolloutDialect::Codex);
+        assert_eq!(entries_after.len(), 1);
+        let components = &groups_after[session_uuid];
+        assert_eq!(components.len(), 2);
+        let snap_after = rollout_group_snapshot(components).unwrap();
+        assert_ne!(snap_before, snap_after);
+
+        let raw =
+            parse_rollout_components(components, false, RolloutDialect::Codex).unwrap().unwrap();
+        assert_eq!(raw.usage_events.len(), 2);
+        assert_eq!(raw.usage_events[0].input_tokens, 40);
+        assert_eq!(raw.usage_events[1].input_tokens, 10);
+        assert_eq!(raw.usage_events[1].cache_read_tokens, 2);
+        assert_eq!(raw.usage_events[1].output_tokens, 2);
+        assert_eq!(raw.usage_events[1].reasoning_tokens, 1);
+        assert_ne!(raw.usage_events[0].event_key, raw.usage_events[1].event_key);
+    }
+
+    #[test]
+    fn post_compaction_token_usage_record_emits_only_when_token_count_is_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root
+            .path()
+            .join("rollout-2026-04-13T10-00-00-01a21e37-0000-7000-8000-000000000020.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "01a21e37-0000-7000-8000-000000000020",
+                    "timestamp": "2026-04-13T10:00:00Z",
+                    "cwd": "/tmp/compact"
+                }
+            }),
+            serde_json::json!({
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.4"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 10,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 4,
+                            "reasoning_output_tokens": 0
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 10,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 4,
+                            "reasoning_output_tokens": 0
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "token_usage_record",
+                "timestamp": "2026-04-13T10:00:02Z",
+                "payload": {
+                    "usage": {
+                        "input_tokens": 50,
+                        "cached_input_tokens": 10,
+                        "cache_write_input_tokens": 5,
+                        "output_tokens": 12,
+                        "reasoning_output_tokens": 2
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "compacted",
+                "timestamp": "2026-04-13T10:00:03Z",
+                "payload": {}
+            }),
+            serde_json::json!({
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.4"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:04Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 10,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 4,
+                            "reasoning_output_tokens": 0
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 0,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 0,
+                            "reasoning_output_tokens": 0
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "token_usage_record",
+                "timestamp": "2026-04-13T10:00:05Z",
+                "payload": {
+                    "usage": {
+                        "input_tokens": 15,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 3,
+                        "reasoning_output_tokens": 0
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "compacted",
+                "timestamp": "2026-04-13T10:00:06Z",
+                "payload": {}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:07Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 25,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 7,
+                            "reasoning_output_tokens": 0
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 15,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 3,
+                            "reasoning_output_tokens": 0
+                        }
+                    }
+                }
+            }),
+        ];
+        let mut f = fs::File::create(&path).unwrap();
+        for line in &lines {
+            writeln!(f, "{line}").unwrap();
+        }
+
+        let raw = parse_rollout(&path, false, RolloutDialect::Codex).unwrap().unwrap();
+        assert_eq!(raw.usage_events.len(), 3);
+        let recovered = &raw.usage_events[1];
+        assert_eq!(recovered.token_source, crate::types::TokenSource::Observed);
+        assert_eq!(recovered.input_tokens, 35);
+        assert_eq!(recovered.cache_read_tokens, 10);
+        assert_eq!(recovered.cache_write_tokens, 5);
+        assert_eq!(recovered.output_tokens, 10);
+        assert_eq!(recovered.reasoning_tokens, 2);
+        assert_eq!(recovered.model, "gpt-5.4");
+        assert_eq!(raw.usage_events[2].input_tokens, 15);
+        assert_eq!(raw.usage_events[2].output_tokens, 3);
     }
 }

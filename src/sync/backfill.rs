@@ -140,10 +140,11 @@ impl SyncJob {
         let mut reprocessed = false;
         if plan.usage
             && let Some(parser_version) = raw.usage_parser_version
-            && self.store.persist_usage_events_for_existing_session(
+            && self.store.persist_usage_events_for_existing_session_with_exclusions(
                 source_id,
                 raw_source_id,
                 &raw.usage_events,
+                &raw.excluded_codex_usage,
                 parser_version,
                 raw.updated_at,
             )?

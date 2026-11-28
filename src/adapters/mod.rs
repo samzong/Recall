@@ -48,7 +48,9 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::db::store::{IndexedSessionMeta, ParserStateMeta, SessionPath};
-use crate::types::{ParentLink, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
+use crate::types::{
+    ExcludedCodexUsage, ParentLink, RawSessionEvent, RawUsageEvent, Role, ThreadRole,
+};
 
 pub(crate) trait SourceAdapter {
     fn id(&self) -> &str;
@@ -264,6 +266,7 @@ pub(crate) struct RawSession {
     pub(crate) entrypoint: Option<String>,
     pub(crate) messages: Vec<RawMessage>,
     pub(crate) usage_events: Vec<RawUsageEvent>,
+    pub(crate) excluded_codex_usage: Vec<ExcludedCodexUsage>,
     pub(crate) usage_parser_version: Option<u32>,
     pub(crate) events: Vec<RawSessionEvent>,
     pub(crate) event_parser_version: Option<u32>,
@@ -295,6 +298,7 @@ impl RawSession {
             entrypoint,
             messages,
             usage_events: Vec::new(),
+            excluded_codex_usage: Vec::new(),
             usage_parser_version: None,
             events: Vec::new(),
             event_parser_version: None,

@@ -70,7 +70,7 @@ fn export_jsonl_emits_session_messages_and_usage_events() {
     assert_eq!(value["usage_events"][0]["token_source"], "observed");
     assert_eq!(value["usage_events"][0]["output_tokens"], 4);
     assert_eq!(value["usage_events"][0]["reasoning_tokens"], 1);
-    assert_eq!(value["usage_events"][0]["parser_version"], 5);
+    assert_eq!(value["usage_events"][0]["parser_version"], 7);
     assert_eq!(value["usage_events"][0]["source_path"], "/tmp/source.jsonl");
     assert_eq!(value["usage_events"][0]["raw_usage_json"], r#"{"input_tokens":10}"#);
     assert_eq!(value["events"][0]["kind"], "file_read");

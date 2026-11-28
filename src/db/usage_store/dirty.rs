@@ -5,8 +5,8 @@ use rusqlite::{OptionalExtension, Transaction};
 
 use super::super::schema::USAGE_INDEX_JOB;
 use super::{
-    OwnershipSourceRow, PersistedUsage, dedup_group_key_from_parts, normalize_persisted_usage,
-    validate_usage_amounts,
+    OwnershipSourceRow, PersistedUsage, codex_mirror_row_suppressed, dedup_group_key_from_parts,
+    normalize_persisted_usage, validate_usage_amounts,
 };
 pub(super) fn has_dirty_usage(conn: &rusqlite::Connection) -> Result<bool> {
     Ok(conn.query_row(
@@ -78,28 +78,31 @@ pub(super) fn rebuild_session_ownership_tx(
 
     let rows: Vec<OwnershipSourceRow> = {
         let mut stmt = tx.prepare(
-            "SELECT id, source, event_seq, timestamp, event_key, model, provider,
-                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    reasoning_tokens, parser_version, raw_usage_json
-             FROM usage_events
-             WHERE session_id = ?1",
+            "SELECT ue.id, ue.source, s.source_id, ue.event_seq, ue.timestamp, ue.event_key,
+                    ue.model, ue.provider, ue.input_tokens, ue.output_tokens,
+                    ue.cache_read_tokens, ue.cache_write_tokens, ue.reasoning_tokens,
+                    ue.parser_version, ue.raw_usage_json
+             FROM usage_events ue
+             JOIN sessions s ON s.id = ue.session_id
+             WHERE ue.session_id = ?1",
         )?;
         stmt.query_map([session_id], |row| {
             Ok(OwnershipSourceRow {
                 event_id: row.get(0)?,
                 source: row.get(1)?,
-                event_seq: row.get(2)?,
-                timestamp: row.get(3)?,
-                event_key: row.get(4)?,
-                model: row.get(5)?,
-                provider: row.get(6)?,
-                input_tokens: row.get(7)?,
-                output_tokens: row.get(8)?,
-                cache_read_tokens: row.get(9)?,
-                cache_write_tokens: row.get(10)?,
-                reasoning_tokens: row.get(11)?,
-                parser_version: row.get(12)?,
-                raw_usage_json: row.get(13)?,
+                source_id: row.get(2)?,
+                event_seq: row.get(3)?,
+                timestamp: row.get(4)?,
+                event_key: row.get(5)?,
+                model: row.get(6)?,
+                provider: row.get(7)?,
+                input_tokens: row.get(8)?,
+                output_tokens: row.get(9)?,
+                cache_read_tokens: row.get(10)?,
+                cache_write_tokens: row.get(11)?,
+                reasoning_tokens: row.get(12)?,
+                parser_version: row.get(13)?,
+                raw_usage_json: row.get(14)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?
@@ -108,7 +111,7 @@ pub(super) fn rebuild_session_ownership_tx(
     let mut insert = tx.prepare(
         "INSERT INTO usage_event_ownership(
             event_id, session_id, dedup_group, timestamp, event_seq, event_key, ownership
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     for row in rows {
         let usage = normalize_persisted_usage(
@@ -148,6 +151,18 @@ pub(super) fn rebuild_session_ownership_tx(
         if let Some(group_key) = group.as_ref() {
             dirty_groups.insert(group_key.clone());
         }
+        let ownership = if codex_mirror_row_suppressed(
+            tx,
+            session_id,
+            &row.source,
+            &row.source_id,
+            row.timestamp,
+            row.raw_usage_json.as_deref(),
+        )? {
+            3
+        } else {
+            1
+        };
         insert.execute(rusqlite::params![
             row.event_id,
             session_id,
@@ -155,6 +170,7 @@ pub(super) fn rebuild_session_ownership_tx(
             row.timestamp,
             row.event_seq,
             row.event_key,
+            ownership,
         ])?;
     }
     Ok(())
@@ -165,9 +181,19 @@ pub(super) fn recompute_dedup_group_tx(
     group: &str,
     affected_sessions: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let rows: Vec<(i64, String, i64)> = {
+    struct GroupMember {
+        event_id: i64,
+        session_id: String,
+        current: i64,
+        source: String,
+        source_id: String,
+        timestamp: i64,
+        raw_usage_json: Option<String>,
+    }
+
+    let rows: Vec<GroupMember> = {
         let mut stmt = tx.prepare(
-            "SELECT o.event_id, ue.session_id, o.ownership
+            "SELECT o.event_id, ue.session_id, o.ownership, ue.source, s.source_id, ue.timestamp, ue.raw_usage_json
              FROM usage_event_ownership o
              JOIN usage_events ue ON ue.id = o.event_id
              JOIN sessions s ON s.id = ue.session_id
@@ -182,27 +208,53 @@ pub(super) fn recompute_dedup_group_tx(
               ue.event_key ASC,
               ue.session_id ASC",
         )?;
-        stmt.query_map([group], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<rusqlite::Result<_>>()?
+        stmt.query_map([group], |row| {
+            Ok(GroupMember {
+                event_id: row.get(0)?,
+                session_id: row.get(1)?,
+                current: row.get(2)?,
+                source: row.get(3)?,
+                source_id: row.get(4)?,
+                timestamp: row.get(5)?,
+                raw_usage_json: row.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?
     };
-    let Some((_, winner_sid, _)) = rows.first() else {
-        return Ok(());
-    };
-    let winner_sid = winner_sid.clone();
+    let mut suppressed_flags = Vec::with_capacity(rows.len());
+    let mut winner_sid: Option<String> = None;
+    for row in &rows {
+        let suppressed = codex_mirror_row_suppressed(
+            tx,
+            &row.session_id,
+            &row.source,
+            &row.source_id,
+            row.timestamp,
+            row.raw_usage_json.as_deref(),
+        )?;
+        if !suppressed && winner_sid.is_none() {
+            winner_sid = Some(row.session_id.clone());
+        }
+        suppressed_flags.push(suppressed);
+    }
+    let mut seen_winner = false;
     let mut update =
         tx.prepare("UPDATE usage_event_ownership SET ownership = ?1 WHERE event_id = ?2")?;
-    for (idx, (event_id, sid, current)) in rows.into_iter().enumerate() {
-        let target = if idx == 0 {
+    for (row, suppressed) in rows.into_iter().zip(suppressed_flags) {
+        let target = if suppressed {
+            3
+        } else if !seen_winner {
+            seen_winner = true;
             1
-        } else if sid == winner_sid {
+        } else if winner_sid.as_deref() == Some(row.session_id.as_str()) {
             2
         } else {
             3
         };
-        if current != target {
-            update.execute(rusqlite::params![target, event_id])?;
-            if current == 1 || target == 1 {
-                affected_sessions.insert(sid);
+        if row.current != target {
+            update.execute(rusqlite::params![target, row.event_id])?;
+            if row.current == 1 || target == 1 {
+                affected_sessions.insert(row.session_id);
             }
         }
     }

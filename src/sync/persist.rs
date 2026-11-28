@@ -309,12 +309,13 @@ impl SyncJob {
             parents: &raw.parent_links,
             parser_version: metadata_parser_version,
         };
-        self.store.replace_session_with_usage_and_events_with_topology(
+        self.store.replace_session_with_usage_events_and_codex_exclusions(
             source_id,
             &raw_source_id,
             &session,
             &messages,
             &raw.usage_events,
+            &raw.excluded_codex_usage,
             raw.usage_parser_version,
             &events,
             event_parser_version,
